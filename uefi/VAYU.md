@@ -33,6 +33,18 @@ It clones Mu-Silicium at `uefi/BASE` if needed, applies the XNUP patch, copies
 `XnuLoader.{c,h}`, creates/reuses `../venv`, and runs `build_uefi.py -d vayu -r
 RELEASE`. Re-running is idempotent. The long form below is what the script does.
 
+Verify the packed image before flashing:
+
+```sh
+./uefi/verify-vayu-bootimg.py out/vayu-boot.img \
+  --fd Mu-Silicium/Build/vayuPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd \
+  --dtb uefi/files/Resources/DTBs/vayu.dtb
+```
+
+It checks the Android header, decompresses the kernel, and confirms
+`BootShim + SILICIUM_UEFI.fd + XNUP payload` plus the appended DTB with
+`cont_splash_region@9c000000`.
+
 It also applies `uefi/vayu-no-recursive-submodules.patch`: Mu-Silicium's
 `RequiredSubmodule` second argument is `recursive`, not `required`. For vayu we
 set it to `False` for `Mu_Basecore` and the `OpensslPkg` OpenSSL, so
