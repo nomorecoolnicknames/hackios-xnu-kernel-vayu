@@ -50,6 +50,15 @@ The output is reproducible: `xnuloader/build.sh` links the loader with
 `/Brepro`, and `mkxnuimg.py` writes the gzip header with `mtime=0`. Two
 consecutive vayu builds produced identical bytes.
 
+### Self-contained XNU diagnostic
+
+`uefi/build-vayu-diag.sh` puts `prebuilt/mach.development.bcm2837` and the
+5-byte `prebuilt/uefi/ramdisk` into the XNUP payload. There is no USB link and
+no iOS image; the loader boots straight into XNU. This is the **prebuilt
+redwood kernel**, not a vayu-built one: use it only for the first P2
+banner/panic, never as a device kernel. The script verifies the kernel entry
+and prints both hashes.
+
 It also applies `uefi/vayu-no-recursive-submodules.patch`: Mu-Silicium's
 `RequiredSubmodule` second argument is `recursive`, not `required`. For vayu we
 set it to `False` for `Mu_Basecore` and the `OpensslPkg` OpenSSL, so

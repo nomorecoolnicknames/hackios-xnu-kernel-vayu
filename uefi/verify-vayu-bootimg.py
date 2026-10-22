@@ -38,6 +38,7 @@ def main() -> None:
     ap.add_argument("--fd", type=Path, required=True)
     ap.add_argument("--dtb", type=Path, required=True)
     ap.add_argument("--platform", default="", help="require the XNUP platform entry to be this device")
+    ap.add_argument("--kernel", action="store_true", help="require a Mach-O kernel entry in the XNUP payload")
     ap.add_argument("--fb-node", default="cont_splash_region@9c000000")
     args = ap.parse_args()
 
@@ -125,6 +126,13 @@ def main() -> None:
         if got != args.platform:
             die(f"payload platform is {got!r}, expected {args.platform!r}")
         print(f"platform    {got}")
+    if args.kernel:
+        kernel = entries.get("kernel")
+        if kernel is None:
+            die("payload has no kernel entry")
+        if kernel[:4] != b"\xcf\xfa\xed\xfe":
+            die(f"kernel entry magic is {kernel[:4]!r}, expected Mach-O 64 little-endian")
+        print(f"kernel      {len(kernel)} bytes (Mach-O 64)")
     print("verify: OK")
 
 
