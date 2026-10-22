@@ -553,6 +553,17 @@ static const struct platform platform_redwood = {
 	.fb_base = 0xE1000000,
 };
 
+static const struct platform platform_vayu = {
+	/* POCO X3 Pro (SM8150-AC / Snapdragon 860). Values from vayu.dtb + vayuPkg MemoryMapLib. */
+	.name = "vayu", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
+	/* Cores 0-3 are Cortex-A55s; 4-7 are Cortex-A76s. */
+	.small_cores = 0x0f,
+	/* HYPOTHESIS: vayuPkg's "Display Reserved" base; corrected from the loader's display log. */
+	.fb_base = 0x9C000000,
+};
+
 /*
  * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
@@ -560,6 +571,7 @@ static const struct platform platform_redwood = {
  */
 static const struct platform *const platforms[] = {
 	&platform_redwood,
+	&platform_vayu,
 };
 
 /* ------------------------------------------------------------------------ */
