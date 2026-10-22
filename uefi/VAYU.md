@@ -1,7 +1,8 @@
 # UEFI for vayu (POCO X3 Pro)
 
-> Status: scaffold. The profile and loader platform are in place; the patched
-> Mu-Silicium UEFI for vayu is not built yet.
+> Status: built 2026-10-22. `SILICIUM_UEFI.fd` is exactly `0x300000` bytes,
+> SHA-256 `008e6ca8…38f46`; `out/vayu-boot.img` is built. Hardware P1 has not
+> been run yet — see `P1_VAYU.md`.
 
 ## What upstream already gives us
 
@@ -31,6 +32,13 @@ Only the generic XNUP hook:
 It clones Mu-Silicium at `uefi/BASE` if needed, applies the XNUP patch, copies
 `XnuLoader.{c,h}`, creates/reuses `../venv`, and runs `build_uefi.py -d vayu -r
 RELEASE`. Re-running is idempotent. The long form below is what the script does.
+
+It also applies `uefi/vayu-no-recursive-submodules.patch`: Mu-Silicium's
+`RequiredSubmodule` second argument is `recursive`, not `required`. For vayu we
+set it to `False` for `Mu_Basecore` and the `OpensslPkg` OpenSSL, so
+`stuart --update` still checks out the top-level submodules but does not drag in
+OpenSSL's test-only trees (`krb5`, `wycheproof`, `fuzz/corpora`, …). The UEFI
+build itself does not need those.
 
 ## Build plan
 

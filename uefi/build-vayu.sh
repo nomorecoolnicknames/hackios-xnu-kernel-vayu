@@ -27,6 +27,15 @@ cd "$MU"
 # Top-level submodules only; stuart --update brings what the build needs.
 git submodule update --init --depth 1
 
+# Mu-Silicium's RequiredSubmodule second argument is "recursive", not
+# "required". Keep the test-only OpenSSL/SPDM trees out of the update.
+if git apply --reverse --check "$HERE/vayu-no-recursive-submodules.patch" >/dev/null 2>&1; then
+	echo "build-vayu: no-recursion patch already applied"
+else
+	echo "build-vayu: applying no-recursion patch"
+	git apply --whitespace=nowarn "$HERE/vayu-no-recursive-submodules.patch"
+fi
+
 if git apply --reverse --check "$HERE/mu-silicium.patch" >/dev/null 2>&1; then
 	echo "build-vayu: XNUP patch already applied"
 else
