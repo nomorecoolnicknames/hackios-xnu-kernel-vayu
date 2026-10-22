@@ -13,11 +13,6 @@ static const struct platform platform_vayu = {
 	 * the small ones only when the big ones are all busy.
 	 */
 	.small_cores = 0x0f,
-	/*
-	 * INFERENCE: vayu.dts has reserved-memory/cont_splash_region@9c000000 (36 MB),
-	 * and vayuPkg's MemoryMapLib calls the same range "Display Reserved". The loader
-	 * prints the real GOP base as "display ... at ..."; correct this and
-	 * common/devices/vayu.conf if it differs.
-	 */
+	/* FACT: on 11cc4e72 the loader printed "display 1080 x 2400 at 9c000000". */
 	.fb_base = 0x9C000000,
 };

@@ -561,7 +561,7 @@ static const struct platform platform_vayu = {
 	.cores = 8, .core_shift = 8,
 	/* Cores 0-3 are Cortex-A55s; 4-7 are Cortex-A76s. */
 	.small_cores = 0x0f,
-	/* INFERENCE, fallback only: vayu.dts cont_splash_region@9c000000. */
+	/* FACT: on 11cc4e72 the loader printed "display 1080 x 2400 at 9c000000"; fallback only. */
 	.fb_base = 0x9C000000,
 };
 

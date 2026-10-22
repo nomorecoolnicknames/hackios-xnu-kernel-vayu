@@ -1,8 +1,8 @@
 # UEFI for vayu (POCO X3 Pro)
 
-> Status: built 2026-10-22. `SILICIUM_UEFI.fd` is exactly `0x300000` bytes,
-> SHA-256 `008e6ca8…38f46`; `out/vayu-boot.img` is built. Hardware P1 has not
-> been run yet — see `P1_VAYU.md`.
+> Status: built 2026-10-22; P1 ran on 2026-10-23 (`11cc4e72`). The loader
+> printed `display 1080 x 2400 at 9c000000`, `platform vayu` and
+> `usb: started`; see `P1_VAYU.md` and `receipts/2026-10-23-p1-vayu.md`.
 
 ## What upstream already gives us
 
@@ -111,14 +111,13 @@ UEFI_FD=$PWD/Mu-Silicium/Build/vayuPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd \
 | UEFI FD base | `0x9FC00000` | `Resources/Configs/vayu.toml` + `vayuPkg` "UEFI FD" |
 | UEFI FD size | `0x300000` | `vayu.toml` `uefi_fd.size`; still compare with the built FD |
 | Payload base | `0xF0000000` | `XnuLoader.h`; free RAM above the UEFI map |
-| Framebuffer | `0x9C000000` (inference) | `vayu.dts` `cont_splash_region@9c000000` (36 MB) |
+| Framebuffer | `0x9C000000` | FACT: P1 loader log, `display 1080 x 2400 at 9c000000` |
 
-The framebuffer base is an inference from the DTB and the UEFI memory map, not a
-hardware measurement. The boot image also carries `platform=vayu`, so the loader
-selects vayu without waiting for the base to match. It prints the real base as
-`display <w> x <h> at <base>`; after the first UEFI session, update `.fb_base` in
-`xnuloader/loader.c` and `FB_BASE` in `common/devices/vayu.conf` as a fallback,
-and use the printed value for the kernel's framebuffer.
+The framebuffer base is now hardware-confirmed: P1 on `11cc4e72` printed
+`display 1080 x 2400 at 9c000000`. The boot image still carries
+`platform=vayu`, so the loader does not depend on the base matching. `.fb_base`
+in `xnuloader/loader.c` and `FB_BASE` in `common/devices/vayu.conf` remain the
+fallback for images built before the platform entry.
 
 ## BootShim
 
