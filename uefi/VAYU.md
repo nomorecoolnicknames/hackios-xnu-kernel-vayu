@@ -46,6 +46,10 @@ It checks the Android header, decompresses the kernel, and confirms
 `BootShim + SILICIUM_UEFI.fd + XNUP payload`, the XNUP `platform=vayu` entry,
 and the appended DTB with `cont_splash_region@9c000000`.
 
+The output is reproducible: `xnuloader/build.sh` links the loader with
+`/Brepro`, and `mkxnuimg.py` writes the gzip header with `mtime=0`. Two
+consecutive vayu builds produced identical bytes.
+
 It also applies `uefi/vayu-no-recursive-submodules.patch`: Mu-Silicium's
 `RequiredSubmodule` second argument is `recursive`, not `required`. For vayu we
 set it to `False` for `Mu_Basecore` and the `OpensslPkg` OpenSSL, so

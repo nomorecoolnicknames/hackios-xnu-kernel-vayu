@@ -67,7 +67,9 @@ if args.payload:
 if os.environ.get('DTB'): parts['dtb'] = os.environ['DTB']
 dtb = open(parts['dtb'], 'rb').read()
 kernel = args.output + '.kernel~'
-open(kernel, 'wb').write(gzip.compress(blob, 6) + dtb)
+# mtime=0: gzip otherwise stores the current time, so the boot image would
+# change on every build even when every input is identical.
+open(kernel, 'wb').write(gzip.compress(blob, 6, mtime=0) + dtb)
 try:
     subprocess.check_call([sys.executable, parts['mkbootimg'], '--kernel', kernel, '--ramdisk', parts['ramdisk'],
                            '--header_version', '1', '-o', args.output])
