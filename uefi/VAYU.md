@@ -38,12 +38,13 @@ Verify the packed image before flashing:
 ```sh
 ./uefi/verify-vayu-bootimg.py out/vayu-boot.img \
   --fd Mu-Silicium/Build/vayuPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd \
-  --dtb uefi/files/Resources/DTBs/vayu.dtb
+  --dtb uefi/files/Resources/DTBs/vayu.dtb \
+  --platform vayu
 ```
 
 It checks the Android header, decompresses the kernel, and confirms
-`BootShim + SILICIUM_UEFI.fd + XNUP payload` plus the appended DTB with
-`cont_splash_region@9c000000`.
+`BootShim + SILICIUM_UEFI.fd + XNUP payload`, the XNUP `platform=vayu` entry,
+and the appended DTB with `cont_splash_region@9c000000`.
 
 It also applies `uefi/vayu-no-recursive-submodules.patch`: Mu-Silicium's
 `RequiredSubmodule` second argument is `recursive`, not `required`. For vayu we
@@ -100,9 +101,11 @@ UEFI_FD=$PWD/Mu-Silicium/Build/vayuPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd \
 | Framebuffer | `0x9C000000` (inference) | `vayu.dts` `cont_splash_region@9c000000` (36 MB) |
 
 The framebuffer base is an inference from the DTB and the UEFI memory map, not a
-hardware measurement. The loader prints it as `display <w> x <h> at <base>`;
-after the first UEFI session, update `.fb_base` in `xnuloader/loader.c` and
-`FB_BASE` in `common/devices/vayu.conf` to the printed value.
+hardware measurement. The boot image also carries `platform=vayu`, so the loader
+selects vayu without waiting for the base to match. It prints the real base as
+`display <w> x <h> at <base>`; after the first UEFI session, update `.fb_base` in
+`xnuloader/loader.c` and `FB_BASE` in `common/devices/vayu.conf` as a fallback,
+and use the printed value for the kernel's framebuffer.
 
 ## BootShim
 

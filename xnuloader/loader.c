@@ -520,11 +520,12 @@ struct platform {
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
+	int hypervisor_wdt;              /* the Qualcomm hypervisor's virtual watchdog is behind SMC */
 	int cores;                       /* at most this many processor cores, numbered from 0 ... */
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
-	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
+	uint64_t fb_base;                /* fallback identification: the framebuffer the firmware reports (GOP) */
 };
 
 static const struct platform platform_qemu_virt = {
@@ -542,7 +543,7 @@ static const struct platform platform_qemu_virt = {
 static const struct platform platform_redwood = {
 	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
 	.name = "redwood", .io_base = 0x00400000, .io_size = 0x3FC00000,
-	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1, .hypervisor_wdt = 1,
 	.cores = 8, .core_shift = 8,
 	/*
 	 * Cores 0-3 are Cortex-A55s (1.8 GHz at most), 4-7 Cortex-A78s (2.4 GHz): a big one is about
@@ -556,23 +557,42 @@ static const struct platform platform_redwood = {
 static const struct platform platform_vayu = {
 	/* POCO X3 Pro (SM8150-AC / Snapdragon 860). Values from vayu.dtb + vayuPkg MemoryMapLib. */
 	.name = "vayu", .io_base = 0x00400000, .io_size = 0x3FC00000,
-	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1, .hypervisor_wdt = 1,
 	.cores = 8, .core_shift = 8,
 	/* Cores 0-3 are Cortex-A55s; 4-7 are Cortex-A76s. */
 	.small_cores = 0x0f,
-	/* INFERENCE: vayu.dts cont_splash_region@9c000000; corrected from the loader's display log. */
+	/* INFERENCE, fallback only: vayu.dts cont_splash_region@9c000000. */
 	.fb_base = 0x9C000000,
 };
 
 /*
- * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
- * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
- * where each value comes from); a display that matches none is QEMU's ramfb.
+ * The devices the loader knows. The image normally names one in its payload; the framebuffer base is the
+ * fallback for images built before that entry existed. A port to another device adds its description
+ * here (common/new-device.sh writes a starting point, docs/PORTING.md says where each value comes from);
+ * a display that matches none is QEMU's ramfb.
  */
 static const struct platform *const platforms[] = {
 	&platform_redwood,
 	&platform_vayu,
 };
+
+/* The image can name its device in the payload ("platform=vayu"), so a wrong
+ * or changed framebuffer base cannot silently fall back to QEMU's platform. */
+static const struct platform *
+platform_by_name(const char *name, uint32_t len)
+{
+	if (len != 0 && name[len - 1] == '\0') {
+		len--;
+	}
+	for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++) {
+		const char *candidate = platforms[i]->name;
+
+		if (str_len(candidate) == len && memcmp(candidate, name, len) == 0) {
+			return platforms[i];
+		}
+	}
+	return 0;
+}
 
 /* ------------------------------------------------------------------------ */
 
@@ -2455,7 +2475,7 @@ wdt_arm(void)
 {
 	uint64_t ctl = 0, since = 0;
 
-	if (PLAT != &platform_redwood) {
+	if (!PLAT->hypervisor_wdt) {
 		return; /* SMC is not routed anywhere useful on QEMU virt */
 	}
 	uint64_t st = smc_call(VIRT_WDT_STATUS, 0, 0, &ctl, &since);
@@ -2511,6 +2531,8 @@ struct payload_info {
 	const uint8_t *ramdisk;
 	uint32_t ramdisk_size;
 	const char *cmdline;
+	const char *platform;           /* optional: the device this image was built for */
+	uint32_t platform_size;
 	uint64_t checkpoint;
 	uint64_t forced_base;
 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
@@ -2559,6 +2581,9 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->kernel = p + sizeof(*e);
 		} else if (str_eq(e->name, "cmdline")) {
 			pi->cmdline = text;
+		} else if (str_eq(e->name, "platform")) {
+			pi->platform = text;
+			pi->platform_size = e->size;
 		} else if (str_eq(e->name, "physbase")) {
 			pi->forced_base = parse_number(text, 16); /* testing aid; must be free RAM */
 		} else if (str_eq(e->name, "rdres")) {
@@ -3944,7 +3969,22 @@ efi_main(efi_handle image, efi_system_table *st)
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
+	install_exception_hook();
+
+	int have_payload = parse_payload(&pi, 0);
+
+	/*
+	 * The image says which device it was built for; that is stronger than
+	 * guessing from the framebuffer base (which can change with the panel).
+	 */
 	PLAT = &platform_qemu_virt;
+	if (have_payload && pi.platform != NULL) {
+		const struct platform *named = platform_by_name(pi.platform, pi.platform_size);
+
+		if (named != NULL) {
+			PLAT = named;
+		}
+	}
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
 		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
@@ -3953,19 +3993,21 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.width = GOP->mode->info->width;
 		SCREEN.height = GOP->mode->info->height;
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
-		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
-			if (platforms[i]->fb_base == SCREEN.base)
-				PLAT = platforms[i];
+		if (PLAT == &platform_qemu_virt) {
+			for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++) {
+				if (platforms[i]->fb_base == SCREEN.base) {
+					PLAT = platforms[i];
+				}
+			}
+		}
 		if (PLAT == &platform_qemu_virt)
 			ramfb_phone_screen();
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
 
-	install_exception_hook();
 	wdt_arm();
 
-	int have_payload = parse_payload(&pi, 0);
 	if (have_payload && pi.usb_mode && usb_start()) {
 		flush_log();
 		usb_command_loop();

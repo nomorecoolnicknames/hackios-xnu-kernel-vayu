@@ -37,6 +37,7 @@ def main() -> None:
     ap.add_argument("image", type=Path)
     ap.add_argument("--fd", type=Path, required=True)
     ap.add_argument("--dtb", type=Path, required=True)
+    ap.add_argument("--platform", default="", help="require the XNUP platform entry to be this device")
     ap.add_argument("--fb-node", default="cont_splash_region@9c000000")
     args = ap.parse_args()
 
@@ -81,6 +82,16 @@ def main() -> None:
         die(f"XNUP payload truncated: {len(after_fd)} of {payload_total} bytes")
     payload = after_fd[:payload_total]
 
+    entries = {}
+    pos = 8
+    entry_end = 8 + payload_data
+    while pos + 24 <= entry_end:
+        name, size, _ = struct.unpack_from("<16sII", payload, pos)
+        if name[0] == 0:
+            break
+        entries[name.rstrip(b"\0").decode()] = payload[pos + 24:pos + 24 + size]
+        pos += 24 + ((size + 15) & ~15)
+
     if not dtb.startswith(FDT_MAGIC):
         die(f"appended DTB has magic {dtb[:4]!r}, expected FDT magic")
     if dtb != dtb_file:
@@ -104,10 +115,16 @@ def main() -> None:
     print(f"shim        {len(shim)} bytes")
     print(f"uefi fd     {len(fd)} bytes (sha256 {sha(fd)})")
     print(f"payload     {len(payload)} bytes, XNUP (data {payload_data})")
+    print("entries     " + ", ".join(f"{name}={len(data)}" for name, data in entries.items()))
     print(f"dtb         {len(dtb)} bytes (sha256 {sha(dtb)})")
     print(f"dtb node    {args.fb_node}: {'yes' if node_ok else 'NO'}")
     if not node_ok:
         die(f"DTB does not contain {args.fb_node}")
+    if args.platform:
+        got = entries.get("platform", b"").rstrip(b"\0").decode()
+        if got != args.platform:
+            die(f"payload platform is {got!r}, expected {args.platform!r}")
+        print(f"platform    {got}")
     print("verify: OK")
 
 

@@ -15,6 +15,7 @@ ap.add_argument('-o', '--output', required=True)
 ap.add_argument('--cmdline', default='')
 ap.add_argument('--physbase', default='', help='hex: force XNU physical base (testing)')
 ap.add_argument('--usb', action='store_true', help='make the loader stay resident and take commands over USB')
+ap.add_argument('--platform', default='', help='device the image is for (vayu, redwood, ...); the loader selects it before the framebuffer guess')
 ap.add_argument('--rdres', default='', help='hex size of a root image already placed at the resident address (QEMU)')
 ap.add_argument('--checkpoint', default='', help='kernel checkpoint to stop at; 999 = loader self test')
 ap.add_argument('items', nargs='*')
@@ -36,6 +37,8 @@ if args.rdres:
     add('rdres', args.rdres.lower().replace('0x', '').encode() + b'\0')
 if args.usb:
     add('usb', b'1\0')
+if args.platform:
+    add('platform', args.platform.encode())
 if args.checkpoint:
     add('checkpoint', args.checkpoint.encode() + b'\0')
 body += b'\0' * 24

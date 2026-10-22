@@ -29,8 +29,10 @@ shim from your Mu-Silicium tree (`mkxnuimg.py` does it when `Mu-Silicium/` is th
 
 ## 2. The loader
 
-`xnuloader/loader.c` describes each device with a `struct platform` and picks it by the framebuffer base the UEFI
-reports. Paste `common/devices/<codename>.platform.c` next to `platform_redwood` and add it to `platforms[]`:
+`xnuloader/loader.c` describes each device with a `struct platform`. `common/build.sh` writes the profile's
+`UEFI_TARGET` into the payload as `platform=<codename>`, and the loader selects that name before falling back
+to the framebuffer base the UEFI reports (for images built before the entry existed). Paste
+`common/devices/<codename>.platform.c` next to `platform_redwood` and add it to `platforms[]`:
 
 | Field | Where it comes from |
 |---|---|
@@ -39,9 +41,10 @@ reports. Paste `common/devices/<codename>.platform.c` next to `platform_redwood`
 | `cores`, `core_shift` | the `cpu@` nodes; Qualcomm numbers cores in MPIDR's second affinity field (shift 8) |
 | `small_cores` | a bit per core of the little cluster (lowest `capacity-dmips-mhz`) |
 | `psci_hvc` | 1 if the firmware's PSCI is called with HVC (QEMU), 0 for SMC (phones) |
-| `fb_base` | the framebuffer address; the loader prints it at start (`display W x H at ...`) |
+| `fb_base` | fallback framebuffer address; the loader prints it at start (`display W x H at ...`) |
 
-Rebuild with `xnuloader/build.sh`; QEMU must still pick `qemu-virt` (no match = ramfb).
+Rebuild with `xnuloader/build.sh`. QEMU has no `platform` entry and no matching framebuffer, so it must still
+pick `qemu-virt` and use ramfb. On a phone, keep the profile's `UEFI_TARGET` equal to the platform name.
 
 ## 3. The kernel
 
