@@ -22,6 +22,16 @@ Only the generic XNUP hook:
   and `XnuLoader.h` — the loader entry point (generic; `XNU_PAYLOAD_BASE`
   is `0xF0000000`, so the profile uses the same `PAYLOAD_BASE`).
 
+## Quick build
+
+```sh
+./uefi/build-vayu.sh
+```
+
+It clones Mu-Silicium at `uefi/BASE` if needed, applies the XNUP patch, copies
+`XnuLoader.{c,h}`, creates/reuses `../venv`, and runs `build_uefi.py -d vayu -r
+RELEASE`. Re-running is idempotent. The long form below is what the script does.
+
 ## Build plan
 
 ```sh
