@@ -64,15 +64,15 @@ UEFI_FD=$PWD/Mu-Silicium/Build/vayuPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd \
 
 | Item | Value | Source |
 |------|-------|--------|
-| UEFI FD base | `0x9FC00000` | "UEFI FD" 0x9FC00000 + 0x300000 |
-| UEFI FD size | `0x300000` | same region; verify against the built FD |
-| Payload base | `0xF0000000` | `XnuLoader.h`; confirm free in the UEFI memory map |
-| Framebuffer | `0x9C000000` (hypothesis) | "Display Reserved" 0x9C000000 + 0x02400000 |
+| UEFI FD base | `0x9FC00000` | `Resources/Configs/vayu.toml` + `vayuPkg` "UEFI FD" |
+| UEFI FD size | `0x300000` | `vayu.toml` `uefi_fd.size`; still compare with the built FD |
+| Payload base | `0xF0000000` | `XnuLoader.h`; free RAM above the UEFI map |
+| Framebuffer | `0x9C000000` (inference) | `vayu.dts` `cont_splash_region@9c000000` (36 MB) |
 
-The framebuffer base is the one value we cannot read from the DTB. The loader
-prints it as `display <w> x <h> at <base>`; after the first UEFI session,
-update `.fb_base` in `xnuloader/loader.c` and `FB_BASE` in
-`common/devices/vayu.conf` to the printed value.
+The framebuffer base is an inference from the DTB and the UEFI memory map, not a
+hardware measurement. The loader prints it as `display <w> x <h> at <base>`;
+after the first UEFI session, update `.fb_base` in `xnuloader/loader.c` and
+`FB_BASE` in `common/devices/vayu.conf` to the printed value.
 
 ## BootShim
 

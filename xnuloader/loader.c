@@ -560,7 +560,7 @@ static const struct platform platform_vayu = {
 	.cores = 8, .core_shift = 8,
 	/* Cores 0-3 are Cortex-A55s; 4-7 are Cortex-A76s. */
 	.small_cores = 0x0f,
-	/* HYPOTHESIS: vayuPkg's "Display Reserved" base; corrected from the loader's display log. */
+	/* INFERENCE: vayu.dts cont_splash_region@9c000000; corrected from the loader's display log. */
 	.fb_base = 0x9C000000,
 };
 

@@ -14,8 +14,9 @@ static const struct platform platform_vayu = {
 	 */
 	.small_cores = 0x0f,
 	/*
-	 * HYPOTHESIS: vayuPkg MemoryMapLib reserves "Display Reserved" at 0x9C000000.
-	 * The loader prints the real GOP base as "display ... at ..."; correct this and
+	 * INFERENCE: vayu.dts has reserved-memory/cont_splash_region@9c000000 (36 MB),
+	 * and vayuPkg's MemoryMapLib calls the same range "Display Reserved". The loader
+	 * prints the real GOP base as "display ... at ..."; correct this and
 	 * common/devices/vayu.conf if it differs.
 	 */
 	.fb_base = 0x9C000000,
