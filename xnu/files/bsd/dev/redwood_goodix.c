@@ -1503,8 +1503,13 @@ void
 redwood_goodix_init(void)
 {
 	uint32_t enabled = 0;
+	char driver[16] = "";
 	thread_t thread;
 
+	/* boot-arg touch_driver=nvt: vayu's Novatek panel, not this one (bsd/dev/redwood_nvt.c) */
+	if (PE_parse_boot_argn("touch_driver", driver, sizeof(driver)) && strcmp(driver, "nvt") == 0) {
+		return;
+	}
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
