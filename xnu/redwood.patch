@@ -65,13 +65,14 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 44274016a4cf..9cd24b42caca 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,37 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,38 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
 +bsd/dev/redwood_input.c		standard
 +bsd/dev/redwood_virtio_input.c	standard
 +bsd/dev/redwood_goodix.c	standard
++bsd/dev/redwood_nvt.c		standard
 +bsd/dev/redwood_buttons.c	standard
 +bsd/dev/redwood_battery.c	standard
 +bsd/dev/redwood_ufs.c	standard
@@ -379,11 +380,12 @@ index 4df41ba1f61b..16cf4fd8d8f1 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +983,14 @@ bsd_init(void)
+@@ -976,6 +983,15 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
 +		redwood_input_init();           /* /dev/redwood-touch */
++		redwood_nvt_init();             /* boot-args touchscreen=1 touch_driver=nvt: vayu's panel */
 +		redwood_audio_init();           /* /dev/redwood-audio */
 +		redwood_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
 +		redwood_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
