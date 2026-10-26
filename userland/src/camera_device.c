@@ -37,6 +37,7 @@
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <sys/sysctl.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
 #include <math.h>
@@ -405,7 +406,7 @@ struct output {
 	bool            enabled;
 	void *          handler;                /* a block: ^(CVPixelBufferRef, CMTime) */
 	bool            said_shape;
-	uint64_t        delivered, refused;
+	uint64_t        delivered, refused, rendered;   /* (rendered: every picture made, for the timing line every 100) */
 	CVPixelBufferRef held[HELD];            /* the pictures given last, kept from the pool (see deliver) */
 	unsigned        held_next;
 	bool            said_pool;
@@ -985,14 +986,26 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	uint64_t began = mach_absolute_time();
 
 	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
-	if (job.still) {
+	{
 		static mach_timebase_info_data_t tb;
+		double ms;
 
 		if (tb.denom == 0) {
 			mach_timebase_info(&tb);
 		}
-		say("%s: %ux%u made of every pixel in %.0f ms", out->name, width, height,
-		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
+		ms = (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6;
+		out->rendered++;
+		if (job.still) {
+			struct isp_still_timing timing;
+
+			isp_take_still_timing(&timing);
+			say("%s: %ux%u made of every pixel in %.0f ms (still: NR %.1f ms, sharpen %.1f ms, local contrast %.1f ms)",
+			    out->name, width, height, ms, timing.nr_ms, timing.sharpen_ms, timing.lcon_ms);
+		} else if (out->rendered % 100 == 0) {
+			/* (the preview's cost: the look adds only the sharpening across the line -- spec L) */
+			say("%s: %ux%u made in %.1f ms (the %lluth picture)", out->name, width, height, ms,
+			    (unsigned long long)out->rendered);
+		}
 	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
 	CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
@@ -1281,14 +1294,65 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 	}
 }
 
+/* a boot-argument's number (cam_nr=..., cam_sharp=...), or what it was without it */
+static float
+boot_number(const char *arguments, const char *name, float fallback)
+{
+	const char *at = strstr(arguments, name);
+	char *end;
+	float v;
+
+	if (at == NULL) {
+		return fallback;
+	}
+	v = strtof(at + strlen(name), &end);
+	return end == at + strlen(name) ? fallback : v;
+}
+
 /* the sensor's colour tuning, when the image has one (fw/camera-<sensor>.isp, tools/camtuning.py) */
 static void
 load_tuning(struct isp *isp, uint32_t sensor)
 {
-	static const char *const names[] = { "ov02b10", "s5khm2sd", "ov16a1q", "s5k4h7" };
+	static const char *const hakios_names[] = { "ov02b10", "s5khm2sd", "ov16a1q", "s5k4h7" };
+	/* vayu (boot-arg vayu_camera=...): sensor 1 the IMX582, 2 the S5K3T2 (camera work); the others not known */
+	static const char *const vayu_names[] = { NULL, "imx582", "s5k3t2", NULL };
+	static struct isp_look vayu_look;       /* the look's knobs, once a session */
+	static int vayu = -1, tone, said;
+	const char *const *names;
 	char path[96];
 
-	if (sensor >= sizeof(names) / sizeof(names[0])) {
+	if (vayu < 0) {
+		char arguments[4096] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		vayu = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "vayu_camera=") != NULL;
+		/* vayu's pictures want more than sRGB's curve: a gentle S-curve and a little saturation (cam_tone=0: none) */
+		tone = vayu && strstr(arguments, "cam_tone=0") == NULL;
+		if (tone) {
+			/* a tester's knobs (0 turns one off): noise reduction, sharpening, local contrast, vibrance */
+			vayu_look.nr = boot_number(arguments, "cam_nr=", 1);
+			vayu_look.sharpen = boot_number(arguments, "cam_sharp=", 1);
+			vayu_look.lcon = boot_number(arguments, "cam_lcon=", 0.15f);
+			vayu_look.vibrance = boot_number(arguments, "cam_vib=", 0.25f);
+			vayu_look.rolloff = 1.0f;
+			vayu_look.preview_sharp = vayu_look.sharpen > 0 ? 0.3f : 0;
+		}
+	}
+	/* every session (isp_init() puts the plain curve back) */
+	if (tone) {
+		isp_set_tone(isp, 0.3f, 1.15f);
+		isp_set_look(isp, &vayu_look);
+		if (!said) {
+			said = 1;
+			say("vayu's look: tone contrast 0.30, saturation 1.15, noise reduction %.2f (cam_nr=), sharpening %.2f "
+			    "(cam_sharp=), local contrast %.2f (cam_lcon=), vibrance %.2f (cam_vib=), highlight roll-off %.2f, "
+			    "preview sharpening %.2f (cam_tone=0 for none)", vayu_look.nr, vayu_look.sharpen, vayu_look.lcon,
+			    vayu_look.vibrance, vayu_look.rolloff, vayu_look.preview_sharp);
+		}
+	}
+	names = vayu ? vayu_names : hakios_names;
+	if (sensor >= 4 || names[sensor] == NULL) {
+		say("no tuning file known for sensor %u", sensor);
 		return;
 	}
 	snprintf(path, sizeof(path), "/redwood/fw/camera-%s.isp", names[sensor]);

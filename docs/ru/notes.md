@@ -1831,7 +1831,7 @@ x-set-apple-store-front header» и адрес `https://bag.itunes.apple.com/bag
 говорит о том, запрашивался ли мешок.
 
 А что консоль всё-таки донесла — обратное тому, что здесь стояло: **сеть на телефоне работает.** У `en0`
-адрес 192.168.9.243, `mDNSResponder` разрешает имена по TCP к 192.168.9.1:53 (четыре запроса, ответы 159,
+адрес <phone-ip>, `mDNSResponder` разрешает имена по TCP к <router>:53 (четыре запроса, ответы 159,
 842, 200 и 107 байт), а `trustd`, `geod`, `maild`, `gamed`, `cloudd`, `StocksWidget` и `nsurlsessiond`
 открывают TLS к Apple и Akamai (17.248.214.x, 17.253.39.x, 2.16.56.93, 23.11.40.157, 95.100.176.233).
 Строка «net_test: en0: flags 0x8802» читалась через 0,1 с после начала пользовательского пространства, до
@@ -1844,7 +1844,7 @@ x-set-apple-store-front header» и адрес `https://bag.itunes.apple.com/bag
 
 ```
 net_test: waitaddr en0: an address after 0.0 s
-net_test: en0: flags 0x8843 up running ... inet 192.168.9.243 netmask 255.255.255.0
+net_test: en0: flags 0x8843 up running ... inet <phone-ip> netmask 255.255.255.0
 net_test: resolve bag.itunes.apple.com, 0.02 s: 17.253.39.138 17.253.39.140 ...
 net_test: fetch https://www.apple.com/library/test/success.html: status 200, 68 bytes in 0.32 s
 net_test: fetch https://bag.itunes.apple.com/bag.xml: status 200, 56219 bytes in 0.53 s

@@ -102,6 +102,9 @@ def main():
 
     best = {}
     for stanza in stanzas(index):
+        # a repository may carry the rootful build (iphoneos-arm) of the same package and version: rootless only
+        if (field(stanza, 'Architecture') or 'iphoneos-arm64') not in ('iphoneos-arm64', 'all'):
+            continue
         name = field(stanza, 'Package')
         if name in names:
             version = field(stanza, 'Version') or '0'
@@ -159,7 +162,10 @@ def main():
                 # "fully_trusted": the prefix is full of links to absolute paths of its own
                 # (/var/jb/bin/run-parts -> /var/jb/usr/bin/run-parts), which the careful filter
                 # refuses; where the files land is checked above instead.
-                tar.extract(member, prefix, set_attrs=True, filter='fully_trusted')
+                try:
+                    tar.extract(member, prefix, set_attrs=True, filter='fully_trusted')
+                except TypeError:           # Python before 3.11.4/3.12: no filter, and no filtering either
+                    tar.extract(member, prefix, set_attrs=True)
         os.unlink(tmp)
         # dpkg's database: the new stanza in place of the old one, or added
         entry = '\n'.join(line for line in stanza.split('\n')

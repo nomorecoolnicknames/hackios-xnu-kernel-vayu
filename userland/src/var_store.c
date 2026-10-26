@@ -117,7 +117,7 @@ struct entry {
 static int
 boot_arg_is(const char *name, const char *value)
 {
-	static char args[1024];
+	static char args[4096];
 	size_t len = sizeof(args) - 1, n = strlen(name), v = strlen(value);
 
 	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {

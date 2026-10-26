@@ -103,7 +103,7 @@ main_loop_turn(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activit
 static void
 watch_main_loop(void)
 {
-	char args[1024] = "";
+	char args[4096] = "";
 	size_t size = sizeof(args) - 1;
 	const char *arg;
 
@@ -640,7 +640,7 @@ battery_post_notifications(void)
 static bool
 gpu_draws(void)
 {
-	char arguments[1024] = "";
+	char arguments[4096] = "";
 	size_t size = sizeof(arguments) - 1;
 	const char *argument;
 	io_service_t gpu;
@@ -845,7 +845,7 @@ switcher_wallpaper_overlay(id self, SEL selector)
 	static unsigned told;
 
 	if (wanted < 0) {
-		char args[1024] = "";
+		char args[4096] = "";
 		size_t size = sizeof(args) - 1;
 		const char *at;
 
@@ -1361,7 +1361,7 @@ hakios_springboard_init(void)
 	    original_battery_view_set_charge_percent ? "ok" : "NO",
 	    original_ring_charging_level ? "ok" : "NO");
 	{
-		char args[1024] = "";
+		char args[4096] = "";
 		size_t size = sizeof(args) - 1;
 		const char *delay;
 
@@ -1386,7 +1386,7 @@ hakios_springboard_init(void)
 		}
 		watch_main_loop();
 		{
-			char arguments[1024] = "";
+			char arguments[4096] = "";
 			size_t size = sizeof(arguments) - 1;
 
 			if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
@@ -1419,7 +1419,7 @@ hakios_springboard_init(void)
 	 * (to show the phone starting the way an iPhone does).
 	 */
 	{
-		char args[1024] = "";
+		char args[4096] = "";
 		size_t size = sizeof(args) - 1;
 		const char *arg;
 

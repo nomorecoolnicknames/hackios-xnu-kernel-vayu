@@ -3,19 +3,49 @@
  * cell, the nearest cell for each pixel of the picture (previews), or every pixel by bilinear
  * demosaic (stills); per pixel, in this order: the black level off, lens shading (a grid of gains per
  * colour, when there is one), the white balance's and AE's gains, the colour matrix (identity until
- * one is set), sRGB's curve. Grey-world white balance; no noise reduction yet. The colour matrix and
- * the lens shading can come from the camera's own tuning (isp_load_tuning(), isp_tune()).
+ * one is set), sRGB's curve. Grey-world white balance. The colour matrix and the lens shading can
+ * come from the camera's own tuning (isp_load_tuning(), isp_tune()). The photographs then get the
+ * "iPhone look" (spec L): noise reduction, sharpening, local contrast and vibrance on Y and the
+ * chroma, and the highlight roll-off in their own gamma table (the look_pipe below); the preview gets
+ * only a line-wide unsharp mask, which is what keeps its cost where it was.
  */
 #include <fcntl.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include "camera_isp.h"
 
 #define WHITE           959             /* 1023 less the black level of 64 */
 #define LUT_WHITE       3836            /* WHITE in the gamma table's steps */
+
+/*
+ * The gamma table: sRGB's curve, the tone's S-curve on it, and -- the stills' -- the look's highlight
+ * roll-off in its last tenth (v > 0.9): a shoulder that leaves 0.9 where it is, is a parabola up to
+ * where white lands (0.975 at rolloff 1), and has half the slope there, so a lamp goes on getting a
+ * little brighter instead of a hard 255.
+ */
+static void
+build_gamma(const struct isp *isp, uint8_t *table, bool still)
+{
+	double rolloff = still ? (double)isp->look.rolloff : 0;
+
+	for (int i = 0; i < 4096; i++) {
+		double v = i >= LUT_WHITE ? 1 : (double)i / LUT_WHITE;
+
+		v = v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055;
+		v += isp->contrast * (v * v * (3 - 2 * v) - v);
+		if (rolloff > 0 && v > 0.9) {
+			double t = (v - 0.9) / 0.1;
+
+			v = 0.9 + 0.1 * (t - 0.25 * rolloff * t * t);
+		}
+		v = v < 0 ? 0 : v > 1 ? 1 : v;
+		table[i] = (uint8_t)(v * 255 + 0.5);
+	}
+}
 
 void
 isp_init(struct isp *isp)
@@ -24,15 +54,45 @@ isp_init(struct isp *isp)
 	isp->wb[0] = isp->wb[1] = isp->wb[2] = 1;
 	isp->digital = 1;
 	isp->zoom = 1;
+	isp->saturation = 1;
 	for (int i = 0; i < 3; i++) {
 		isp->ccm[i][i] = 1;
+		isp->ccm_plain[i][i] = 1;
 	}
-	for (int i = 0; i < 4096; i++) {
-		double v = i >= LUT_WHITE ? 1 : (double)i / LUT_WHITE;
+	build_gamma(isp, isp->gamma, false);
+	build_gamma(isp, isp->gamma_still, true);
+}
 
-		v = v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055;
-		isp->gamma[i] = (uint8_t)(v * 255 + 0.5);
+/*
+ * The gamma table again, with an S-curve of contrast c on sRGB's values (v + c * (smoothstep(v) - v): darker darks,
+ * brighter lights, the ends and the middle where they were), and the saturation the colour matrix gets from now on.
+ * vayu's pictures came out flat (camera work, 2026-10-26): sRGB's curve and a 15 % exposure target alone.
+ */
+void
+isp_set_tone(struct isp *isp, float contrast, float saturation)
+{
+	isp->contrast = contrast;
+	isp->saturation = saturation > 0 ? saturation : 1;
+	build_gamma(isp, isp->gamma, false);
+	build_gamma(isp, isp->gamma_still, true);
+}
+
+/* the stills' look and the preview's sharpening; NULL (or a field at 0) is the pictures as they were before */
+void
+isp_set_look(struct isp *isp, const struct isp_look *look)
+{
+	memset(&isp->look, 0, sizeof(isp->look));
+	if (look != NULL) {
+		isp->look = *look;
 	}
+	isp->look.nr = isp->look.nr > 0 ? isp->look.nr : 0;
+	isp->look.sharpen = isp->look.sharpen > 0 ? isp->look.sharpen : 0;
+	isp->look.lcon = isp->look.lcon > 0 ? isp->look.lcon : 0;
+	isp->look.vibrance = isp->look.vibrance > 0 ? isp->look.vibrance : 0;
+	isp->look.rolloff = isp->look.rolloff > 0 ? isp->look.rolloff : 0;
+	isp->look.preview_sharp = isp->look.preview_sharp > 0 ? isp->look.preview_sharp : 0;
+	/* (the curve already has the tone's contrast in it: the roll-off goes on top) */
+	build_gamma(isp, isp->gamma_still, true);
 }
 
 /* where red and blue are in a cell (0 top left, 1 top right, 2 bottom left, 3 bottom right) */
@@ -47,15 +107,16 @@ cell_places(uint32_t bayer, int *r, int *b)
 
 /* the four values of the cell at cx of the pair of lines from `top' (above black, 0 and up) */
 static inline void
-cell(const uint8_t *top, size_t stride, uint32_t cx, int v[4])
+cell(const uint8_t *top, size_t stride, uint32_t cx, int black, int v[4])
 {
 	const uint8_t *g0 = top + (size_t)(cx >> 1) * 5, *g1 = g0 + stride;
 	unsigned o = (cx & 1) * 2;
 
-	v[0] = (g0[o] << 2 | (g0[4] >> (o * 2) & 3)) - 64;
-	v[1] = (g0[o + 1] << 2 | (g0[4] >> (o * 2 + 2) & 3)) - 64;
-	v[2] = (g1[o] << 2 | (g1[4] >> (o * 2) & 3)) - 64;
-	v[3] = (g1[o + 1] << 2 | (g1[4] >> (o * 2 + 2) & 3)) - 64;
+	/* the frame's own black level (the kernel says 64 today; it was taken as 64 here before) */
+	v[0] = (g0[o] << 2 | (g0[4] >> (o * 2) & 3)) - black;
+	v[1] = (g0[o + 1] << 2 | (g0[4] >> (o * 2 + 2) & 3)) - black;
+	v[2] = (g1[o] << 2 | (g1[4] >> (o * 2) & 3)) - black;
+	v[3] = (g1[o + 1] << 2 | (g1[4] >> (o * 2 + 2) & 3)) - black;
 	for (int i = 0; i < 4; i++) {
 		v[i] = v[i] < 0 ? 0 : v[i];
 	}
@@ -94,7 +155,7 @@ isp_sharpness(const struct hakios_camera_frame *f, const uint8_t *raw, float x0,
 				for (uint32_t cx = cx0 + bx * BLOCK; cx < cx0 + bx * BLOCK + BLOCK; cx++) {
 					int v[4];
 
-					cell(top, f->stride, cx, v);
+					cell(top, f->stride, cx, (int)f->black, v);
 					for (int i = 0; i < 4; i++) {
 						g += i != r && i != b ? (uint32_t)v[i] : 0;
 					}
@@ -139,7 +200,7 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 		for (uint32_t cx = 0; cx < cells_w; cx += 4) {
 			int v[4], g = 0, top_v = 0;
 
-			cell(top, f->stride, cx, v);
+			cell(top, f->stride, cx, (int)f->black, v);
 			for (int i = 0; i < 4; i++) {
 				g += i != r && i != b ? v[i] : 0;
 				top_v = v[i] > top_v ? v[i] : top_v;
@@ -377,8 +438,25 @@ crop(const struct isp *isp, const struct hakios_camera_frame *f, uint32_t width,
 void
 isp_set_ccm(struct isp *isp, const float m[9])
 {
-	for (int i = 0; i < 9; i++) {
-		isp->ccm[i / 3][i % 3] = m[i];
+	/* the saturation after the matrix: S = (1 - s) L + s I, L every row the luma weights, so rows still sum to 1 */
+	static const float luma[3] = { 0.2126f, 0.7152f, 0.0722f };
+	float s = isp->saturation > 0 ? isp->saturation : 1;
+
+	/* kept without it: the stills' vibrance does the saturating instead (pipe_init) */
+	for (int r = 0; r < 3; r++) {
+		for (int c = 0; c < 3; c++) {
+			isp->ccm_plain[r][c] = m[r * 3 + c];
+		}
+	}
+	for (int r = 0; r < 3; r++) {
+		for (int c = 0; c < 3; c++) {
+			float sum = 0;
+
+			for (int k = 0; k < 3; k++) {
+				sum += ((1 - s) * luma[k] + (r == k ? s : 0)) * m[k * 3 + c];
+			}
+			isp->ccm[r][c] = sum;
+		}
 	}
 }
 
@@ -392,37 +470,40 @@ struct pipe {
 };
 
 static void
-pipe_init(const struct isp *isp, struct pipe *p)
+pipe_init(const struct isp *isp, struct pipe *p, bool still)
 {
+	/* the stills' vibrance wants the colours as the matrix has them, not with its saturation folded in */
+	const float (*m)[3] = still && isp->look.vibrance > 0 ? isp->ccm_plain : isp->ccm;
+
 	p->identity = true;
 	for (int c = 0; c < 3; c++) {
 		for (int j = 0; j < 3; j++) {
-			p->m[c][j] = isp->ccm[c][j] * isp->wb[j] * isp->digital * (LUT_WHITE / (float)WHITE);
-			p->identity = p->identity && (c == j ? isp->ccm[c][j] == 1 : isp->ccm[c][j] == 0);
+			p->m[c][j] = m[c][j] * isp->wb[j] * isp->digital * (LUT_WHITE / (float)WHITE);
+			p->identity = p->identity && (c == j ? m[c][j] == 1 : m[c][j] == 0);
 		}
 	}
 }
 
 static inline uint8_t
-curve(const struct isp *isp, float v)
+curve(const struct isp *isp, const uint8_t *table, float v)
 {
 	int i = (int)(v + 0.5f);
 
-	return isp->gamma[i < 0 ? 0 : i > 4095 ? 4095 : i];
+	return table[i < 0 ? 0 : i > 4095 ? 4095 : i];
 }
 
 static inline void
-pixel(const struct isp *isp, const struct pipe *p, float r, float g, float b, uint8_t *rgb)
+pixel(const struct isp *isp, const struct pipe *p, const uint8_t *table, float r, float g, float b, uint8_t *rgb)
 {
 	if (p->identity) {
-		rgb[0] = curve(isp, r * p->m[0][0]);
-		rgb[1] = curve(isp, g * p->m[1][1]);
-		rgb[2] = curve(isp, b * p->m[2][2]);
+		rgb[0] = curve(isp, table, r * p->m[0][0]);
+		rgb[1] = curve(isp, table, g * p->m[1][1]);
+		rgb[2] = curve(isp, table, b * p->m[2][2]);
 		return;
 	}
-	rgb[0] = curve(isp, p->m[0][0] * r + p->m[0][1] * g + p->m[0][2] * b);
-	rgb[1] = curve(isp, p->m[1][0] * r + p->m[1][1] * g + p->m[1][2] * b);
-	rgb[2] = curve(isp, p->m[2][0] * r + p->m[2][1] * g + p->m[2][2] * b);
+	rgb[0] = curve(isp, table, p->m[0][0] * r + p->m[0][1] * g + p->m[0][2] * b);
+	rgb[1] = curve(isp, table, p->m[1][0] * r + p->m[1][1] * g + p->m[1][2] * b);
+	rgb[2] = curve(isp, table, p->m[2][0] * r + p->m[2][1] * g + p->m[2][2] * b);
 }
 
 /* the lens shading's gains at (u, v), 0 to 1 across the sensor */
@@ -454,7 +535,7 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 
 	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
 	cell_places(f->bayer, &r, &b);
-	pipe_init(isp, &p);
+	pipe_init(isp, &p, false);
 	if (isp->turned) {
 		row = height - 1 - row;         /* (and each line from its end, below) */
 	}
@@ -485,7 +566,7 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 				int v[4];
 				float w = (k & 1 ? tx : 1 - tx) * (k & 2 ? ty : 1 - ty);
 
-				cell(k & 2 ? t1 : t0, f->stride, k & 1 ? cx1 : cx0, v);
+				cell(k & 2 ? t1 : t0, f->stride, k & 1 ? cx1 : cx0, (int)f->black, v);
 				c[0] += w * v[r];
 				c[2] += w * v[b];
 				for (int j = 0; j < 4; j++) {
@@ -495,7 +576,8 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 			if (isp->lsc.on) {
 				lsc_at(isp, cells_w > 1 ? (float)cx0 / (cells_w - 1) : 0, v_at, gains);
 			}
-			pixel(isp, &p, c[0] * gains[0], c[1] * gains[1], c[2] * gains[2], rgb + 3 * (isp->turned ? width - 1 - x : x));
+			pixel(isp, &p, isp->gamma, c[0] * gains[0], c[1] * gains[1], c[2] * gains[2],
+			    rgb + 3 * (isp->turned ? width - 1 - x : x));
 		}
 		return;
 	}
@@ -508,14 +590,15 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 		uint32_t cx = (uint32_t)(at >> 16);
 		int v[4], g = 0;
 
-		cell(top, f->stride, cx, v);
+		cell(top, f->stride, cx, (int)f->black, v);
 		for (int j = 0; j < 4; j++) {
 			g += j != r && j != b ? v[j] : 0;
 		}
 		if (isp->lsc.on) {
 			lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
 		}
-		pixel(isp, &p, v[r] * gains[0], g * 0.5f * gains[1], v[b] * gains[2], rgb + 3 * (isp->turned ? width - 1 - x : x));
+		pixel(isp, &p, isp->gamma, v[r] * gains[0], g * 0.5f * gains[1], v[b] * gains[2],
+		    rgb + 3 * (isp->turned ? width - 1 - x : x));
 	}
 }
 
@@ -560,6 +643,43 @@ nv12_pair(const uint8_t *rgb0, const uint8_t *rgb1, uint32_t width, uint8_t *y0,
 	}
 }
 
+/*
+ * The preview's sharpening (spec L: only this of the look, at 0.3): an unsharp mask of radius 1 across the
+ * line, on the Y that is already made. Down the line too it would keep two more lines of the picture and
+ * cost what the preview cannot: the camera's frames are already down to 6-11 of 15-30 a second.
+ */
+static void
+preview_sharpen(uint8_t *line, uint32_t width, float amount)
+{
+	int prev;
+
+	if (width < 3) {
+		return;
+	}
+	prev = line[0];
+	for (uint32_t x = 0; x < width; x++) {
+		int cur = line[x], next = line[x + 1 < width ? x + 1 : x - 1], blur = (prev + 2 * cur + next + 2) >> 2;
+		int delta = cur - blur, out = cur;
+
+		if (delta > 2) {
+			delta -= 2;
+		} else if (delta < -2) {
+			delta += 2;
+		} else {
+			delta = 0;
+		}
+		if (delta != 0) {
+			int add = (int)(delta * amount + (delta > 0 ? 0.5f : -0.5f));
+
+			add = add > 24 ? 24 : add < -24 ? -24 : add;
+			out = cur + add;
+			out = out < 0 ? 0 : out > 255 ? 255 : out;
+		}
+		prev = line[x];
+		line[x] = (uint8_t)out;
+	}
+}
+
 void
 isp_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
     uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
@@ -576,6 +696,12 @@ isp_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, cons
 		render_line(isp, f, raw, width, height, second ? row + 1 : row, line[1]);
 		nv12_pair(line[0], line[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
 		    uv + (size_t)(row / 2) * uv_stride, video_range);
+		if (isp->look.preview_sharp > 0) {
+			preview_sharpen(y + (size_t)row * y_stride, width, isp->look.preview_sharp);
+			if (second) {
+				preview_sharpen(y + (size_t)(row + 1) * y_stride, width, isp->look.preview_sharp);
+			}
+		}
 	}
 }
 
@@ -633,10 +759,10 @@ unpack_line(const struct hakios_camera_frame *f, const uint8_t *raw, int y, int 
 	}
 }
 
-/* one line (y) at full size as 8-bit R, G, B, from the lines y - 1, y, y + 1 (l[0..2]) */
+/* one line (y) at full size as 8-bit R, G, B, from the lines y - 1, y, y + 1 (l[0..2]), through the gamma table lut */
 static void
 full_line(const struct isp *isp, const struct hakios_camera_frame *f, const int *const l[3], uint32_t y, const int colour[4],
-    const struct pipe *p, uint8_t *rgb)
+    const struct pipe *p, const uint8_t *lut, uint8_t *rgb)
 {
 	int w = (int)f->width;
 	float v_pos = f->height > 1 ? (float)y / (f->height - 1) : 0, gains[3] = { 1, 1, 1 };
@@ -667,7 +793,7 @@ full_line(const struct isp *isp, const struct hakios_camera_frame *f, const int 
 		if (isp->lsc.on) {
 			lsc_at(isp, w > 1 ? (float)x / (w - 1) : 0, v_pos, gains);
 		}
-		pixel(isp, p, sum[0] / (n[0] ? n[0] : 1) * gains[0], sum[1] / (n[1] ? n[1] : 1) * gains[1],
+		pixel(isp, p, lut, sum[0] / (n[0] ? n[0] : 1) * gains[0], sum[1] / (n[1] ? n[1] : 1) * gains[1],
 		    sum[2] / (n[2] ? n[2] : 1) * gains[2], rgb + 3 * x);
 	}
 }
@@ -695,7 +821,7 @@ isp_render_full_nv12(const struct isp *isp, const struct hakios_camera_frame *f,
 		have = width;
 	}
 	cfa(f->bayer, colour);
-	pipe_init(isp, &p);
+	pipe_init(isp, &p, false);
 	for (uint32_t row = first_row & ~1u; row < end_row && row < f->height; row += 2) {
 		for (int i = 0; i < 4; i++) {
 			unpack_line(f, raw, (int)row - 1 + i, lines[i]);
@@ -704,46 +830,460 @@ isp_render_full_nv12(const struct isp *isp, const struct hakios_camera_frame *f,
 
 		bool second = row + 1 < f->height;
 
-		full_line(isp, f, above, row, colour, &p, rgb[0]);
-		full_line(isp, f, below, second ? row + 1 : row, colour, &p, rgb[1]);
+		full_line(isp, f, above, row, colour, &p, isp->gamma, rgb[0]);
+		full_line(isp, f, below, second ? row + 1 : row, colour, &p, isp->gamma, rgb[1]);
 		nv12_pair(rgb[0], rgb[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
 		    uv + (size_t)(row / 2) * uv_stride, video_range);
 	}
 }
 
-/* one line (y) of the sensor demosaiced, as 8-bit R, G, B (the unpacked lines around it in this thread's l) */
+/* one line (y) of the sensor demosaiced, as 8-bit R, G, B (the unpacked lines around it in this thread's l), through
+ * the gamma table lut */
 static void
 demosaic_row(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint32_t row, const int colour[4],
-    const struct pipe *p, int *const l[3], uint8_t *rgb)
+    const struct pipe *p, const uint8_t *lut, int *const l[3], uint8_t *rgb)
 {
 	for (int i = 0; i < 3; i++) {
 		unpack_line(f, raw, (int)row - 1 + i, l[i]);
 	}
-	full_line(isp, f, (const int *const *)l, row, colour, p, rgb);
+	full_line(isp, f, (const int *const *)l, row, colour, p, lut, rgb);
 }
 
-void
-isp_render_still_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
-    uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
+/* ---- the stills' look ----------------------------------------------------------------------------------- */
+
+/*
+ * Noise reduction (1), sharpening (2), local contrast (3), vibrance (4) and the highlight roll-off (5) of
+ * spec L, all but the roll-off on the photograph's Y: the roll-off is in gamma_still. The rows come in
+ * pairs from the demosaic below; they are kept in a small ring of LOOK_ROWS so that the 5x5's and the
+ * sharpening's 3x3 have their neighbours. A piece of the picture (the render is done in pieces) clamps
+ * at its own ends for those: two rows of the same scene at most, where a piece meets the next.
+ */
+#define LOOK_ROWS       8               /* (5 rows for the 5x5's, 3 for the sharpening, and the lag between) */
+#define LOOK_LCON_W     33              /* (the local contrast's box: 1/32 of the width, 33 points across) */
+#define LOOK_LCON_H     25
+#define LOOK_THRESHOLD  2.5f            /* codes of Y below which the sharpening leaves the noise alone */
+#define LOOK_HALO       24              /* the most the sharpening may add or take, in codes */
+
+static unsigned long long look_ns[3];   /* the time in noise reduction, sharpening, local contrast (ns this still) */
+
+static inline unsigned long long
+now_ns(void)
 {
-	uint32_t x0, y0, cw, ch, fw = f->width;
-	int colour[4];
-	struct pipe p;
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
+}
+
+static inline void
+look_add(unsigned i, unsigned long long ns)
+{
+	__sync_fetch_and_add(&look_ns[i], ns);
+}
+
+/* the last photograph's time in its pieces, and the counters emptied for the next */
+void
+isp_take_still_timing(struct isp_still_timing *timing)
+{
+	timing->nr_ms = (double)__sync_lock_test_and_set(&look_ns[0], 0) / 1e6;
+	timing->sharpen_ms = (double)__sync_lock_test_and_set(&look_ns[1], 0) / 1e6;
+	timing->lcon_ms = (double)__sync_lock_test_and_set(&look_ns[2], 0) / 1e6;
+}
+
+/* the rows the look works on, this thread's (the pieces run on several at once) */
+struct look_rows {
+	uint8_t         *luma[LOOK_ROWS];       /* the row's Y, as the picture has it */
+	uint8_t         *h[LOOK_ROWS];          /* and after the noise reduction's 1-D pass across it */
+	uint8_t         *nr[LOOK_ROWS];         /* and after the noise reduction, the sharpening's input */
+	int16_t         *cb[LOOK_ROWS], *cr[LOOK_ROWS];        /* chroma rows, 5 across summed */
+	uint8_t         *cbcur, *crcur;         /* one chroma row before the box */
+	float           sy[LOOK_ROWS];          /* the sensor line each row is from (the local contrast's map) */
+	uint32_t        have_w, have_cw;
+};
+static __thread struct look_rows look_rows;
+
+static inline uint32_t
+look_slot(uint32_t row)
+{
+	return row % LOOK_ROWS;
+}
+
+static inline int
+clamp_int(int v, int lo, int hi)
+{
+	return v < lo ? lo : v > hi ? hi : v;
+}
+
+static inline uint32_t
+clamp_row(int r, uint32_t lo, uint32_t hi)
+{
+	return (uint32_t)(r < (int)lo ? (int)lo : r > (int)hi ? (int)hi : r);
+}
+
+static bool
+look_alloc(uint32_t width)
+{
+	struct look_rows *r = &look_rows;
+	uint32_t cw = (width + 1) / 2;
+
+	if (width > r->have_w) {
+		for (int i = 0; i < LOOK_ROWS; i++) {
+			free(r->luma[i]);
+			free(r->h[i]);
+			free(r->nr[i]);
+			r->luma[i] = malloc(width);
+			r->h[i] = malloc(width);
+			r->nr[i] = malloc(width);
+		}
+		r->have_w = width;
+	}
+	if (cw > r->have_cw) {
+		for (int i = 0; i < LOOK_ROWS; i++) {
+			free(r->cb[i]);
+			free(r->cr[i]);
+			r->cb[i] = malloc(sizeof(int16_t) * cw);
+			r->cr[i] = malloc(sizeof(int16_t) * cw);
+		}
+		free(r->cbcur);
+		free(r->crcur);
+		r->cbcur = malloc(cw);
+		r->crcur = malloc(cw);
+		r->have_cw = cw;
+	}
+	for (int i = 0; i < LOOK_ROWS; i++) {
+		if (r->luma[i] == NULL || r->h[i] == NULL || r->nr[i] == NULL || r->cb[i] == NULL || r->cr[i] == NULL) {
+			return false;
+		}
+	}
+	return r->cbcur != NULL && r->crcur != NULL;
+}
+
+/* the row's Y as BT.601 makes it of the 8-bit R, G, B (the same coefficients as nv12_pair's full range) */
+static void
+look_luma_row(const uint8_t *rgb, uint8_t *out, uint32_t width)
+{
+	for (uint32_t x = 0; x < width; x++, rgb += 3) {
+		out[x] = (uint8_t)((19595 * rgb[0] + 38470 * rgb[1] + 7471 * rgb[2] + 32768) >> 16);
+	}
+}
+
+/* the noise reduction's pass across a row: the mean of the cells around, each weighted by how near its Y is
+ * to the middle's (exp(-(dY/sigma)^2), w[] of the 256 differences), so an edge does not go soft */
+static void
+look_h_row(const uint8_t *in, uint8_t *out, uint32_t width, int radius, const float *w)
+{
+	for (uint32_t x = 0; x < width; x++) {
+		int c = in[x];
+		float sum = 0, weights = 0;
+
+		for (int dx = -radius; dx <= radius; dx++) {
+			int v = in[clamp_int((int)x + dx, 0, (int)width - 1)];
+			float weight = w[v > c ? v - c : c - v];
+
+			sum += (float)v * weight;
+			weights += weight;
+		}
+		out[x] = (uint8_t)(sum / weights + 0.5f);
+	}
+}
+
+/* and down a row: the same weights, of the rows above and below it (clamped into the piece at its ends) */
+static void
+look_nr_row(const struct look_rows *r, uint32_t row, uint32_t lo, uint32_t hi, int radius, const float *w, bool nr,
+    uint32_t width)
+{
+	unsigned long long began = now_ns();
+	uint8_t *out = r->nr[look_slot(row)];
+
+	if (!nr) {
+		memcpy(out, r->luma[look_slot(row)], width);
+	} else {
+		const uint8_t *c = r->h[look_slot(row)];
+
+		for (uint32_t x = 0; x < width; x++) {
+			int cv = c[x];
+			float sum = 0, weights = 0;
+
+			for (int dy = -radius; dy <= radius; dy++) {
+				int v = r->h[look_slot(clamp_row((int)row + dy, lo, hi))][x];
+				float weight = w[v > cv ? v - cv : cv - v];
+
+				sum += (float)v * weight;
+				weights += weight;
+			}
+			out[x] = (uint8_t)(sum / weights + 0.5f);
+		}
+	}
+	look_add(0, now_ns() - began);
+}
+
+/* the stills' local contrast map: the Y of a 33x25 grid of the frame's blocks (a box of 1/32 of the width),
+ * made from the sensor's own cells (the lens shading and the white balance on them, as the picture has them) */
+static void
+lcon_map(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, const uint8_t *lut,
+    uint8_t map[LOOK_LCON_H][LOOK_LCON_W])
+{
+	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
+	int r, b, g1 = -1, g2 = -1;
+
+	cell_places(f->bayer, &r, &b);
+	for (int i = 0; i < 4; i++) {
+		if (i != r && i != b) {
+			if (g1 < 0) {
+				g1 = i;
+			} else {
+				g2 = i;
+			}
+		}
+	}
+	if (cells_w == 0 || cells_h == 0) {
+		memset(map, 128, sizeof(uint8_t) * LOOK_LCON_H * LOOK_LCON_W);
+		return;
+	}
+	for (int gy = 0; gy < LOOK_LCON_H; gy++) {
+		uint32_t cy0 = (uint32_t)((uint64_t)gy * cells_h / LOOK_LCON_H), cy1;
+		uint32_t cy_at = (uint32_t)((uint64_t)(gy + 1) * cells_h / LOOK_LCON_H);
+
+		cy1 = cy_at > cy0 ? cy_at : cy0 + 1;
+		cy1 = cy1 > cells_h ? cells_h : cy1;
+		for (int gx = 0; gx < LOOK_LCON_W; gx++) {
+			uint32_t cx0 = (uint32_t)((uint64_t)gx * cells_w / LOOK_LCON_W), cx1;
+			uint32_t cx_at = (uint32_t)((uint64_t)(gx + 1) * cells_w / LOOK_LCON_W);
+			double sum = 0;
+			int n = 0;
+
+			cx1 = cx_at > cx0 ? cx_at : cx0 + 1;
+			cx1 = cx1 > cells_w ? cells_w : cx1;
+			/* nine cells spread over the block, not all of them: a cheap picture of where the light is */
+			for (int j = 0; j < 3; j++) {
+				uint32_t cy = cy0 + (uint32_t)((uint64_t)(2 * j + 1) * (cy1 - cy0) / 6);
+				float v_pos;
+
+				cy = cy >= cells_h ? cells_h - 1 : cy;
+				v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0;
+				for (int i = 0; i < 3; i++) {
+					uint32_t cx = cx0 + (uint32_t)((uint64_t)(2 * i + 1) * (cx1 - cx0) / 6);
+					float gains[3] = { 1, 1, 1 }, y;
+					int v[4], index;
+
+					cx = cx >= cells_w ? cells_w - 1 : cx;
+					cell(raw + (size_t)cy * 2 * f->stride, f->stride, cx, (int)f->black, v);
+					if (isp->lsc.on) {
+						lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+					}
+					gains[0] *= isp->wb[0] * isp->digital;
+					gains[1] *= isp->wb[1] * isp->digital;
+					gains[2] *= isp->wb[2] * isp->digital;
+					y = 0.2126f * v[r] * gains[0] + 0.7152f * (v[g1] + v[g2]) * 0.5f * gains[1] +
+					    0.0722f * v[b] * gains[2];
+					index = (int)(y * (LUT_WHITE / (float)WHITE) + 0.5f);
+					sum += lut[clamp_int(index, 0, 4095)];
+					n++;
+				}
+			}
+			map[gy][gx] = (uint8_t)(sum / n + 0.5);
+		}
+	}
+}
+
+/* the local contrast's blur where the sensor is at (u, v), 0 to 1 across it: the map, between its points */
+static int
+lcon_at(const uint8_t map[LOOK_LCON_H][LOOK_LCON_W], float u, float v)
+{
+	float mx = (u < 0 ? 0 : u > 1 ? 1 : u) * (LOOK_LCON_W - 1), my = (v < 0 ? 0 : v > 1 ? 1 : v) * (LOOK_LCON_H - 1);
+	int x = clamp_int((int)mx, 0, LOOK_LCON_W - 2), y = clamp_int((int)my, 0, LOOK_LCON_H - 2);
+	float fx = mx - x, fy = my - y, top, bottom;
+
+	fx = fx < 0 ? 0 : fx > 1 ? 1 : fx;
+	fy = fy < 0 ? 0 : fy > 1 ? 1 : fy;
+	top = map[y][x] * (1 - fx) + map[y][x + 1] * fx;
+	bottom = map[y + 1][x] * (1 - fx) + map[y + 1][x + 1] * fx;
+	return (int)(top * (1 - fy) + bottom * fy + 0.5f);
+}
+
+/* one row out: the sharpening's unsharp mask (a 3x3 Gaussian of radius 1, the threshold, the +-24 halo limit),
+ * then the local contrast, then the picture's range */
+static void
+look_out_row(const struct look_rows *r, uint32_t row, uint32_t lo, uint32_t hi, float amount, float lcon,
+    const uint8_t map[LOOK_LCON_H][LOOK_LCON_W], uint32_t width, float sx_at, float sx_step, uint32_t fw, uint32_t fh,
+    bool turned, bool video_range, uint8_t *dst)
+{
+	const uint8_t *a = r->nr[look_slot(clamp_row((int)row - 1, lo, hi))];
+	const uint8_t *c = r->nr[look_slot(row)];
+	const uint8_t *b = r->nr[look_slot(clamp_row((int)row + 1, lo, hi))];
+	float sy = r->sy[look_slot(row)];
+	unsigned long long began = now_ns(), sharpened;
+
+	for (uint32_t x = 0; x < width; x++) {
+		int xm = x > 0 ? (int)x - 1 : 0, xp = x + 1 < width ? (int)x + 1 : (int)width - 1;
+		int y = c[x], blur, delta, out = y;
+
+		blur = (a[xm] + 2 * a[x] + a[xp] + 2 * (c[xm] + 2 * c[x] + c[xp]) + b[xm] + 2 * b[x] + b[xp] + 8) >> 4;
+		delta = y - blur;
+		/* (a soft threshold: what is under it is noise, and what is over loses just it) */
+		if (delta > LOOK_THRESHOLD) {
+			delta = (int)((delta - LOOK_THRESHOLD) * amount + 0.5f);
+		} else if (delta < -LOOK_THRESHOLD) {
+			delta = (int)((delta + LOOK_THRESHOLD) * amount - 0.5f);
+		} else {
+			delta = 0;
+		}
+		delta = clamp_int(delta, -LOOK_HALO, LOOK_HALO);
+		out = clamp_int(y + delta, 0, 255);
+		dst[x] = (uint8_t)out;
+	}
+	sharpened = now_ns();
+
+	if (lcon > 0) {
+		for (uint32_t x = 0; x < width; x++) {
+			/* (a turned picture's line is back to front: the sensor column of what is at x is the other way) */
+			uint32_t sx = turned ? width - 1 - x : x;
+			float u = fw > 1 ? (sx_at + (float)sx * sx_step) / (fw - 1) : 0;
+			float v = fh > 1 ? sy / (fh - 1) : 0;
+			int blur = lcon_at(map, u, v);
+			int out = dst[x] + (int)(lcon * (dst[x] - blur) + (dst[x] >= blur ? 0.5f : -0.5f));
+
+			dst[x] = (uint8_t)clamp_int(out, 0, 255);
+		}
+	}
+	for (uint32_t x = 0; x < width; x++) {
+		int out = dst[x];
+
+		if (video_range) {
+			out = 16 + (out * 219 + 127) / 255;
+			out = clamp_int(out, 16, 235);
+		}
+		dst[x] = (uint8_t)out;
+	}
+	look_add(1, sharpened - began);
+	look_add(2, now_ns() - sharpened);
+}
+
+/* a pair's chroma at half resolution, as BT.601 makes it of the four pixels; kept 5 across summed (when the
+ * noise reduction is on: without it the row is kept as it is) */
+static void
+look_chroma_push(struct look_rows *r, const uint8_t *rgb0, const uint8_t *rgb1, uint32_t width, uint32_t pair, bool nr)
+{
+	static const int32_t k[9] = { 19595, 38470, 7471, -11058, -21710, 32768, 32768, -27439, -5329 };
+	uint32_t cw = (width + 1) / 2;
+	int16_t *hsb = r->cb[look_slot(pair)], *hsr = r->cr[look_slot(pair)];
+	unsigned long long began = now_ns();
+
+	for (uint32_t x = 0; x < cw; x++) {
+		uint32_t x0 = 2 * x, x1 = x0 + 1 < width ? x0 + 1 : x0;
+		int32_t R = rgb0[3 * x0] + rgb0[3 * x1] + rgb1[3 * x0] + rgb1[3 * x1];
+		int32_t G = rgb0[3 * x0 + 1] + rgb0[3 * x1 + 1] + rgb1[3 * x0 + 1] + rgb1[3 * x1 + 1];
+		int32_t B = rgb0[3 * x0 + 2] + rgb0[3 * x1 + 2] + rgb1[3 * x0 + 2] + rgb1[3 * x1 + 2];
+		int32_t cb = (k[3] * R + k[4] * G + k[5] * B + (128 << 18) + (1 << 17) - 1) >> 18;
+		int32_t cr = (k[6] * R + k[7] * G + k[8] * B + (128 << 18) + (1 << 17) - 1) >> 18;
+
+		r->cbcur[x] = (uint8_t)(cb < 0 ? 0 : cb > 255 ? 255 : cb);
+		r->crcur[x] = (uint8_t)(cr < 0 ? 0 : cr > 255 ? 255 : cr);
+	}
+	for (uint32_t x = 0; x < cw; x++) {
+		if (nr) {
+			int sb = 0, sr = 0;
+
+			for (int dx = -2; dx <= 2; dx++) {
+				int xx = clamp_int((int)x + dx, 0, (int)cw - 1);
+
+				sb += r->cbcur[xx];
+				sr += r->crcur[xx];
+			}
+			hsb[x] = (int16_t)sb;
+			hsr[x] = (int16_t)sr;
+		} else {
+			hsb[x] = r->cbcur[x];
+			hsr[x] = r->crcur[x];
+		}
+	}
+	look_add(0, now_ns() - began);
+}
+
+/* one chroma row out: the 5x5 box of the rows around (clamped into the piece), the vibrance, the range */
+static void
+look_uv_row(const struct look_rows *r, uint32_t pair, uint32_t lo, uint32_t hi, uint32_t cw, bool nr, float vibrance,
+    bool video_range, uint8_t *uv)
+{
+	unsigned long long began = now_ns();
+
+	for (uint32_t x = 0; x < cw; x++) {
+		int cb = 0, cr = 0;
+
+		if (nr) {
+			for (int dy = -2; dy <= 2; dy++) {
+				uint32_t row = clamp_row((int)pair + dy, lo, hi);
+
+				cb += r->cb[look_slot(row)][x];
+				cr += r->cr[look_slot(row)][x];
+			}
+			cb = (cb + 12) / 25;
+			cr = (cr + 12) / 25;
+		} else {
+			cb = r->cb[look_slot(pair)][x];
+			cr = r->cr[look_slot(pair)][x];
+		}
+		if (vibrance > 0) {
+			int dcb = cb - 128, dcr = cr - 128;
+			int mag = dcb > 0 ? dcb : -dcb, other = dcr > 0 ? dcr : -dcr;
+			float s;
+
+			mag = other > mag ? other : mag;
+			s = 1 + vibrance * (1 - (float)mag / 127);
+			cb = 128 + (int)(dcb * s + (dcb >= 0 ? 0.5f : -0.5f));
+			cr = 128 + (int)(dcr * s + (dcr >= 0 ? 0.5f : -0.5f));
+		}
+		if (video_range) {
+			cb = 128 + (cb - 128) * 224 / 255;
+			cr = 128 + (cr - 128) * 224 / 255;
+		}
+		uv[2 * x] = (uint8_t)clamp_int(cb, 0, 255);
+		uv[2 * x + 1] = (uint8_t)clamp_int(cr, 0, 255);
+	}
+	look_add(0, now_ns() - began);
+}
+
+/* the generator: two output rows of the photograph at a time (demosaic, scale, the matrix and the curve) */
+struct still_gen {
+	const struct isp *isp;
+	const struct hakios_camera_frame *f;
+	const uint8_t *raw;
+	uint32_t        width, height, x0, y0, cw, ch, fw;
+	float           sx_step, sy_step;
+	int             colour[4];
+	struct pipe     p;
+	int32_t         cached[2];
+	int             *lines[3];
+	uint8_t         *rows[2], *out[2];
+	float           sy[2];          /* the sensor line each of the two is from */
+};
+
+static bool
+still_gen_init(struct still_gen *g, const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw,
+    uint32_t width, uint32_t height)
+{
 	static __thread int *lines[3];
 	static __thread uint8_t *rows[2], *out[2];
 	static __thread uint32_t have_fw, have_width;
-	int32_t cached[2] = { -1, -1 };
 
-	if (fw > have_fw) {
+	memset(g, 0, sizeof(*g));
+	g->isp = isp;
+	g->f = f;
+	g->raw = raw;
+	g->width = width;
+	g->height = height;
+	g->fw = f->width;
+	g->cached[0] = g->cached[1] = -1;
+	if (f->width > have_fw) {
 		for (int i = 0; i < 3; i++) {
 			free(lines[i]);
-			lines[i] = malloc(sizeof(int) * fw);
+			lines[i] = malloc(sizeof(int) * f->width);
 		}
 		for (int i = 0; i < 2; i++) {
 			free(rows[i]);
-			rows[i] = malloc(3 * (size_t)fw);
+			rows[i] = malloc(3 * (size_t)f->width);
 		}
-		have_fw = fw;
+		have_fw = f->width;
 	}
 	if (width > have_width) {
 		for (int i = 0; i < 2; i++) {
@@ -753,58 +1293,194 @@ isp_render_still_nv12(const struct isp *isp, const struct hakios_camera_frame *f
 		have_width = width;
 	}
 	if (lines[2] == NULL || rows[1] == NULL || out[1] == NULL) {
-		return;
+		return false;
 	}
-	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
-	cfa(f->bayer, colour);
-	pipe_init(isp, &p);
-	float sx_step = 2.0f * cw / width, sy_step = 2.0f * ch / height;
+	for (int i = 0; i < 3; i++) {
+		g->lines[i] = lines[i];
+	}
+	for (int i = 0; i < 2; i++) {
+		g->rows[i] = rows[i];
+		g->out[i] = out[i];
+	}
+	crop(isp, f, width, height, &g->x0, &g->y0, &g->cw, &g->ch);
+	cfa(f->bayer, g->colour);
+	pipe_init(isp, &g->p, true);
+	g->sx_step = 2.0f * g->cw / width;
+	g->sy_step = 2.0f * g->ch / height;
+	return true;
+}
 
-	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
-		for (int k = 0; k < 2; k++) {
-			uint32_t r = row + k < height ? row + k : row, at = isp->turned ? height - 1 - r : r;
-			float sy = 2.0f * y0 + (at + 0.5f) * sy_step - 0.5f, ty;
-			uint32_t sy0 = sy < 0 ? 0 : (uint32_t)sy, sy1, slot[2];
+static void
+still_gen_rows(struct still_gen *g, uint32_t row)
+{
+	const struct isp *isp = g->isp;
+	const struct hakios_camera_frame *f = g->f;
+	uint32_t fw = g->fw;
 
-			sy0 = sy0 > f->height - 1 ? f->height - 1 : sy0;
-			sy1 = sy0 + 1 > f->height - 1 ? f->height - 1 : sy0 + 1;
-			ty = sy < (float)sy0 ? 0 : sy - sy0;
-			/* the two lines of the sensor it is between, demosaiced (kept from the line before where they are the same) */
-			for (int n = 0; n < 2; n++) {
-				uint32_t want = n ? sy1 : sy0;
+	for (int k = 0; k < 2; k++) {
+		uint32_t r = row + k < g->height ? row + k : row, at = isp->turned ? g->height - 1 - r : r;
+		float sy = 2.0f * g->y0 + (at + 0.5f) * g->sy_step - 0.5f, ty;
+		uint32_t sy0 = sy < 0 ? 0 : (uint32_t)sy, sy1, slot[2];
 
-				if (cached[0] == (int32_t)want || cached[1] == (int32_t)want) {
-					slot[n] = cached[0] == (int32_t)want ? 0 : 1;
-					continue;
-				}
-				/* (into the slot the other line does not need: sy0's for sy1, and sy1's kept for sy0) */
-				slot[n] = n == 1 ? slot[0] ^ 1 : cached[0] == (int32_t)sy1 ? 1 : 0;
-				demosaic_row(isp, f, raw, want, colour, &p, lines, rows[slot[n]]);
-				cached[slot[n]] = (int32_t)want;
+		sy0 = sy0 > f->height - 1 ? f->height - 1 : sy0;
+		sy1 = sy0 + 1 > f->height - 1 ? f->height - 1 : sy0 + 1;
+		ty = sy < (float)sy0 ? 0 : sy - sy0;
+		g->sy[k] = sy;
+		/* the two lines of the sensor it is between, demosaiced (kept from the line before where they are the same) */
+		for (int n = 0; n < 2; n++) {
+			uint32_t want = n ? sy1 : sy0;
+
+			if (g->cached[0] == (int32_t)want || g->cached[1] == (int32_t)want) {
+				slot[n] = g->cached[0] == (int32_t)want ? 0 : 1;
+				continue;
 			}
-			const uint8_t *a = rows[slot[0]], *b = rows[slot[1]];
-			uint8_t *o = out[k];
+			/* (into the slot the other line does not need: sy0's for sy1, and sy1's kept for sy0) */
+			slot[n] = n == 1 ? slot[0] ^ 1 : g->cached[0] == (int32_t)sy1 ? 1 : 0;
+			demosaic_row(isp, f, g->raw, want, g->colour, &g->p, isp->look.rolloff > 0 ? isp->gamma_still : isp->gamma,
+			    g->lines, g->rows[slot[n]]);
+			g->cached[slot[n]] = (int32_t)want;
+		}
+		const uint8_t *a = g->rows[slot[0]], *b = g->rows[slot[1]];
+		uint8_t *o = g->out[k];
 
-			for (uint32_t x = 0; x < width; x++) {
-				float sx = 2.0f * x0 + (x + 0.5f) * sx_step - 0.5f, tx;
-				uint32_t sx0 = sx < 0 ? 0 : (uint32_t)sx, sx1;
+		for (uint32_t x = 0; x < g->width; x++) {
+			float sx = 2.0f * g->x0 + (x + 0.5f) * g->sx_step - 0.5f, tx;
+			uint32_t sx0 = sx < 0 ? 0 : (uint32_t)sx, sx1;
 
-				sx0 = sx0 > fw - 1 ? fw - 1 : sx0;
-				sx1 = sx0 + 1 > fw - 1 ? fw - 1 : sx0 + 1;
-				tx = sx < (float)sx0 ? 0 : sx - sx0;
-				uint8_t *px = o + 3 * (isp->turned ? width - 1 - x : x);
+			sx0 = sx0 > fw - 1 ? fw - 1 : sx0;
+			sx1 = sx0 + 1 > fw - 1 ? fw - 1 : sx0 + 1;
+			tx = sx < (float)sx0 ? 0 : sx - sx0;
+			uint8_t *px = o + 3 * (isp->turned ? g->width - 1 - x : x);
 
-				for (int c = 0; c < 3; c++) {
-					float top = a[3 * sx0 + c] + tx * (a[3 * sx1 + c] - a[3 * sx0 + c]);
-					float bottom = b[3 * sx0 + c] + tx * (b[3 * sx1 + c] - b[3 * sx0 + c]);
+			for (int c = 0; c < 3; c++) {
+				float top = a[3 * sx0 + c] + tx * (a[3 * sx1 + c] - a[3 * sx0 + c]);
+				float bottom = b[3 * sx0 + c] + tx * (b[3 * sx1 + c] - b[3 * sx0 + c]);
 
-					px[c] = (uint8_t)(top + ty * (bottom - top) + 0.5f);
-				}
+				px[c] = (uint8_t)(top + ty * (bottom - top) + 0.5f);
 			}
 		}
+	}
+}
+
+/* the look's rows through the noise reduction, the sharpening, the local contrast and the vibrance, into y and uv */
+static void
+look_render(struct still_gen *g, uint8_t *y, size_t y_stride, uint8_t *uv, size_t uv_stride, uint32_t lo, uint32_t hi,
+    bool video_range, const uint8_t *lut)
+{
+	const struct isp *isp = g->isp;
+	struct look_rows *rows = &look_rows;
+	uint32_t width = g->width;
+	float gain = g->f->gain_unity ? (float)g->f->gain / g->f->gain_unity : 1;
+	uint8_t map[LOOK_LCON_H][LOOK_LCON_W];
+	float w[256];
+	float amount, lcon = isp->look.lcon, vibrance = isp->look.vibrance;
+	bool nr = isp->look.nr > 0;
+	int radius;
+	uint32_t next_nr = lo, next_out = lo, nr_hi = lo, gen_hi = lo - 1;
+	uint32_t next_uv = lo / 2, uv_hi = lo / 2 - 1;
+	bool have_nr = false;
+
+	if (!look_alloc(width)) {
+		return;
+	}
+	gain = gain < 1 ? 1 : gain > 16 ? 16 : gain;
+	radius = gain >= 8 ? 2 : 1;
+	if (nr) {
+		double sigma = 3.0 * isp->look.nr * sqrt((double)gain);
+
+		for (int d = 0; d < 256; d++) {
+			w[d] = (float)exp(-(double)d * d / (sigma * sigma));
+		}
+	}
+	/* the sharpening: 0.6 at 1x gain, 0.25 at 16x (the noise reduction has taken the noise by then) */
+	amount = isp->look.sharpen * (0.6f - 0.35f * (gain - 1) / 15);
+	if (lcon > 0) {
+		lcon_map(isp, g->f, g->raw, lut, map);
+	}
+
+	for (uint32_t row = lo; row <= hi; row += 2) {
+		still_gen_rows(g, row);
+		for (int k = 0; k < 2; k++) {
+			uint32_t at = row + k > hi ? row : row + k, slot = look_slot(at);
+			unsigned long long began = now_ns();
+			uint8_t *luma = rows->luma[slot];
+
+			look_luma_row(g->out[k], luma, width);
+			if (nr) {
+				look_h_row(luma, rows->h[slot], width, radius, w);
+			}
+			rows->sy[slot] = g->sy[k];
+			look_add(0, now_ns() - began);
+			gen_hi = at;
+		}
+		look_chroma_push(rows, g->out[0], g->out[1], width, row / 2, nr);
+		uv_hi = row / 2;
+
+		while (next_nr <= gen_hi && next_nr + (uint32_t)radius <= gen_hi) {
+			look_nr_row(rows, next_nr, lo, gen_hi, radius, w, nr, width);
+			nr_hi = next_nr++;
+			have_nr = true;
+		}
+		while (have_nr && next_out + 1 <= nr_hi) {
+			look_out_row(rows, next_out, lo, nr_hi, amount, lcon, map, width,
+			    2.0f * g->x0 + 0.5f * g->sx_step - 0.5f, g->sx_step, g->fw, g->f->height, isp->turned,
+			    video_range, y + (size_t)next_out * y_stride);
+			next_out++;
+		}
+		while (next_uv + 2 <= uv_hi) {
+			look_uv_row(rows, next_uv, lo / 2, uv_hi, (width + 1) / 2, nr, vibrance, video_range,
+			    uv + (size_t)next_uv * uv_stride);
+			next_uv++;
+		}
+	}
+	/* the piece's last rows: their neighbours beyond it are their own (two rows of the same scene at most) */
+	while (next_nr <= hi) {
+		look_nr_row(rows, next_nr, lo, hi, radius, w, nr, width);
+		nr_hi = next_nr++;
+		have_nr = true;
+	}
+	while (have_nr && next_out <= hi) {
+		look_out_row(rows, next_out, lo, nr_hi, amount, lcon, map, width,
+		    2.0f * g->x0 + 0.5f * g->sx_step - 0.5f, g->sx_step, g->fw, g->f->height, isp->turned, video_range,
+		    y + (size_t)next_out * y_stride);
+		next_out++;
+	}
+	while (next_uv <= hi / 2) {
+		look_uv_row(rows, next_uv, lo / 2, hi / 2, (width + 1) / 2, nr, vibrance, video_range,
+		    uv + (size_t)next_uv * uv_stride);
+		next_uv++;
+	}
+}
+
+void
+isp_render_still_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
+    uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
+{
+	struct still_gen g;
+	uint32_t lo = first_row & ~1u, hi;
+	bool filters = isp->look.nr > 0 || isp->look.sharpen > 0 || isp->look.lcon > 0 || isp->look.vibrance > 0;
+	const uint8_t *lut = isp->look.rolloff > 0 ? isp->gamma_still : isp->gamma;
+
+	if (width == 0 || height == 0 || end_row <= lo) {
+		return;
+	}
+	hi = end_row > height ? height : end_row;
+	hi--;
+	if (hi < lo) {
+		return;
+	}
+	if (!still_gen_init(&g, isp, f, raw, width, height)) {
+		return;
+	}
+	if (filters) {
+		look_render(&g, y, y_stride, uv, uv_stride, lo, hi, video_range, lut);
+		return;
+	}
+	for (uint32_t row = lo; row <= hi; row += 2) {
 		bool second = row + 1 < height;
 
-		nv12_pair(out[0], out[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
+		still_gen_rows(&g, row);
+		nv12_pair(g.out[0], g.out[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
 		    uv + (size_t)(row / 2) * uv_stride, video_range);
 	}
 }
@@ -834,7 +1510,7 @@ isp_lsc_from_flat(struct isp *isp, const struct hakios_camera_frame *f, const ui
 					if (cx < 0 || cy < 0 || cx >= (int)cells_w || cy >= (int)cells_h) {
 						continue;
 					}
-					cell(raw + (size_t)cy * 2 * f->stride, f->stride, (uint32_t)cx, v);
+					cell(raw + (size_t)cy * 2 * f->stride, f->stride, (uint32_t)cx, (int)f->black, v);
 					sum[0] += v[r];
 					sum[2] += v[b];
 					for (int j = 0; j < 4; j++) {

@@ -7,7 +7,7 @@
  *   store [PATTERN]       what configd has in its dynamic store (default: everything under
  *                         State:/Network and Setup:/Network)
  *   dhcp IF               ask configd's IPConfiguration plugin to configure IF by DHCP
- *   waitaddr IF SECONDS   wait until IF has an IPv4 address
+ *   waitaddr IF SECONDS   wait until IF has an IPv4 address that is not link-local (169.254.x.x)
  *   resolve NAME          getaddrinfo(): the question goes to mDNSResponder, which asks the
  *                         servers configd has told it about
  *   tcp HOST PORT         connect a socket, send an HTTP request, show the first line of the answer
@@ -25,6 +25,10 @@
  *                         state: State:/Network/Service/.../IPv4, State:/Network/Interface/en0/...,
  *                         State:/Network/Global/IPv4 (the key, whether it is there, the names in it;
  *                         no addresses)
+ *   ensure IF SECONDS     wait (up to SECONDS) for IF to exist and for configd to make a network service of
+ *                         its own for it; if none comes, ask for DHCP on IF ("dhcp IF"): the wifi step
+ *                         below for any interface (en2, the USB Ethernet of vayu's usbnet)
+ *   waitdns SECONDS       wait until configd publishes DNS servers (State:/Network/Global/DNS ServerAddresses)
  *   wrongjoin             ask the radio to join the network it is on with a passphrase that is
  *                         wrong on purpose, through the request wifid uses (Apple80211's
  *                         ASSOCIATE), and say what the kernel answers: Apple80211's result number
@@ -117,7 +121,11 @@ show(const char *only, bool quiet)
 		} else if (a->ifa_addr->sa_family == AF_INET) {
 			struct sockaddr_in *in = (struct sockaddr_in *)a->ifa_addr, *mask = (struct sockaddr_in *)a->ifa_netmask;
 
-			has_ipv4 = true;
+			/* a link-local 169.254.x.x is no address to use (run 070520: configd's service self-assigned one before the
+			 * USB handover, and nothing could be reached): only a routable one counts */
+			if ((ntohl(in->sin_addr.s_addr) >> 16) != 0xa9fe) {
+				has_ipv4 = true;
+			}
 			if (!quiet) {
 				printf("net_test: %s: inet %s", a->ifa_name, inet_ntop(AF_INET, &in->sin_addr, text, sizeof(text)));
 				printf(" netmask %s\n", mask ? inet_ntop(AF_INET, &mask->sin_addr, text, sizeof(text)) : "?");
@@ -378,13 +386,73 @@ reach(const char *name)
  * makes has none (Settings then shows a spinner where the tick belongs). Only a kernel without
  * those IOKit objects gets the call.
  */
+/*
+ * An interface into use: wait up to `appear` seconds for it to exist, then up to `service` seconds for configd
+ * to have a network service of its own for it (a Setup:/Network/Service/.../Interface naming it); if none
+ * comes, ask for DHCP on it.
+ */
+static void
+ensure(const char *name, double appear, double service)
+{
+	double start = seconds();
+	bool there = false;
+
+	while (!(there = if_nametoindex(name) != 0) && seconds() - start < appear) {
+		usleep(500000);
+	}
+	if (!there) {
+		printf("net_test: ensure %s: no %s after %.0f s\n", name, name, seconds() - start);
+		return;
+	}
+	printf("net_test: ensure %s: %s is there after %.1f s\n", name, name, seconds() - start);
+	start = seconds();
+	for (;;) {
+		SCDynamicStoreRef session = SCDynamicStoreCreate(NULL, CFSTR("net_test"), NULL, NULL);
+		NSArray *keys = session ? CFBridgingRelease(SCDynamicStoreCopyKeyList(session, CFSTR("Setup:/Network/Service/[^/]+/Interface"))) : nil;
+		bool configd_has_it = false;
+
+		for (NSString *key in keys) {
+			NSDictionary *interface = CFBridgingRelease(SCDynamicStoreCopyValue(session, (__bridge CFStringRef)key));
+
+			configd_has_it |= [interface isKindOfClass:NSDictionary.class] &&
+			    [interface[@"DeviceName"] isEqual:[NSString stringWithUTF8String:name]];
+		}
+		if (session != NULL) {
+			CFRelease(session);
+		}
+		if (configd_has_it) {
+			double since = seconds();
+
+			printf("net_test: ensure %s: configd has a network service for %s after %.1f s: it configures it itself\n",
+			    name, name, seconds() - start);
+			/* and it has to get somewhere: an address within 300 s, else DHCP after all (run 063518: the service
+			 * was there from boot, IPConfigurationBusy until the USB handover at +usbnet_delay and the lease after it) */
+			while (!show(name, true) && seconds() - since < 300) {
+				usleep(250000);
+			}
+			if (show(name, true)) {
+				printf("net_test: ensure %s: an address after %.1f s\n", name, seconds() - since);
+				return;
+			}
+			printf("net_test: ensure %s: configd's service gave no address in 300 s: DHCP asked for\n", name);
+			dhcp(name);
+			return;
+		}
+		if (seconds() - start > service) {
+			break;
+		}
+		usleep(500000);
+	}
+	printf("net_test: ensure %s: configd has no network service for %s: DHCP asked for\n", name, name);
+	dhcp(name);
+}
+
 static void
 wifi(void)
 {
-	char arguments[1024] = "";
+	char arguments[4096] = "";
 	size_t size = sizeof(arguments) - 1;
-	double start = seconds();
-	bool wanted = false, there = false;
+	bool wanted = false;
 
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
 		return;
@@ -395,38 +463,34 @@ wifi(void)
 	if (!wanted) {
 		return;
 	}
-	while (!(there = if_nametoindex("en0") != 0) && seconds() - start < 120) {
-		usleep(500000);
-	}
-	if (!there) {
-		printf("net_test: wifi: no en0 after %.0f s: the radio has not come up\n", seconds() - start);
-		return;
-	}
-	printf("net_test: wifi: en0 is there after %.1f s\n", seconds() - start);
+	ensure("en0", 120, 30);
+}
+
+/* DNS servers, as mDNSResponder will be told them: State:/Network/Global/DNS ServerAddresses */
+static void
+waitdns(double limit)
+{
+	double start = seconds();
+	NSArray *servers = nil;
+
 	for (;;) {
 		SCDynamicStoreRef session = SCDynamicStoreCreate(NULL, CFSTR("net_test"), NULL, NULL);
-		NSArray *keys = session ? CFBridgingRelease(SCDynamicStoreCopyKeyList(session, CFSTR("Setup:/Network/Service/[^/]+/Interface"))) : nil;
-		bool configd_has_it = false;
+		NSDictionary *dns = session ? CFBridgingRelease(SCDynamicStoreCopyValue(session, CFSTR("State:/Network/Global/DNS"))) : nil;
 
-		for (NSString *key in keys) {
-			NSDictionary *interface = CFBridgingRelease(SCDynamicStoreCopyValue(session, (__bridge CFStringRef)key));
-
-			configd_has_it |= [interface isKindOfClass:NSDictionary.class] && [interface[@"DeviceName"] isEqual:@"en0"];
-		}
 		if (session != NULL) {
 			CFRelease(session);
 		}
-		if (configd_has_it) {
-			printf("net_test: wifi: configd has a network service for en0 after %.1f s: it configures it itself\n", seconds() - start);
-			return;
-		}
-		if (seconds() - start > 30) {
+		servers = [dns isKindOfClass:NSDictionary.class] ? dns[@"ServerAddresses"] : nil;
+		if ([servers isKindOfClass:NSArray.class] && servers.count > 0) {
 			break;
 		}
-		usleep(500000);
+		if (seconds() - start > limit) {
+			printf("net_test: waitdns: NO DNS servers after %.1f s\n", seconds() - start);
+			return;
+		}
+		usleep(250000);
 	}
-	printf("net_test: wifi: configd has no network service for en0 (a kernel without its IOKit objects): DHCP asked for\n");
-	dhcp("en0");
+	printf("net_test: waitdns: %s after %.1f s\n", [[servers componentsJoinedByString:@" "] UTF8String], seconds() - start);
 }
 
 /* ---- watch ------------------------------------------------------------------------------------------ */
@@ -584,6 +648,11 @@ main(int argc, char **argv)
 				wifi();
 			} else if (strcmp(step, "watch") == 0 && i + 1 < argc) {
 				watch(atof(argv[++i]));
+			} else if (strcmp(step, "ensure") == 0 && i + 2 < argc) {
+				ensure(argv[i + 1], 120, atof(argv[i + 2]));
+				i += 2;
+			} else if (strcmp(step, "waitdns") == 0 && i + 1 < argc) {
+				waitdns(atof(argv[++i]));
 			} else if (strcmp(step, "wrongjoin") == 0) {
 				wrongjoin();
 			} else {

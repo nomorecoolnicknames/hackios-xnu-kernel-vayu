@@ -73,13 +73,17 @@ if [ ! -x venv/bin/python3 ]; then
 	python3 -m venv venv
 	venv/bin/pip -q install mako pyyaml packaging
 fi
+# Mesa 25 wants meson >= 1.1 (Debian 12 has 1.0.1): one in the venv, which is first in PATH below
+if [ ! -x venv/bin/meson ]; then
+	venv/bin/pip -q install 'meson>=1.1,<1.6'
+fi
 export PATH=$B/venv/bin:$PATH
 
 # the compiler is the kernel's wrapper: it names the target (arm64-apple-ios) and the linker (ld64)
 cat > cross.ini <<INI
 [binaries]
 c = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK']
-cpp = ['$CC++', '-arch', 'arm64', '-isysroot', '$SDK', '-fuse-cxa-atexit']
+cpp = ['$CC++', '-arch', 'arm64', '-isysroot', '$SDK', '-fuse-cxa-atexit', '-stdlib=libc++']
 objc = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK']
 ar = 'llvm-ar'
 ranlib = 'llvm-ranlib'

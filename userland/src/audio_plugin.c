@@ -58,6 +58,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <sys/ioctl.h>
+#include <sys/sysctl.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -181,6 +182,9 @@ enum {
 	kAudioLevelControlPropertyScalarValue = 'lcsv', kAudioLevelControlPropertyDecibelValue = 'lcdv',
 	kAudioLevelControlPropertyDecibelRange = 'lcdr', kAudioLevelControlPropertyConvertScalarToDecibels = 'lcsd',
 	kAudioLevelControlPropertyConvertDecibelsToScalar = 'lcds',
+
+	kAudioBooleanControlClassID = 'togl', kAudioMuteControlClassID = 'mute', kAudioBooleanControlPropertyValue = 'bcvl',
+	kAudioDevicePropertyJackIsConnected = 'jack', kAudioStreamTerminalTypeHeadphones = 'hdph',
 };
 
 /* ---- the devices ---------------------------------------------------------------------------------- */
@@ -197,7 +201,9 @@ enum {
 	OBJECT_CODEC, OBJECT_CODEC_INPUT,
 	OBJECT_SPEAKER_VOLUME,          /* the speaker output's volume control */
 	OBJECT_CODEC_SOURCE,            /* the codec input's data source control: its microphones */
-	OBJECT_LAST = OBJECT_CODEC_SOURCE
+	OBJECT_HEADPHONES, OBJECT_HEADPHONES_OUTPUT,    /* the 3.5 mm jack, while a plug is in (boot-arg hp_usb=1) */
+	OBJECT_HEADPHONES_VOLUME, OBJECT_HEADPHONES_MUTE,
+	OBJECT_LAST = OBJECT_HEADPHONES_MUTE
 };
 
 #define VOLUME_RANGE_DB         48.0    /* from the loudest the kernel allows down to the quietest step above 0 */
@@ -211,18 +217,38 @@ struct device {
 	unsigned running;               /* how many clients have started I/O */
 	UInt64 anchor;                  /* mach_absolute_time() when the first of them did */
 	UInt64 periods;                 /* whole timestamp periods since */
+	Float64 rate;                   /* its sample rate: HAKIOS_AUDIO_RATE, or SPEAKER_RATE_44 for the speaker */
 };
 
 static struct device devices[] = {
 	{ .object = OBJECT_SPEAKER, .uid = CFSTR("Speaker"), .output = OBJECT_SPEAKER_OUTPUT, .input = OBJECT_SPEAKER_INPUT,
-	  .output_channels = HAKIOS_AUDIO_CHANNELS, .input_channels = 2 },
-	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1 },
-	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 1 },
-	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = 1 },
+	  .output_channels = HAKIOS_AUDIO_CHANNELS, .input_channels = 2, .rate = HAKIOS_AUDIO_RATE },
+	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1,
+	  .rate = HAKIOS_AUDIO_RATE },
+	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 1,
+	  .rate = HAKIOS_AUDIO_RATE },
+	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = 1,
+	  .rate = HAKIOS_AUDIO_RATE },
+	{ .object = OBJECT_HEADPHONES, .uid = CFSTR("Headphones"), .output = OBJECT_HEADPHONES_OUTPUT,
+	  .output_channels = HAKIOS_AUDIO_CHANNELS, .rate = HAKIOS_AUDIO_RATE },
 };
 #define DEVICES                 (sizeof(devices) / sizeof(devices[0]))
 
 #define TRANSPORT_BUILT_IN      'bltn'
+/*
+ * The 3.5 mm jack (the bring-up notes). The iPhone X's VirtualAudio makes a wired-headphones
+ * port for its Codec only from the iPhone X's routing database, which has none; it makes one for any USB audio
+ * device that has an output volume and mute control (Device_USB_Aspen). So the jack is a device of that kind,
+ * "Headphones", listed only while the kernel says a plug is in (kern.vayu_jack >= 1, jack3), polled here. Its samples
+ * go to /dev/hakios-audio like the speaker's; the kernel moves them to the jack by itself (jack4). Off unless
+ * boot-arg hp_usb=1; hp_codecjack=1 also has the Codec say 'jack' (the check that VirtualAudio ignores it there).
+ */
+#define TRANSPORT_USB           'usb '
+static Boolean hp_enabled, hp_codec_jack;       /* boot-args hp_usb=1, hp_codecjack=1 */
+static volatile Boolean hp_present;             /* a plug is in: the device is listed */
+static Float32 hp_volume = 1.0f;                /* its volume control, 0 to 1: a gain on its samples */
+static Boolean hp_muted;
+static int16_t hp_scaled[16384 * HAKIOS_AUDIO_CHANNELS];
 /*
  * The codec's input has data sources, one for each microphone, and the virtual audio device will not
  * take a codec without them (VirtualAudio asks for kAudioDevicePropertyDataSources on its input, and
@@ -238,7 +264,18 @@ static struct device devices[] = {
 static AudioServerPlugInHostRef host;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int sink = -1;                   /* /dev/hakios-audio */
-static Float64 ticks_per_frame;
+static Float64 ticks_per_second;        /* mach_absolute_time() ticks in a second */
+/*
+ * The speaker also runs at 44.1 kHz, converted here to the kernel's 48 kHz. On vayu (runs 194827, 001804,
+ * 022501) every 44.1 kHz source -- an MP3 in Filza, the ringtones -- made the virtual audio device ask for 44100
+ * and, refused ('!dat': this device offered 48000 alone), its route was torn down and almost nothing was played;
+ * a 48 kHz WAV played through. Now the device offers both, and at 44100 its samples are resampled (linear
+ * interpolation, which is enough for a phone's speaker) before they go to /dev/hakios-audio.
+ */
+#define SPEAKER_RATE_44         44100.0
+static int16_t resample_prev[HAKIOS_AUDIO_CHANNELS];
+static Float64 resample_pos;            /* where the next output frame lies, in input frames from the frame before the buffer */
+static int16_t resampled[(TIMESTAMP_PERIOD * 48000 / 44100 + 4) * HAKIOS_AUDIO_CHANNELS];
 static UInt64 written, refused;         /* frames since the speaker's I/O started */
 static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
 static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
@@ -309,7 +346,7 @@ format_of(AudioObjectID stream)
 	UInt32 channels = stream == d->output ? d->output_channels : d->input_channels;
 
 	return (AudioStreamBasicDescription) {
-		       .mSampleRate = HAKIOS_AUDIO_RATE, .mFormatID = kAudioFormatLinearPCM,
+		       .mSampleRate = d->rate, .mFormatID = kAudioFormatLinearPCM,
 		       .mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
 		       .mBytesPerPacket = 2 * channels, .mFramesPerPacket = 1, .mBytesPerFrame = 2 * channels,
 		       .mChannelsPerFrame = channels, .mBitsPerChannel = 16,
@@ -342,6 +379,60 @@ release(__unused void *driver)
 	return 1;
 }
 
+/*
+ * The jack, every 250 ms: kern.vayu_jack (-1 driver off, 0 none, 1 headphones, 2 headset) and kern.vayu_jack_gen (up by
+ * one at every event, so that a quick out-and-in between two looks is not missed). A change lists or unlists the device.
+ */
+static void *
+hp_watch(__unused void *arg)
+{
+	int last_gen = -1;
+	Boolean said_missing = false;
+
+	pthread_setname_np("redwood jack");
+	for (;;) {
+		int jack = -1, gen = 0;
+		size_t size = sizeof(jack);
+
+		if (sysctlbyname("kern.vayu_jack", &jack, &size, NULL, 0) != 0) {
+			if (!said_missing) {
+				say("redwood: audio: no kern.vayu_jack (a kernel without jack3, or vayu_jack=3 not given): no headphones\n");
+				said_missing = true;
+			}
+			jack = -1;
+		}
+		size = sizeof(gen);
+		if (sysctlbyname("kern.vayu_jack_gen", &gen, &size, NULL, 0) != 0) {
+			gen = 0;
+		}
+		if (gen != last_gen || (jack >= 1) != hp_present) {
+			Boolean present = jack >= 1;
+			AudioObjectPropertyAddress changed[2] = {
+				{ kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, 0 },
+				{ kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, 0 },
+			};
+
+			if (present != hp_present) {
+				say("redwood: audio: jack: %s (kern.vayu_jack %d, event %d)\n", present ? "plugged: Headphones listed" :
+				    "unplugged: Headphones gone", jack, gen);
+				hp_present = present;
+				if (host != NULL) {
+					AudioObjectPropertyAddress jack_changed = { kAudioDevicePropertyJackIsConnected,
+					    kAudioObjectPropertyScopeGlobal, 0 };
+
+					host->PropertiesChanged(host, OBJECT_PLUGIN, 2, changed);
+					if (hp_codec_jack) {
+						host->PropertiesChanged(host, OBJECT_CODEC, 1, &jack_changed);
+					}
+				}
+			}
+			last_gen = gen;
+		}
+		usleep(250000);
+	}
+	return NULL;
+}
+
 static OSStatus
 initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef the_host)
 {
@@ -349,9 +440,24 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 
 	host = the_host;
 	mach_timebase_info(&timebase);
-	ticks_per_frame = 1e9 * timebase.denom / timebase.numer / HAKIOS_AUDIO_RATE;
+	ticks_per_second = 1e9 * timebase.denom / timebase.numer;
 	sink = open(HAKIOS_AUDIO_DEVICE, O_WRONLY);
 	say("hakios: audio: the speaker is with the HAL (%s: %s)\n", HAKIOS_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open");
+	{
+		char arguments[4096] = "";
+		size_t size = sizeof(arguments) - 1;
+		pthread_t thread;
+
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+			hp_enabled = strstr(arguments, "hp_usb=1") != NULL;
+			hp_codec_jack = strstr(arguments, "hp_codecjack=1") != NULL;
+		}
+		say("hakios: audio: headphones as a USB device: %s%s\n", hp_enabled ? "on" : "off (hp_usb=1 to try)",
+		    hp_codec_jack ? ", and 'jack' on the Codec" : "");
+		if (hp_enabled && pthread_create(&thread, NULL, hp_watch, NULL) == 0) {
+			pthread_detach(thread);
+		}
+	}
 	return 0;
 }
 
@@ -382,6 +488,48 @@ configuration_change(__unused AudioServerPlugInDriverRef driver, __unused AudioO
 	return 0;
 }
 
+/* The HAL's go for a change asked for in set_property_data(): the speaker's new rate (action, in Hz). */
+static OSStatus
+perform_configuration_change(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, UInt64 action,
+    __unused void *info)
+{
+	struct device *d = device_of(object);
+
+	if (d == NULL || object != OBJECT_SPEAKER || (action != 44100 && action != HAKIOS_AUDIO_RATE)) {
+		return kAudioHardwareBadObjectError;
+	}
+	pthread_mutex_lock(&lock);
+	d->rate = (Float64)action;
+	d->anchor = mach_absolute_time();
+	d->periods = 0;
+	memset(resample_prev, 0, sizeof(resample_prev));
+	resample_pos = 0;
+	pthread_mutex_unlock(&lock);
+	say("redwood: audio: the speaker runs at %llu Hz now%s\n", action, action == HAKIOS_AUDIO_RATE ? "" :
+	    " (resampled to 48000 for the kernel)");
+	return 0;
+}
+
+/* Is this a rate the device can run at? */
+static bool
+rate_supported(const struct device *d, Float64 rate)
+{
+	return rate == HAKIOS_AUDIO_RATE || (d->object == OBJECT_SPEAKER && rate == SPEAKER_RATE_44);
+}
+
+/* Ask the HAL to change the speaker's rate (it calls perform_configuration_change() when it is safe). */
+static OSStatus
+request_rate(struct device *d, Float64 rate)
+{
+	if (rate == d->rate) {
+		return 0;
+	}
+	if (host == NULL) {
+		return kAudioHardwareUnsupportedOperationError;
+	}
+	return host->RequestDeviceConfigurationChange(host, d->object, (UInt64)rate, NULL);
+}
+
 /* A property's value: `size` bytes of it, or a list with nothing in it, or (neither) no such property. */
 struct value {
 	UInt32 size;
@@ -395,6 +543,8 @@ struct value {
 		AudioValueRange range;
 		AudioStreamBasicDescription format;
 		AudioStreamRangedDescription ranged;
+		AudioValueRange ranges[2];
+		AudioStreamRangedDescription rangeds[2];
 	} u;
 };
 
@@ -444,6 +594,59 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 		case kAudioLevelControlPropertyConvertScalarToDecibels:
 		case kAudioLevelControlPropertyConvertDecibelsToScalar:
 			FLOAT(0);       /* (converts what it is given: get_property_data()) */
+			break;
+		}
+		return v;
+	}
+	if (object == OBJECT_HEADPHONES_VOLUME || object == OBJECT_HEADPHONES_MUTE) {
+		Boolean mute = object == OBJECT_HEADPHONES_MUTE;
+
+		switch (selector) {
+		case kAudioObjectPropertyBaseClass:
+			WORD(mute ? kAudioBooleanControlClassID : kAudioLevelControlClassID);
+			break;
+		case kAudioObjectPropertyClass:
+			WORD(mute ? kAudioMuteControlClassID : kAudioVolumeControlClassID);
+			break;
+		case kAudioObjectPropertyOwner:
+			WORD(OBJECT_HEADPHONES);
+			break;
+		case kAudioObjectPropertyOwnedObjects:
+			v.empty = true;
+			break;
+		case kAudioControlPropertyScope:
+			WORD(kAudioObjectPropertyScopeOutput);
+			break;
+		case kAudioControlPropertyElement:
+			WORD(0);
+			break;
+		case kAudioBooleanControlPropertyValue:
+			if (mute) {
+				WORD(hp_muted);
+			}
+			break;
+		case kAudioLevelControlPropertyScalarValue:
+			if (!mute) {
+				FLOAT(hp_volume);
+			}
+			break;
+		case kAudioLevelControlPropertyDecibelValue:
+			if (!mute) {
+				FLOAT(scalar_to_db(hp_volume));
+			}
+			break;
+		case kAudioLevelControlPropertyDecibelRange:
+			if (!mute) {
+				v.u.range.mMinimum = -VOLUME_RANGE_DB;
+				v.u.range.mMaximum = 0;
+				v.size = sizeof(AudioValueRange);
+			}
+			break;
+		case kAudioLevelControlPropertyConvertScalarToDecibels:
+		case kAudioLevelControlPropertyConvertDecibelsToScalar:
+			if (!mute) {
+				FLOAT(0);
+			}
 			break;
 		}
 		return v;
@@ -504,7 +707,9 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 		case kAudioObjectPropertyOwnedObjects:
 		case kAudioPlugInPropertyDeviceList:
 			for (unsigned i = 0; i < DEVICES; i++) {
-				LIST(devices[i].object);
+				if (devices[i].object != OBJECT_HEADPHONES || hp_present) {
+					LIST(devices[i].object);
+				}
 			}
 			break;
 		case kAudioPlugInPropertyBoxList:
@@ -517,7 +722,8 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			WORD(0);
 			for (unsigned i = 0; i < DEVICES; i++) {
 				if (qualifier_size == sizeof(CFStringRef) && qualifier != NULL && *(const CFStringRef *)qualifier != NULL &&
-				    CFEqual(*(const CFStringRef *)qualifier, devices[i].uid)) {
+				    CFEqual(*(const CFStringRef *)qualifier, devices[i].uid) &&
+				    (devices[i].object != OBJECT_HEADPHONES || hp_present)) {
 					WORD(devices[i].object);
 				}
 			}
@@ -537,7 +743,15 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			STRING(d->uid);
 			break;
 		case kAudioDevicePropertyTransportType:
-			WORD(TRANSPORT_BUILT_IN);
+			WORD(d->object == OBJECT_HEADPHONES ? TRANSPORT_USB : TRANSPORT_BUILT_IN);
+			break;
+		case kAudioDevicePropertyJackIsConnected:
+			/* the jack: always plugged while listed; the Codec only with hp_codecjack=1 (the check) */
+			if (d->object == OBJECT_HEADPHONES) {
+				WORD(1);
+			} else if (d->object == OBJECT_CODEC && hp_codec_jack) {
+				WORD(hp_present);
+			}
 			break;
 		case kAudioDevicePropertyRelatedDevices:
 			WORD(d->object);
@@ -573,6 +787,10 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_CODEC && scope != kAudioObjectPropertyScopeOutput) {
 				LIST(OBJECT_CODEC_SOURCE);
 			}
+			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_HEADPHONES && scope != kAudioObjectPropertyScopeInput) {
+				LIST(OBJECT_HEADPHONES_VOLUME);
+				LIST(OBJECT_HEADPHONES_MUTE);
+			}
 			v.empty = v.size == 0;
 			break;
 		case kAudioObjectPropertyControlList:
@@ -582,15 +800,23 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			if (d->object == OBJECT_CODEC) {
 				LIST(OBJECT_CODEC_SOURCE);
 			}
+			if (d->object == OBJECT_HEADPHONES) {
+				LIST(OBJECT_HEADPHONES_VOLUME);
+				LIST(OBJECT_HEADPHONES_MUTE);
+			}
 			v.empty = v.size == 0;
 			break;
 		case kAudioDevicePropertyNominalSampleRate:
-			v.u.number = HAKIOS_AUDIO_RATE;
+			v.u.number = d->rate;
 			v.size = sizeof(Float64);
 			break;
 		case kAudioDevicePropertyAvailableNominalSampleRates:
-			v.u.range.mMinimum = v.u.range.mMaximum = HAKIOS_AUDIO_RATE;
+			v.u.ranges[0].mMinimum = v.u.ranges[0].mMaximum = HAKIOS_AUDIO_RATE;
 			v.size = sizeof(AudioValueRange);
+			if (d->object == OBJECT_SPEAKER) {
+				v.u.ranges[1].mMinimum = v.u.ranges[1].mMaximum = SPEAKER_RATE_44;
+				v.size = 2 * sizeof(AudioValueRange);
+			}
 			break;
 		case kAudioDevicePropertyPreferredChannelsForStereo:
 			v.u.words[0] = 1;
@@ -610,7 +836,8 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			WORD(object == d->input);
 			break;
 		case kAudioStreamPropertyTerminalType:
-			WORD(object == d->input ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker);
+			WORD(object == d->input ? kAudioStreamTerminalTypeMicrophone :
+			    d->object == OBJECT_HEADPHONES ? kAudioStreamTerminalTypeHeadphones : kAudioStreamTerminalTypeSpeaker);
 			break;
 		case kAudioStreamPropertyStartingChannel:
 			WORD(1);
@@ -625,9 +852,16 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			break;
 		case kAudioStreamPropertyAvailableVirtualFormats:
 		case kAudioStreamPropertyAvailablePhysicalFormats:
-			v.u.ranged.mFormat = format_of(object);
-			v.u.ranged.mSampleRateRange.mMinimum = v.u.ranged.mSampleRateRange.mMaximum = HAKIOS_AUDIO_RATE;
+			v.u.rangeds[0].mFormat = format_of(object);
+			v.u.rangeds[0].mFormat.mSampleRate = HAKIOS_AUDIO_RATE;
+			v.u.rangeds[0].mSampleRateRange.mMinimum = v.u.rangeds[0].mSampleRateRange.mMaximum = HAKIOS_AUDIO_RATE;
 			v.size = sizeof(AudioStreamRangedDescription);
+			if (d->object == OBJECT_SPEAKER) {
+				v.u.rangeds[1] = v.u.rangeds[0];
+				v.u.rangeds[1].mFormat.mSampleRate = SPEAKER_RATE_44;
+				v.u.rangeds[1].mSampleRateRange.mMinimum = v.u.rangeds[1].mSampleRateRange.mMaximum = SPEAKER_RATE_44;
+				v.size = 2 * sizeof(AudioStreamRangedDescription);
+			}
 			break;
 		}
 	}
@@ -698,6 +932,11 @@ is_property_settable(AudioServerPlugInDriverRef driver, AudioObjectID object, pi
 	if (object == OBJECT_SPEAKER_VOLUME) {
 		*settable = address->mSelector == kAudioLevelControlPropertyScalarValue ||
 		    address->mSelector == kAudioLevelControlPropertyDecibelValue;
+	} else if (object == OBJECT_HEADPHONES_VOLUME) {
+		*settable = address->mSelector == kAudioLevelControlPropertyScalarValue ||
+		    address->mSelector == kAudioLevelControlPropertyDecibelValue;
+	} else if (object == OBJECT_HEADPHONES_MUTE) {
+		*settable = address->mSelector == kAudioBooleanControlPropertyValue;
 	} else if (object == OBJECT_CODEC_SOURCE) {
 		*settable = address->mSelector == kAudioSelectorControlPropertyCurrentItem;
 	} else if (object == OBJECT_PLUGIN) {
@@ -732,7 +971,8 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	if (address == NULL || size == NULL || data == NULL || !has_property(driver, object, client, address)) {
 		return object < OBJECT_PLUGIN || object > OBJECT_LAST ? kAudioHardwareBadObjectError : kAudioHardwareUnknownPropertyError;
 	}
-	if (object == OBJECT_SPEAKER_VOLUME && (address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
+	if ((object == OBJECT_SPEAKER_VOLUME || object == OBJECT_HEADPHONES_VOLUME) &&
+	    (address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
 	    address->mSelector == kAudioLevelControlPropertyConvertDecibelsToScalar)) {
 		/* what is in the buffer, converted where it is */
 		if (room < sizeof(Float32)) {
@@ -797,6 +1037,32 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		}
 		return 0;
 	}
+	if (object == OBJECT_HEADPHONES_VOLUME || object == OBJECT_HEADPHONES_MUTE) {
+		AudioObjectPropertyAddress changed[2] = {
+			{ object == OBJECT_HEADPHONES_MUTE ? kAudioBooleanControlPropertyValue : kAudioLevelControlPropertyScalarValue,
+			  kAudioObjectPropertyScopeGlobal, 0 },
+			{ kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, 0 },
+		};
+
+		if (object == OBJECT_HEADPHONES_MUTE ? size != sizeof(UInt32) : size != sizeof(Float32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		pthread_mutex_lock(&lock);
+		if (object == OBJECT_HEADPHONES_MUTE) {
+			hp_muted = *(const UInt32 *)data != 0;
+		} else {
+			Float32 wanted = *(const Float32 *)data;
+
+			hp_volume = address->mSelector == kAudioLevelControlPropertyDecibelValue ? db_to_scalar(wanted) :
+			    wanted < 0 ? 0 : wanted > 1 ? 1 : wanted;
+		}
+		say("redwood: audio: headphones volume %.3f%s\n", hp_volume, hp_muted ? ", muted" : "");
+		pthread_mutex_unlock(&lock);
+		if (host != NULL) {
+			host->PropertiesChanged(host, object, object == OBJECT_HEADPHONES_MUTE ? 1 : 2, changed);
+		}
+		return 0;
+	}
 	if (object == OBJECT_CODEC_SOURCE) {
 		/* the one microphone there is */
 		return size == sizeof(UInt32) ? (*(const UInt32 *)data == MIC_SOURCE ? 0 : kAudioHardwareIllegalOperationError) :
@@ -812,7 +1078,20 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		return 0;
 	}
 	if (address->mSelector == kAudioDevicePropertyNominalSampleRate) {
-		return size == sizeof(Float64) && *(const Float64 *)data == HAKIOS_AUDIO_RATE ? 0 : kAudioDeviceUnsupportedFormatError;
+		/*
+		 * Only HAKIOS_AUDIO_RATE. Anything else is answered "done" and left as it is, with no change
+		 * announced: the virtual audio device then reads the rate back and converts to it itself. Refusing it
+		 * ('!dat') was what stopped the sound on the phone (vayu, 24 October, run 194827): a ringtone asked its
+		 * route for 44100, the refusal tore the route down and nothing was written again until a restart.
+		 */
+		if (size != sizeof(Float64)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		if (rate_supported(device_of(object), *(const Float64 *)data)) {
+			return request_rate(device_of(object), *(const Float64 *)data);
+		}
+		say("redwood: audio: asked for %.0f Hz, keeps %.0f\n", *(const Float64 *)data, device_of(object)->rate);
+		return 0;
 	}
 	/* a format: the one we have, or nothing */
 	if (size != sizeof(AudioStreamBasicDescription)) {
@@ -820,9 +1099,21 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	} else {
 		const AudioStreamBasicDescription *wanted = data, format = format_of(object);
 
-		return wanted->mSampleRate == format.mSampleRate && wanted->mFormatID == format.mFormatID &&
-		       wanted->mChannelsPerFrame == format.mChannelsPerFrame && wanted->mBitsPerChannel == format.mBitsPerChannel &&
-		       (wanted->mFormatFlags & kAudioFormatFlagIsSignedInteger) ? 0 : kAudioDeviceUnsupportedFormatError;
+		if (wanted->mFormatID != format.mFormatID || wanted->mChannelsPerFrame != format.mChannelsPerFrame ||
+		    wanted->mBitsPerChannel != format.mBitsPerChannel || !(wanted->mFormatFlags & kAudioFormatFlagIsSignedInteger)) {
+			say("redwood: audio: format refused on object %u: %.0f Hz, %u channels, %u bits, flags 0x%x\n", object,
+			    wanted->mSampleRate, wanted->mChannelsPerFrame, wanted->mBitsPerChannel, wanted->mFormatFlags);
+			return kAudioDeviceUnsupportedFormatError;
+		}
+		/* another rate: the device's, if it has it, else kept as it is like the nominal rate above */
+		if (wanted->mSampleRate != format.mSampleRate && rate_supported(device_of(object), wanted->mSampleRate)) {
+			return request_rate(device_of(object), wanted->mSampleRate);
+		}
+		if (wanted->mSampleRate != format.mSampleRate) {
+			say("redwood: audio: format at %.0f Hz asked for on object %u, keeps %.0f\n", wanted->mSampleRate, object,
+			    format.mSampleRate);
+		}
+		return 0;
 	}
 }
 
@@ -929,13 +1220,14 @@ static OSStatus
 get_zero_time_stamp(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused UInt32 client,
     Float64 *sample_time, UInt64 *host_time, UInt64 *seed)
 {
-	Float64 ticks_per_period = ticks_per_frame * TIMESTAMP_PERIOD;
 	UInt64 now = mach_absolute_time();
 	struct device *d = device_of(object);
+	Float64 ticks_per_period;
 
 	if (d == NULL) {
 		return kAudioHardwareBadObjectError;
 	}
+	ticks_per_period = ticks_per_second / d->rate * TIMESTAMP_PERIOD;
 	pthread_mutex_lock(&lock);
 	while (now >= d->anchor + (UInt64)((Float64)(d->periods + 1) * ticks_per_period)) {
 		d->periods++;
@@ -998,6 +1290,38 @@ actuator_write(const int16_t *samples, UInt32 frames)
 	}
 }
 
+/* 44.1 kHz frames to 48 kHz, into resampled[]: linear interpolation, carried across buffers. */
+static UInt32
+resample_44_to_48(const int16_t *in, UInt32 frames)
+{
+	const Float64 step = SPEAKER_RATE_44 / HAKIOS_AUDIO_RATE;
+	const UInt32 room = sizeof(resampled) / sizeof(resampled[0]) / HAKIOS_AUDIO_CHANNELS;
+	UInt32 out = 0;
+
+	if (frames == 0) {
+		return 0;
+	}
+	/* input frame i of this buffer is at position i + 1; position 0 is the last frame of the one before */
+	while (resample_pos < (Float64)frames && out < room) {
+		UInt32 i = (UInt32)resample_pos;
+		Float64 f = resample_pos - i;
+
+		for (UInt32 c = 0; c < HAKIOS_AUDIO_CHANNELS; c++) {
+			int a = i == 0 ? resample_prev[c] : in[(i - 1) * HAKIOS_AUDIO_CHANNELS + c];
+			int b = in[i * HAKIOS_AUDIO_CHANNELS + c];
+
+			resampled[out * HAKIOS_AUDIO_CHANNELS + c] = (int16_t)(a + (b - a) * f);
+		}
+		out++;
+		resample_pos += step;
+	}
+	resample_pos -= frames;
+	for (UInt32 c = 0; c < HAKIOS_AUDIO_CHANNELS; c++) {
+		resample_prev[c] = in[(frames - 1) * HAKIOS_AUDIO_CHANNELS + c];
+	}
+	return out;
+}
+
 static OSStatus
 do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object, AudioObjectID stream,
     __unused UInt32 client, UInt32 operation, UInt32 frames, __unused const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
@@ -1016,18 +1340,37 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
 		actuator_write(buffer, frames);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
-		/* the kernel takes it all or leaves it: this thread must not wait */
-		if (sink < 0 || write(sink, buffer, (size_t)frames * HAKIOS_AUDIO_FRAME) < 0) {
-			refused += frames;
+		const int16_t *out = buffer;
+		UInt32 count = frames;
+
+		if (d->rate == SPEAKER_RATE_44) {
+			count = resample_44_to_48(buffer, frames);
+			out = resampled;
 		}
-		written += frames;
+		if (d->object == OBJECT_HEADPHONES) {
+			/* its volume and mute are ours to apply: a gain on the samples (the kernel's volume is the speaker's) */
+			UInt32 n = frames * HAKIOS_AUDIO_CHANNELS, room = sizeof(hp_scaled) / sizeof(hp_scaled[0]);
+			Float32 gain = hp_muted ? 0 : hp_volume;
+
+			n = n < room ? n : room;
+			for (UInt32 i = 0; i < n; i++) {
+				hp_scaled[i] = (int16_t)lrintf((Float32)((const int16_t *)buffer)[i] * gain);
+			}
+			out = hp_scaled;
+			count = n / HAKIOS_AUDIO_CHANNELS;
+		}
+		/* the kernel takes it all or leaves it: this thread must not wait */
+		if (sink < 0 || write(sink, out, (size_t)count * HAKIOS_AUDIO_FRAME) < 0) {
+			refused += count;
+		}
+		written += count;
 	}
 	return 0;
 }
 
 static AudioServerPlugInDriverInterface interface = {
 	NULL, query_interface, add_ref, release, initialize, create_device, destroy_device, device_client, device_client,
-	configuration_change, configuration_change, has_property, is_property_settable, get_property_data_size,
+	perform_configuration_change, configuration_change, has_property, is_property_settable, get_property_data_size,
 	get_property_data, set_property_data, start_io, stop_io, get_zero_time_stamp, will_do_io_operation,
 	begin_end_io_operation, do_io_operation, begin_end_io_operation,
 };

@@ -81,9 +81,10 @@ ALL_PICTURES = ('System/Library/PrivateFrameworks/ProgressUI.framework/',)
 BIG_CATALOGS = ('System/Library/PrivateFrameworks/SFSymbols.framework/',)
 # taken whole in principle, but not these: big and of no use until much later
 # (/Library is the wallpapers and a few tables of regional settings, apart from the sounds)
+# (Library/Ringtones is in now, 53 files, 18 MB: without them a ringtone played silence on vayu, 25 October)
 HEALTH = 'System/Library/Health/'
 SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra/',
-               'usr/standalone/', 'Library/Audio/', 'Library/Ringtones/',
+               'usr/standalone/', 'Library/Audio/',
                HEALTH + 'Assets/FitnessUIAssets.bundle/') + \
     tuple(f'System/Library/{name}/' for name in SKIP_SYSTEM_LIBRARY)
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, ...) are not on the way to the screen
@@ -93,7 +94,9 @@ BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, .
 AUDIO = ('Library/Audio/Plug-Ins/', 'Library/Audio/Tunings/D22/', 'Library/Audio/Tunings/Generic/',
          'System/Library/Audio/UISounds/')
 SKIP_AUDIO = ('System/Library/Audio/UISounds/nano/',)
-KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB')
+# Russian too (vayu tester, 24 October 2026): a bundle with LANGUAGE.lproj directories offers only the languages
+# it has a directory for, so with en alone Settings' change of language came back in English. +1746 entries, 8.8 MB.
+KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB', 'ru', 'ru_RU')
 
 
 def entries(listing):
@@ -149,7 +152,9 @@ def wanted_file(path, size):
     if path.startswith(('Applications/', HEALTH)):
         return not path.lower().endswith(SKIP_APP_EXT) and '.mlmodelc/' not in path
     if path.startswith(FRAMEWORKS):
-        if re.search(r'/(XPCServices|Support|Helpers)/', path):
+        # (an extension's own program: the Files app's local storage, LocalStorageFileProvider, is 9 MB, and its
+        # document browser's services are 5.5 MB each -- over SMALL, Files showed nothing on vayu)
+        if re.search(r'/(XPCServices|Support|Helpers)/', path) or re.search(r'/PlugIns/([^/]+)\.appex/\1$', path):
             return size <= 32 << 20 and not path.lower().endswith(('.png', '.car', '.loctable', '.caml'))
         if path.endswith('.car'):
             return size <= MAX_ASSET_CATALOG or path.startswith(BIG_CATALOGS)

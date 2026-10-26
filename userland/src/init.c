@@ -62,7 +62,7 @@ join(const char *a, const char *b, const char *c)
 static const char *
 boot_arg(const char *name)
 {
-	static char args[1024], value[128];
+	static char args[4096], value[128];
 	size_t len = sizeof(args) - 1, n = strlen(name);
 
 	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {

@@ -4,7 +4,9 @@
  * (AWB), and a picture: each 2x2 Bayer cell one pixel of colour, scaled to the size asked for, or
  * every pixel (bilinear demosaic) at the sensor's own size; lens shading (a grid of gains per
  * colour), the white balance's and AE's gains, a colour matrix, a gamma; as 8-bit YCbCr 4:2:0 (NV12,
- * full range: CoreVideo's 420f, or video range: 420v) or BGRA.
+ * full range: CoreVideo's 420f, or video range: 420v) or BGRA. The photographs then get the stills'
+ * look (struct isp_look: noise reduction, sharpening, local contrast, vibrance, a highlight roll-off),
+ * off by default; the preview gets only the look's sharpening across its lines.
  */
 #ifndef CAMERA_ISP_H
 #define CAMERA_ISP_H
@@ -68,21 +70,62 @@ struct isp_tuning {
 	void            *file;
 };
 
+/*
+ * The "iPhone look" of the photographs (spec L): every field is off at 0, where the picture is exactly
+ * what it was before; camera_device.c turns them on for vayu in the same place it sets the tone
+ * (cam_tone=0 turns them off), and cam_nr=, cam_sharp=, cam_lcon= and cam_vib= are a tester's knobs.
+ * The preview gets none of it but the sharpening (preview_sharp), and that one across the line only, to
+ * keep the preview as cheap as it is: the rest is the stills' (isp_render_still_nv12) alone.
+ */
+struct isp_look {
+	/* 0 none; 1: edge-preserving noise reduction on the stills' Y, sigma 3 codes * sqrt(gain) -- 3x3,
+	 * 5x5 from 8x gain -- and a 5x5 box on the chroma at half resolution (look.nr scales the sigma) */
+	float           nr;
+	/* 0 none; 1: unsharp mask on the stills' Y, 0.6 at 1x gain falling to 0.25 at 16x, threshold 2.5 codes,
+	 * the delta limited to +-24 (look.sharpen scales the amount) */
+	float           sharpen;
+	/* 0 none; 0.15: Y += lcon * (Y - the mean of the 1/32 of the width around it) (look.lcon is the amount) */
+	float           lcon;
+	/* 0 none; 0.25: saturation 1 + vibrance * (1 - the pixel's own chroma), so that what is already
+	 * coloured is left alone; the colour matrix's folded saturation is off for the stills when this is on */
+	float           vibrance;
+	/* 0 none; 1: the last 10 % of the stills' gamma table rolled off, white landing at 97.5 % (249)
+	 * instead of clipping, and flat where the shoulder ends (on vayu) */
+	float           rolloff;
+	/* 0 none; the preview's unsharp mask on Y, across the line only (0.3 on vayu) */
+	float           preview_sharp;
+};
+
 struct isp {
 	float           wb[3];          /* the white balance's gains, green 1 */
 	float           digital;        /* more gain, for what AE cannot reach with the sensor's */
 	float           zoom;           /* the picture is the middle 1/zoom of the sensor each way (1: the whole of it) */
 	bool            turned;         /* the picture turned half round (a sensor mounted the other way up) */
 	float           ccm[3][3];      /* the colour matrix, camera RGB (white balanced) to linear sRGB; rows sum to 1 */
+	float           ccm_plain[3][3];        /* the same without the folded saturation (the stills' with vibrance) */
 	struct isp_lsc  lsc;
 	uint8_t         gamma[4096];    /* linear (959 above black is 3836) to 8 bits, sRGB's curve */
+	uint8_t         gamma_still[4096];      /* the same with the look's highlight roll-off (stills only) */
+	struct isp_look look;           /* the stills' look, and the preview's sharpening (all off by default) */
 	uint32_t        asked_lines, asked_gain, asked_frame_lines;     /* what AE asked for last */
 	bool            asked;
 	uint32_t        max_frame_lines;        /* the longest frame AE may ask for (0: twice the shortest) */
 	struct isp_tuning *tuning;              /* isp_load_tuning()'s, or none */
+	float           saturation;     /* applied to every colour matrix set (1: none) */
+	float           contrast;       /* the S-curve folded into the gamma table (0: none) */
 };
 
 void isp_init(struct isp *isp);
+/* the tone of the picture: an S-curve of contrast c (0 none, ~0.3 gentle) into the gamma table, and saturation s
+ * (1 none) applied to the colour matrix from now on */
+void isp_set_tone(struct isp *isp, float contrast, float saturation);
+/* the stills' look and the preview's sharpening (look NULL: none of it, today's pictures) */
+void isp_set_look(struct isp *isp, const struct isp_look *look);
+/* how the last photograph's time went, in ms (0 when the look was off); the counters are emptied */
+struct isp_still_timing {
+	double          nr_ms, sharpen_ms, lcon_ms;
+};
+void isp_take_still_timing(struct isp_still_timing *timing);
 /*
  * How sharp the picture is in a part of the frame (fractions of it, x0 < x1, y0 < y1): the squares of
  * green's steps between neighbouring blocks of 4x4 cells, over green's level squared -- higher is sharper,

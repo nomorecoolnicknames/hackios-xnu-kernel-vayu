@@ -40,7 +40,8 @@
  * pixel or two of the framebuffer; gltrace_lit=1: and how much of the framebuffer is not black);
  * gltrace_at=SECONDS does so for the first frame that long after the window server started,
  * gltrace_draws=N for the first frame after one of N draws, gltrace_function=N[,K] for the frame
- * after the Kth draw CoreAnimation makes of its function N with no program, gltrace_frames=N for
+ * after the Kth draw CoreAnimation makes of its function N with no program, gltrace_refused=N for the frame after the
+ * first that asked for its function N and was told there is none, gltrace_frames=N for
  * N frames from any of them on; gltrace_place=X0,Y0,X1,Y1 writes down, of those frames, only the draws whose corners
  * reach into that rectangle, a line each (lines "gl-at:"; writing everything down is slow, and a
  * window server that is slow draws other frames), gltrace_look=1 adds the pixel each of them
@@ -53,7 +54,7 @@
  * draws without a program alone, glskip=N[,N...] leaves out the draws of those programs (see skip_draw()), glcopy=1 copies every IOSurface as if the library could not
  * share one, glwait=1 waits for the GPU at the end of every frame and glwait=0 never (see
  * wait_for_frames), glfetch=0 keeps EXT_shader_framebuffer_fetch from CoreAnimation (see
- * fetch_offered), glgroup=0 leaves vibrant layers inside groups as they were (see group_draw_begin()), glprecision=0 leaves the shaders' "lowp" and "mediump" as they are (see all_highp), glenv=NAME=VALUE puts that into the environment for the library to find
+ * fetch_offered), glgroup=0 leaves vibrant layers inside groups as they were, glgroup=1 is the older flatten-in-place (see group_draw_begin()), glprecision=0 leaves the shaders' "lowp" and "mediump" as they are (see all_highp), glenv=NAME=VALUE puts that into the environment for the library to find
  * (its own switches: FD_MESA_DEBUG=sysmem, say), vblur=0 blurs nothing whose radius varies and
  * vblur=2 paints such blurs by their masks instead (see vblur_on), glframes=1 writes a line for
  * every frame (see frame_end()).
@@ -137,7 +138,8 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 
 struct eagl;
 static int eagl_tracing;                /* this frame's calls are written down (boot-arg gltrace=FIRST-LAST) */
-static int frame_lines;                 /* boot-arg glframes=1: a line for every frame (see frame_end()) */
+static int frame_lines;                 /* boot-arg glframes=1: a line for every frame (see frame_end()); glframes=2: only the
+                                           lines of what changed in what CoreAnimation asks for (frame_functions()) */
 static int latency_lines;               /* boot-arg touch_lat=1: when every frame began and ended (see frame_end()) */
 static uint64_t slow_calls_us;          /* boot-arg glslow=US: a line for every call that takes longer (eagl_leave()) */
 static uint64_t call_began_us;          /* (when the call in progress began) */
@@ -216,10 +218,14 @@ now_us(void)
 enum { GROUP_NONE, GROUP_FRESH, GROUP_VIBRANT };
 struct group_texture {
 	uint8_t state;                  /* GROUP_FRESH: cleared, nothing drawn in it since; GROUP_VIBRANT: a vibrant layer's coverage */
+	GLuint side;                    /* a picture of ours beside it, holding that coverage where mode 2 keeps it (group_side()) */
+	GLsizei side_width, side_height;
 	GLfloat colours[20];            /* ... and that layer's colour matrix */
 };
-static int group_vibrant_on = 1;        /* boot-arg glgroup=0 */
-static unsigned group_covered, group_laid, group_flattened;    /* (glframes=1) this frame's */
+static int group_vibrant_on = 2;        /* boot-arg glgroup=0 (1: the coverage in the group itself, as before sides) */
+static unsigned group_covered, group_laid, group_flattened, group_kept;        /* (glframes=1) this frame's */
+/* ... and why each flattening was: read another way, laid by another function, no side to pass it to, drawn into, laid into */
+static unsigned group_flat_why[5];
 
 /* A texture that stands for an IOSurface. */
 struct image {
@@ -250,6 +256,7 @@ struct eagl {
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
 	GLuint writer;                  /* ... and one to copy a frame into its surface with (blit_targets) */
+	GLuint side_framebuffer;        /* ... and one a group's side texture is cleared through (group_side()) */
 	GLuint program;                 /* the one in use, as CoreAnimation has it */
 	GLuint plain, lookup;           /* programs of ours for when that is none (plain_draw_begin()) */
 	GLint plain_matrix, plain_textured, lookup_matrix;
@@ -262,12 +269,15 @@ struct eagl {
 	GLfloat unclear_colour[4];
 	GLboolean unclear_boxed;
 	struct group_texture *groups;   /* CoreAnimation's textures: which are groups with a vibrant layer in them (group_draw_begin()) */
-	GLuint group_cover, group_over, group_flat;     /* ... and our programs for them */
+	GLuint group_cover, group_over, group_flat, group_flat_side;    /* ... and our programs for them */
 	bool group_failed;
 	GLint group_cover_matrix, group_cover_texmat, group_over_matrix, group_over_texmat, group_over_colours;
 	GLint group_flat_matrix, group_flat_colour;
+	GLint group_flat_side_matrix, group_flat_side_colour, group_flat_side_size;
 	GLboolean group_blend;          /* the blending a draw of those had, to be put back after it */
 	GLint group_blend_func[4];
+	bool group_rebind;              /* a draw of ours went into a side texture: CoreAnimation's framebuffer is to be bound back after it */
+	bool group_side_bound;          /* ... and a side of ours is on the first texture unit, where CoreAnimation's belongs */
 	GLuint box;                     /* and one that makes a picture eight times smaller */
 	GLint box_matrix, box_places;
 	GLuint blur4;                   /* and for the four samples of a shadow's blur (blur4_fragment) */
@@ -321,6 +331,7 @@ static unsigned trace_frames = 1, trace_left;   /* ... and how many frames from 
 static int trace_lit;                           /* boot-arg gltrace_lit=1: count the lit pixels after every traced draw (slow) */
 static int trace_function = -1, trace_function_after = 1;       /* boot-arg gltrace_function=N[,K]: the frames after the Kth draw ... */
 static int trace_function_met;                                  /* ... CoreAnimation makes of its function N with no program */
+static int trace_refused = -1;                                  /* boot-arg gltrace_refused=N: or the frame after the first in which it is refused N */
 static float trace_place[4];                    /* boot-arg gltrace_place=X0,Y0,X1,Y1: of those frames, only the draws that touch this */
 static int trace_placed, trace_placing;         /* ... is set; ... and this frame is one of them */
 static int trace_look;                          /* boot-arg gltrace_look=1: ... and what each of them left in the middle of itself */
@@ -1080,7 +1091,7 @@ frame_end(struct eagl *e, bool finished)
 		/* "tl: g FRAME began US ended US DRAWS": microseconds of mach_absolute_time (tools/latency.py) */
 		say("tl: g %u began %llu ended %llu %u\n", e->frames, e->began, after, e->draws);
 	}
-	if (frame_lines) {
+	if (frame_lines == 1) {
 		/*
 		 * One line a frame, for matching with a screen recording (the kernel's rec_ring, whose log
 		 * says when it began in the same time): when the frame ended, in the kernel's time; what was
@@ -1093,6 +1104,8 @@ frame_end(struct eagl *e, bool finished)
 		    after / 1000000, after / 1000 % 1000, e->draws, e->clears, e->line.surface, e->line.into_display, e->line.boxed ? "on" : "off", e->line.box[0], e->line.box[1],
 		    e->line.box[2], e->line.box[3], e->line.vrd, e->line.vrb, in_place, copied, e->line.solid_spans, e->line.blended_spans,
 		    e->line.solid_ends, e->line.blended_ends, e->line.other_spans, e->line.other_ends);
+	}
+	if (frame_lines) {
 		bzero(&e->line, sizeof(e->line));
 		frame_functions(e);
 	}
@@ -2248,6 +2261,10 @@ hakios_gl_function_refused(unsigned function)
 	if (frame_lines && function < 90) {
 		frame_refused[function]++;
 	}
+	if ((int)function == trace_refused) {
+		trace_refused = -1;
+		trace_function_met = 1;         /* (frame_begin(): the next frame is written down) */
+	}
 	if (census_on && function < 90) {
 		census[function].refused++;
 		census[function].refused_lately++;
@@ -2320,8 +2337,8 @@ census_draw(struct eagl *e, unsigned function, unsigned kind)
 static void
 frame_functions(struct eagl *e)
 {
-	static char said[600];
-	char text[600] = "";
+	static char said[1000];
+	char text[1000] = "";
 	size_t used = 0;
 
 	for (unsigned f = 0; f < 90 && used < sizeof(text) - 40; f++) {
@@ -2335,11 +2352,14 @@ frame_functions(struct eagl *e)
 			}
 		}
 	}
-	if (group_covered + group_laid + group_flattened != 0 && used < sizeof(text) - 60) {
-		used += (size_t)snprintf(text + used, sizeof(text) - used, " groups: %u covered, %u laid, %u flattened;", group_covered,
-		    group_laid, group_flattened);
+	if (group_covered + group_laid + group_flattened + group_kept != 0 && used < sizeof(text) - 160) {
+		used += (size_t)snprintf(text + used, sizeof(text) - used,
+		    " groups: %u covered, %u laid, %u flattened (read %u, other function %u, no side %u, drawn into %u, laid into %u), %u kept;",
+		    group_covered, group_laid, group_flattened, group_flat_why[0], group_flat_why[1], group_flat_why[2], group_flat_why[3],
+		    group_flat_why[4], group_kept);
 	}
-	group_covered = group_laid = group_flattened = 0;
+	group_covered = group_laid = group_flattened = group_kept = 0;
+	bzero(group_flat_why, sizeof(group_flat_why));
 	if (used != 0 && strcmp(text, said) != 0) {
 		say("hakios-gl: f %u functions:%s\n", e->frames, text);
 	}
@@ -2501,6 +2521,15 @@ vblur_draw_begin(struct eagl *e, struct vblur_chain *chain, GLint enabled[4])
  * holds a vibrant layer's coverage and is then drawn into, or read any other way, is first made
  * what it would have been (the colour matrix of nothing, by the coverage). A group laid into
  * another group that holds nothing yet passes its coverage on. Boot-arg glgroup=0: as before.
+ *
+ * Mode 2, the default, keeps that coverage in a picture of ours beside the group instead
+ * (group_side()), and lets whatever is drawn into the group afterwards go over it: App Library's
+ * folder backgrounds are a vibrant material with the folders' icons drawn into the same group,
+ * and flattening the group when the icons arrived turned them flat grey-white as Control Center
+ * faded in. Such a group keeps its coverage until something reads it other than by laying it over
+ * a picture; made what it would have been, the colour the matrix makes of nothing goes under the
+ * content by the coverage, not instead of it (group_flat_side_fragment). Boot-arg glgroup=1: the
+ * coverage flattened into the group itself, as before; glgroup=0: as before that.
  */
 
 static const char group_cover_fragment[] =
@@ -2539,6 +2568,16 @@ static const char group_flat_fragment[] =
     "void main() {\n"
     "  result = flat_colour * result.a;\n"
     "}\n";
+static const char group_flat_side_fragment[] =
+    "#version 300 es\n"
+    "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+    "uniform lowp sampler2D side;\n"
+    "uniform mediump vec4 flat_colour;\n"
+    "uniform highp vec2 size;\n"
+    "layout(location = 0) inout highp vec4 result;\n"
+    "void main() {\n"
+    "  result = result + (1.0 - result.a) * flat_colour * texture(side, gl_FragCoord.xy / size).a;\n"
+    "}\n";
 
 #ifndef GL_BLEND_SRC_ALPHA
 #define GL_BLEND_SRC_ALPHA              0x80cb
@@ -2546,6 +2585,7 @@ static const char group_flat_fragment[] =
 #endif
 #define GL_ONE                          1
 #define GL_ONE_MINUS_SRC_ALPHA          0x0303
+#define GL_RGBA8                        0x8058
 
 static GLfloat
 clamp01(GLfloat value)
@@ -2570,7 +2610,7 @@ group_of(struct eagl *e, GLuint texture)
 static bool
 group_programs(struct eagl *e)
 {
-	GLint good = 0, good2 = 0, good3 = 0;
+	GLint good = 0, good2 = 0, good3 = 0, good4 = 1;
 
 	if (e->group_cover != 0 || e->group_failed) {
 		return !e->group_failed;
@@ -2578,10 +2618,15 @@ group_programs(struct eagl *e)
 	e->group_cover = plain_program(group_cover_fragment, "a vibrant layer's coverage, in a group");
 	e->group_over = plain_program(group_over_fragment, "a group's vibrant layer over what is behind it");
 	e->group_flat = plain_program(group_flat_fragment, "a group's vibrant layer as it would have been");
+	if (group_vibrant_on == 2) {
+		/* (mode 1 has no sides, and no program for what it would make of them) */
+		e->group_flat_side = plain_program(group_flat_side_fragment, "a group's content over what its vibrant layer makes of nothing");
+		glGetProgramiv(e->group_flat_side, GL_LINK_STATUS, &good4);
+	}
 	glGetProgramiv(e->group_cover, GL_LINK_STATUS, &good);
 	glGetProgramiv(e->group_over, GL_LINK_STATUS, &good2);
 	glGetProgramiv(e->group_flat, GL_LINK_STATUS, &good3);
-	e->group_failed = !good || !good2 || !good3;
+	e->group_failed = !good || !good2 || !good3 || !good4;
 	e->group_cover_matrix = glGetUniformLocation(e->group_cover, "vertex_matrix");
 	e->group_cover_texmat = glGetUniformLocation(e->group_cover, "texmat");
 	e->group_over_matrix = glGetUniformLocation(e->group_over, "vertex_matrix");
@@ -2589,13 +2634,106 @@ group_programs(struct eagl *e)
 	e->group_over_colours = glGetUniformLocation(e->group_over, "colours");
 	e->group_flat_matrix = glGetUniformLocation(e->group_flat, "vertex_matrix");
 	e->group_flat_colour = glGetUniformLocation(e->group_flat, "flat_colour");
+	if (e->group_flat_side != 0) {
+		e->group_flat_side_matrix = glGetUniformLocation(e->group_flat_side, "vertex_matrix");
+		e->group_flat_side_colour = glGetUniformLocation(e->group_flat_side, "flat_colour");
+		e->group_flat_side_size = glGetUniformLocation(e->group_flat_side, "size");
+	}
 	return !e->group_failed;
+}
+
+/*
+ * A side texture that cannot be used, or is no longer how the group keeps its coverage: gone, so
+ * that a group whose coverage goes into its own picture instead is flattened as mode 1 flattens it.
+ */
+static void
+group_side_forget(struct group_texture *g)
+{
+	if (g->side != 0) {
+		glDeleteTextures(1, &g->side);
+		g->side = 0;
+	}
+	g->side_width = g->side_height = 0;
+}
+
+/*
+ * The picture beside a group: a texture of ours, of the group's size, that holds a vibrant layer's
+ * coverage (premultiplied, as group_cover_fragment writes it) while what is drawn into the group
+ * afterwards goes over it. Made the first time and again when the group changes size; with `clear`
+ * it is cleared to nothing through a framebuffer of ours. CoreAnimation's state put back: the
+ * texture bound to its first unit, its framebuffer, its clear colour, its scissor. False if there
+ * is no side to be had, and then the caller does what it did before there were sides.
+ */
+static bool
+group_side(struct eagl *e, GLuint texture, struct group_texture *g, bool clear)
+{
+	GLint width = 0, height = 0, box[4];
+	GLfloat colour[4];
+	GLboolean scissored;
+	bool made = false;
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+	if (width <= 0 || height <= 0) {
+		glBindTexture(GL_TEXTURE_2D, e->bound[0]);
+		glActiveTexture(GL_TEXTURE0 + e->unit);
+		return false;
+	}
+	if (g->side == 0 || g->side_width != width || g->side_height != height) {
+		if (g->side == 0) {
+			glGenTextures(1, &g->side);
+		}
+		if (g->side == 0) {
+			glBindTexture(GL_TEXTURE_2D, e->bound[0]);
+			glActiveTexture(GL_TEXTURE0 + e->unit);
+			return false;
+		}
+		glBindTexture(GL_TEXTURE_2D, g->side);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, 0x2801, 0x2601);         /* min filter: linear */
+		glTexParameteri(GL_TEXTURE_2D, 0x2800, 0x2601);         /* mag filter: linear */
+		glTexParameteri(GL_TEXTURE_2D, 0x2802, 0x812f);         /* clamp to edge */
+		glTexParameteri(GL_TEXTURE_2D, 0x2803, 0x812f);
+		g->side_width = (GLsizei)width;
+		g->side_height = (GLsizei)height;
+		made = true;
+	}
+	glBindTexture(GL_TEXTURE_2D, e->bound[0]);
+	glActiveTexture(GL_TEXTURE0 + e->unit);
+	if (e->side_framebuffer == 0) {
+		glGenFramebuffers(1, &e->side_framebuffer);
+	}
+	if (e->side_framebuffer == 0) {
+		group_side_forget(g);
+		return false;
+	}
+	if (!clear && !made) {
+		return true;
+	}
+	/* (a new picture holds nothing yet, whatever it is to be used for) */
+	glGetIntegerv(GL_SCISSOR_BOX, box);
+	scissored = glIsEnabled(GL_SCISSOR_TEST);
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, colour);
+	glBindFramebuffer(GL_FRAMEBUFFER, e->side_framebuffer);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g->side, 0);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(0, 0, 0, 0);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glClearColor(colour[0], colour[1], colour[2], colour[3]);
+	glScissor(box[0], box[1], box[2], box[3]);
+	(scissored ? glEnable : glDisable)(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
+	return true;
 }
 
 /*
  * A group that holds a vibrant layer's coverage made what CoreAnimation drew into it: the colour
  * matrix of nothing (its numbers added, opacity and all), by the coverage. Drawn through a
- * framebuffer of ours, the whole texture; everything of CoreAnimation's put back after.
+ * framebuffer of ours, the whole texture; everything of CoreAnimation's put back after. In mode 2
+ * what was drawn over the coverage stays, and the colour goes under it by the coverage: what was
+ * laid over a picture of that colour would have come to.
  */
 static void
 group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
@@ -2605,6 +2743,7 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 	GLint view[4], box[4], width = 0, height = 0, enabled[3];
 	GLboolean scissored, blending;
 	GLfloat flat[4], alpha = clamp01(g->colours[19]);
+	bool beside = group_vibrant_on == 2 && g->side != 0;
 
 	g->state = GROUP_NONE;
 	group_flattened++;
@@ -2630,18 +2769,30 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 	glViewport(0, 0, width, height);
 	glDisable(GL_SCISSOR_TEST);
 	if (flat[3] == 0) {
-		GLfloat colour[4];
+		if (!beside) {
+			GLfloat colour[4];
 
-		/* (nothing by any coverage is nothing: the numbers add no opacity, as they do not in Control Center) */
-		glGetFloatv(GL_COLOR_CLEAR_VALUE, colour);
-		glClearColor(0, 0, 0, 0);
-		glClear(GL_COLOR_BUFFER_BIT);
-		glClearColor(colour[0], colour[1], colour[2], colour[3]);
+			/* (nothing by any coverage is nothing: the numbers add no opacity, as they do not in Control Center) */
+			glGetFloatv(GL_COLOR_CLEAR_VALUE, colour);
+			glClearColor(0, 0, 0, 0);
+			glClear(GL_COLOR_BUFFER_BIT);
+			glClearColor(colour[0], colour[1], colour[2], colour[3]);
+		}
 	} else if (group_programs(e)) {
 		glDisable(GL_BLEND);
-		glUseProgram(e->group_flat);
-		glUniformMatrix4fv(e->group_flat_matrix, 1, 0, identity);
-		glUniform4fv(e->group_flat_colour, 1, flat);
+		if (beside) {
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, g->side);
+			glActiveTexture(GL_TEXTURE0 + e->unit);
+			glUseProgram(e->group_flat_side);
+			glUniformMatrix4fv(e->group_flat_side_matrix, 1, 0, identity);
+			glUniform4fv(e->group_flat_side_colour, 1, flat);
+			glUniform2f(e->group_flat_side_size, (GLfloat)width, (GLfloat)height);
+		} else {
+			glUseProgram(e->group_flat);
+			glUniformMatrix4fv(e->group_flat_matrix, 1, 0, identity);
+			glUniform4fv(e->group_flat_colour, 1, flat);
+		}
 		for (GLuint i = 0; i < 3; i++) {
 			glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
 		}
@@ -2653,6 +2804,11 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 		glVertexAttribPointer(0, e->arrays[0].size, e->arrays[0].type, 0, e->arrays[0].stride, e->arrays[0].pointer);
 		for (GLuint i = 0; i < 3; i++) {
 			(enabled[i] ? glEnableVertexAttribArray : glDisableVertexAttribArray)(i);
+		}
+		if (beside) {
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, e->bound[0]);
+			glActiveTexture(GL_TEXTURE0 + e->unit);
 		}
 		glUseProgram(e->program);
 		(blending ? glEnable : glDisable)(GL_BLEND);
@@ -2681,6 +2837,15 @@ group_read(struct eagl *e, GLuint texture)
 	struct group_texture *g = e->groups != NULL && texture != 0 && texture < GROUP_TEXTURES ? &e->groups[texture] : NULL;
 
 	if (g != NULL && g->state == GROUP_VIBRANT) {
+		static uint8_t said[91];
+		unsigned function = ca_context != NULL ? *(*(uint8_t **)((char *)ca_context + 0x10) + 0x10) : 90;
+
+		if (function <= 90 && !said[function]) {
+			said[function] = 1;
+			say("hakios-gl: a group that holds a vibrant layer is read by CoreAnimation's function %u (\"%s\"), program %u: "
+			    "made what it would have been\n", function, census_name(function), e->program);
+		}
+		group_flat_why[0]++;
 		group_flatten(e, texture, g);
 	}
 }
@@ -2700,7 +2865,9 @@ group_uniform(struct eagl *e, const char *name, GLfloat *values)
 
 /*
  * Before a draw: is it one of the above, and if so, set up for it (the draw itself is CoreAnimation's,
- * with its arrays). Returns 0 for a draw left as it is, 1 for one of ours (group_draw_end() after it).
+ * with its arrays). Returns 0 for a draw left as it is, 1 for one of ours (group_draw_end() after it),
+ * 2 for one of ours and then CoreAnimation's own draw (group_draw_end() between them: mode 2, a group
+ * that holds a vibrant layer laid over what is behind).
  */
 static int
 group_draw_begin(struct eagl *e, GLint enabled[4])
@@ -2711,7 +2878,7 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 	struct group_texture *into = group_of(e, e->colour), *from = NULL;
 	const GLfloat *colours = NULL;
 	GLfloat matrix[16], texmat[4] = { 1, 1, 0, 0 };
-	bool cover;
+	bool cover = false, side_ready = false, then = false;
 
 	if (!group_vibrant_on || e->colour == 0 || e->framebuffer == 0) {
 		return 0;
@@ -2742,6 +2909,7 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 			    function, census_name(function), laid ? "the layer over what is behind it" : "made what it would have been");
 		}
 		if (!laid || !group_uniform(e, "vertex_matrix", matrix)) {
+			group_flat_why[1]++;
 			group_flatten(e, e->bound[0], from);
 			from = NULL;
 		} else {
@@ -2751,24 +2919,82 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 			colours = from->colours;
 			cover = into != NULL && (into->state == GROUP_FRESH ||
 			    (into->state == GROUP_VIBRANT && memcmp(into->colours, colours, sizeof(into->colours)) == 0));
+			if (group_vibrant_on == 2 && from->side != 0) {
+				/*
+				 * Mode 2: the coverage in the side of the group being laid goes over what is
+				 * behind, and then CoreAnimation's own draw of the group (its icons and its
+				 * material) goes over that.
+				 */
+				if (!cover) {
+					then = true;
+				} else if (group_side(e, e->colour, into, into->state == GROUP_FRESH)) {
+					side_ready = true;
+					then = true;
+				} else {
+					/* (no side to pass it on to: made what it would have been, and laid as it is) */
+					group_flat_why[2]++;
+					group_flatten(e, e->bound[0], from);
+					from = NULL;
+					colours = NULL;
+				}
+			}
 		}
 	}
 	if (colours == NULL || !group_programs(e)) {
-		/* not one of ours: what it reads is what CoreAnimation drew, and what it draws into is no longer a
-		 * vibrant layer's coverage, nor empty */
+		/*
+		 * Not one of ours: what it reads is what CoreAnimation drew, and what it draws into is no
+		 * longer a vibrant layer's coverage, nor empty. In mode 2 a group that holds a vibrant layer
+		 * keeps it while what is drawn into it goes over it, unless the draw is another colour matrix
+		 * or reads the group itself: then it is made what it would have been, as before.
+		 */
+		bool reads = false;
+
 		for (unsigned unit = 0; unit < 4 && e->groups != NULL; unit++) {
+			if (e->bound[unit] == e->colour) {
+				reads = true;
+			}
 			group_read(e, e->bound[unit]);
 		}
 		if (into != NULL) {
-			if (into->state == GROUP_VIBRANT) {
-				group_flatten(e, e->colour, into);
+			bool other = function == FUNCTION_VIBRANT_MATRIX && (function_given[function] != 20 ||
+			    memcmp(into->colours, function_values[function], sizeof(into->colours)) != 0);
+
+			if (group_vibrant_on == 2 && into->state == GROUP_VIBRANT && into->side != 0 && !reads && !other) {
+				group_kept++;           /* (what is drawn over it is over it: group_flat_side_fragment) */
+			} else {
+				if (into->state == GROUP_VIBRANT) {
+					group_flat_why[3]++;
+					group_flatten(e, e->colour, into);
+				}
+				into->state = GROUP_NONE;
 			}
-			into->state = GROUP_NONE;
 		}
 		return 0;
 	}
 	clear_now(e);
 	if (cover) {
+		if (group_vibrant_on == 2 && (from == NULL || then) &&
+		    (into->state == GROUP_FRESH || into->side != 0)) {
+			/* (a vibrant draw of CoreAnimation's own, or a group's coverage passed on from its side) */
+			if (side_ready || group_side(e, e->colour, into, into->state == GROUP_FRESH)) {
+				glBindFramebuffer(GL_FRAMEBUFFER, e->side_framebuffer);
+				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, into->side, 0);
+				e->group_rebind = true;
+			} else {
+				/* (no side of ours to draw the coverage into: it goes into the group itself, as mode 1) */
+				group_side_forget(into);
+			}
+		} else if (group_vibrant_on == 2) {
+			/* (the coverage of the group being laid is in its picture, not beside it: this one goes there too) */
+			group_side_forget(into);
+		}
+		if (then) {
+			/* (the coverage of the group being laid, in the same texcoords: the side is of the group's size) */
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, from->side);
+			glActiveTexture(GL_TEXTURE0 + e->unit);
+			e->group_side_bound = true;
+		}
 		glUseProgram(e->group_cover);
 		glUniformMatrix4fv(e->group_cover_matrix, 1, 0, matrix);
 		glUniform4fv(e->group_cover_texmat, 1, texmat);
@@ -2785,6 +3011,12 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 		into->state = GROUP_VIBRANT;
 		group_covered++;
 	} else {
+		if (then) {
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, from->side);
+			glActiveTexture(GL_TEXTURE0 + e->unit);
+			e->group_side_bound = true;
+		}
 		glUseProgram(e->group_over);
 		glUniformMatrix4fv(e->group_over_matrix, 1, 0, matrix);
 		glUniform4fv(e->group_over_texmat, 1, texmat);
@@ -2797,6 +3029,7 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 		glDisable(GL_BLEND);            /* (the program blends) */
 		if (into != NULL) {
 			if (into->state == GROUP_VIBRANT) {
+				group_flat_why[4]++;
 				group_flatten(e, e->colour, into);
 			}
 			into->state = GROUP_NONE;
@@ -2809,7 +3042,7 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 			glEnableVertexAttribArray(i);
 		}
 	}
-	return 1;
+	return then ? 2 : 1;
 }
 
 static void
@@ -2823,6 +3056,16 @@ group_draw_end(struct eagl *e, const GLint enabled[4])
 	(e->group_blend ? glEnable : glDisable)(GL_BLEND);
 	glBlendFuncSeparate((GLenum)e->group_blend_func[0], (GLenum)e->group_blend_func[1], (GLenum)e->group_blend_func[2],
 	    (GLenum)e->group_blend_func[3]);
+	if (e->group_side_bound) {
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, e->bound[0]);
+		glActiveTexture(GL_TEXTURE0 + e->unit);
+		e->group_side_bound = false;
+	}
+	if (e->group_rebind) {
+		glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
+		e->group_rebind = false;
+	}
 	glUseProgram(e->program);
 }
 
@@ -3100,6 +3343,7 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	struct eagl *e = context;
 	GLint enabled[4] = { 1, 1, 1, 1 };
 	bool plain;
+	int group;
 
 	EAGL_ENTER(e, 0x210);
 	drawing(e);
@@ -3115,9 +3359,13 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	}
 	if (skipping != 0 && skip_draw(e)) {
 		/* glskip=N: nothing is drawn, so that what this program puts there can be seen missing */
-	} else if (group_draw_begin(e, enabled)) {
+	} else if ((group = group_draw_begin(e, enabled)) != 0) {
 		glDrawArrays(mode, first, count);
 		group_draw_end(e, enabled);
+		if (group == 2) {
+			/* (a group that holds a vibrant layer: what is behind it of ours, then CoreAnimation's own draw) */
+			glDrawArrays(mode, first, count);
+		}
 	} else {
 		plain = plain_draw_begin(e, enabled);
 		glDrawArrays(mode, first, count);
@@ -3140,6 +3388,7 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	struct eagl *e = context;
 	GLint enabled[4] = { 1, 1, 1, 1 };
 	bool plain;
+	int group;
 
 	EAGL_ENTER(e, 0x220);
 	drawing(e);
@@ -3155,9 +3404,13 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	}
 	if (skipping != 0 && skip_draw(e)) {
 		/* glskip=N: see my_glDrawArrays */
-	} else if (group_draw_begin(e, enabled)) {
+	} else if ((group = group_draw_begin(e, enabled)) != 0) {
 		glDrawElements(mode, count, type, indices);
 		group_draw_end(e, enabled);
+		if (group == 2) {
+			/* (a group that holds a vibrant layer: see my_glDrawArrays) */
+			glDrawElements(mode, count, type, indices);
+		}
 	} else {
 		plain = plain_draw_begin(e, enabled);
 		glDrawElements(mode, count, type, indices);
@@ -3233,6 +3486,9 @@ my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 		image_forget(e, textures[i]);
 		vblur_forget(e, textures[i]);
 		group_forget(e, textures[i]);
+		if (e->groups != NULL && textures[i] < GROUP_TEXTURES) {
+			group_side_forget(&e->groups[textures[i]]);     /* (a picture of the screen's size each: not kept for a name reused) */
+		}
 		if (textures[i] == e->colour) {
 			e->colour = 0;          /* (a texture that is deleted leaves the framebuffer bound) */
 		}
@@ -3998,9 +4254,21 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	}
 	e->attaching += now_us() - began;
 	if (attached++ < 24) {
-		say("hakios-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s%s\n", texture,
+		/* (the size of its memory and the cache mode it was made with, if any: for sizing a pool of display surfaces) */
+		CFTypeRef cache = IOSurfaceCopyValue(surface, CFSTR("IOSurfaceCacheMode"));
+		int cache_mode = -1;
+
+		if (cache != NULL) {
+			if (CFGetTypeID(cache) == CFNumberGetTypeID()) {
+				CFNumberGetValue((CFNumberRef)cache, kCFNumberIntType, &cache_mode);
+			}
+			CFRelease(cache);
+		}
+		say("hakios-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row, %zu bytes in all, "
+		    "cache mode %d)%s%s\n", texture,
 		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, image->width, image->height,
-		    IOSurfaceGetBytesPerRow(surface), inverted ? ", drawn inverted" : "", image->shared ? ": its memory" :
+		    IOSurfaceGetBytesPerRow(surface), IOSurfaceGetAllocSize(surface), cache_mode,
+		    inverted ? ", drawn inverted" : "", image->shared ? ": its memory" :
 		    image->mirror != 0 ? ": a texture, copied into its memory by the GPU" : ": a copy");
 	}
 	eagl_leave(e, 0x970);
@@ -4069,7 +4337,7 @@ install(void)
 	};
 	Class class = objc_getClass("EAGLContext");
 	unsigned replaced = 0;
-	char arguments[1024] = "";
+	char arguments[4096] = "";       /* (the boot line is over a kilobyte now; too short a buffer and sysctl fails) */
 	size_t size = sizeof(arguments) - 1;
 	const char *argument;
 
@@ -4103,7 +4371,8 @@ install(void)
 			trace_corners = (GLsizei)strtol(argument + 16, NULL, 10);
 		}
 		fetch_offered = strstr(arguments, "glfetch=0") == NULL;
-		group_vibrant_on = strstr(arguments, "glgroup=0") == NULL;
+		group_vibrant_on = strstr(arguments, "glgroup=0") != NULL ? 0 :
+		    strstr(arguments, "glgroup=1") != NULL ? 1 : 2;
 		if ((argument = strstr(arguments, "gltrace_place=")) != NULL) {
 			char *end = (char *)argument + 14;
 
@@ -4115,7 +4384,10 @@ install(void)
 		}
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
-		frame_lines = strstr(arguments, "glframes=1") != NULL;
+		frame_lines = strstr(arguments, "glframes=1") != NULL ? 1 : strstr(arguments, "glframes=2") != NULL ? 2 : 0;
+		if ((argument = strstr(arguments, "gltrace_refused=")) != NULL) {
+			trace_refused = (int)strtol(argument + 16, NULL, 10);
+		}
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
 		if ((argument = strstr(arguments, "glslow=")) != NULL) {
 			slow_calls_us = strtoull(argument + 7, NULL, 10);

@@ -126,7 +126,7 @@ import sys
 # absent, while launchd's "Last log repeated 2312 times" of failed lookups fills the window. So the
 # store's missing bag strings are not evidence that no bag was fetched; they are evidence of nothing.
 # What the console did carry, and what is therefore true, is the opposite of what was written here:
-# THE PHONE'S NETWORK WORKS. en0 is 192.168.9.243, mDNSResponder resolves over TCP to 192.168.9.1:53
+# THE PHONE'S NETWORK WORKS. en0 has its address, mDNSResponder resolves over TCP to the router
 # (four queries, answers of 159, 842, 200 and 107 bytes), and trustd, geod, maild, gamed, cloudd,
 # StocksWidget and nsurlsessiond all open TLS to Apple and Akamai (17.248.214.x, 17.253.39.x,
 # 2.16.56.93, 23.11.40.157, 95.100.176.233). "net_test: en0: flags 0x8802" was read 0.1 s into user
