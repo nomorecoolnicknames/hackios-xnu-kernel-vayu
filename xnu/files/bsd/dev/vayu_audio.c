@@ -3914,6 +3914,15 @@ ios_mic_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
+/* vayu_mic_test=1: close the node the self-test opened, after three seconds. */
+static void
+ios_mic_test_stop(__unused void *parameter, __unused wait_result_t result)
+{
+	delay_for_interval(3, NSEC_PER_SEC);
+	ios_wants = 0;
+	thread_terminate(current_thread());
+}
+
 /* vayu_mic=1: make /dev/hakios-mic and its thread, once the codec is up. */
 static void
 vayu_mic_start(void)
@@ -3956,6 +3965,25 @@ vayu_mic_start(void)
 	thread_deallocate(thread);
 	say("vayu-audio: mic: vayu_mic=1: /dev/hakios-mic is made; iOS's \"Codec\" input is fed from AFE 0x4001 "
 	    "(session 2), one channel of TX7/AMIC3\n");
+	{
+		uint32_t test = 0;
+		thread_t stopper;
+
+		/*
+		 * vayu_mic_test=1: open the node for three seconds at boot. The capture's path is lazy -- it comes
+		 * up in ios_mic_thread() only when ios_wants is set -- so without an app that records, a whole log
+		 * says nothing about AFE/codec/ASM/ADM (215010-run.log: the node is made at 7867 and never opened,
+		 * and Voice Memos' silence cannot be attributed). This makes the kernel prove the path and print
+		 * the peaks by itself; ios_wants = 0 afterwards takes it down the normal way.
+		 */
+		if (PE_parse_boot_argn("vayu_mic_test", &test, sizeof(test)) && test == 1) {
+			say("vayu-audio: mic: vayu_mic_test=1: opening /dev/hakios-mic for 3 s\n");
+			ios_wants = 1;
+			if (kernel_thread_start(ios_mic_test_stop, NULL, &stopper) == KERN_SUCCESS) {
+				thread_deallocate(stopper);
+			}
+		}
+	}
 }
 
 /* On the way back to the loader: the path down before the DSP stops. */
