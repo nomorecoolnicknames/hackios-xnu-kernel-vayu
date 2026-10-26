@@ -1,7 +1,6 @@
 /*
  * MiniAppleStockholm: AppleStockholmControl (GPIO) and AppleStockholmSPMI (SPMI socket), as iOS
- * 16.5's nfcd reaches them through libNFC_HAL / libPN548_API (iPhone10,3 20F66 dyld cache;
- * research notes /dev/shm/vayu-nfc/research/B-ios.md, "Shim contract" and "Shim contract 2").
+ * 16.5's nfcd reaches them through libNFC_HAL / libPN548_API (iPhone10,3 20F66 dyld cache).
  *   GPIO: _NFHardwareGPIOOpen (0x1f51eac20) matches AppleStockholmControl by name, opens type 0;
  *   absent -> "Could not open service". Selectors (0x1f51e8e08): 0 SetPower, 1 SetDownloadRequest,
  *   2 SetPMUStandbyPower, 3 SetDeviceWake, 5 SetVBAT (one scalar in), 6 ValidateSPMIConfig,
