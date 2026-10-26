@@ -23,6 +23,11 @@
  * enabled. With cpufreq_dry=1 it writes nothing at all and only says what it sees; with
  * cpufreq_turbo=1 single-core rows are allowed too.
  *
+ * With cpufreq_gov=1 (default 0: nothing changes) the row of each group follows the load: the idle
+ * time of every core is read every cpufreq_gov_ms and a quiet group goes to the slowest row, a busy
+ * one to the top (see the "governor" section below). Without it the top row stays written from boot
+ * until the temperature throttle (vayu_thermal, 85 C) takes a step down.
+ *
  * The system cache's clock (L3) is a fourth OSM group at 0x18321000 with the same table and row
  * register (vendor clk-cpu-osm.c:985-992,44-53,935-972,1170,245); cpufreq_l3=0 leaves it alone. With
  * vayu_ddr=1 the driver also votes for memory bandwidth on the RPMH bus clock managers MC0, SH0 and
@@ -42,6 +47,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_line(const char *line);
 extern bool hakios_spmi_peek(uint16_t id, uint8_t reg, uint8_t *value);
+extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);        /* osfmk/arm64/machine_routines.c */
 extern bool vayu_rpmh_tcs_lock(void);
 extern void vayu_rpmh_tcs_unlock(bool held);
 
@@ -566,7 +572,6 @@ vote_bandwidth(bool dry)
 #define TSENS_SROT_CTRL         0x004
 #define TSENS_VALID             (1u << 21)
 #define THERMAL_POLL_MS         2000
-#define THERMAL_SUMMARY_POLLS   30
 
 static const uint32_t tsens_tm_phys[TSENS_CONTROLLERS] = { 0x0c263000, 0x0c265000 };
 static const uint32_t tsens_srot_phys[TSENS_CONTROLLERS] = { 0x0c222000, 0x0c223000 };
@@ -584,11 +589,125 @@ static struct {
 	uint32_t enabled[TSENS_CONTROLLERS];    /* sensor mask from SROT */
 	int hot;                                /* deci-C */
 	uint32_t level;                         /* what the temperature asks for */
-	uint32_t applied;                       /* what is written: the higher of level and the SDP hold's */
+	uint32_t applied;                       /* signature of what is written (see applied_signature()) */
+	bool sensors;                           /* vayu_thermal: the TSENS/PMIC side is on */
 	bool sdp_hold;                          /* charging from a PC port (SDP, 500 mA) with the battery low: level 2 */
 	uint32_t sdp_on, sdp_below;             /* vayu_sdp_slow (default 1), vayu_sdp_below (default 50 %) */
 	volatile bool stopped;                  /* set by vayu_cpufreq_quiesce(): no more writes */
 } thermal;
+
+/*
+ * cpufreq_gov=1 (default 0: nothing changes): a load governor on the rows the throttle already
+ * steps through. Every cpufreq_gov_ms (default 100, 20..1000) the idle time of every core of ours
+ * (ml_cpu_idle_time(), as hakios.cpufreq.c's cpuload does) is read, and each OSM group takes
+ *   level 0  the top row, while the group's cores were 50 % busy or more;
+ *   level 1  the ~3/4 row, between 15 and 50 %;
+ *   level 2  the slowest row, under 15 % -- after three samples in a row (300 ms), so that the
+ *            bursts of the framebuffer's copy and of a gesture do not throw it down and up again.
+ * A busier group goes back up at once. The governor only ever asks for a slower row than the
+ * temperature/SDP level does: thermal_apply() takes the higher of the two. It writes only groups
+ * the driver raised, and nothing after vayu_cpufreq_quiesce().
+ */
+#define GOVERNOR_BUSY_TOP       50      /* per cent of the cores' time, per group */
+#define GOVERNOR_BUSY_MID       15
+#define GOVERNOR_QUIET_SAMPLES  3
+
+static struct {
+	bool on;
+	uint32_t every_ms;
+	uint32_t level[OSM_DOMAINS];            /* 0 top, 1 the ~3/4 row, 2 the slowest row */
+	uint32_t quiet[OSM_DOMAINS];            /* samples in a row that ask for a slower level */
+	uint64_t idle_before[MAX_CPUS];
+	uint64_t then;
+} governor;
+
+/* The row the group should be at: the slower (higher) of the temperature's and the load's. */
+static uint32_t
+effective_level(uint32_t domain)
+{
+	uint32_t level = thermal.level;
+
+	if (thermal.sdp_hold) {
+		level = 2;
+	}
+	return governor.level[domain] > level ? governor.level[domain] : level;
+}
+
+/* What thermal_apply() would write now: 0 is never a valid signature. */
+static uint32_t
+applied_signature(void)
+{
+	uint32_t signature = (thermal.level + 1) * 2 + (thermal.sdp_hold ? 1 : 0);
+
+	for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
+		signature = signature * 4 + governor.level[domain];
+	}
+	return signature;
+}
+
+static void
+governor_sample(void)
+{
+	const ml_topology_info_t *topology = ml_get_topology_info();
+	uint64_t now = mach_absolute_time();
+	uint32_t busy[OSM_DOMAINS] = { 0 }, cores[OSM_DOMAINS] = { 0 };
+
+	if (governor.then == 0) {
+		/* the first sample only takes the counters: there is no interval to divide by yet */
+		for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
+			uint64_t idle = 0;
+
+			if (ml_cpu_idle_time((int)i, &idle)) {
+				governor.idle_before[i] = idle;
+			}
+		}
+		governor.then = now;
+		return;
+	}
+	for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
+		uint64_t idle = 0, idle_then, delta = now - governor.then;
+		uint32_t domain;
+
+		if (!ml_cpu_idle_time((int)i, &idle)) {
+			continue;
+		}
+		idle_then = governor.idle_before[i];
+		governor.idle_before[i] = idle;
+		if (idle < idle_then || delta == 0) {
+			continue;
+		}
+		domain = domain_of(topology->cpus[i].phys_id);
+		if (domain >= OSM_DOMAINS) {
+			continue;
+		}
+		cores[domain]++;
+		if (delta > idle - idle_then) {
+			busy[domain] += (uint32_t)(100 * (delta - (idle - idle_then)) / delta);
+		}
+	}
+	governor.then = now;
+	for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
+		uint32_t percent = cores[domain] != 0 ? busy[domain] / cores[domain] : 0;
+		uint32_t want = percent >= GOVERNOR_BUSY_TOP ? 0 : percent >= GOVERNOR_BUSY_MID ? 1 : 2;
+		uint32_t level = governor.level[domain];
+
+		if (want < level) {
+			governor.level[domain] = want;          /* busier: at once */
+			governor.quiet[domain] = 0;
+		} else if (want > level) {
+			if (++governor.quiet[domain] >= GOVERNOR_QUIET_SAMPLES) {
+				governor.level[domain] = want;  /* quieter for a while: down */
+				governor.quiet[domain] = 0;
+			}
+		} else {
+			governor.quiet[domain] = 0;
+		}
+		if (governor.level[domain] != level && raised[domain].wrote) {
+			tell("cpufreq: vayu: governor: group %u %u%% busy: row %u, %u MHz\n", domain, percent,
+			    raised[domain].row[governor.level[domain]], raised[domain].khz[governor.level[domain]] / 1000);
+		}
+	}
+}
 
 /* The hottest valid sensor, in tenths of a degree; false if none is valid. */
 static bool
@@ -651,14 +770,15 @@ pmic_stage(int stage[3])
 }
 
 static void
-thermal_apply(uint32_t level)
+thermal_apply(void)
 {
 	for (uint32_t domain = 0; domain < OSM_DOMAINS && !thermal.stopped; domain++) {
-		uint32_t row, state;
+		uint32_t row, state, level;
 
 		if (!raised[domain].wrote) {
 			continue;
 		}
+		level = effective_level(domain);
 		row = raised[domain].row[level];
 		*(volatile uint32_t *)(raised[domain].base + OSM_PERF_STATE) = row;
 		if (raised[domain].per_core) {
@@ -669,12 +789,29 @@ thermal_apply(uint32_t level)
 		delay_for_interval(20, NSEC_PER_MSEC);
 		__asm__ volatile ("dsb sy" ::: "memory");
 		state = *(volatile uint32_t *)(raised[domain].base + OSM_PERF_STATE);
-		tell("thermal: vayu: group %u -> row %u, %u MHz%s\n", domain, row, raised[domain].khz[level] / 1000,
-		    state == row ? "" : " (the hardware reports another row)");
+		tell("thermal: vayu: group %u -> row %u, %u MHz (level %u)%s\n", domain, row, raised[domain].khz[level] / 1000,
+		    level, state == row ? "" : " (the hardware reports another row)");
 	}
 	if (l3_raised.wrote && !thermal.stopped) {
-		uint32_t row = level == 2 ? l3_raised.was : l3_raised.top;
+		uint32_t level = 2, any = 0, row;
 
+		/* L3 is shared: it follows the busiest group (the lowest level), and only all-idle drops it */
+		for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
+			uint32_t use;
+
+			if (!raised[domain].wrote) {
+				continue;
+			}
+			use = effective_level(domain);
+			if (use < level) {
+				level = use;
+			}
+			any = 1;
+		}
+		if (!any) {
+			level = thermal.level;
+		}
+		row = level == 2 ? l3_raised.was : l3_raised.top;
 		*(volatile uint32_t *)(l3_raised.base + OSM_PERF_STATE) = row;
 		tell("thermal: vayu: L3 -> row %u\n", row);
 	}
@@ -718,88 +855,116 @@ static void
 thermal_thread(__unused void *arg, __unused wait_result_t wr)
 {
 	uint32_t polls = 0, which = 0, valid = 0;
+	uint32_t interval = governor.on ? governor.every_ms : THERMAL_POLL_MS;
+	uint32_t thermal_every = (THERMAL_POLL_MS + interval - 1) / interval;
+	uint32_t summary_every = (60000 + interval - 1) / interval;
 	int last_pmic = -2;
 
+	if (thermal_every == 0) {
+		thermal_every = 1;
+	}
+	if (summary_every == 0) {
+		summary_every = 1;
+	}
 	for (;;) {
-		int temp = 0, stage[3], pmic, threshold;
-		bool have = tsens_hottest(&temp, &which, &valid);
-		uint32_t want = thermal.level;
-
 		if (thermal.stopped) {
 			return;
 		}
-		pmic = pmic_stage(stage);
-		if (!have) {
-			want = 1;
-		} else {
-			if (temp >= thermal.hot + 100) {
-				want = 2;
-			} else if (temp >= thermal.hot && want < 1) {
-				want = 1;
-			}
-			threshold = want == 2 ? thermal.hot + 100 : thermal.hot;
-			if (want > 0 && want == thermal.level && temp < threshold - 100) {
-				want--;
-			}
+		if (governor.on) {
+			governor_sample();
 		}
-		if (pmic >= 1) {
-			want = 2;
-		}
-		if (pmic != last_pmic) {
-			tell("thermal: vayu: PMIC alarm stages %s %d, %s %d, %s %d (-1: not read)\n", pmic_name[0], stage[0],
-			    pmic_name[1], stage[1], pmic_name[2], stage[2]);
-			last_pmic = pmic;
-		}
-		if (want != thermal.level) {
-			if (have) {
-				tell("thermal: vayu: hottest %s (tsens%u s%u) %d.%d C, PMIC stage %d: level %u -> %u\n",
-				    tsens_name[which >> 8][which & 0xff], which >> 8, which & 0xff, temp / 10, (temp < 0 ? -temp : temp) % 10,
-				    pmic, thermal.level, want);
-			} else {
-				tell("thermal: vayu: no valid TSENS sensor, PMIC stage %d: level %u -> %u\n", pmic, thermal.level, want);
-			}
-			thermal.level = want;
-		} else if (polls % THERMAL_SUMMARY_POLLS == 0) {
-			if (have) {
-				tell("thermal: vayu: hottest %s (tsens%u s%u) %d.%d C of %u valid, PMIC stage %d, level %u\n",
-				    tsens_name[which >> 8][which & 0xff], which >> 8, which & 0xff, temp / 10, (temp < 0 ? -temp : temp) % 10,
-				    valid, pmic, thermal.level);
-			} else {
-				tell("thermal: vayu: no valid TSENS sensor, PMIC stage %d, level %u\n", pmic, thermal.level);
-			}
-		}
-		sdp_check();
-		{
-			uint32_t target = thermal.sdp_hold && thermal.level < 2 ? 2 : thermal.level;
+		if (thermal.sensors && polls % thermal_every == 0) {
+			int temp = 0, stage[3], pmic, threshold;
+			bool have = tsens_hottest(&temp, &which, &valid);
+			uint32_t want = thermal.level;
 
-			if (target != thermal.applied) {
-				tell("thermal: vayu: rows to level %u (temperature %u, SDP hold %s)\n", target, thermal.level,
-				    thermal.sdp_hold ? "on" : "off");
-				thermal.applied = target;
-				thermal_apply(target);
+			pmic = pmic_stage(stage);
+			if (!have) {
+				want = 1;
+			} else {
+				if (temp >= thermal.hot + 100) {
+					want = 2;
+				} else if (temp >= thermal.hot && want < 1) {
+					want = 1;
+				}
+				threshold = want == 2 ? thermal.hot + 100 : thermal.hot;
+				if (want > 0 && want == thermal.level && temp < threshold - 100) {
+					want--;
+				}
+			}
+			if (pmic >= 1) {
+				want = 2;
+			}
+			if (pmic != last_pmic) {
+				tell("thermal: vayu: PMIC alarm stages %s %d, %s %d, %s %d (-1: not read)\n", pmic_name[0], stage[0],
+				    pmic_name[1], stage[1], pmic_name[2], stage[2]);
+				last_pmic = pmic;
+			}
+			if (want != thermal.level) {
+				if (have) {
+					tell("thermal: vayu: hottest %s (tsens%u s%u) %d.%d C, PMIC stage %d: level %u -> %u\n",
+					    tsens_name[which >> 8][which & 0xff], which >> 8, which & 0xff, temp / 10,
+					    (temp < 0 ? -temp : temp) % 10, pmic, thermal.level, want);
+				} else {
+					tell("thermal: vayu: no valid TSENS sensor, PMIC stage %d: level %u -> %u\n", pmic,
+					    thermal.level, want);
+				}
+				thermal.level = want;
+			} else if (polls % summary_every == 0) {
+				if (have) {
+					tell("thermal: vayu: hottest %s (tsens%u s%u) %d.%d C of %u valid, PMIC stage %d, level %u\n",
+					    tsens_name[which >> 8][which & 0xff], which >> 8, which & 0xff, temp / 10,
+					    (temp < 0 ? -temp : temp) % 10, valid, pmic, thermal.level);
+				} else {
+					tell("thermal: vayu: no valid TSENS sensor, PMIC stage %d, level %u\n", pmic, thermal.level);
+				}
+			}
+			sdp_check();
+		}
+		{
+			uint32_t signature = applied_signature();
+
+			if (signature != thermal.applied) {
+				tell("thermal: vayu: rows: temperature level %u, SDP hold %s, governor %u/%u/%u\n", thermal.level,
+				    thermal.sdp_hold ? "on" : "off", governor.level[0], governor.level[1], governor.level[2]);
+				thermal.applied = signature;
+				thermal_apply();
 			}
 		}
 		polls++;
-		delay_for_interval(THERMAL_POLL_MS, NSEC_PER_MSEC);
+		delay_for_interval(interval, NSEC_PER_MSEC);
 	}
 }
 
 static void
 vayu_thermal_init(void)
 {
-	uint32_t on = 1, hot = 85;
+	uint32_t on = 1, hot = 85, gov = 0, every = 100;
 	thread_t thread;
 
 	PE_parse_boot_argn("vayu_thermal", &on, sizeof(on));
 	PE_parse_boot_argn("vayu_thermal_hot", &hot, sizeof(hot));
+	PE_parse_boot_argn("cpufreq_gov", &gov, sizeof(gov));
+	PE_parse_boot_argn("cpufreq_gov_ms", &every, sizeof(every));
+	governor.on = gov != 0;
+	governor.every_ms = every < 20 ? 20 : every > 1000 ? 1000 : every;
+	if (governor.on) {
+		tell("cpufreq: vayu: governor on: a sample every %u ms; rows 0 (top) / 1 (~3/4) / 2 (slowest)\n",
+		    governor.every_ms);
+	}
 	thermal.sdp_on = 1;
 	thermal.sdp_below = 50;
 	PE_parse_boot_argn("vayu_sdp_slow", &thermal.sdp_on, sizeof(thermal.sdp_on));
 	PE_parse_boot_argn("vayu_sdp_below", &thermal.sdp_below, sizeof(thermal.sdp_below));
 	thermal.sdp_below = thermal.sdp_below > 95 ? 95 : thermal.sdp_below;
-	if (on == 0) {
+	if (on == 0 && !governor.on) {
 		tell("thermal: vayu: off (vayu_thermal=0)\n");
 		return;
+	}
+	thermal.sensors = on != 0;
+	if (!thermal.sensors) {
+		tell("thermal: vayu: off (vayu_thermal=0); the governor still runs\n");
+		goto start;
 	}
 	thermal.hot = (int)(hot < 40 ? 40 : hot > 110 ? 110 : hot) * 10;
 	for (uint32_t c = 0; c < TSENS_CONTROLLERS; c++) {
@@ -824,7 +989,7 @@ vayu_thermal_init(void)
 		}
 	}
 	tell("thermal: vayu: throttle at %d C (level 1), %d C (level 2), each 10 C lower to step back; poll %u ms\n",
-	    thermal.hot / 10, thermal.hot / 10 + 10, THERMAL_POLL_MS);
+	    thermal.hot / 10, thermal.hot / 10 + 10, governor.on ? governor.every_ms : THERMAL_POLL_MS);
 	for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
 		if (raised[domain].wrote) {
 			tell("thermal: vayu: group %u levels: row %u %u MHz / row %u %u MHz / row %u %u MHz\n", domain,
@@ -832,6 +997,8 @@ vayu_thermal_init(void)
 			    raised[domain].row[2], raised[domain].khz[2] / 1000);
 		}
 	}
+start:
+	thermal.applied = applied_signature();          /* (the rows are where the boot left them: no write yet) */
 	if (kernel_thread_start(thermal_thread, NULL, &thread) != KERN_SUCCESS) {
 		tell("thermal: vayu: cannot start the thread\n");
 		return;
