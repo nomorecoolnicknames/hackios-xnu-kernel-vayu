@@ -25,7 +25,7 @@ Only my code and my data:
 - the boot loader (`xnuloader/`), my programs and libraries (`userland/src/`), tools (`tools/`),
   build and run scripts;
 - `prebuilt/`: the kernel, loader and libraries built from this repository;
-- `devices/poco-x5-pro/`: what one phone needs (its UEFI port, device tree, firmware script).
+- `devices/poco-x5-pro/`, `devices/poco-x3-pro/`: what one phone needs (its UEFI port, device tree, firmware script).
 
 Not in the repository, never:
 
@@ -130,6 +130,7 @@ module, or the open lzfse library gets built). User space and the images: `REST=
 | `userland/` | my programs and libraries (`src/`), the image build, launchd jobs |
 | `sysimage/` | scripts that fetch and unpack the OS files from the IPSW (none of the files themselves) |
 | `devices/poco-x5-pro/` | one phone: its UEFI port, device tree, prebuilt UEFI images, firmware script, tools |
+| `devices/poco-x3-pro/` | a second phone, the POCO X3 Pro (`vayu`, Snapdragon 860): its own drivers `xnu/files/bsd/dev/vayu_*.c`, UEFI build, user-space extras |
 | `tools/` | APFS, firmware, QMI tests, run scripts |
 | `qemu/` | running in QEMU |
 | `docs/` | `notes.md`: the detailed notes (Russian); `cellular.md`: cellular; `air.md`, `metal.md`: the GPU |
@@ -138,8 +139,9 @@ module, or the open lzfse library gets built). User space and the images: `REST=
 ## Devices
 
 The kernel, loader and user space are shared. Everything about one phone lives in
-`devices/<name>/`: its UEFI, device tree, firmware list and tools. Today there is one,
-`devices/poco-x5-pro/`, and its README is the map of what a port to another Qualcomm phone must bring.
+`devices/<name>/`: its UEFI, device tree, firmware list and tools. There are two: `devices/poco-x5-pro/`,
+whose README is the map of what a port to another Qualcomm phone must bring, and `devices/poco-x3-pro/`
+(Snapdragon 860, an older SoC with its own drivers; `DEVICE=poco-x3-pro` selects it).
 The phone's drivers are the files `xnu/files/bsd/dev/hakios.*.c`; the head of each says where its
 numbers came from.
 
