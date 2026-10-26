@@ -77,8 +77,11 @@
 #include <libkern/libkern.h>
 #include <libkern/OSAtomic.h>
 #include <mach/mach_types.h>
+#include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
+#include <sys/conf.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
 #include <sys/hakios.audio.h>
@@ -93,6 +96,7 @@ extern uint64_t kvtophys(vm_offset_t va);
 extern void loader_log_putc(char c);
 
 static uint32_t level, want_i2c, xnu_tlmm;
+static uint32_t mic_ios;                /* vayu_mic=1: /dev/hakios-mic for iOS's audio plug-in */
 static uint32_t command_step = 4;       /* the step command()'s lines carry (6 while the microphones are up) */
 static vm_offset_t north, south;
 static bool sdz_driven;                 /* set once a step drives an SDZ pin; the quiesce only undoes what was done */
@@ -798,8 +802,25 @@ apr_post(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const 
  *                 holds the feeder ~130 ms, most of the DSP's 8 x 20 ms queue); default 1, the steps
  *   vayu_sound_quiet_ms=N  with vayu_sound=5: how long iOS writes silence before the amplifier is faded out and
  *                 shut down (default 3000; 0: never while the feeder runs)
+ *
+ *   vayu_mic=1    the microphone for iOS: /dev/hakios-mic, the node the audio plug-in (userland/src/audio_plugin.c,
+ *                 its device "Codec") opens while its input runs. Needs vayu_jack>=2 and vayu_audio>=3 (the codec
+ *                 and the DSP), and it implies vayu_audio_keep=1: the DSP and the codec are not shut down at the
+ *                 end of the steps. The path is the one vayu_sound=6 uses -- AFE port 0x4001 (SLIMbus TX, the
+ *                 codec's TX7/TX8 on channels 135/136), ASM session 2, an ADM live-recording path -- but it is
+ *                 brought up only while iOS has the node open, and its samples go into a ring that
+ *                 /dev/hakios-mic gives to the plug-in: 16-bit signed, one channel, 48 kHz (TX7/AMIC3, the
+ *                 capture's channel 0), which is exactly what the plug-in declares to CoreAudio. It coexists with
+ *                 the playback feeder (vayu_sound=5): the capture has its own 32 KB buffer, mapped in a second
+ *                 region of the same SMMU context (stream 0x1b21), while the playback keeps the first. Every DSP
+ *                 command of the capture is logged as "vayu-audio: mic: ..."; one level line every 10 s while the
+ *                 node is open.
  */
 extern lck_mtx_t hakios_smmu_lock;     /* (the SMMU's match registers and contexts: the Wi-Fi's and the GPU's take it too) */
+
+static LCK_GRP_DECLARE(vayu_audio_lock_group, "vayu-audio");
+static LCK_MTX_DECLARE(apr_lock, &vayu_audio_lock_group);       /* one APR command and its answer at a time */
+static LCK_MTX_DECLARE(mic_lock, &vayu_audio_lock_group);       /* the capture path's state, for the node and quiesce */
 
 #define APR_SVC_AFE             4
 #define APR_SVC_ASM             7
@@ -817,25 +838,108 @@ dsp_error(uint32_t status)
 	return status < sizeof(names) / sizeof(names[0]) ? names[status] : "an error this does not know";
 }
 
-/* One command and its answer: true if the basic answer has status 0, or the answer is `wanted' (then in apr_answer). */
+/* One command and its answer: true if the basic answer has status 0, or the answer is `wanted' (its first two words
+ * copied out to word0/word1 before another command can overwrite apr_answer). */
 static bool
-command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint32_t length, uint32_t wanted)
+command_words(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint32_t length,
+    uint32_t wanted, uint32_t *word0, uint32_t *word1)
 {
+	bool ok;
+
+	if (word0 != NULL) {
+		*word0 = 0;
+	}
+	if (word1 != NULL) {
+		*word1 = 0;
+	}
+	/*
+	 * apr_answer and apr_waited_for are one per kernel: the playback feeder's thread and the microphone's feed
+	 * (its own thread, while iOS records) both send commands. One at a time, and the words a caller needs are
+	 * copied out before the lock goes: another command must not overwrite them between this function's return
+	 * and the caller's read.
+	 */
+	lck_mtx_lock(&apr_lock);
 	if (!apr_ask(service, port, opcode, payload, length, 1000)) {
 		say("vayu-audio: %u: %s (opcode %#x to service %u, port %#x): NO ANSWER\n", command_step, what, opcode, service, port);
+		lck_mtx_unlock(&apr_lock);
 		return false;
 	}
 	if (apr_answer.opcode == APR_BASIC_RSP_RESULT && apr_answer.words[0] == opcode) {
 		say("vayu-audio: %u: %s: %s%s\n", command_step, what, apr_answer.words[1] == 0 ? "done" : "REFUSED: ",
 		    apr_answer.words[1] == 0 ? "" : dsp_error(apr_answer.words[1]));
-		return apr_answer.words[1] == 0 && wanted == 0;
+		ok = apr_answer.words[1] == 0 && wanted == 0;
+		lck_mtx_unlock(&apr_lock);
+		return ok;
 	}
 	if (wanted != 0 && apr_answer.opcode == wanted) {
+		if (word0 != NULL) {
+			*word0 = apr_answer.words[0];
+		}
+		if (word1 != NULL) {
+			*word1 = apr_answer.words[1];
+		}
+		lck_mtx_unlock(&apr_lock);
 		return true;
 	}
 	say("vayu-audio: %u: %s: an answer not expected: opcode %#x, %u bytes: %#x %#x\n", command_step, what,
 	    apr_answer.opcode, apr_answer.length, apr_answer.words[0], apr_answer.words[1]);
+	lck_mtx_unlock(&apr_lock);
 	return false;
+}
+
+static bool
+command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint32_t length, uint32_t wanted)
+{
+	return command_words(what, service, port, opcode, payload, length, wanted, NULL, NULL);
+}
+
+/* A command of the microphone's iOS path: the same, but every line says "vayu-audio: mic: ...". */
+static bool
+mic_command_words(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint32_t length,
+    uint32_t wanted, uint32_t *word0, uint32_t *word1)
+{
+	bool ok;
+
+	if (word0 != NULL) {
+		*word0 = 0;
+	}
+	if (word1 != NULL) {
+		*word1 = 0;
+	}
+	lck_mtx_lock(&apr_lock);
+	if (!apr_ask(service, port, opcode, payload, length, 1000)) {
+		say("vayu-audio: mic: %s (opcode %#x to service %u, port %#x): NO ANSWER\n", what, opcode, service, port);
+		lck_mtx_unlock(&apr_lock);
+		return false;
+	}
+	if (apr_answer.opcode == APR_BASIC_RSP_RESULT && apr_answer.words[0] == opcode) {
+		say("vayu-audio: mic: %s (opcode %#x, service %u, port %#x): %s%s\n", what, opcode, service, port,
+		    apr_answer.words[1] == 0 ? "done" : "REFUSED: ", apr_answer.words[1] == 0 ? "" : dsp_error(apr_answer.words[1]));
+		ok = apr_answer.words[1] == 0 && wanted == 0;
+		lck_mtx_unlock(&apr_lock);
+		return ok;
+	}
+	if (wanted != 0 && apr_answer.opcode == wanted) {
+		if (word0 != NULL) {
+			*word0 = apr_answer.words[0];
+		}
+		if (word1 != NULL) {
+			*word1 = apr_answer.words[1];
+		}
+		lck_mtx_unlock(&apr_lock);
+		return true;
+	}
+	say("vayu-audio: mic: %s: an answer not expected: opcode %#x, %u bytes: %#x %#x\n", what, apr_answer.opcode,
+	    apr_answer.length, apr_answer.words[0], apr_answer.words[1]);
+	lck_mtx_unlock(&apr_lock);
+	return false;
+}
+
+static bool
+mic_command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint32_t length,
+    uint32_t wanted)
+{
+	return mic_command_words(what, service, port, opcode, payload, length, wanted, NULL, NULL);
 }
 
 /* ---- AFE: the quaternary MI2S port ---- */
@@ -920,6 +1024,75 @@ afe_port_param(const char *what, uint16_t port, uint32_t module, uint32_t param,
 	p->size = size;
 	memcpy(packet + 16 + sizeof(*p), data, size);
 	return command(what, APR_SVC_AFE, 0, AFE_PORT_CMD_SET_PARAM_V2, packet, 16 + (uint32_t)sizeof(*p) + size, 0);
+}
+
+/* The same, for the microphone's iOS path: logged as "vayu-audio: mic: ...". */
+static bool
+mic_afe_port_param(const char *what, uint16_t port, uint32_t module, uint32_t param, const void *data, uint16_t size)
+{
+	uint8_t packet[16 + sizeof(struct afe_param) + 64];
+	struct afe_param *p = (struct afe_param *)(packet + 16);
+
+	bzero(packet, sizeof(packet));
+	*(uint16_t *)packet = port;
+	*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
+	p->module = module;
+	p->param = param;
+	p->size = size;
+	memcpy(packet + 16 + sizeof(*p), data, size);
+	return mic_command(what, APR_SVC_AFE, 0, AFE_PORT_CMD_SET_PARAM_V2, packet, 16 + (uint32_t)sizeof(*p) + size, 0);
+}
+
+/*
+ * The capture path is shared by the boot test (vayu_sound=6, whose lines carry step 6) and by iOS's feed
+ * (vayu_mic=1, whose lines all say "mic"). The flag is only ever set on the microphone's own thread.
+ */
+static bool mic_ios_mode;
+
+static const char *
+mic_tag(void)
+{
+	return mic_ios_mode ? "mic" : "6";
+}
+
+/* A line of the capture's path: "vayu-audio: mic: ..." for iOS's feed, "vayu-audio: 6: ..." for the boot test. */
+static int
+mic_say(const char *format, ...) __printflike(1, 2);
+
+static int
+mic_say(const char *format, ...)
+{
+	char line[280];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	return say("vayu-audio: %s: %s", mic_tag(), line);
+}
+
+static bool
+mic_step_command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint32_t length,
+    uint32_t wanted)
+{
+	return mic_ios_mode ? mic_command(what, service, port, opcode, payload, length, wanted) :
+	    command(what, service, port, opcode, payload, length, wanted);
+}
+
+/* The same, with the answer's first two words copied out before another command can overwrite them. */
+static bool
+mic_step_command_words(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const void *payload,
+    uint32_t length, uint32_t wanted, uint32_t *word0, uint32_t *word1)
+{
+	return mic_ios_mode ? mic_command_words(what, service, port, opcode, payload, length, wanted, word0, word1) :
+	    command_words(what, service, port, opcode, payload, length, wanted, word0, word1);
+}
+
+static bool
+mic_step_afe_port_param(const char *what, uint16_t port, uint32_t module, uint32_t param, const void *data, uint16_t size)
+{
+	return mic_ios_mode ? mic_afe_port_param(what, port, module, param, data, size) :
+	    afe_port_param(what, port, module, param, data, size);
 }
 
 #define JACK_AFE_PORT           0x400C          /* AFE_PORT_ID_SLIMBUS_MULTI_CHAN_6_RX (q6afe.c:113-114); HAL's SLIMBUS_6_RX */
@@ -1133,8 +1306,9 @@ static struct {
 	uint32_t page, pages, match, context, old_smr, old_s2cr, old_sctlr;
 	vm_offset_t tables;
 } space;
-static vm_offset_t buffer;
-static uint64_t buffer_address;
+static vm_offset_t buffer, mic_buf;            /* playback's 32 KB, and the capture's own 32 KB (vayu_mic=1) */
+static uint64_t buffer_address, mic_buf_address;
+static bool mic_space_held;                     /* the capture's feed holds the SMMU context up */
 
 static void
 smmu_put(vm_offset_t base, const char *name, uint32_t offset, uint32_t value)
@@ -1150,6 +1324,9 @@ space_find(void)
 	bool used[256] = { false };
 	uint32_t scr0, idr0, idr1, matches, contexts;
 
+	if (space.on) {                          /* a mapping of ours, made for the playback or for the capture: reuse it */
+		return true;
+	}
 	if (smmu_base == 0) {
 		smmu_base = ml_io_map(SMMU_PHYS, 0x2000);
 	}
@@ -1235,6 +1412,8 @@ space_on(void)
 {
 	uint64_t *root, *second, *third, table_root;
 	uint32_t sees = 1u << 31 | AUDIO_STREAM;
+	unsigned pages = BUFFER_BYTES / 4096;
+	unsigned mic_pages = mic_buf != 0 ? BUFFER_BYTES / 4096 : 0;
 
 	if (kmem_alloc(kernel_map, &space.tables, 3 * 4096, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		return false;
@@ -1244,8 +1423,16 @@ space_on(void)
 	third = (uint64_t *)(space.tables + 8192);
 	root[AUDIO_ADDRESSES >> 30 & 0x1ff] = kvtophys((vm_offset_t)second) | 3;
 	second[AUDIO_ADDRESSES >> 21 & 0x1ff] = kvtophys((vm_offset_t)third) | 3;
-	for (unsigned page = 0; page < BUFFER_BYTES / 4096; page++) {
+	for (unsigned page = 0; page < pages; page++) {
 		third[(AUDIO_ADDRESSES >> 12 & 0x1ff) + page] = kvtophys(buffer + 4096 * page) | AUDIO_PTE;
+	}
+	/*
+	 * The capture's own pages, in the second region of the same mapping: the playback's stream 0x1b21 and
+	 * the microphone's session 2 are both the DSP's stream 0x1b21, so they share one context and one set of
+	 * tables; only the addresses the DSP is given differ.
+	 */
+	for (unsigned page = 0; page < mic_pages; page++) {
+		third[(AUDIO_ADDRESSES >> 12 & 0x1ff) + pages + page] = kvtophys(mic_buf + 4096 * page) | AUDIO_PTE;
 	}
 	for (vm_offset_t line = space.tables; line < space.tables + 3 * 4096; line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
@@ -1253,7 +1440,7 @@ space_on(void)
 	__asm__ volatile ("dsb sy");
 	table_root = kvtophys(space.tables) | (uint64_t)space.context << 48;
 	crumb("%u: smmu: ABOUT TO BE WRITTEN: context %u, page tables at %#llx for %u KB at %#llx; match register %u sends %#x there",
-	    command_step, space.context, table_root & PTE_ADDRESS, BUFFER_BYTES / 1024, AUDIO_ADDRESSES, space.match,
+	    command_step, space.context, table_root & PTE_ADDRESS, (pages + mic_pages) * 4, AUDIO_ADDRESSES, space.match,
 	    AUDIO_STREAM);
 	smmu_put(smmu_context, "sctlr", SMMU_CB_SCTLR, 0);
 	smmu_put(smmu_second, "cba2r", SMMU_CBA2R(space.context), SMMU_CBA2R_64_BIT);
@@ -1294,6 +1481,10 @@ space_on(void)
 static void
 space_off(void)
 {
+	if (mic_space_held) {
+		/* The capture's feed has its own pages in this mapping and may need it after the playback stops. */
+		return;
+	}
 	if (!space.on) {
 		return;
 	}
@@ -1302,6 +1493,16 @@ space_off(void)
 	smmu_put(smmu_base, "s2cr (as found)", SMMU_S2CR(space.match), space.old_s2cr);
 	smmu_put(smmu_context, "sctlr (as found)", SMMU_CB_SCTLR, space.old_sctlr);
 	space.on = false;
+}
+
+/* The mapping once, whoever asks first (hakios_smmu_lock held). */
+static bool
+space_ensure(void)
+{
+	if (space.passed || space.on) {
+		return true;
+	}
+	return space_find() && space_on();
 }
 
 /* ---- ADM and ASM: the path and the stream ---- */
@@ -1396,7 +1597,7 @@ sound_events(uint8_t service, uint32_t opcode, uint32_t token, const uint32_t *p
 				for (uint32_t i = 0; i < length / 4 && i < 10 && at < (int)sizeof(line) - 12; i++) {
 					at += snprintf(line + at, sizeof(line) - (size_t)at, " %#x", payload[i]);
 				}
-				say("vayu-audio: 6: the first READ_DONE: opcode %#x, token %#x, %u bytes:%s\n", opcode, token, length,
+				mic_say("the first READ_DONE: opcode %#x, token %#x, %u bytes:%s\n", opcode, token, length,
 				    line);
 			}
 		} else if (opcode == APR_BASIC_RSP_RESULT && length >= 8 && payload[1] != 0) {
@@ -1419,16 +1620,17 @@ adm_open(uint16_t port, uint32_t *opened)
 		uint8_t map[8];
 	} __attribute__((packed)) open = { 0, ADM_PATH_PLAYBACK, port, 0xffff, ADM_TOPOLOGY_NONE, 2, 16, RATE,
 		                           { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
+	uint32_t status = 0, opened_copp = 0;
 
-	if (!command("a device path to the port: playback, no processing, 2 channels of 16 bits at 48 kHz", APR_SVC_ADM, port,
-	    ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5)) {
+	if (!command_words("a device path to the port: playback, no processing, 2 channels of 16 bits at 48 kHz", APR_SVC_ADM,
+	    port, ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5, &status, &opened_copp)) {
 		return false;
 	}
-	if (apr_answer.words[0] != 0) {
-		say("vayu-audio: 4: the device path: REFUSED: %s\n", dsp_error(apr_answer.words[0]));
+	if (status != 0) {
+		say("vayu-audio: 4: the device path: REFUSED: %s\n", dsp_error(status));
 		return false;
 	}
-	*opened = apr_answer.words[1] & 0xffff;
+	*opened = opened_copp & 0xffff;
 	say("vayu-audio: 4: the device path is open: COPP %u\n", *opened);
 	return true;
 }
@@ -1476,14 +1678,15 @@ stream_on(void)
 		uint8_t map[8];
 	} __attribute__((packed)) format = { 20, 2, 16, RATE, 1, 0, { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
 	uint32_t run[3] = { 0, 0, 0 };
+	uint32_t found_handle = 0;
 
 	crumb("4: the DSP is given our periods (ASM), a device path to the port (ADM) and a stream routed to it (ASM)");
-	if (!command("our periods, mapped for the DSP", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, &map, sizeof(map),
-	    ASM_CMDRSP_SHARED_MEM_MAP_REGIONS)) {
+	if (!command_words("our periods, mapped for the DSP", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, &map, sizeof(map),
+	    ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, &found_handle, NULL)) {
 		return false;
 	}
 	mapped = true;
-	map_handle = apr_answer.words[0];
+	map_handle = found_handle;
 	say("vayu-audio: 4: our %u KB at %#llx are the DSP's handle %#x\n", BUFFER_BYTES / 1024, buffer_address, map_handle);
 	if (!adm_open(port_id, &copp)) {
 		return false;
@@ -2919,30 +3122,54 @@ isqrt64(uint64_t value)                 /* no floating point: integer square roo
 	return (uint32_t)root;
 }
 
-/* The buffer and the DSP's view of it, as the playback path sets them up (space_find, buffer, space_on). */
+/* The memory the capture's periods live in: its own when vayu_mic has one, the playback's for the boot test. */
+static vm_offset_t
+mic_memory(void)
+{
+	return mic_buf != 0 ? mic_buf : buffer;
+}
+
+static uint64_t
+mic_address(void)
+{
+	return mic_buf != 0 ? mic_buf_address : buffer_address;
+}
+
+/*
+ * The buffer and the DSP's view of it, as the playback path sets them up (space_find, buffer, space_on). The
+ * capture's own 32 KB (mic_buf) is mapped in the second region of the playback's mapping (AUDIO_ADDRESSES +
+ * BUFFER_BYTES) so that both can run at once; without vayu_mic the boot test uses the playback's buffer, as it
+ * always has.
+ */
 static bool
 mic_buffer(void)
 {
 	bool ok;
 
-	lck_mtx_lock(&hakios_smmu_lock);
-	ok = space_find();
-	lck_mtx_unlock(&hakios_smmu_lock);
-	if (!ok) {
+	if (mic_ios && mic_buf == 0) {
+		say("vayu-audio: mic: there is no capture buffer: vayu_mic=1 cannot run\n");
 		return false;
 	}
 	if (buffer == 0 && kmem_alloc(kernel_map, &buffer, BUFFER_BYTES, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		buffer = 0;
+		say("vayu-audio: mic: no memory for the playback's 32 KB\n");
 		return false;
 	}
 	lck_mtx_lock(&hakios_smmu_lock);
-	ok = space.passed || space_on();
+	ok = space_ensure();
 	lck_mtx_unlock(&hakios_smmu_lock);
 	if (!ok) {
 		return false;
 	}
 	buffer_address = space.passed ? (kvtophys(buffer) | AUDIO_STREAM_BITS) : (AUDIO_ADDRESSES | AUDIO_STREAM_BITS);
+	if (mic_buf != 0) {
+		mic_buf_address = space.passed ? (kvtophys(mic_buf) | AUDIO_STREAM_BITS) :
+		    ((AUDIO_ADDRESSES + BUFFER_BYTES) | AUDIO_STREAM_BITS);
+	}
+	if (mic_ios) {
+		mic_space_held = true;
+	}
 	return true;
 }
 
@@ -2954,11 +3181,12 @@ mic_afe_on(void)
 		               .data_format = 0, .num_channels = 2, .shared_ch = { 135, 136 }, .sample_rate = RATE };
 	uint16_t start[2] = { MIC_AFE_PORT, 0 };
 
-	if (!afe_port_param("the port 0x4001: SLIMbus, 2 channels 135/136, 16 bits, 48 kHz", MIC_AFE_PORT,
+	if (!mic_step_afe_port_param("the port 0x4001: SLIMbus, 2 channels 135/136, 16 bits, 48 kHz", MIC_AFE_PORT,
 	    AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &slim, sizeof(slim))) {
 		return false;
 	}
-	mic_port_on = command("the port 0x4001, started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0);
+	mic_port_on = mic_step_command("the port 0x4001, started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start,
+	    sizeof(start), 0);
 	return mic_port_on;
 }
 
@@ -2969,7 +3197,7 @@ mic_asm_on(void)
 	struct {
 		uint16_t pool, regions;
 		uint32_t property, low, high, size;
-	} __attribute__((packed)) map = { ASM_SHMEM_4K_POOL, 1, 0, (uint32_t)buffer_address, (uint32_t)(buffer_address >> 32),
+	} __attribute__((packed)) map = { ASM_SHMEM_4K_POOL, 1, 0, (uint32_t)mic_address(), (uint32_t)(mic_address() >> 32),
 		                          BUFFER_BYTES };
 	struct {
 		uint32_t mode, endpoint, topology, format;
@@ -2984,21 +3212,22 @@ mic_asm_on(void)
 		uint8_t map[8];
 	} __attribute__((packed)) encoder = { ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2, 28, 0, 20, 2, 16, RATE, 1, 0,
 		                               { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
+	uint32_t found_handle = 0;
 
-	if (!command("our periods, mapped for the DSP (the microphones)", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, &map,
-	    sizeof(map), ASM_CMDRSP_SHARED_MEM_MAP_REGIONS)) {
+	if (!mic_step_command_words("our periods, mapped for the DSP (the microphones)", APR_SVC_ASM, 0,
+	    ASM_CMD_SHARED_MEM_MAP_REGIONS, &map, sizeof(map), ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, &found_handle, NULL)) {
 		return false;
 	}
 	mic_mapped = true;
-	mic_map_handle = apr_answer.words[0];
-	say("vayu-audio: 6: our %u KB at %#llx are the DSP's handle %#x (the microphones)\n", BUFFER_BYTES / 1024,
-	    buffer_address, mic_map_handle);
-	if (!command("the stream (session 2), opened for reading: 2 channels of 16-bit PCM, no processing", APR_SVC_ASM,
-	    MIC_STREAM_PORT, ASM_STREAM_CMD_OPEN_READ_V3, &reading, sizeof(reading), 0)) {
+	mic_map_handle = found_handle;
+	say("vayu-audio: %s: our %u KB at %#llx are the DSP's handle %#x (the microphones)\n", mic_tag(), BUFFER_BYTES / 1024,
+	    mic_address(), mic_map_handle);
+	if (!mic_step_command("the stream (session 2), opened for reading: 2 channels of 16-bit PCM, no processing",
+	    APR_SVC_ASM, MIC_STREAM_PORT, ASM_STREAM_CMD_OPEN_READ_V3, &reading, sizeof(reading), 0)) {
 		return false;
 	}
 	mic_stream_open = true;
-	return command("the stream's format: 2 channels of 16 bits at 48 kHz", APR_SVC_ASM, MIC_STREAM_PORT,
+	return mic_step_command("the stream's format: 2 channels of 16 bits at 48 kHz", APR_SVC_ASM, MIC_STREAM_PORT,
 	           ASM_STREAM_CMD_SET_ENCDEC_PARAM, &encoder, sizeof(encoder), 0);
 }
 
@@ -3019,20 +3248,21 @@ mic_adm_on(void)
 		uint16_t session, copps;
 		uint16_t copp[2];
 	} __attribute__((packed)) route = { ADM_MATRIX_AUDIO_TX, 1, MIC_SESSION, 1, { 0, 0 } };
+	uint32_t status = 0, copp = 0;
 
-	if (!command("a device path from the port: live recording, no processing, 2 channels of 16 bits at 48 kHz",
-	    APR_SVC_ADM, MIC_AFE_PORT, ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5)) {
+	if (!mic_step_command_words("a device path from the port: live recording, no processing, 2 channels of 16 bits at 48 kHz",
+	    APR_SVC_ADM, MIC_AFE_PORT, ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5, &status, &copp)) {
 		return false;
 	}
-	if (apr_answer.words[0] != 0) {
-		say("vayu-audio: 6: the device path: REFUSED: %s\n", dsp_error(apr_answer.words[0]));
+	if (status != 0) {
+		say("vayu-audio: %s: the device path: REFUSED: %s\n", mic_tag(), dsp_error(status));
 		return false;
 	}
 	mic_copp_open = true;
-	mic_copp = apr_answer.words[1] & 0xffff;
+	mic_copp = copp & 0xffff;
 	route.copp[0] = (uint16_t)mic_copp;
-	say("vayu-audio: 6: the device path is open: COPP %u\n", mic_copp);
-	return command("session 2 routed to the device path (the microphones)", APR_SVC_ADM, 0,
+	say("vayu-audio: %s: the device path is open: COPP %u\n", mic_tag(), mic_copp);
+	return mic_step_command("session 2 routed to the device path (the microphones)", APR_SVC_ADM, 0,
 	           ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &route, sizeof(route), 0);
 }
 
@@ -3041,14 +3271,15 @@ mic_run(void)
 {
 	uint32_t run[3] = { 0, 0, 0 };
 
-	return command("the session (session 2), run", APR_SVC_ASM, MIC_STREAM_PORT, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), 0);
+	return mic_step_command("the session (session 2), run", APR_SVC_ASM, MIC_STREAM_PORT, ASM_SESSION_CMD_RUN_V2, run,
+	    sizeof(run), 0);
 }
 
 /* One 20 ms period: its own 4096-byte page, the DSP address mapped above, not waited for. */
 static bool
 mic_read(uint32_t period)
 {
-	uint64_t address = buffer_address + (uint64_t)4096 * period;
+	uint64_t address = mic_address() + (uint64_t)4096 * period;
 	uint32_t read[5] = { (uint32_t)address, (uint32_t)(address >> 32), mic_map_handle, MIC_PERIOD_BYTES, period };
 
 	return apr_post(APR_SVC_ASM, MIC_STREAM_PORT, MIC_READ_TOKEN | period, ASM_DATA_CMD_READ_V2, read, sizeof(read));
@@ -3072,11 +3303,11 @@ mic_listen(uint32_t secs)
 	}
 	for (unsigned p = 0; p < MIC_PERIODS; p++) {
 		if (!mic_read(p)) {
-			say("vayu-audio: 6: a read of 20 ms could not be given to the DSP (period %u)\n", p);
+			mic_say("a read of 20 ms could not be given to the DSP (period %u)\n", p);
 			return false;
 		}
 	}
-	say("vayu-audio: 6: reading: %u reads of 20 ms (3840 bytes, one page each), for %u s\n", MIC_PERIODS, secs);
+	mic_say("reading: %u reads of 20 ms (3840 bytes, one page each), for %u s\n", MIC_PERIODS, secs);
 	for (;;) {
 		uint64_t now = mach_absolute_time(), since_event, since_data, elapsed;
 		uint32_t done = mic_reads_done;
@@ -3088,14 +3319,14 @@ mic_listen(uint32_t secs)
 		absolutetime_to_nanoseconds(now - last_event, &since_event);
 		absolutetime_to_nanoseconds(now - last_data, &since_data);
 		if (since_event >= 500 * NSEC_PER_MSEC || since_data >= 500 * NSEC_PER_MSEC) {
-			say("vayu-audio: 6: NO DATA FROM THE DSP (%llu ms without a read done, %llu ms without samples)\n",
+			mic_say("NO DATA FROM THE DSP (%llu ms without a read done, %llu ms without samples)\n",
 			    since_event / NSEC_PER_MSEC, since_data / NSEC_PER_MSEC);
 			ok = false;
 			break;
 		}
 		absolutetime_to_nanoseconds(now - began, &elapsed);
 		if (elapsed >= ((uint64_t)secs + 2) * NSEC_PER_SEC) {       /* (one period lost must not hang the thread) */
-			say("vayu-audio: 6: the reading stops: %u s of data in %llu ms (wanted %u s)\n", seconds,
+			mic_say("the reading stops: %u s of data in %llu ms (wanted %u s)\n", seconds,
 			    elapsed / NSEC_PER_MSEC, secs);
 			ok = false;
 			break;
@@ -3109,7 +3340,7 @@ mic_listen(uint32_t secs)
 			OSBitAndAtomic(~(1u << p), &mic_read_ready);
 			size = mic_read_sizes[p];
 			{
-				int16_t *samples = (int16_t *)(buffer + 4096 * p);
+				int16_t *samples = (int16_t *)(mic_memory() + 4096 * p);
 
 				for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + MIC_PERIOD_BYTES; line += 64) {
 					__asm__ volatile ("dc ivac, %0" : : "r" (line));
@@ -3128,7 +3359,7 @@ mic_listen(uint32_t secs)
 							    (unsigned)(uint16_t)samples[i]);
 						}
 						samples_said = true;
-						say("vayu-audio: 6: the first period's first %u samples: %s\n", n, line);
+						mic_say("the first period's first %u samples: %s\n", n, line);
 					}
 					for (uint32_t i = 0; i < got; i++) {
 						int32_t l = samples[2 * i], r = samples[2 * i + 1];
@@ -3148,7 +3379,7 @@ mic_listen(uint32_t secs)
 			}
 			periods++;
 			if (!mic_read(p)) {
-				say("vayu-audio: 6: the read of period %u could not be given back to the DSP\n", p);
+				mic_say("the read of period %u could not be given back to the DSP\n", p);
 				ok = false;
 			}
 		}
@@ -3161,7 +3392,7 @@ mic_listen(uint32_t secs)
 			rms[0] = isqrt64(squares[0] / frames);
 			rms[1] = isqrt64(squares[1] / frames);
 			seconds++;
-			say("vayu-audio: 6: +%us mic L(ch135, AMIC3/DEC7) peak %d rms %d, R(ch136, AMIC1/DEC8) peak %d rms %d, "
+			mic_say("+%us mic L(ch135, AMIC3/DEC7) peak %d rms %d, R(ch136, AMIC1/DEC8) peak %d rms %d, "
 			    "%u periods, %u errors\n", seconds, (int)peaks[0], (int)rms[0], (int)peaks[1], (int)rms[1], periods,
 			    mic_read_errors);
 			frames = 0;
@@ -3188,26 +3419,28 @@ mic_off(void)
 	uint16_t stop[2] = { MIC_AFE_PORT, 0 };
 
 	if (mic_stream_open) {
-		command("the stream (session 2), closed", APR_SVC_ASM, MIC_STREAM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0, 0);
+		mic_step_command("the stream (session 2), closed", APR_SVC_ASM, MIC_STREAM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0, 0);
 		mic_stream_open = false;
 	}
 	if (mic_copp_open) {
-		command("the device path, closed", APR_SVC_ADM, (uint16_t)mic_copp, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 0);
+		mic_step_command("the device path, closed", APR_SVC_ADM, (uint16_t)mic_copp, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 0);
 		mic_copp_open = false;
 	}
 	vayu_jack_mic_off();
 	if (mic_port_on) {
-		command("the port 0x4001, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0);
+		mic_step_command("the port 0x4001, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0);
 		mic_port_on = false;
 	}
 	if (mic_mapped) {
-		command("our periods, unmapped (the microphones)", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &handle,
+		mic_step_command("our periods, unmapped (the microphones)", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &handle,
 		    sizeof(handle), 0);
 		mic_mapped = false;
 	}
-	lck_mtx_lock(&hakios_smmu_lock);
-	space_off();
-	lck_mtx_unlock(&hakios_smmu_lock);
+	if (!mic_space_held) {
+		lck_mtx_lock(&hakios_smmu_lock);
+		space_off();
+		lck_mtx_unlock(&hakios_smmu_lock);
+	}
 }
 
 static bool
@@ -3217,81 +3450,543 @@ step_mic(void)
 	const char *failed = NULL;
 	bool ok;
 
+	if (mic_ios) {
+		say("vayu-audio: mic: vayu_sound=6 is not run: vayu_mic=1 owns session 2 and the codec's microphones\n");
+		return false;
+	}
 	PE_parse_boot_argn("vayu_mic_secs", &secs, sizeof(secs));
 	secs = secs < 1 ? 1 : secs;
 	secs = secs > 30 ? 30 : secs;
 	command_step = 6;
 	crumb("6: port 0x4001, the microphones and a %u s recording", secs);
 	if (!vayu_jack_ready()) {
-		say("vayu-audio: 6: needs vayu_jack=2 (the codec): not done\n");
+		mic_say("needs vayu_jack=2 (the codec): not done\n");
 		command_step = 4;
 		return false;
 	}
 	if (!mic_buffer()) {
-		say("vayu-audio: 6: 1/8 the buffer and the SMMU: FAILED\n");
+		mic_say("1/8 the buffer and the SMMU: FAILED\n");
 		failed = "the buffer and the SMMU";
 	} else {
-		say("vayu-audio: 6: 1/8 the buffer and the SMMU: %u KB at %#llx%s\n", BUFFER_BYTES / 1024, buffer_address,
+		mic_say("1/8 the buffer and the SMMU: %u KB at %#llx%s\n", BUFFER_BYTES / 1024, mic_address(),
 		    space.passed ? " (the DSP's stream 0x1b21 already matches)" : " (a context of ours)");
 	}
 	if (failed == NULL) {
 		if (!mic_afe_on()) {
-			say("vayu-audio: 6: 2/8 the AFE port 0x4001: FAILED\n");
+			mic_say("2/8 the AFE port 0x4001: FAILED\n");
 			failed = "the AFE port 0x4001";
 		} else {
-			say("vayu-audio: 6: 2/8 the AFE port 0x4001: SLIMbus, 2 channels 135/136, 16 bits, 48 kHz, started\n");
+			mic_say("2/8 the AFE port 0x4001: SLIMbus, 2 channels 135/136, 16 bits, 48 kHz, started\n");
 		}
 	}
 	if (failed == NULL) {
 		if (!vayu_jack_mic_on()) {
-			say("vayu-audio: 6: 3/8 the codec's microphone path: FAILED\n");
+			mic_say("3/8 the codec's microphone path: FAILED\n");
 			failed = "the codec's microphone path";
 		} else {
-			say("vayu-audio: 6: 3/8 the codec's microphone path: TX7/TX8 on channels 135/136, on\n");
+			mic_say("3/8 the codec's microphone path: TX7/TX8 on channels 135/136, on\n");
 		}
 	}
 	if (failed == NULL) {
 		if (!mic_asm_on()) {
-			say("vayu-audio: 6: 4/8 the ASM stream (session 2): FAILED\n");
+			mic_say("4/8 the ASM stream (session 2): FAILED\n");
 			failed = "the ASM stream";
 		} else {
-			say("vayu-audio: 6: 4/8 the ASM stream (session 2): mapped, opened for reading, 2 channels of 16 bits at 48 kHz\n");
+			mic_say("4/8 the ASM stream (session 2): mapped, opened for reading, 2 channels of 16 bits at 48 kHz\n");
 		}
 	}
 	if (failed == NULL) {
 		if (!mic_adm_on()) {
-			say("vayu-audio: 6: 5/8 the ADM path: FAILED\n");
+			mic_say("5/8 the ADM path: FAILED\n");
 			failed = "the ADM path";
 		} else {
-			say("vayu-audio: 6: 5/8 the ADM path: live recording from 0x4001, COPP %u, routed to session 2\n", mic_copp);
+			mic_say("5/8 the ADM path: live recording from 0x4001, COPP %u, routed to session 2\n", mic_copp);
 		}
 	}
 	if (failed == NULL) {
 		if (!mic_run()) {
-			say("vayu-audio: 6: 6/8 the session, run: FAILED\n");
+			mic_say("6/8 the session, run: FAILED\n");
 			failed = "the run";
 		} else {
-			say("vayu-audio: 6: 6/8 the session (session 2), run\n");
+			mic_say("6/8 the session (session 2), run\n");
 		}
 	}
 	if (failed == NULL) {
 		if (!mic_listen(secs)) {
-			say("vayu-audio: 6: 7/8 the reading: FAILED after %u s\n", mic_seconds);
+			mic_say("7/8 the reading: FAILED after %u s\n", mic_seconds);
 			failed = "the reading";
 		} else {
-			say("vayu-audio: 6: 7/8 the reading: %u s of data, %u errors\n", mic_seconds, mic_read_errors);
+			mic_say("7/8 the reading: %u s of data, %u errors\n", mic_seconds, mic_read_errors);
 		}
 	}
-	say("vayu-audio: 6: 8/8 taking it down, in reverse\n");
+	mic_say("8/8 taking it down, in reverse\n");
 	mic_off();
 	command_step = 4;
 	ok = failed == NULL && mic_seconds >= secs;
 	if (ok) {
-		say("vayu-audio: 6: DONE: %u s, peaks L %d R %d\n", mic_seconds, (int)mic_peaks[0], (int)mic_peaks[1]);
+		mic_say("DONE: %u s, peaks L %d R %d\n", mic_seconds, (int)mic_peaks[0], (int)mic_peaks[1]);
 	} else {
-		say("vayu-audio: 6: FAILED at %s\n", failed != NULL ? failed : "the reading");
+		mic_say("FAILED at %s\n", failed != NULL ? failed : "the reading");
 	}
 	return ok;
+}
+
+/* ---- vayu_mic=1: /dev/hakios-mic, the microphone iOS records from ---------------------------------- */
+
+/*
+ * The node and the ring are hakios.mic.c's mic=4 (that file is the other phone's: bsd/dev/hakios.mic.c),
+ * fed by vayu's own capture: AFE port 0x4001 (SLIMbus TX, the codec's TX7/AMIC3 on channel 135 and
+ * TX8/AMIC1 on 136), ASM session 2 and an ADM live-recording path -- the code vayu_sound=6 uses. What the
+ * plug-in reads is one channel of 16-bit samples at 48 kHz -- TX7/AMIC3, the capture's channel 0 -- exactly
+ * the format it declares to CoreAudio. A read never waits and gives only what has come; the plug-in fills the
+ * rest with silence. The path is up only while the node is open.
+ */
+#define IOS_RING_FRAMES         16384           /* 341 ms; a power of two */
+#define IOS_RING_KEEP           1920            /* 40 ms: how far behind the DSP a reader is kept */
+#define IOS_RING_MOST           4800            /* 100 ms: more than this waiting, and the oldest is skipped */
+
+static int16_t *ios_ring;
+static vm_offset_t ios_ring_mem;
+static volatile uint64_t ios_ring_written;      /* frames put into the ring since the node was made */
+static volatile uint64_t ios_ring_read;         /* frames taken from it (one reader: the audio server) */
+static volatile bool ios_ring_primed;           /* the reader is IOS_RING_KEEP behind; false after it ran dry */
+static volatile uint64_t ios_ring_skipped, ios_ring_dry; /* frames skipped, reads that found too little: said when iOS stops */
+static volatile uint32_t ios_wants;             /* /dev/hakios-mic is open */
+static volatile bool mic_stopping;              /* the run ends (vayu_audio_quiesce()) */
+static volatile bool mic_thread_started;
+static bool mic_node_made;
+static volatile bool mic_thread_done;
+static volatile bool mic_active;
+static bool mic_path_live;                      /* under mic_lock: between mic_path_up's first step and mic_path_down's end */
+static unsigned mic_failures, mic_recordings;
+
+static void
+ios_ring_put(const int16_t *samples, uint32_t count)
+{
+	uint64_t at = ios_ring_written;
+
+	for (uint32_t i = 0; i < count; i++) {
+		ios_ring[(at + i) % IOS_RING_FRAMES] = samples[i];
+	}
+	__atomic_store_n(&ios_ring_written, at + count, __ATOMIC_RELEASE);
+}
+
+static int
+ios_mic_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	uint64_t written = __atomic_load_n(&ios_ring_written, __ATOMIC_ACQUIRE), avail, want;
+	int error = 0;
+
+	if (ios_ring == NULL || uio_resid(uio) < 2) {
+		return 0;
+	}
+	want = (uint64_t)uio_resid(uio) / 2;
+	avail = written - ios_ring_read;
+	if (avail > IOS_RING_MOST) {
+		__atomic_fetch_add(&ios_ring_skipped, avail - IOS_RING_KEEP, __ATOMIC_RELAXED);
+		ios_ring_read = written - IOS_RING_KEEP;
+		avail = IOS_RING_KEEP;
+	}
+	if (!ios_ring_primed) {
+		if (avail < IOS_RING_KEEP) {
+			return 0;
+		}
+		ios_ring_primed = true;
+	}
+	if (avail < want) {
+		__atomic_fetch_add(&ios_ring_dry, 1, __ATOMIC_RELAXED);
+		ios_ring_primed = false;
+	}
+	while (want > 0 && avail > 0 && error == 0) {
+		uint64_t at = ios_ring_read % IOS_RING_FRAMES, n = want < avail ? want : avail;
+
+		n = n < IOS_RING_FRAMES - at ? n : IOS_RING_FRAMES - at;
+		error = uiomove((caddr_t)&ios_ring[at], (int)(n * 2), uio);
+		ios_ring_read += n;
+		want -= n;
+		avail -= n;
+	}
+	return error;
+}
+
+static int
+ios_mic_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	/* No stale samples from the recording before: the reader starts where the DSP last stopped. */
+	__atomic_store_n(&ios_ring_read, __atomic_load_n(&ios_ring_written, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+	ios_ring_primed = false;
+	ios_wants = 1;
+	return 0;
+}
+
+/* (on the last close) */
+static int
+ios_mic_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	ios_wants = 0;
+	return 0;
+}
+
+static const struct cdevsw ios_mic_cdevsw = {
+	.d_open = ios_mic_open, .d_close = ios_mic_close, .d_read = ios_mic_read, .d_write = eno_rdwrt,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+/*
+ * On the loader's way out the other processors are stopped, and with them the GLINK edge's thread: the DSP
+ * answers no ASM/ADM/AFE command any more (each would wait its second and fail), and it is reset a few lines
+ * after this by vayu_pas_quiesce(). What must not outlive this kernel is the codec's own path: its registers
+ * are written directly (I2C and the SLIMbus NGD's hardware), and it is taken down. The DSP's session, device
+ * path and port die with the DSP.
+ */
+static void
+mic_path_down_quiet(void)
+{
+	if (!mic_path_live) {
+		return;
+	}
+	mic_ios_mode = true;
+	mic_say("the capture's path down for the loader (the DSP is reset next; its session, path and port are not asked)\n");
+	vayu_jack_mic_off();
+	mic_stream_open = false;
+	mic_copp_open = false;
+	mic_port_on = false;
+	mic_mapped = false;
+	mic_ios_mode = false;
+	mic_path_live = false;
+}
+
+/* The capture's path down; the SMMU mapping (shared with the playback) is kept. Under mic_lock; one way. */
+static void
+mic_path_down(void)
+{
+	if (!mic_path_live) {
+		return;
+	}
+	if (mic_stopping) {
+		/* The loader is going out: no DSP command would be answered (see mic_path_down_quiet()). */
+		mic_path_down_quiet();
+		return;
+	}
+	mic_ios_mode = true;
+	mic_say("taking the capture's path down\n");
+	mic_off();
+	mic_ios_mode = false;
+	mic_path_live = false;
+}
+
+/* Everything the capture needs, in the order vayu_sound=6 uses; false (path already down) on a failure. */
+static bool
+mic_path_up(void)
+{
+	mic_ios_mode = true;
+	mic_path_live = false;
+	__atomic_store_n(&ios_ring_read, __atomic_load_n(&ios_ring_written, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+	ios_ring_primed = false;
+	ios_ring_skipped = ios_ring_dry = 0;
+	mic_say("the path up: AFE 0x4001, codec TX7/TX8, ASM session 2, ADM live recording\n");
+	if (!vayu_jack_ready()) {
+		mic_say("not vayu_jack>=2 (the codec): the path cannot come up\n");
+		mic_ios_mode = false;
+		return false;
+	}
+	mic_path_live = true;                   /* from here, mic_path_down() has something to take down */
+	if (!mic_buffer()) {
+		mic_say("the capture's memory and SMMU mapping did not come up\n");
+		goto fail;
+	}
+	mic_say("the capture's 32 KB is at %#llx%s; one 4096-byte page per 20 ms period\n", mic_address(),
+	    space.passed ? " (the stream 0x1b21 is bypassed)" : " (the second region of the stream 0x1b21 mapping)");
+	if (mic_stopping) {
+		goto fail;                      /* (no DSP command after the way out has begun: see mic_path_down()) */
+	}
+	if (!mic_afe_on()) {
+		mic_say("the AFE port 0x4001 did not start\n");
+		goto fail;
+	}
+	if (!vayu_jack_mic_on()) {
+		mic_say("the codec's microphone path did not come up\n");
+		goto fail;
+	}
+	mic_say("the codec's microphone path is up: AMIC3 -> DEC7 -> SLIM TX7 (channel 135), AMIC1 -> DEC8 -> "
+	    "SLIM TX8 (channel 136)\n");
+	if (mic_stopping) {
+		goto fail;
+	}
+	if (!mic_asm_on()) {
+		mic_say("the ASM stream (session 2) did not open\n");
+		goto fail;
+	}
+	if (!mic_adm_on()) {
+		mic_say("the ADM live-recording path did not open\n");
+		goto fail;
+	}
+	if (mic_stopping) {
+		goto fail;
+	}
+	if (!mic_run()) {
+		mic_say("session 2 did not run\n");
+		goto fail;
+	}
+	mic_say("the PATH IS UP: TX7/AMIC3 (channel 0) is what /dev/hakios-mic gives iOS, 16-bit signed, 1 channel, "
+	    "48 kHz\n");
+	return true;
+
+fail:
+	mic_path_down();
+	return false;
+}
+
+/* The reads, the ring, and one level line every 10 s while the node is open. */
+static bool
+mic_feed(void)
+{
+	uint64_t began = mach_absolute_time(), last_level = began, last_next = began, ns;
+	uint64_t frames = 0, posted = 0, window_frames = 0, sums[2] = { 0, 0 };
+	uint32_t next = 0, seconds = 0, periods = 0, peaks[2] = { 0, 0 }, all_peaks[2] = { 0, 0 };
+	bool ok = true;
+	int16_t mono[MIC_PERIOD_FRAMES];
+
+	if (!ios_wants || mic_stopping) {
+		return true;
+	}
+	mic_read_ready = 0;
+	mic_reads_done = 0;
+	mic_read_errors = 0;
+	for (unsigned p = 0; p < MIC_PERIODS; p++) {
+		mic_read_sizes[p] = 0;
+	}
+	for (unsigned p = 0; p < MIC_PERIODS; p++) {
+		if (!mic_read(p)) {
+			mic_say("ASM read period %u (opcode %#x) could not be posted\n", p, ASM_DATA_CMD_READ_V2);
+			return false;
+		}
+		posted++;
+		mic_say("ASM read period %u (opcode %#x, 20 ms, 3840 bytes): posted\n", p, ASM_DATA_CMD_READ_V2);
+	}
+	mic_say("%u reads in flight; iOS reads the ring, the DSP fills it\n", MIC_PERIODS);
+	mic_say("later 20 ms ASM_DATA_CMD_READ_V2 re-posts are not said one by one (50 a second); the 10 s level lines "
+	    "count them\n");
+	while (ok) {
+		uint64_t now;
+		uint32_t size, got;
+
+		if (!ios_wants || mic_stopping) {
+			break;
+		}
+		if (!(mic_read_ready & (1u << next))) {
+			now = mach_absolute_time();
+			absolutetime_to_nanoseconds(now - last_next, &ns);
+			if (ns >= 1500 * NSEC_PER_MSEC) {
+				mic_say("NO DATA FROM THE DSP FOR 1.5 s (period %u, %llu reads posted)\n", next, posted);
+				ok = false;
+				break;
+			}
+			delay_for_interval(2, NSEC_PER_MSEC);
+			continue;
+		}
+		OSBitAndAtomic(~(1u << next), &mic_read_ready);
+		size = mic_read_sizes[next];
+		got = size / 4;                          /* 2 channels of 16 bits a frame */
+		got = got > MIC_PERIOD_FRAMES ? MIC_PERIOD_FRAMES : got;
+		if (got != 0) {
+			int16_t *samples = (int16_t *)(mic_memory() + 4096 * next);
+
+			for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + MIC_PERIOD_BYTES; line += 64) {
+				__asm__ volatile ("dc ivac, %0" : : "r" (line));
+			}
+			__asm__ volatile ("dsb sy");
+			for (uint32_t i = 0; i < got; i++) {
+				int32_t l = samples[2 * i], r = samples[2 * i + 1];
+				uint32_t al = l < 0 ? (uint32_t)-l : (uint32_t)l;
+				uint32_t ar = r < 0 ? (uint32_t)-r : (uint32_t)r;
+
+				mono[i] = (int16_t)l;            /* TX7/AMIC3: what the plug-in's one channel gets */
+				sums[0] += (uint64_t)((int64_t)l * l);
+				sums[1] += (uint64_t)((int64_t)r * r);
+				peaks[0] = al > peaks[0] ? al : peaks[0];
+				peaks[1] = ar > peaks[1] ? ar : peaks[1];
+				all_peaks[0] = al > all_peaks[0] ? al : all_peaks[0];
+				all_peaks[1] = ar > all_peaks[1] ? ar : all_peaks[1];
+			}
+			ios_ring_put(mono, got);
+			frames += got;
+			window_frames += got;
+		}
+		if (!mic_read(next)) {
+			mic_say("ASM read period %u could not be posted back (opcode %#x)\n", next, ASM_DATA_CMD_READ_V2);
+			ok = false;
+			break;
+		}
+		posted++;
+		next = (next + 1) % MIC_PERIODS;
+		periods++;
+		last_next = mach_absolute_time();
+		now = mach_absolute_time();
+		absolutetime_to_nanoseconds(now - last_level, &ns);
+		if (ns >= 10 * NSEC_PER_SEC) {
+			uint32_t rms0 = window_frames != 0 ? isqrt64(sums[0] / window_frames) : 0;
+			uint32_t rms1 = window_frames != 0 ? isqrt64(sums[1] / window_frames) : 0;
+
+			seconds += 10;
+			mic_say("+%u s open: ch0 TX7/AMIC3 peak %d rms %d (-%u dBFS); ch1 TX8/AMIC1 peak %d rms %d; %llu "
+			    "frames, %llu reads, %u errors; ring %llu skipped, %llu dry\n", seconds, (int)peaks[0], (int)rms0,
+			    under_full_scale(peaks[0]), (int)peaks[1], (int)rms1, window_frames, posted, mic_read_errors,
+			    (unsigned long long)__atomic_load_n(&ios_ring_skipped, __ATOMIC_RELAXED),
+			    (unsigned long long)__atomic_load_n(&ios_ring_dry, __ATOMIC_RELAXED));
+			sums[0] = sums[1] = 0;
+			peaks[0] = peaks[1] = 0;
+			window_frames = 0;
+			last_level = now;
+		}
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	mic_say("the feed stopped after %llu.%02llu s: %llu frames from the DSP (peak ch0 %u, ch1 %u), %llu ASM reads "
+	    "posted, %u errors, %u periods; ring %llu skipped, %llu dry%s\n", ns / NSEC_PER_SEC,
+	    ns % NSEC_PER_SEC / (NSEC_PER_SEC / 100), frames, all_peaks[0], all_peaks[1], posted, mic_read_errors, periods,
+	    (unsigned long long)__atomic_load_n(&ios_ring_skipped, __ATOMIC_RELAXED),
+	    (unsigned long long)__atomic_load_n(&ios_ring_dry, __ATOMIC_RELAXED), ok ? "" : " (the capture failed)");
+	return ok;
+}
+
+/* The node's thread: the path up when iOS opens it, down when it closes it; after three failures, off. */
+static void
+ios_mic_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	mic_say("/dev/hakios-mic is up; the capture's path comes up when iOS opens it\n");
+	for (;;) {
+		bool ok;
+
+		while (!ios_wants && !mic_stopping) {
+			delay_for_interval(20, NSEC_PER_MSEC);
+		}
+		if (mic_stopping) {
+			break;
+		}
+		lck_mtx_lock(&mic_lock);
+		if (mic_stopping) {
+			lck_mtx_unlock(&mic_lock);
+			break;
+		}
+		mic_recordings++;
+		mic_say("iOS records (%u): the path up\n", mic_recordings);
+		if (!mic_path_up()) {
+			mic_failures++;
+			lck_mtx_unlock(&mic_lock);
+			mic_say("the path did not come up (%u of 3)\n", mic_failures);
+			while (ios_wants && !mic_stopping) {
+				delay_for_interval(20, NSEC_PER_MSEC);
+			}
+			if (mic_failures >= 3) {
+				mic_say("three captures broke off: the microphone stays off until the run ends\n");
+				break;
+			}
+			continue;
+		}
+		mic_active = true;
+		lck_mtx_unlock(&mic_lock);
+		ok = mic_feed();
+		lck_mtx_lock(&mic_lock);
+		mic_active = false;
+		mic_say("iOS's recording %u ended%s; the path down\n", mic_recordings, ok ? "" : " (the capture failed)");
+		mic_path_down();
+		lck_mtx_unlock(&mic_lock);
+		if (!ok) {
+			mic_failures++;
+			if (mic_failures >= 3) {
+				mic_say("three captures broke off: the microphone stays off until the run ends\n");
+				break;
+			}
+			while (ios_wants && !mic_stopping) {
+				delay_for_interval(20, NSEC_PER_MSEC);
+			}
+		}
+	}
+	lck_mtx_lock(&mic_lock);
+	if (mic_active) {
+		mic_active = false;
+		mic_path_down();
+	}
+	lck_mtx_unlock(&mic_lock);
+	mic_say("done\n");
+	mic_thread_done = true;
+	thread_terminate(current_thread());
+}
+
+/* vayu_mic=1: make /dev/hakios-mic and its thread, once the codec is up. */
+static void
+vayu_mic_start(void)
+{
+	thread_t thread;
+	int major;
+
+	if (!mic_ios || mic_thread_started || mic_node_made) {
+		return;
+	}
+	if (!vayu_jack_ready()) {
+		say("vayu-audio: mic: vayu_mic=1 needs vayu_jack>=2 (the codec): not started\n");
+		return;
+	}
+	if (mic_buf == 0) {
+		say("vayu-audio: mic: the capture's own 32 KB is not there: vayu_mic=1 not started\n");
+		return;
+	}
+	if (ios_ring == NULL && kmem_alloc(kernel_map, &ios_ring_mem, IOS_RING_FRAMES * sizeof(int16_t),
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+		ios_ring = (int16_t *)ios_ring_mem;
+	}
+	if (ios_ring == NULL) {
+		say("vayu-audio: mic: no memory for the 32 KB ring: vayu_mic=1 not started\n");
+		return;
+	}
+	major = cdevsw_add(-1, &ios_mic_cdevsw);
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-mic") == NULL) {
+		say("vayu-audio: mic: /dev/hakios-mic cannot be made\n");
+		return;
+	}
+	mic_node_made = true;
+	mic_stopping = false;
+	mic_thread_started = true;
+	if (kernel_thread_start(ios_mic_thread, NULL, &thread) != KERN_SUCCESS) {
+		mic_thread_started = false;
+		say("vayu-audio: mic: no thread: /dev/hakios-mic stays silent\n");
+		return;
+	}
+	thread_deallocate(thread);
+	say("vayu-audio: mic: vayu_mic=1: /dev/hakios-mic is made; iOS's \"Codec\" input is fed from AFE 0x4001 "
+	    "(session 2), one channel of TX7/AMIC3\n");
+}
+
+/* On the way back to the loader: the path down before the DSP stops. */
+static void
+vayu_mic_quiesce(void)
+{
+	if (!mic_thread_started) {
+		return;
+	}
+	mic_stopping = true;
+	say("vayu-audio: mic: stopping the capture for the way back to the loader\n");
+	/* The feed loop looks at this every 2 ms: let it leave the reads before the DSP is stopped. */
+	for (unsigned ms = 0; ms < 100 && mic_active; ms++) {
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+	/*
+	 * Then take the capture's own path down here, once. A try: the loader's way out has interrupts off and
+	 * the other processors stopped, so a thread that holds the lock is not going to give it back;
+	 * mic_path_live makes whichever of the two comes second do nothing.
+	 */
+	if (lck_mtx_try_lock(&mic_lock)) {
+		if (mic_path_live) {
+			mic_path_down_quiet();
+		}
+		mic_active = false;
+		lck_mtx_unlock(&mic_lock);
+	} else {
+		say("vayu-audio: mic: the feed's thread has the capture's state; the DSP's reset follows\n");
+	}
+	mic_space_held = false;
+	say("vayu-audio: mic: stopped%s\n", mic_thread_done ? "" : " (its thread is on its way out)");
 }
 
 /* vayu_sound=1|2|3|6 (see the top of this section); everything taken down again, in reverse. */
@@ -3340,9 +4035,10 @@ step_sound(uint32_t sound, uint32_t secs)
 		lck_mtx_lock(&hakios_smmu_lock);
 		/*
 		 * The free match register and context found above are found again under this same hold of the lock: in a
-		 * boot where vayu_camera's smmu_up runs too (a combined kernel), it may have taken them in between.
+		 * boot where vayu_camera's smmu_up runs too (a combined kernel), it may have taken them in between. A
+		 * mapping of ours (the capture's, when iOS already records) is reused as it is.
 		 */
-		ok = ok && (space.passed || (space_find() && space_on()));
+		ok = ok && space_ensure();
 		lck_mtx_unlock(&hakios_smmu_lock);
 		if (ok) {
 			buffer_address = space.passed ? (kvtophys(buffer) | AUDIO_STREAM_BITS) : (AUDIO_ADDRESSES | AUDIO_STREAM_BITS);
@@ -3510,6 +4206,9 @@ step_link(void)
 	say("vayu-audio: 3: APR sent %u, received %u packets\n", apr_out, apr_in);
 	if (up) {
 		vayu_jack_run(&qrtr);                   /* boot-arg vayu_jack=N: the 3.5 mm jack's codec (vayu_jack.c) */
+		if (mic_ios) {
+			vayu_mic_start();               /* vayu_mic=1: /dev/hakios-mic, once the codec is up */
+		}
 	}
 	return up;
 }
@@ -3528,6 +4227,18 @@ audio_thread(void *arg __unused, wait_result_t wr __unused)
 		say("vayu-audio: cannot map the TLMM tiles (north %#lx south %#lx)\n", north, south);
 		thread_terminate(current_thread());
 		return;
+	}
+	if (mic_ios && mic_buf == 0) {
+		/*
+		 * The capture's own 32 KB, before the SMMU mapping is first made: space_on() maps it in the second
+		 * region then, whoever asks first. Without it vayu_mic=1 is not done.
+		 */
+		if (kmem_alloc(kernel_map, &mic_buf, BUFFER_BYTES, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			mic_buf = 0;
+			mic_ios = 0;
+			say("vayu-audio: mic: no memory for the capture's own 32 KB: vayu_mic=1 is not done\n");
+		}
 	}
 	if (level >= 2) {
 		/* (the firmware may be in /fw of the root, which is not mounted yet when this begins: a minute at most) */
@@ -3581,13 +4292,22 @@ audio_thread(void *arg __unused, wait_result_t wr __unused)
 				step_sound(then, tone_secs > 3 ? 3 : tone_secs);
 			}
 		}
-		vayu_jack_finish();                     /* path off, MCLK off, the codec quiet (vayu_jack.c) */
-		delay_for_interval(secs, NSEC_PER_SEC);
-		say("vayu-audio: after %u s more its \"slave-kernel\" says %#x\n", secs, vayu_pas_state(&adsp));
-		if (!keep) {
-			vayu_pas_stop(&adsp, "the steps are over");
+		if (mic_thread_started) {
+			/*
+			 * vayu_mic=1: the codec and the DSP stay up for /dev/hakios-mic, whose thread brings the
+			 * capture's path up and down while iOS records. vayu_audio_keep is implied.
+			 */
+			say("vayu-audio: mic: the DSP and the codec stay up: /dev/hakios-mic is iOS's while this kernel runs "
+			    "(vayu_mic=1 implies vayu_audio_keep=1)\n");
 		} else {
-			say("vayu-audio: the audio DSP stays on (vayu_audio_keep=1)\n");
+			vayu_jack_finish();             /* path off, MCLK off, the codec quiet (vayu_jack.c) */
+			delay_for_interval(secs, NSEC_PER_SEC);
+			say("vayu-audio: after %u s more its \"slave-kernel\" says %#x\n", secs, vayu_pas_state(&adsp));
+			if (!keep) {
+				vayu_pas_stop(&adsp, "the steps are over");
+			} else {
+				say("vayu-audio: the audio DSP stays on (vayu_audio_keep=1)\n");
+			}
 		}
 	}
 	say("vayu-audio: done\n");
@@ -3597,6 +4317,7 @@ audio_thread(void *arg __unused, wait_result_t wr __unused)
 void
 vayu_audio_quiesce(void)
 {
+	vayu_mic_quiesce();                     /* vayu_mic=1: the capture's path down before the DSP is stopped */
 	if (north != 0) {
 		if (amp_bottom.live) {
 			wr(gpio_io(PIN_SDZ_RIGHT), 0);  /* the speaker's amplifier into hardware shutdown, first of all */
@@ -3626,8 +4347,16 @@ vayu_audio_init(void)
 	uint32_t cx = 0, pause = 2200, ear = 0;
 	thread_t thread;
 
+	PE_parse_boot_argn("vayu_mic", &mic_ios, sizeof(mic_ios));
 	if (!PE_parse_boot_argn("vayu_audio", &level, sizeof(level)) || level == 0) {
+		if (mic_ios) {
+			say("vayu-audio: mic: vayu_mic=1 needs vayu_audio>=3 (the DSP) and vayu_jack>=2 (the codec): not done\n");
+		}
 		return;
+	}
+	if (mic_ios && level < 3) {
+		say("vayu-audio: mic: vayu_mic=1 needs vayu_audio>=3 (the DSP) and vayu_jack>=2 (the codec): not done\n");
+		mic_ios = 0;
 	}
 	PE_parse_boot_argn("vayu_audio_i2c", &want_i2c, sizeof(want_i2c));
 	PE_parse_boot_argn("vayu_audio_xnu_tlmm", &xnu_tlmm, sizeof(xnu_tlmm));
@@ -3655,6 +4384,10 @@ vayu_audio_init(void)
 	PE_parse_boot_argn("vayu_pause", &pause, sizeof(pause));
 	vayu_pas_set_pause(pause);
 	say("vayu-audio: vayu_audio=%u vayu_audio_i2c=%u vayu_audio_cx=%u vayu_pause=%u\n", level, want_i2c, cx, pause);
+	if (mic_ios) {
+		say("vayu-audio: mic: vayu_mic=1: /dev/hakios-mic will be made once vayu_jack>=2 has the codec up; "
+		    "it implies vayu_audio_keep=1\n");
+	}
 	if (amp_ear_enabled) {
 		say("vayu-audio: vayu_audio_ear=1: the earpiece's TAS2564 at 0x4d, DVC index %u (%d dB)\n", ear_dvc_index,
 		    2 * (int)ear_dvc_index - 110);
