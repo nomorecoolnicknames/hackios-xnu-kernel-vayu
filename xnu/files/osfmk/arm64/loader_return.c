@@ -491,9 +491,6 @@ loader_return(void)
 	hakios_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
 	vayu_ir_quiesce();              /* the IR blaster's transfer stopped, if one was in flight */
 	vayu_usbnet_quiesce();          /* the USB controller stopped, if vayu_usbnet=2/3 took it from the loader */
-#if defined(GENERIC_PSCI_SMP)
-	printf("loader: the drivers are quiesced (action %d); the firmware is next\n", loader_end_action);
-#endif
 	/*
 	 * A panic's text is first collected in the panic buffer and only later
 	 * flushed to the console; if the console itself is what failed, that
@@ -523,10 +520,17 @@ loader_return(void)
 		bool power_off = loader_end_action == LOADER_END_POWER_OFF;
 		int64_t status;
 
-		printf("\n--- PSCI SYSTEM_%s ---\n", power_off ? "OFF" : "RESET");
+		/* Interrupts are off here: printf() would panic ("Console I/O from interrupt-disabled context"),
+		 * so the loader's own log is written to directly. */
+		loader_log_puts(power_off ? "\n--- PSCI SYSTEM_OFF ---\n" : "\n--- PSCI SYSTEM_RESET ---\n");
 		status = power_off ? psci_system_off() : psci_system_reset();
-		printf("--- PSCI SYSTEM_%s refused (%d): back to the loader ---\n",
-		    power_off ? "OFF" : "RESET", (int)status);
+		{
+			char line[96];
+
+			snprintf(line, sizeof(line), "--- PSCI SYSTEM_%s refused (%d): back to the loader ---\n",
+			    power_off ? "OFF" : "RESET", (int)status);
+			loader_log_puts(line);
+		}
 		loader_end_action = LOADER_END_RETURN;  /* once is enough if the loader is the way out again */
 	}
 #endif /* defined(GENERIC_PSCI_SMP) */
