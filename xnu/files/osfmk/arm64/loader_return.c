@@ -72,6 +72,7 @@ extern void vayu_smmu_quiesce(void);        /* bsd/dev/vayu_pas.c: bypass stream
 extern void vayu_mdp_quiesce(void);
 extern void vayu_haptic_quiesce(void);
 extern void vayu_camera_quiesce(void);
+extern void vayu_venus_quiesce(void);          /* bsd/dev/vayu_venus.c: the video encoder stopped, if M1 started it */
 extern void hakios_camera_quiesce(void);
 extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
@@ -485,6 +486,7 @@ loader_return(void)
 	vayu_mdp_quiesce();             /* the boot framebuffer back on the panel, if vayu_mdp=2 flipped it */
 	vayu_haptic_quiesce();          /* vayu's PM8150B haptics: PLAY off, module off, if anything was written */
 	vayu_camera_quiesce();          /* vayu: a camera sensor this probe powered, off again */
+	vayu_venus_quiesce();           /* vayu: the video encoder's firmware, SMMU context and MM3 vote, if M1 took them */
 	hakios_camera_quiesce();       /* the camera powered down, if it was powered up */
 	hakios_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
 	vayu_ir_quiesce();              /* the IR blaster's transfer stopped, if one was in flight */

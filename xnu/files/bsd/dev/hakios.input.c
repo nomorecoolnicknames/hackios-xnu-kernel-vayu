@@ -17,6 +17,7 @@
 #include <sys/vayu_vsync.h>
 #include <sys/vayu_bt.h>
 #include <sys/vayu_camera.h>
+#include <sys/vayu_venus.h>
 #include <sys/vayu_nfc.h>
 #include <sys/vayu_wled.h>
 #include <sys/vayu_mdp.h>
@@ -275,6 +276,7 @@ hakios_input_init(void)
 	vayu_vsync_init();              /* boot-arg vayu_vsync=1: a read-only look at the display controller's timing engine */
 	vayu_bt_init();                 /* boot-arg vayu_bt=1: a read-only look at the Bluetooth UART (QUP wrapper 2 SE3) */
 	vayu_camera_init();             /* boot-arg vayu_camera=1: a read-only look at the camera clocks, GDSC and sensor pins */
+	vayu_venus_init();              /* boot-arg vayu_venus=1: the video encoder's M1 (power, PAS, HFI SYS_INIT) */
 	vayu_nfc_init();                /* boot-arg vayu_nfc=N: the PN553 NFC controller, steps 1-4 (see bsd/dev/vayu_nfc.c) */
 	vayu_wled_init();               /* boot-arg vayu_wled=1: the backlight looked at; =2: off/on with iOS's display power */
 	vayu_mdp_init();                /* boot-arg vayu_mdp=1: the display controller as UEFI left it, read only */
