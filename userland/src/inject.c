@@ -693,6 +693,12 @@ service_copy_property(__unused void *target, void *refcon, __unused IOHIDService
 #define TOUCH_MODE_OFF          0xff
 static volatile int touch_mode;
 
+/*
+ * Boot-arg touch_report_interval=US (or touch_hz=N): the interval the touch screen tells the event
+ * server it produces samples at, and the flag that asks for the measured sample rate in the log.
+ */
+static int report_interval_us;
+
 /* What the event server tells a service of ours: said once per name, to learn what there is. */
 static Boolean
 service_set_property(__unused void *target, void *refcon, __unused IOHIDServiceClientRef service, CFStringRef key,
@@ -783,6 +789,19 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 	CFDictionarySetValue(properties, CFSTR("ProductID"), zero);
 	if (display) {
 		CFDictionarySetValue(properties, CFSTR("DisplayIntegrated"), kCFBooleanTrue);
+		/*
+		 * The event server asks every service for "ReportInterval" (the logs: "the event server asks
+		 * for property "ReportInterval", which we do not have"); without it IOHIDService keeps
+		 * reportInterval 0 and batchInterval 1, i.e. "the device never said how fast it is". Saying it
+		 * lets the server's delivery timer and the clients that care about the digitizer's cadence
+		 * expect the rate we really produce (boot-arg touch_report_interval=US, or touch_hz=N).
+		 */
+		if (report_interval_us > 0) {
+			CFNumberRef interval = number(report_interval_us);
+
+			CFDictionarySetValue(properties, CFSTR("ReportInterval"), interval);
+			CFRelease(interval);
+		}
 	}
 	/* the dictionary stays: it is what service_copy_property() answers from */
 	made->properties = properties;
@@ -915,7 +934,21 @@ input_thread(__unused void *arg)
 		size_t size = sizeof(arguments) - 1;
 
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+			const char *rate = strstr(arguments, "touch_report_interval=");
+
 			touch_latency = strstr(arguments, "touch_lat=1") != NULL;
+			if (rate != NULL) {
+				report_interval_us = (int)strtoul(rate + strlen("touch_report_interval="), NULL, 0);
+			} else if ((rate = strstr(arguments, "touch_hz=")) != NULL) {
+				unsigned long hz = strtoul(rate + strlen("touch_hz="), NULL, 0);
+
+				if (hz >= 30 && hz <= 2000) {
+					report_interval_us = (int)(1000000 / hz);
+				}
+			}
+			if (report_interval_us < 0 || report_interval_us > 100000) {
+				report_interval_us = 0;
+			}
 		}
 		mach_timebase_info(&timebase);
 	}
@@ -942,13 +975,43 @@ input_thread(__unused void *arg)
 		buttons = make_service(client, "HakiOS buttons", HID_PAGE_CONSUMER, HID_USAGE_CONSUMER_CONTROL, false);
 	}
 	say("hakios: input: touch screen service %p, buttons %p\n", (void *)screen, (void *)buttons);
+	if (report_interval_us > 0) {
+		say("hakios: input: ReportInterval %d us told to the event server\n", report_interval_us);
+	}
 	dispatch_semaphore_signal(input_services_made); /* see wait_for_als_arrival() */
 	if (screen == NULL) {
 		return NULL;
 	}
 
+	uint64_t rate_start_us = 0, last_us = 0, worst_gap_us = 0;
+	unsigned rate_count = 0;
+
 	while (read(device, &t, sizeof(t)) == (ssize_t)sizeof(t)) {
-		uint64_t read_at = mach_absolute_time();
+		uint64_t read_at = mach_absolute_time(), now_us = micros(read_at);
+
+		/*
+		 * Boot-arg touch_report_interval= (or touch_hz=) also asks for the measured rate: what the
+		 * kernel posted per second and the longest gap between two samples, i.e. the size of the
+		 * stutter a scroll can show. 1200 samples is about 5 s at 240 Hz.
+		 */
+		if (report_interval_us > 0) {
+			if (last_us != 0 && now_us - last_us > worst_gap_us) {
+				worst_gap_us = now_us - last_us;
+			}
+			last_us = now_us;
+			if (rate_start_us == 0) {
+				rate_start_us = now_us;
+			}
+			if (++rate_count >= 1200) {
+				double span_ms = (double)(now_us - rate_start_us) / 1000.0;
+
+				say("hakios: input: %u samples in %.0f ms (%.0f a second, the longest gap %.1f ms)\n", rate_count,
+				    span_ms, span_ms > 0 ? rate_count * 1000.0 / span_ms : 0.0, (double)worst_gap_us / 1000.0);
+				rate_count = 0;
+				rate_start_us = now_us;
+				worst_gap_us = 0;
+			}
+		}
 
 		if (count++ < 4) {
 			say("hakios: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
