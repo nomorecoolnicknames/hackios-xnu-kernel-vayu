@@ -12,16 +12,11 @@
 /redwood/bin/cpu_test 240 &
 # where iOS sends its sound, once SpringBoard is up
 /redwood/bin/sound_test springboard route &
-# nfcd for the NFC bridge (vayu_nfc_ios=2). FIRST, not last: the old line sat after music_import
-# --wait 60, media_import --wait 75 and sleep 120, and no boot in 215010-run.log lived long enough
-# to reach it (no nfcd process appears in the whole log). /bin/launchctl is iOS's own; the
-# prefix's /var/jb/bin/launchctl is the fallback of the old line.
-/bin/launchctl kickstart -p system/com.apple.nfcd
-# a tester's song into the Music library: 5 s, not 60 -- and in the foreground, so the repair
-# below runs after the row is in, not beside it
-/redwood/bin/music_import --wait 5 /redwood/share/music/Тёмный_принц-Отвратительный_король.mp3 RDWD.mp3
-/redwood/bin/music_import --repair RDWD.mp3
-/redwood/bin/music_import --ml3 RDWD.mp3
+# a tester's song into the Music library: 5 s, not 60. In the BACKGROUND: music_import goes on watching
+# the library at +60, +180 and +420 s, and a foreground run held every later line back 7 minutes
+# (TEST4: media_import, ssh and the Files steps never started). The repair and the ML3 look are
+# near the end of this file, long after the row is in.
+/redwood/bin/music_import --wait 5 /redwood/share/music/Тёмный_принц-Отвратительный_король.mp3 RDWD.mp3 &
 # ... and into the Files app (On My iPhone) with its cover, and the cover into Photos
 /redwood/bin/media_import --wait 5 --files /redwood/share/music/Тёмный_принц-Отвратительный_король.mp3 /redwood/share/music/Отвратительный_король.jpg --photos /redwood/share/music/Отвратительный_король.jpg &
 # USB networking (USB networking; kernel vayu_usbnet=3 usb_handover=1 usbnet_delay=60, en2 by ~+62 s): OpenSSH from the prefix
@@ -39,6 +34,9 @@
 /redwood/bin/run_migrator 00LaunchServicesMigrator SystemAppMigrator MediaLibrary
 /redwood/bin/ls_rebuild --check
 /var/jb/bin/sh /var/jb/prep.sh
+# nfcd for the NFC bridge (vayu_nfc_ios=2), once the prefix is there. TEST4 FACT: /bin/launchctl does not
+# exist on this system image ("/bin/launchctl: No such file or directory", exit 127), so the first kickstart never ran.
+/var/jb/bin/launchctl kickstart -p system/com.apple.nfcd
 # Files' On My iPhone: the directories fileproviderd needs, the app groups, and the enable the toggle asks for
 /var/jb/bin/sh /redwood/etc/fp-dirs.sh
 /redwood/bin/fp_enable --trace
@@ -47,6 +45,9 @@
 /var/jb/bin/sh /redwood/etc/fp-log.sh
 # GPU-B: LS has the LocalStorage plug-in but NSExtension (pkd) does not find it: what pkd finds per extension point
 /redwood/bin/ls_rebuild --check
+# the song's sort data and the ML3 look, long after its import
+/redwood/bin/music_import --repair RDWD.mp3
+/redwood/bin/music_import --ml3 RDWD.mp3
 # what nfcd made of the bridge: after the INIT the hwspoof line must be in the kernel log
 /var/jb/bin/sleep 5
-/bin/launchctl print system/com.apple.nfcd
+/var/jb/bin/launchctl print system/com.apple.nfcd
