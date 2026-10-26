@@ -746,6 +746,15 @@ MiniAppleStockholmStart(void)
 	/* the services exist only when asked for; every other boot stays without them */
 	if (!PE_parse_boot_argn("vayu_nfc_ios", &gIosLevel, sizeof(gIosLevel)) || gIosLevel == 0) return;
 	(void)PE_parse_boot_argn("vayu_nfc_hwspoof", &gHwSpoof, sizeof(gHwSpoof));
+	/*
+	 * Say it here and not only when a packet is rewritten: a test run had vayu_nfc_hwspoof=1 in the
+	 * command line and not a single line about it, because nfcd never started and no CORE_INIT_RSP
+	 * ever crossed the bridge (the kernel's own probe at vayu_nfc.c is a different path). This line
+	 * makes the next log answer "was the option seen?" before the answer "was a byte rewritten?".
+	 */
+	if (gHwSpoof != 0) {
+		stockholmLog("MiniAppleStockholm: hwspoof: on (CORE_INIT_RSP hardware byte 0x41 -> 0x42 for nfcd)\n");
+	}
 	resources = IOService::getResourceService();
 	if (resources == NULL) return;
 	/* IOService:/IOResources/AppleStockholmControl and .../AppleStockholmSPMI */
