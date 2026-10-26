@@ -95,3 +95,4 @@ __pycache__/
 /xnuloader/identity.h
 !/xnuloader/im4p.py
 !/xnuloader/mkidentity.sh
+/fw-*/

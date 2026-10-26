@@ -84,6 +84,7 @@ CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protec
 LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
 DYN="xnu-clang -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1"
 IOS=../sysimage
+DEVICE=${DEVICE:-poco-x5-pro}       # the phone: devices/$DEVICE/ (see the hooks below)
 CACHE=$IOS/20F66__iPhone10,3_6
 # sysimage/rootfs and sysimage/cryptex must be this copy's own directories of hard links, the way
 # tools/new-workspace.sh makes them. A symlink to another copy's tree makes sysroot a symlink too, because
@@ -278,6 +279,14 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			# it, and it is copied in when it is there.
 			[ -f $M/air_run ] && cp $M/air_run obj/air_run
 		fi
+		# a phone with programs of its own: devices/<name>/userland/build.sh builds them into obj/ and names
+		# them in DEVICE_BIN (programs for /redwood/bin), DEVICE_LIB (libraries for /redwood/lib) and DEVICE_APPS
+		# (application bundles in obj/ for /Applications); it may add to INJECT. DEVICE defaults to poco-x5-pro,
+		# which has none.
+		DEVICE_BIN= DEVICE_LIB= DEVICE_APPS=
+		if [ -f ../devices/$DEVICE/userland/build.sh ]; then
+			. ../devices/$DEVICE/userland/build.sh
+		fi
 	fi
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
@@ -299,6 +308,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/camera_test ] && cp obj/camera_test root/bin/
 	[ -f obj/camera_avtest ] && cp obj/camera_avtest root/bin/
 	[ -f obj/record_test ] && cp obj/record_test root/bin/
+	for f in $DEVICE_BIN; do [ -f obj/$f ] && cp obj/$f root/bin/; done      # (devices/$DEVICE/userland/build.sh)
 	for f in $EXTRA; do cp "$f" root/bin/; done
 	# /dev and /private/var exist so that this image can also be the root on its own:
 	# devfs is mounted on /dev, and init puts a ramfs on /private/var
@@ -310,6 +320,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.fairplay.dylib ] && cp obj/libhakios.fairplay.dylib root/lib/
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
+	for f in $DEVICE_LIB; do [ -f obj/$f ] && cp obj/$f root/lib/; done
 	if [ -f obj/HakiosAudio ]; then
 		mkdir -p root/lib/HakiosAudio.driver
 		cp obj/HakiosAudio root/lib/HakiosAudio.driver/
@@ -389,6 +400,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
+fi
+# a phone whose firmware devices/<name>/pull-firmware.sh left in ../fw-<name>/: the files go to fw/ as they are
+if [ -d ../fw-$DEVICE ]; then
+	mkdir -p root/fw
+	cp -a ../fw-$DEVICE/. root/fw/
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
 # (it is the vendor's and never in the repository): the kernel's GPU bring-up, bsd/dev/hakios.adreno.c, finds it in fw/
@@ -613,6 +629,9 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# the package manager's prefix, when tools/mk-jb.sh has fetched one: the Procursus bootstrap with
 	# Sileo in it, as /jb. It cannot live at /var/jb in the image -- /private/var is a memory
 	# filesystem made afresh at every boot -- so init copies it there (src/init.c, copy_tree).
+	for app in $DEVICE_APPS; do
+		[ -d obj/$app ] && cp -a obj/$app sysroot/Applications/
+	done
 	if [ -d ../jb/root/var/jb ]; then
 		rm -rf sysroot/jb
 		cp -a ../jb/root/var/jb sysroot/jb
