@@ -1123,12 +1123,25 @@ afe_port_start_slimbus_rx(void)
 		               .data_format = 0, .num_channels = 2, .shared_ch = { 146, 147 }, .sample_rate = RATE };
 	uint16_t start[2] = { JACK_AFE_PORT, 0 };
 	uint32_t slave = 0;
+	uint32_t order = 0;
 
 	if (jack_port_on) {                     /* (a stop that failed left it running; only the path is down) */
 		return vayu_jack_path_on();
 	}
 	crumb("4: the port 0x400c: SLIMbus configuration, start (AFE)");
 	PE_parse_boot_argn("vayu_jack_afe_slave", &slave, sizeof(slave));
+	PE_parse_boot_argn("vayu_jack_order", &order, sizeof(order));
+	/*
+	 * vayu_jack_order=1 (task H, a test): the codec's path first, the data source after it. On Android the DAPM
+	 * power-up -- and the vendor's wcd9xxx_cfg_slim_sch_rx() inside it, which connects and activates the SLIM
+	 * channels -- completes before the PCM trigger starts the AFE port, so data never enters a port whose RX path
+	 * is not clocked yet. Here the port is started first (combo3k log: 0x400c at 285.222, the codec's path
+	 * 285.226-285.499) and the port FIFOs overflow in that window. If that latched the overflow, this order fixes it.
+	 */
+	if (order != 0 && !vayu_jack_path_on()) {
+		say("vayu-audio: 4: vayu_jack_order=1: the codec's path did not come up; the port 0x400c is not started\n");
+		return false;
+	}
 	if (slave != 0) {
 		struct afe_slave_cfg cfg = { 1, 0x02500100, 0x00000217, 0, 16 };
 
@@ -1140,13 +1153,19 @@ afe_port_start_slimbus_rx(void)
 	}
 	if (!afe_port_param("the port 0x400c: SLIMbus, 2 channels 146/147, 16 bits, 48 kHz", JACK_AFE_PORT,
 	    AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &slim, sizeof(slim))) {
+		if (order != 0) {
+			vayu_jack_path_off();
+		}
 		return false;
 	}
 	if (!command("the port 0x400c, started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0)) {
+		if (order != 0) {
+			vayu_jack_path_off();
+		}
 		return false;
 	}
 	jack_port_on = true;
-	if (!vayu_jack_path_on()) {
+	if (order == 0 && !vayu_jack_path_on()) {
 		command("the port 0x400c, stopped (the jack's path did not come up)", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP,
 		    start, sizeof(start), 0);
 		jack_port_on = false;

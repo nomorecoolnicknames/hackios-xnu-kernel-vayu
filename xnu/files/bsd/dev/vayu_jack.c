@@ -527,6 +527,40 @@ static struct {
 } jack_rx[JACK_RX_MESSAGES];
 static unsigned jack_rx_head, jack_rx_tail;
 
+/*
+ * Task H's test switches. All default to 0: a plain vayu_jack=2 run does exactly what it did before.
+ *   vayu_jack_native=1  the vendor's "native" RX clock domain (tavil_enable_native_supply, wcd934x.c:3494-3545):
+ *                       PLL 0x070e bit0, MCLK2 0x0712 bits 2:0, RPM gate 0x0002 bit2, 0x0d41 bit1, 0x0d42 bit4.
+ *                       Neither mainline's wcd934x nor our J9 writes any of them; the vendor has six RX-only
+ *                       "RX INTn NATIVE SUPPLY" widgets and no TX equivalent (wcd934x.c:8264-8281).
+ *   vayu_jack_rearm=N  1: after P9 disable, clear and re-enable the two RX ports (0x42/0x43 bit0);
+ *                       2: also pulse the RX1/RX2 path reset (0x0b55/0x0b69 bit6), then clock and rate back.
+ *   vayu_jack_hub=N      DATA_HUB_RX2_CFG 0x0053 / DATA_HUB_RX3_CFG 0x0054, mask 0x03: N=1 -> 0x00 (the SLIMbus
+ *                       side, which is what Android runs: the vendor only writes these two in its I2C defaults,
+ *                       wcd934x.c:9653-9667 + 9680-9688), N=2 -> 0x01 (the I2C side). Both read first and log.
+ *   vayu_jack_clsh3=1   the LOHIFI class-H in full (los/wcd-clsh.c:338-368) and without the K1/CLSH_EN writes
+ *                       path_p6() adds, which that function does not have; instead of path_p6()'s partial one.
+ *   vayu_jack_pa20=1    the vendor's PA settle: 20 ms, not 7, while the compander is off (wcd934x.c:2439-2442;
+ *                       a 1.1 chip with COMPANDER_1 disabled -> usleep_range(20000, 20100)). Analog only.
+ *   vayu_jack_msgdump=1 log the exact bytes of every SLIMbus user message, so CONNECT_SINK / DEF_ACT_CHAN /
+ *                       RECONFIG_NOW can be compared with slim-msm-ngd.c:1128-1160 without a bus capture.
+ * NOT here on purpose: HD2 (0x0b60/0x0b74 0x3c<-0x14, 0x0b56/0x0b6a bit2). Mainline does it (wcd934x.c:4176-4212),
+ * but the vendor returns early for a 1.1 chip (wcd934x.c:3588-3592) and vayu's codec is a 1.1 (J7 chip id x1),
+ * so enabling it would be a deviation from the one driver that actually plays audio on this phone.
+ */
+static uint32_t rx_native, rx_rearm, rx_hub, rx_clsh3, rx_pa20, rx_msgdump;
+
+static void
+rx_flags(void)
+{
+	PE_parse_boot_argn("vayu_jack_native", &rx_native, sizeof(rx_native));
+	PE_parse_boot_argn("vayu_jack_rearm", &rx_rearm, sizeof(rx_rearm));
+	PE_parse_boot_argn("vayu_jack_hub", &rx_hub, sizeof(rx_hub));
+	PE_parse_boot_argn("vayu_jack_clsh3", &rx_clsh3, sizeof(rx_clsh3));
+	PE_parse_boot_argn("vayu_jack_pa20", &rx_pa20, sizeof(rx_pa20));
+	PE_parse_boot_argn("vayu_jack_msgdump", &rx_msgdump, sizeof(rx_msgdump));
+}
+
 static void
 rx_push(const uint32_t *words, uint32_t length, uint32_t count)
 {
@@ -1161,6 +1195,15 @@ user_msg(uint8_t *bytes, uint32_t length, unsigned tid_index) __unused
 	lck_mtx_lock(&jack_ngd_lock);
 	tid = next_tid();
 	bytes[tid_index] = tid;
+	if (rx_msgdump) {
+		char line[200];
+		int at = 0;
+
+		for (unsigned i = 0; i < length && at < (int)sizeof(line) - 5; i++) {
+			at += snprintf(line + at, sizeof(line) - (size_t)at, " %02x", bytes[i]);
+		}
+		say("vayu-jack: msg dump:%s (TID byte %u)\n", line, tid_index);
+	}
 	error = tx_send(wcd_step, bytes, length);
 	if (error == 0) {
 		began = now_ms();
@@ -2010,6 +2053,7 @@ static bool
 path_p1(void)
 {
 	PE_parse_boot_argn("vayu_jack_rxpath", &rx_main_path, sizeof(rx_main_path));
+	rx_flags();
 	if (rx_main_path) {
 		/*
 		 * The test path: RX2/RX3 into the interpolators' MAIN inputs (RX INT1_1 MIX1 INP0 = RX2, RX INT2_1 MIX1 INP0
@@ -2061,6 +2105,26 @@ path_p3(void)
 {
 	uint8_t connect[7] = { 0x47, 0x2d, 0xff, 0, 0x12, 0x92, 0 };       /* L 7, MT 2, MC 0x2D */
 
+	/*
+	 * vayu_jack_hub=N (a test): DATA_HUB_RX2_CFG 0x0053 / DATA_HUB_RX3_CFG 0x0054, the mux that picks what feeds
+	 * the RX2/RX3 paths. Nothing in our sequence writes them. The vendor writes 0x03 <- 0x01 for RX2/RX3 only in its
+	 * I2C defaults (wcd934x.c:9653-9667) and applies that table only when intf_type == I2C (wcd934x.c:9680-9688);
+	 * on SLIMbus it never touches these two registers. N=1 forces the field to 0 (the SLIMbus side; a no-op unless
+	 * something left it dirty), N=2 forces 0x01 (the I2C side). Both log the readback.
+	 */
+	if (rx_hub) {
+		uint8_t hub2 = 0xff, hub3 = 0xff;
+		uint8_t want = rx_hub == 1 ? 0x00 : 0x01;
+
+		if (!wcd_read_raw(0x0053, &hub2) || !wcd_read_raw(0x0054, &hub3)) {
+			return path_fail(3, "the data hub RX2/RX3 config (0x0053/0x0054) cannot be read");
+		}
+		if (!path_write(3, 0x0053, 0x03, want) || !path_write(3, 0x0054, 0x03, want)) {
+			return false;
+		}
+		say("vayu-jack: P3: TEST: data hub 0x0053 %02x -> %02x, 0x0054 %02x -> %02x (vayu_jack_hub=%u)\n",
+		    hub2, want, hub3, want, rx_hub);
+	}
 	if (!path_ifd_write(3, 0x0188, 0x0c) || !path_ifd_write(3, 0x0042, 0x05)) {
 		return false;
 	}
@@ -2109,6 +2173,29 @@ path_p4(void)
 static bool
 path_p5(void)
 {
+	/*
+	 * vayu_jack_native=1 (a test): the vendor's "native" RX clock domain, the one block an Android run has and
+	 * ours has not. tavil_enable_native_supply() runs on the RX (and only the RX) path and does exactly these
+	 * writes in this order (wcd934x.c:3494-3545): PLL enable, 100-120 us, MCLK2 programme, RPM gate bit2 off,
+	 * 30-50 us, then 0x0d41 bit1 and 0x0d42 bit4. Our J9 only does 0x0d41 bit0 and 0x0d42 bit0 (mainline's two
+	 * bits), so if the SLIM "_2" interpolator input is clocked from this domain the interpolator never asks the
+	 * port for data and the port overflows for ever while every register we print reads "on".
+	 */
+	if (rx_native) {
+		if (!path_write(5, 0x070E, 0x01, 0x01)) {
+			return false;
+		}
+		spin_us(110);
+		if (!path_write(5, 0x0712, 0x06, 0x02) || !path_write(5, 0x0712, 0x01, 0x01) ||
+		    !path_write(5, 0x0002, 0x04, 0x00)) {
+			return false;
+		}
+		spin_us(40);
+		if (!path_write(5, 0x0D41, 0x02, 0x02) || !path_write(5, 0x0D42, 0x10, 0x10)) {
+			return false;
+		}
+		say("vayu-jack: P5: TEST: native RX clock on (0x070e bit0, 0x0712 bits 2:0, 0x0002 bit2 off, 0x0d41 bit1, 0x0d42 bit4)\n");
+	}
 	if (!path_write(5, 0x0B55, 0x10, 0x10) || !path_write(5, 0x0B55, 0x20, 0x20) ||
 	    !path_write(5, 0x0C0F, 0x01, 0x00) || !path_write(5, 0x0D8B, 0x80, 0x80) ||
 	    (!rx_main_path && !path_write(5, 0x0B5A, 0x20, 0x20)) ||
@@ -2146,6 +2233,61 @@ path_p6(void)
 		return false;
 	}
 	say("vayu-jack: P6: class-H HPHL from IDLE, LOHIFI (0x0609 m0c v04)\n");
+	return true;
+}
+
+/*
+ * P6-B (vayu_jack_clsh3=1): the LOHIFI class-H in full, and without the K1/CLSH_EN writes our P6 adds
+ * (0x0c01 block enable, K1 0x0c08/0x0c09, CLSH_EN 0x0b56 bit6). FACT: the vendor's own headphone class-H,
+ * wcd_clsh_state_hph_l() at los/wcd-clsh.c:338-368, contains no K1 and no CLSH_EN at all (grep: zero hits in
+ * that file), and its helper order is this one: set_buck_regulator_mode, set_flyback_mode, force_iq_ctl
+ * (+100 us), flyback_ctrl (+100 us), set_flyback_current, set_buck_mode, buck_ctrl (+500 us), set_hph_mode.
+ * Mainline's v3 does the same thing (mainline sound_soc_codecs_wcd-clsh-v2.c:626-655 with 147-477); the K1 and
+ * CLSH_EN writes are mainline's *v2* function (:658-714), which neither the vendor nor mainline's wcd934x path
+ * calls. The writes and the two waits our P6 does not have are marked TEST.
+ */
+static bool
+path_p6b(void)
+{
+	if (!path_write(6, 0x0608, 0x02, 0x00) || !path_write(6, 0x0608, 0x04, 0x04) ||
+	    !path_write(6, 0x06A8, 0xf0, 0x80)) {                 /* buck regulator mode, flyback mode, VNEG_CTRL_4 */
+		return false;
+	}
+	if (!path_write(6, 0x06AF, 0xe0, 0xa0)) {                  /* TEST: force_iq, VNEGDAC_CTRL_2 <- 0xA0 */
+		return false;
+	}
+	spin_us(110);                                             /* 100-110 us */
+	if (!path_write(6, 0x0699, 0x02, 0x02) || !path_write(6, 0x0698, 0xff, 0x1c)) {  /* TEST: CLASSH_MODE_3/2 */
+		return false;
+	}
+	if (!path_write(6, 0x0738, 0x20, 0x20) || !path_write(6, 0x06BF, 0xf0, 0xc0) ||
+	    !path_write(6, 0x06D1, 0x0e, 0x02)) {                  /* LOHIFI: PA_MISC2, HPH LOWPOWER, PA_CTL1 */
+		return false;
+	}
+	if (!path_write(6, 0x06A5, 0xe0, 0xe0) || !path_write(6, 0x0608, 0x40, 0x40)) {  /* TEST: VNEG_CTRL_1, VNEG_EN */
+		return false;
+	}
+	spin_us(110);
+	if (!path_write(6, 0x06AF, 0xe0, 0xe0)) {                  /* TEST: VNEGDAC_CTRL_2 <- 0xE0 */
+		return false;
+	}
+	spin_us(550);
+	if (!path_write(6, 0x06C7, 0x0f, 0x0a) || !path_write(6, 0x06C7, 0xf0, 0xa0)) {  /* TEST: flyback current */
+		return false;
+	}
+	spin_us(110);
+	if (!path_write(6, 0x0608, 0x08, 0x08) || !path_write(6, 0x0608, 0x80, 0x80)) {  /* buck HIFI, VPOS_EN */
+		return false;
+	}
+	spin_us(550);
+	if (!path_write(6, 0x0699, 0x02, 0x00) || !path_write(6, 0x0698, 0xff, 0x3a)) {  /* TEST: CLASSH_MODE_3/2 */
+		return false;
+	}
+	spin_us(550);
+	if (!path_write(6, 0x0609, 0x0c, 0x04)) {                  /* LOHIFI */
+		return false;
+	}
+	say("vayu-jack: P6-B: TEST: vendor v3 class-H LOHIFI in full (0x0698/0x0699/0x06a5/0x06af/0x06c7), no v2 K1/CLSH_EN\n");
 	return true;
 }
 
@@ -2195,15 +2337,17 @@ path_p8(void)
 static bool
 path_p9(void)
 {
+	unsigned settle = rx_pa20 ? 20 : 7;
+
 	if (!path_write(9, 0x06B6, 0x0f, 0x0f) || !path_write(9, 0x06CE, 0x10, 0x00) ||
 	    !path_write(9, 0x0609, 0x80, 0x80)) {
 		return false;
 	}
-	delay_for_interval(7, NSEC_PER_MSEC);
+	delay_for_interval(settle, NSEC_PER_MSEC);
 	if (!path_write(9, 0x0609, 0x40, 0x40)) {
 		return false;
 	}
-	delay_for_interval(7, NSEC_PER_MSEC);
+	delay_for_interval(settle, NSEC_PER_MSEC);
 	if (!path_write(9, 0x06D4, 0x01, 0x01) || !path_write(9, 0x06D7, 0x01, 0x01) ||
 	    !path_write(9, 0x06CC, 0x80, 0x80) || !path_write(9, 0x073A, 0x02, 0x02) ||
 	    !path_write(9, 0x0B55, 0x10, 0x00) || !path_write(9, 0x0B5A, 0x10, 0x00) ||
@@ -2211,7 +2355,74 @@ path_p9(void)
 	    !path_write(9, 0x06CE, 0x10, 0x10) || !path_write(9, 0x06B6, 0x0f, 0x02)) {
 		return false;
 	}
-	say("vayu-jack: P9: PAs on: OCP off, 7 ms settles, unmuted, OCP on (0x0609 should read 0xf4)\n");
+	say("vayu-jack: P9: PAs on: OCP off, %u ms settles, unmuted, OCP on (0x0609 should read 0xf4)\n", settle);
+	return true;
+}
+
+/*
+ * What a port's interrupt-source byte says: bit0 overflow, bit1 underflow, bit2 port closed (wcd934x.c:102-104,
+ * 9765-9795). The status bit in 0x34/0x35 only says "something happened on this port"; this byte says what.
+ */
+static const char *
+port_source_text(uint8_t value)
+{
+	if (value == 0xff) {
+		return "?";
+	}
+	if ((value & 0x07) == 0x00) {
+		return "-";
+	}
+	if (value & 0x04) {
+		return "PORT_CLOSED";
+	}
+	if ((value & 0x03) == 0x03) {
+		return "OVERFLOW+UNDERFLOW";
+	}
+	return (value & 0x01) ? "OVERFLOW" : "UNDERFLOW";
+}
+
+/*
+ * P9-B (vayu_jack_rearm=N): the ports are enabled and the channels activated several ms before the interpolator
+ * clocks come on (the AFE port itself starts ~60 ms earlier, the combo3k log), so the port FIFOs fill in that
+ * window. Toggle the port enable, clear the latched status and look again: if only the bring-up window overflowed,
+ * the ports drain now; if the overflow is back 2 ms later, the consumer itself is not running.
+ * Each helper (path_ifd_write/path_write/ifd_read) takes jack_ngd_lock itself.
+ */
+static bool
+path_p9b(void)
+{
+	uint8_t status = 0xff, source0 = 0xff, source1 = 0xff;
+	uint8_t bits = (uint8_t)(1u << (18 - 16) | 1u << (19 - 16));
+
+	if (rx_rearm == 0) {
+		return true;
+	}
+	if (!path_ifd_write(9, (uint16_t)(0x30 + 18), 0x04) ||
+	    !path_ifd_write(9, (uint16_t)(0x30 + 19), 0x04) || !path_ifd_write(9, 0x0038, bits)) {
+		return false;
+	}
+	if (rx_rearm >= 2) {
+		/* the mainline power-down reset pulse (0x0b55/0x0b69 bit6), then clock, mute and rate back (wcd934x.c:4330-4340) */
+		if (!path_write(9, 0x0B55, 0x40, 0x40) || !path_write(9, 0x0B69, 0x40, 0x40)) {
+			return false;
+		}
+		spin_us(5);
+		if (!path_write(9, 0x0B55, 0x40, 0x00) || !path_write(9, 0x0B69, 0x40, 0x00) ||
+		    !path_write(9, 0x0B55, 0x30, 0x30) || !path_write(9, 0x0B69, 0x30, 0x30) ||
+		    !path_write(9, 0x0B55, 0x0f, 0x04) || !path_write(9, 0x0B69, 0x0f, 0x04)) {
+			return false;
+		}
+	}
+	if (!path_ifd_write(9, (uint16_t)(0x30 + 18), 0x05) ||
+	    !path_ifd_write(9, (uint16_t)(0x30 + 19), 0x05)) {
+		return false;
+	}
+	delay_for_interval(2, NSEC_PER_MSEC);
+	if (!ifd_read(0x0034, &status) || !ifd_read(0x0062, &source0) || !ifd_read(0x0063, &source1)) {
+		return path_fail(9, "the port status after the re-arm cannot be read");
+	}
+	say("vayu-jack: P9-B: re-armed (vayu_jack_rearm=%u): ifd 0x34=%02x 0x62=%02x 0x63=%02x (%s/%s)\n", rx_rearm,
+	    status, source0, source1, port_source_text(source0), port_source_text(source1));
 	return true;
 }
 
@@ -2250,8 +2461,9 @@ proof_read_locked(const char *where)
 			ok = false;
 		}
 	}
-	say("vayu-jack: %s: ifd 0x34=%02x 0x35=%02x 0x62=%02x 0x63=%02x 0x188=%02x 0x18C=%02x 0x42=%02x 0x43=%02x\n",
-	    where, ports[0], ports[1], ports[2], ports[3], ports[4], ports[5], ports[6], ports[7]);
+	say("vayu-jack: %s: ifd 0x34=%02x 0x35=%02x 0x62=%02x 0x63=%02x 0x188=%02x 0x18C=%02x 0x42=%02x 0x43=%02x %s/%s\n",
+	    where, ports[0], ports[1], ports[2], ports[3], ports[4], ports[5], ports[6], ports[7],
+	    port_source_text(ports[2]), port_source_text(ports[3]));
 	return ok;
 }
 
@@ -2338,8 +2550,9 @@ vayu_jack_path_on(void)
 	}
 	wcd_step = 10;
 
-	if (!path_p1() || !path_p2() || !path_p3() || !path_p4() || !path_p5() || !path_p6() || !path_p7() ||
-	    !path_p8() || !path_p9() || !path_p10() || !path_p11()) {
+	if (!path_p1() || !path_p2() || !path_p3() || !path_p4() || !path_p5() ||
+	    !(rx_clsh3 ? path_p6b() : path_p6()) || !path_p7() || !path_p8() || !path_p9() || !path_p9b() ||
+	    !path_p10() || !path_p11()) {
 		vayu_jack_path_off();
 		return false;
 	}
