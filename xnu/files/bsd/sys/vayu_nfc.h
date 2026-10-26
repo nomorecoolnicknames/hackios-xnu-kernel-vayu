@@ -1,10 +1,11 @@
 /*
- * NFC on the POCO X3 Pro (vayu, SM8150): the one entry point of bsd/dev/vayu_nfc.c.
+ * NFC on the POCO X3 Pro (vayu, SM8150): the entry points of bsd/dev/vayu_nfc.c.
  *
  * That file looks at the phone's NFC controller, a NXP PN553 at I2C address 0x28 on
  * i2c@a84000 (QUP serial engine 9), and -- behind this port's TLMM exception -- talks NCI
  * to it over two bit-banged pins. Nothing here runs unless boot-arg vayu_nfc=N asks for
- * it; step 1 is read-only, steps 2-4 need vayu_nfc_xnu_tlmm=1.
+ * it; step 1 is read-only, steps 2-4 need vayu_nfc_xnu_tlmm=1. The nfcd bridge
+ * (vayu_nfc_ios >= 2) is a second user of the same bus.
  *
  * The facts, with their sources:
  *
@@ -36,10 +37,28 @@
 #ifndef _SYS_VAYU_NFC_H_
 #define _SYS_VAYU_NFC_H_
 
+#include <stdint.h>
+#include <sys/cdefs.h>
+
+__BEGIN_DECLS
+
 /*
  * The NFC probe and, with vayu_nfc_xnu_tlmm=1, steps 2-4: one kernel thread that prints
  * what it finds and returns. It leaves every pin as it found it.
  */
 extern void vayu_nfc_init(void);
+
+/*
+ * The nfcd bridge (boot-arg vayu_nfc_ios >= 2): the PN553's raw NCI packets go to the
+ * callback, and nfcd's packets are written to the chip. start returns 0 or EBUSY, ENODEV,
+ * EPERM; send returns 0 or EIO. stop is safe when no bridge runs.
+ */
+typedef void (*vayu_nfc_rx_fn)(const uint8_t *packet, unsigned length);
+
+extern int vayu_nfc_bridge_start(vayu_nfc_rx_fn rx);
+extern int vayu_nfc_bridge_send(const uint8_t *packet, unsigned length);
+extern void vayu_nfc_bridge_stop(void);
+
+__END_DECLS
 
 #endif /* _SYS_VAYU_NFC_H_ */

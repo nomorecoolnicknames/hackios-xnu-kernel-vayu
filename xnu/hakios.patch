@@ -1829,10 +1829,10 @@ index 5219fb0d9ed6..29978e9cff43 100644
  		}
  	}
 diff --git a/iokit/conf/files b/iokit/conf/files
-index 5fb0a52062e0..c07be8d9e0b0 100644
+index 5fb0a52062e0..0ffbe273ab75 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,14 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,15 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
@@ -1844,6 +1844,7 @@ index 5fb0a52062e0..c07be8d9e0b0 100644
 +iokit/Kernel/hakios.battery.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
 +iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
++iokit/Kernel/MiniAppleStockholm.cpp			optional iokitcpp
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
  
  iokit/Kernel/IOCPU.cpp					optional iokitcpp

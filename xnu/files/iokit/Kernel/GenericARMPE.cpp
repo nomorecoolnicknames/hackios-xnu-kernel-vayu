@@ -303,6 +303,7 @@ GenericARMPE::start(IOService * provider)
 	MiniIOMobileFramebufferStart(this);
 	MiniAppleKeyStoreStart();
 	MiniIONetworkStackStart();
+	MiniAppleStockholmStart();      /* boot-arg vayu_nfc_ios=1 only */
 	return true;
 }
 

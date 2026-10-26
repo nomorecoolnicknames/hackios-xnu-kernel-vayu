@@ -51,6 +51,8 @@
  *   vayu_nfc_tech=MASK     bit 0 NFC-A, bit 1 NFC-B, bit 2 NFC-F, bit 3 NFC-V (ISO15693);
  *                          default 0x7.
  *   vayu_nfc_pause=MS      sleep before step 1, time for the loader's log (default 2000).
+ *   vayu_nfc_ios=N         iOS side (MiniAppleStockholm): N >= 2 starts the nfcd bridge on this
+ *                          bus; N = 1 keeps the log-only stand-in. The probe need not be asked for.
  *
  * What each step does:
  *   1  reads pins 39, 40, 47, 48 and 102 into the loader's log and prints a verdict: VEN on,
@@ -72,11 +74,13 @@
 
 #include <machine/machine_routines.h>
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <stdbool.h>
+#include <sys/errno.h>
 #include <sys/systm.h>
 #include <sys/vayu_nfc.h>
 
@@ -124,6 +128,8 @@ extern void loader_log_putc(char c);
 
 #define NFC_BUF                 260             /* every packet buffer is this size (hard rule) */
 #define NFC_SHOW_BYTES          48              /* at most this many bytes of a packet are shown */
+#define NFC_LOG_ALWAYS          400             /* the first packets are all logged ... */
+#define NFC_LOG_EVERY           20              /* ... after that, one in this many */
 
 /* NCI's message types and group ids (NCI 1.0/2.0). */
 #define NCI_MT_RSP              0x40            /* response (MT 2) */
@@ -284,7 +290,7 @@ pin_function(unsigned pin)
 static uint32_t taken_cfg[2], taken_io[2];
 static uint64_t i2c_deadline;           /* mach_absolute_time() past which a transaction gives up */
 static bool i2c_late;
-static bool i2c_quiet;                  /* step 3's long polling: no per-transaction pin line */
+static volatile bool i2c_quiet;          /* step 3's long polling or the bridge: no per-transaction pin line */
 static unsigned bus_fail_run;           /* bus_take() failures in a row */
 static bool bus_dead;                   /* three in a row: the step stops */
 
@@ -477,8 +483,13 @@ hex_string(const uint8_t *bytes, unsigned count, char *out, size_t capacity, uns
 static void
 log_packet(const char *direction, const uint8_t *bytes, unsigned count)
 {
+	static uint32_t packets;
 	char shown[200];
 
+	packets++;
+	if (packets > NFC_LOG_ALWAYS && (packets % NFC_LOG_EVERY) != 0) {
+		return;
+	}
 	hex_string(bytes, count, shown, sizeof(shown), NFC_SHOW_BYTES);
 	say("%s %u: %s\n", direction, count, shown);
 }
@@ -597,6 +608,9 @@ nfc_recv(uint8_t *packet, unsigned capacity, unsigned timeout_ms)
 
 	if (capacity < 3) {
 		return 0;
+	}
+	if (timeout_ms == 0 && !irq_high()) {
+		return 0;               /* the bridge's poll: an IRQ that is already high is read at once */
 	}
 	start = mach_absolute_time();
 	while (!irq_high()) {
@@ -1611,6 +1625,44 @@ retry_discover:
 	return result;
 }
 
+/* ---- the I2C lock, shared by steps 2-4 and the nfcd bridge ------------------------------------- */
+
+static lck_grp_t *nfc_lock_group;
+static lck_mtx_t nfc_lock;
+static bool nfc_lock_ready;
+
+static bool
+nfc_lock_init(void)
+{
+	if (nfc_lock_ready) {
+		return true;
+	}
+	nfc_lock_group = lck_grp_alloc_init("vayu_nfc", LCK_GRP_ATTR_NULL);
+	if (nfc_lock_group == NULL) {
+		say("the I2C lock's group cannot be allocated\n");
+		return false;
+	}
+	lck_mtx_init(&nfc_lock, nfc_lock_group, LCK_ATTR_NULL);
+	nfc_lock_ready = true;
+	return true;
+}
+
+static void
+nfc_bus_lock(void)
+{
+	if (nfc_lock_ready) {
+		lck_mtx_lock(&nfc_lock);
+	}
+}
+
+static void
+nfc_bus_unlock(void)
+{
+	if (nfc_lock_ready) {
+		lck_mtx_unlock(&nfc_lock);
+	}
+}
+
 /* ---- the thread -------------------------------------------------------------------------------- */
 
 static bool
@@ -1643,6 +1695,7 @@ static void
 nfc_thread(__unused void *parameter, __unused wait_result_t result_thread)
 {
 	unsigned reached = 0;
+	bool bus_locked = false;
 
 	say("starting: %u step%s asked, xnu_tlmm %u, secs %u, tech %#x, pause %u ms\n", nfc_level_wanted,
 	    nfc_level_wanted == 1 ? "" : "s", nfc_xnu_tlmm, nfc_secs, nfc_tech, nfc_pause);
@@ -1670,6 +1723,12 @@ nfc_thread(__unused void *parameter, __unused wait_result_t result_thread)
 			    i2c_pins_are_gpio() ? "gpio (function 0)" : "not gpio");
 			goto out;
 		}
+		/*
+		 * Steps 2-4 own the bus from here: the bridge's per-transaction lock waits until
+		 * step 3's polling (and step 4 inside it) is over.
+		 */
+		nfc_bus_lock();
+		bus_locked = nfc_lock_ready;
 		if (step2() < 0) {
 			goto out;
 		}
@@ -1689,6 +1748,9 @@ nfc_thread(__unused void *parameter, __unused wait_result_t result_thread)
 	}
 
 out:
+	if (bus_locked) {
+		nfc_bus_unlock();
+	}
 	say("done (reached step %u of %u)\n", reached, nfc_level_wanted);
 	thread_terminate(current_thread());
 }
@@ -1699,6 +1761,11 @@ vayu_nfc_init(void)
 	thread_t thread;
 	uint32_t value;
 
+	/* The bridge may be asked for even when the probe is not running. */
+	(void)nfc_lock_init();
+	if (PE_parse_boot_argn("vayu_nfc_xnu_tlmm", &value, sizeof(value))) {
+		nfc_xnu_tlmm = value;
+	}
 	if (!PE_parse_boot_argn("vayu_nfc", &nfc_level_wanted, sizeof(nfc_level_wanted)) ||
 	    nfc_level_wanted == 0) {
 		return;
@@ -1708,9 +1775,6 @@ vayu_nfc_init(void)
 		say("only steps 1-4 exist: %u steps asked, treating it as 4\n", nfc_level);
 		nfc_level = 4;
 		nfc_level_wanted = 4;
-	}
-	if (PE_parse_boot_argn("vayu_nfc_xnu_tlmm", &value, sizeof(value))) {
-		nfc_xnu_tlmm = value;
 	}
 	if (PE_parse_boot_argn("vayu_nfc_secs", &value, sizeof(value))) {
 		nfc_secs = value > 3600 ? 3600 : value;
@@ -1726,4 +1790,136 @@ vayu_nfc_init(void)
 		return;
 	}
 	thread_deallocate(thread);
+}
+
+/* ---- the nfcd bridge (boot-arg vayu_nfc_ios >= 2) ---------------------------------------------- */
+
+static vayu_nfc_rx_fn bridge_rx;
+static volatile bool bridge_running;
+static volatile unsigned bridge_generation;      /* a stop makes every older thread exit */
+static uint32_t bridge_packets_in, bridge_packets_out;
+
+/*
+ * One packet at a time while the IRQ is high: the receive helper already returns at once when
+ * the line is high, and the timeout of 0 never waits. The step thread's lock keeps steps 2-4
+ * and these transactions apart.
+ */
+static void
+bridge_thread(void *parameter, __unused wait_result_t result_thread)
+{
+	unsigned generation = (unsigned)(uintptr_t)parameter;
+	uint8_t packet[NFC_BUF];
+
+	while (bridge_running && generation == bridge_generation) {
+		if (irq_high()) {
+			unsigned length = 0;
+
+			nfc_bus_lock();
+			if (bridge_running && generation == bridge_generation) {
+				i2c_quiet = true;
+				length = nfc_recv(packet, sizeof(packet), 0);
+			}
+			nfc_bus_unlock();
+			if (length != 0 && bridge_running && generation == bridge_generation) {
+				vayu_nfc_rx_fn rx = bridge_rx;
+
+				bridge_packets_in++;
+				if (rx != NULL) {
+					rx(packet, length);
+				}
+			}
+		} else {
+			delay_for_interval(2, NSEC_PER_MSEC);
+		}
+	}
+	thread_terminate(current_thread());
+}
+
+int
+vayu_nfc_bridge_start(vayu_nfc_rx_fn rx)
+{
+	thread_t thread;
+	unsigned generation;
+
+	if (rx == NULL) {
+		return EINVAL;
+	}
+	if (!nfc_lock_init()) {
+		return ENODEV;
+	}
+	if (!nfc_xnu_tlmm) {
+		say("bridge: refused: vayu_nfc_xnu_tlmm=1 is not given\n");
+		return EPERM;
+	}
+	if (north_i2c == 0 || north_ven == 0 || east_nfc == 0) {
+		if (!map_pins()) {
+			say("bridge: refused: the pin windows are not mapped\n");
+			return ENODEV;
+		}
+	}
+	if (!ven_is_on() || !firm_is_low() || !i2c_pins_are_gpio()) {
+		say("bridge: refused: ven %s, firm %s, i2c pins %s (need ven on, firm low and both I2C pins "
+		    "function 0)\n", ven_is_on() ? "on" : "off", firm_state(),
+		    i2c_pins_are_gpio() ? "gpio (function 0)" : "not gpio");
+		return ENODEV;
+	}
+	if (bridge_running) {
+		return EBUSY;
+	}
+
+	bridge_generation++;
+	generation = bridge_generation;
+	bridge_rx = rx;
+	bridge_packets_in = 0;
+	bridge_packets_out = 0;
+	bridge_running = true;
+	i2c_quiet = true;
+	if (kernel_thread_start(bridge_thread, (void *)(uintptr_t)generation, &thread) != KERN_SUCCESS) {
+		bridge_running = false;
+		bridge_rx = NULL;
+		i2c_quiet = false;
+		say("bridge: the thread cannot be started\n");
+		return EIO;
+	}
+	thread_deallocate(thread);
+	say("bridge: started\n");
+	return 0;
+}
+
+int
+vayu_nfc_bridge_send(const uint8_t *packet, unsigned length)
+{
+	bool sent;
+
+	if (!bridge_running) {
+		return EIO;
+	}
+	if (packet == NULL || length < 3 || length > 255 || length != 3 + (unsigned)packet[2]) {
+		return EIO;
+	}
+	nfc_bus_lock();
+	if (!bridge_running) {
+		nfc_bus_unlock();
+		return EIO;
+	}
+	i2c_quiet = true;
+	sent = nfc_write(packet, length);
+	if (sent) {
+		bridge_packets_out++;
+	}
+	nfc_bus_unlock();
+	return sent ? 0 : EIO;
+}
+
+void
+vayu_nfc_bridge_stop(void)
+{
+	if (!bridge_running) {
+		return;
+	}
+	bridge_running = false;
+	bridge_generation++;                    /* the running thread sees this and exits */
+	bridge_rx = NULL;
+	i2c_quiet = false;
+	say("bridge: stopped (%u packets in, %u out)\n", bridge_packets_in, bridge_packets_out);
 }
