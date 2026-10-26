@@ -35,6 +35,13 @@
  *   vayu_wifi_hostcap=N  1 (default): host_cap with the normal table; 2: the 8-bit table; 0: no
  *                        host_cap at all.
  *   vayu_wifi_cap=0      do not send the cap request (default 1: send it).
+ *   vayu_wifi_bdf_name=NAME  take exactly fw/NAME as the board data file, and no other: a name
+ *                        that is not in the boot image is an error, not a fallback, so a run
+ *                        cannot silently test the wrong file.
+ *   vayu_wifi_bdf_pick=1 try, in this order: bdwlan.b<hex board id>, bd_j20s.bin (the file named
+ *                        after this phone's hardware project: the stock device tree calls its
+ *                        panel and its battery "j20s"), bdwlan.b<decimal board id>, bdwlan.bin.
+ *                        Default 0: bdwlan.b<decimal board id>, then bdwlan.bin.
  *
  * After cap and with vayu_wifi_bdf=1 (default) it downloads the board data file from the boot
  * image's fw/ (bdwlan.b<board>, fallback bdwlan.bin) over BDF_DOWNLOAD, sends CAL_REPORT, waits
@@ -114,6 +121,8 @@ static LCK_MTX_DECLARE(vayu_wifi_lock, &vayu_wifi_lck_grp);
 
 static uint32_t wifi_level, wifi_hostcap = 1, wifi_cap = 1;
 static uint32_t wifi_bdf = 1, wifi_wlan = 1;   /* 1: BDF download / WLAN cfg+mode after cap */
+static uint32_t wifi_bdf_pick;            /* 1: try bdwlan.b<hex> and bd_j20s.bin before the rest */
+static char wifi_bdf_name[64];            /* vayu_wifi_bdf_name=NAME: that file, and no fallback */
 static uint32_t wifi_msa_fixed_perm;      /* 1: TZ fixes the MSA permissions; skip the assign */
 static uint32_t wifi_listen_s;
 static bool wifi_started;
@@ -2477,27 +2486,83 @@ static const struct vayu_wlfw_shadow_reg_cfg_s_v01 vayu_wlan_shadow_reg[] = {
 	{ 10, 0x40 }, { 11, 0x40 },
 };
 
+/*
+ * The board data file from the boot image's fw/, and what its first bytes say.
+ *
+ * ath10k takes the file by the name its board-2.bin entry carries for this chip and board id
+ * ("bdwlan.b<hex board id>") and falls back to "bdwlan.bin" when the board id is 0xff
+ * (qmi.c:616-619).  Our cap answer carries no board_info TLV (the log says "board_id ?"), so
+ * only the fallback was ever tried -- while the stock modem partition next to it carries a file
+ * named after this phone's hardware project, bd_j20s.bin: "j20s" is what the stock device tree
+ * calls the panel (live.dts:2915) and the battery (:27247).  It is the same 26328 bytes as
+ * bdwlan.bin and differs in 4602 of them, the header included (0x0C: 0x10a against 0x101, the
+ * field the firmware prints as bdf_version / board_data_rev).
+ *
+ * The first 16 bytes go to the log because they are the only part of the blob a run can show;
+ * the two candidates differ in them (0x08, 0x0C).
+ */
+static const uint8_t *
+vayu_wifi_bdf_open(const char *name, uint64_t *size, uint32_t board_id, const char *why, bool noisy)
+{
+	const uint8_t *bdf = hakios_image_file("fw", name, size, NULL);
+	char hdr[40];
+	size_t at = 0;
+
+	if (bdf == NULL) {
+		if (noisy) {
+			say("vayu-wifi: wlfw: bdf: fw/%s: not in the boot image\n", name);
+		}
+		return NULL;
+	}
+	for (unsigned i = 0; i < 12 && i < *size; i++) {
+		at += (size_t)snprintf(hdr + at, sizeof(hdr) - at, "%02x", (unsigned int)bdf[i]);
+		if (i == 3 || i == 7) {
+			at += (size_t)snprintf(hdr + at, sizeof(hdr) - at, " ");
+		}
+	}
+	say("vayu-wifi: wlfw: bdf: fw/%s %llu bytes (%s, board %#x) hdr %s\n", name,
+	    (unsigned long long)*size, why, board_id, hdr);
+	return bdf;
+}
+
 static const uint8_t *
 vayu_wifi_bdf_file(uint32_t board_id, uint64_t *size)
 {
 	char name[64];
 	const uint8_t *bdf;
+	bool known = board_id != 0 && board_id != 0xff && board_id != 0xffffffffU;
+	bool noisy = wifi_bdf_pick != 0 || wifi_bdf_name[0] != 0;
 
 	*size = 0;
-	if (board_id != 0 && board_id != 0xff && board_id != 0xffffffffU) {
-		snprintf(name, sizeof(name), "bdwlan.b%u", (unsigned int)board_id);
-		bdf = hakios_image_file("fw", name, size, NULL);
+	if (wifi_bdf_name[0] != 0) {
+		bdf = vayu_wifi_bdf_open(wifi_bdf_name, size, board_id, "vayu_wifi_bdf_name", noisy);
+		if (bdf == NULL) {
+			say("vayu-wifi: wlfw: bdf: vayu_wifi_bdf_name=%s is not in the boot image: no "
+			    "fallback, so this run tests nothing\n", wifi_bdf_name);
+		}
+		return bdf;
+	}
+	if (wifi_bdf_pick != 0) {
+		if (known) {
+			snprintf(name, sizeof(name), "bdwlan.b%x", (unsigned int)board_id);
+			bdf = vayu_wifi_bdf_open(name, size, board_id, "hex board id", noisy);
+			if (bdf != NULL) {
+				return bdf;
+			}
+		}
+		bdf = vayu_wifi_bdf_open("bd_j20s.bin", size, board_id, "the phone's project file", noisy);
 		if (bdf != NULL) {
-			say("vayu-wifi: wlfw: bdf: fw/%s %llu bytes (board %#x)\n", name,
-			    (unsigned long long)*size, board_id);
 			return bdf;
 		}
 	}
-	bdf = hakios_image_file("fw", "bdwlan.bin", size, NULL);
-	if (bdf != NULL) {
-		say("vayu-wifi: wlfw: bdf: fw/bdwlan.bin %llu bytes (board %#x, fallback)\n",
-		    (unsigned long long)*size, board_id);
+	if (known) {
+		snprintf(name, sizeof(name), "bdwlan.b%u", (unsigned int)board_id);
+		bdf = vayu_wifi_bdf_open(name, size, board_id, noisy ? "decimal board id" : "board", noisy);
+		if (bdf != NULL) {
+			return bdf;
+		}
 	}
+	bdf = vayu_wifi_bdf_open("bdwlan.bin", size, board_id, "fallback", noisy);
 	return bdf;
 }
 
@@ -2542,6 +2607,16 @@ vayu_wifi_bdf_download(const uint8_t *bdf, uint64_t size)
 		    vayu_wlfw_bdf_download_resp_msg_v01_ei, &resp);
 		if (ret < 0) {
 			return ret;
+		}
+		if (end && resp.resp.result != QMI_RESULT_SUCCESS_V01) {
+			/* end=1 also asks the firmware for a CRC check of the BDF; a failure comes
+			 * back as MALFORMED and the firmware still uses the file (ath10k qmi.c:294-307).
+			 * Either way the answer is worth a line: it says the whole file arrived. */
+			say("vayu-wifi: wlfw: bdf: last segment: result %u error %u (%s)\n",
+			    (unsigned int)resp.resp.result, (unsigned int)resp.resp.error,
+			    resp.resp.result == VAYU_QMI_ERR_MALFORMED_MSG_V01 ?
+			    "the firmware's CRC check said no; ath10k treats that as non-fatal" :
+			    "not the CRC answer");
 		}
 		if (resp.resp.result != QMI_RESULT_SUCCESS_V01 &&
 		    !(end && (resp.resp.error == VAYU_QMI_ERR_MALFORMED_MSG_V01 ||
@@ -2963,10 +3038,13 @@ vayu_wifi_start(struct vayu_qrtr *q, uint32_t listen_s)
 	PE_parse_boot_argn("vayu_wifi_bdf", &wifi_bdf, sizeof(wifi_bdf));
 	PE_parse_boot_argn("vayu_wifi_wlan", &wifi_wlan, sizeof(wifi_wlan));
 	PE_parse_boot_argn("vayu_msa_fixed_perm", &wifi_msa_fixed_perm, sizeof(wifi_msa_fixed_perm));
+	PE_parse_boot_argn("vayu_wifi_bdf_pick", &wifi_bdf_pick, sizeof(wifi_bdf_pick));
+	PE_parse_boot_argn("vayu_wifi_bdf_name", wifi_bdf_name, sizeof(wifi_bdf_name));
 	wifi_listen_s = listen_s;
 	say("vayu-wifi: vayu_wifi=%u vayu_wifi_hostcap=%u vayu_wifi_cap=%u vayu_wifi_bdf=%u "
-	    "vayu_wifi_wlan=%u vayu_msa_fixed_perm=%u listen=%u s\n",
-	    wifi_level, wifi_hostcap, wifi_cap, wifi_bdf, wifi_wlan, wifi_msa_fixed_perm, listen_s);
+	    "vayu_wifi_wlan=%u vayu_msa_fixed_perm=%u listen=%u s bdf_pick=%u bdf_name=%s\n",
+	    wifi_level, wifi_hostcap, wifi_cap, wifi_bdf, wifi_wlan, wifi_msa_fixed_perm, listen_s,
+	    wifi_bdf_pick, wifi_bdf_name[0] != 0 ? wifi_bdf_name : "(default)");
 	if (wifi_level == 0) {
 		return;
 	}
