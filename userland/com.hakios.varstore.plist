@@ -13,6 +13,10 @@
 		<string>/redwood/bin/var_store</string>
 		<string>watch</string>
 	</array>
+	<!-- the saver ignores the shutdown's SIGTERM (src/var_store.c, watch) so that it can answer the
+	     kernel's request to save: launchd waits this long for it before it kills the job -->
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardOutPath</key>
