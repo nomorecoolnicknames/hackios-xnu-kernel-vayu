@@ -1021,6 +1021,49 @@ ml3_probe(ML3MusicLibrary *library)
 
 static BOOL ascii_names;
 
+/*
+ * Rows left by a half-finished import. The marker is written only after the row and its sort data are
+ * complete (import(), near the end); a boot that resets in between leaves an item with this location
+ * and no sort_map/orders, and Music draws it as an empty entry that does not play. When the good row
+ * is in, drop every other row that names the same file. The pids are selected before item_extra is
+ * touched, so nothing else in the library can match.
+ */
+static void
+drop_stale_rows(const char *location, int64_t keep)
+{
+	static const char *db = "/var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb";
+	static const char *const sql[] = {
+		"DELETE FROM item WHERE item_pid IN "
+		"(SELECT item_pid FROM item_extra WHERE location = ?1 AND item_pid != ?2)",
+		"DELETE FROM item_extra WHERE location = ?1 AND item_pid != ?2",
+	};
+	sqlite3 *h = NULL;
+
+	if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
+		fprintf(stderr, "music_import: stale rows: cannot open %s: %s\n", db, h ? sqlite3_errmsg(h) : "?");
+		sqlite3_close(h);
+		return;
+	}
+	sqlite3_busy_timeout(h, 5000);
+	for (unsigned i = 0; i < sizeof(sql) / sizeof(sql[0]); i++) {
+		sqlite3_stmt *st = NULL;
+
+		if (sqlite3_prepare_v2(h, sql[i], -1, &st, NULL) != SQLITE_OK) {
+			fprintf(stderr, "music_import: stale rows: %s\n", sqlite3_errmsg(h));
+			continue;
+		}
+		sqlite3_bind_text(st, 1, location, -1, SQLITE_STATIC);
+		sqlite3_bind_int64(st, 2, keep);
+		if (sqlite3_step(st) != SQLITE_DONE) {
+			fprintf(stderr, "music_import: stale rows: %s\n", sqlite3_errmsg(h));
+		} else if (sqlite3_changes(h) > 0) {
+			fprintf(stderr, "music_import: stale rows: %d row(s) of %s dropped\n", sqlite3_changes(h), location);
+		}
+		sqlite3_finalize(st);
+	}
+	sqlite3_close(h);
+}
+
 static int import(int argc, char **argv) {
 	const char *source, *dest = "RDWD.mp3";
 	double wait = 0;
@@ -1195,6 +1238,7 @@ static int import(int argc, char **argv) {
 	fix_rows([track persistentID], copied);
 	repair_entities([track persistentID], artist, album);
 	repair_local([track persistentID], title, artist, album, copied, seconds);
+	drop_stale_rows(dest, [track persistentID]);
 	dump_songs([track persistentID]);
 	fprintf(stderr, "music_import: the track says now: file path %s, playable %s, local %s, restricted %s\n",
 	    UTF8([[track valueForProperty:ML3TrackPropertyFilePath] description]),
