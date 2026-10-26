@@ -34,21 +34,36 @@
  * rail. Sensor 1 is the rear IMX582 (1920x1080), sensor 2 the front S5K3T2 (1280x720); the frames
  * are a colour chart in RAW10 at vayu_camera_fake_fps (default 10, 1..30). Step 1 is not run.
  *
- * With vayu_camera=6 the same node and ABI are fed by the real cameras instead: ABI sensor 1 is
- * the rear IMX582 in step 4's res3 mode, sensor 2 the front S5K3T2 in its res2 mode. A session is
- * step 4's whole bring-up (vendor tables, rails, GDSC, PLL0, clocks, ldoc3, TLMM, I2C, chip ID,
- * init and one mode, CSIPHY, CSID-lite 0's RDI 0, IFE-lite 0, stream-on), with the camera row's
- * 4x frame, exposure and gain (0x0340/0x0202/0x0204: ~15 fps rear, ~30 fps front) written at
- * every start; then IFE-lite 0's WM0 writes frame after frame into step 5's three-place ring, the
- * whole ring mapped in the apps SMMU (place p at FRAME_ADDRESSES + p * place_bytes, no header).
- * WM0 is re-armed per frame and its done bit polled every 2 ms for at most 3 frame times + 100 ms;
- * the place's cache lines are invalidated and its readers woken. The session ends after 1 s
- * without reads, the last close, a sensor command, an SMMU fault or three consecutive frame
- * timeouts, always with the module's off block and step 4's teardown. A failure makes that
+ * With vayu_camera=6 the same node and ABI are fed by the real cameras instead. ABI sensor 1 is
+ * the rear IMX582, sensor 2 the front S5K3T2, and each has two modes: mode 0 (the usual one, step
+ * 4's) is the IMX582's res3 1920x1080 at 60.08 fps or the S5K3T2's res2 1280x720 at 120.41 fps;
+ * mode 1 is the vendor's full 4:3 stills mode, res1 4000x3000 at 30.03 fps or res1 2592x1940 at
+ * 30.13 fps. HAKIOS_CAMERA_SENSOR's a is the sensor and b the mode: 0 or ~0 is mode 0, 1 is mode
+ * 1, anything else is EINVAL. Every SENSOR command is a switch, as before: the session ends and
+ * the next read starts the requested sensor and mode (one line per switch, "sensor N mode M asked
+ * (WxH)").
+ *
+ * A session is step 4's whole bring-up (vendor tables, rails, GDSC, PLL0, clocks, ldoc3, TLMM,
+ * I2C, chip ID, init and one mode, CSIPHY, CSID-lite 0's RDI 0, IFE-lite 0, stream-on). Mode 0
+ * then has the camera row's 4x frame, exposure and gain (0x0340/0x0202/0x0204: ~15 fps rear,
+ * ~30 fps front) written at every start; mode 1 writes none of them at bring-up: its frame
+ * length, exposure and gain are the vendor block's own, and the header's frame lines come from the
+ * block's 0x0340 (IMX582: 1-byte writes at 0x0340/0x0341; S5K3T2: one 2-byte write there) with
+ * line_ns = 1e9 / (fps * frame_lines). Then IFE-lite 0's WM0 writes frame after frame into step
+ * 5's three-place ring, the whole ring mapped in the apps SMMU (place p at FRAME_ADDRESSES + p *
+ * place_bytes, no header). Each place is round_page()d to the largest mode's frame (mode 1's
+ * 4000x3000 RAW10 is 5008 * 3000 = 15,024,000 bytes: a 4000-pixel line is rounded to 16 bytes),
+ * and the ring is kmem_alloc()ed page by page -- not physically contiguous: the SMMU's tables map
+ * every 4 KB page through kvtophys(). WM0 is re-armed per frame and its done bit polled every 2 ms
+ * for at most 3 frame times + 100 ms (from the mode's fps); the place's cache lines are invalidated
+ * and its readers woken. The session ends
+ * after 1 s without reads, the last close, a sensor command, an SMMU fault or three consecutive
+ * frame timeouts, always with the module's off block and step 4's teardown. A failure makes that
  * session's reads EIO; one later session may retry, the second failed session ends the node.
  * Step 1 is not run (only GCC and camcc are mapped, from camera_ahb as step 1 does), and
- * vayu_camera_xnu_tlmm=1 is required. Exposure commands are accepted and ignored (logged once per
- * session), focus is ignored.
+ * vayu_camera_xnu_tlmm=1 is required. EXPOSURE commands go to the session thread between frames
+ * (only 0x0202 and 0x0204; mode 1's frame length stays the vendor's), FOCUS to the rear DW9800
+ * with vayu_camera_af=1 and is ignored otherwise.
  *
  * vayu_camera_quiesce() is for the loader-return/panic path: if a step-2, step-4 or step-6 sensor
  * is still powered it stops the MCLKs this run started and lowers the output pins it raised (the
@@ -81,8 +96,9 @@
  * the selected module's vendor init, one mode block and stream-on/off, a NACK ends the block, and
  * the off block (0x0100 = 0) is written before any power-down once init was attempted. The
  * IMX582 is covered by the 2026-10-25 amendment; the S5K3T2 is requested (see the bring-up notes); no
- * other sensor register is written; step 6 adds only 0x0340/0x0202/0x0204 from the camera row, at
- * every session start. Steps 3, 4 and 6 are bounded everywhere
+ * other sensor register is written; step 6 adds only 0x0340/0x0202/0x0204, from the camera row, at
+ * every session start in mode 0 (mode 1 writes none of them at bring-up; AE writes only
+ * 0x0202/0x0204). Steps 3, 4 and 6 are bounded everywhere
  * (1 ms for PLL0's lock, 500 us for an RCG or a branch, 10 ms for the SMMU's TLB,
  * vayu_camera_frames_ms for step 4's frame, 3 frame times + 100 ms for step 6's, 100 ms for a
  * table delay), leave a branch that was on already on, refuse a PLL0 somebody else runs, and leave

@@ -58,7 +58,8 @@
  *     never off, because the DSI PLL uses it too;
  *   - TLMM's outputs of the selected sensor and its CCI pins, then I2C to the module's four
  *     vendor blocks from fw/camera-imx582.tab or fw/camera-s5k3t2.tab (init, the mode block --
- *     res3/res2 -- on, off). TLMM exception 3's amendment of 2026-10-25 (maintainers; amendment 2 of
+ *     res3/res2 for mode 0, res1 for step 6's mode 1 -- on, off). TLMM exception 3's amendment of
+ *     2026-10-25 (maintainers; amendment 2 of
  *     the same day for the S5K3T2): only those four blocks of the selected module, off is
  *     0x0100 = 0, and no exposure, gain, OTP or EEPROM register is ever written;
  *   - CSIPHY1 (0x0ac66000) or CSIPHY2 (0x0ac67000), both qcom,csiphy-v1.1, with the v1.1
@@ -81,33 +82,47 @@
  * the rear IMX582 at 1920x1080, sensor 2 the front S5K3T2 at 1280x720. There is no sensor, no
  * CSIPHY, no CSID, no IFE, no SMMU, no TLMM, no I2C, no rail and no RPMh access in step 5. The
  * per-sensor timing and gain values in cam_fake_sensors[] are HYPOTHESES for this synthetic
- * source only; step 6's real ones are in cam_real_sensors[]. Three places of contiguous kernel
- * memory hold the ring. A session starts with the first read, ends with the last close, a
- * second without a read, or a sensor command; its log is one line at the start and one at the
- * end, never one per frame.
+ * source only; step 6's real ones are in cam_real_sensors[]. Three places of kernel memory (one
+ * kmem_alloc(), page by page, not necessarily physically contiguous) hold the ring. A session
+ * starts with the first read, ends with the last close, a second without a read, or a sensor
+ * command; its log is one line at the start and one at the end, never one per frame.
  *
- * Step 6 is step 5's node and ABI with the synthetic source replaced by the real cameras: ABI
- * sensor 1 is the rear IMX582 in cam_streams[0]'s mode (res3), sensor 2 the front S5K3T2 in
- * cam_streams[1]'s (res2). A session is step 4's bring-up -- the tab load, the rails, the GDSC,
- * PLL0, the clocks, ldoc3, the pins, the module's power-up, the chip ID (MATCH required), the
- * vendor init and one mode block, then 0x0340/0x0202/0x0204 ALWAYS with the camera row's 4x
- * frame and its exposure and gain (the fixed exposure: ~15.02 fps rear, ~30.10 front), the
- * SMMU the whole ring, CSID-lite 0 with RDI 0 running, CSIPHY, IFE-lite 0 and the vendor on
- * block -- and then a continuous capture loop. The ring is step 5's three places, the whole of
- * it mapped in the apps SMMU: place p is IOVA FRAME_ADDRESSES + p * place_bytes, no header in
- * front, so the frame bytes start at the place. Every frame: the oldest FREE place is marked
- * WRITING, WM0_IMAGE_ADDR gets its IOVA, WM0 is on, IFE_REG_UPDATE is 0x2 and the bus's status1
- * bit 0 is cleared; the loop sleeps 2 ms at a time for it, at most 3 frame times + 100 ms,
- * invalidates the place's cache lines, marks it READY with the next sequence and the times and
- * wakes the readers. Every 100 frames one line; an SMMU fault or three consecutive frame
- * timeouts ends the session. The session ends after 1 s without reads, the last close, a
- * SENSOR command or a failure: the vendor off block and its 30 ms, then step 4's teardown order,
- * then one line with the counts. A failure tears everything down and makes the session's reads
- * EIO, but not the node: one later session may retry, and the second failed session ends it.
+ * Step 6 is step 5's node and ABI with the synthetic source replaced by the real cameras. ABI
+ * sensor 1 is the rear IMX582, sensor 2 the front S5K3T2, and each camera row has two modes: mode
+ * 0 (the usual one, step 4's) is the IMX582's res3 1920x1080 at 60.08 fps or the S5K3T2's res2
+ * 1280x720 at 120.41 fps; mode 1 is the vendor's full 4:3 stills mode, its res1 4000x3000 at
+ * 30.03 fps or its res1 2592x1940 at 30.13 fps. HAKIOS_CAMERA_SENSOR's a is the sensor and b the
+ * mode: 0 or ~0 is mode 0, 1 is mode 1, anything else is EINVAL. Every SENSOR command is a switch,
+ * as before: the session ends and the next read starts the requested sensor and mode (one line per
+ * switch, "sensor N mode M asked (WxH)").
+ *
+ * A session is step 4's bring-up -- the tab load, the rails, the GDSC, PLL0, the clocks, ldoc3,
+ * the pins, the module's power-up, the chip ID (MATCH required), the vendor init and the mode's
+ * block. In mode 0 it then writes 0x0340/0x0202/0x0204 ALWAYS with the camera row's 4x frame and
+ * its exposure and gain (the fixed exposure: ~15.02 fps rear, ~30.10 front). Mode 1 writes none of
+ * them at bring-up: its frame length, exposure and gain are the vendor block's own, and the
+ * header's numbers come from that block (0x0340 as the IMX582's two 1-byte writes at 0x0340/0x0341
+ * or the S5K3T2's one 2-byte write at 0x0340) and line_ns = 1e9 / (fps * frame_lines). AE later
+ * writes only 0x0202/0x0204; 0x0340 is never touched after bring-up, so mode 1 keeps the vendor's
+ * frame length. Then the SMMU maps the whole ring, CSID-lite 0 runs RDI 0, CSIPHY and IFE-lite 0
+ * come up, the vendor's on block goes out, and a continuous capture loop follows. The ring is step
+ * 5's three places, each round_page()d to the largest mode's frame (mode 1's 4000x3000 RAW10 is
+ * 5008 * 3000 = 15,024,000 bytes: a 4000-pixel line is rounded to 16 bytes), the whole of it
+ * mapped in the apps SMMU: place p is IOVA FRAME_ADDRESSES + p * place_bytes, no header in front,
+ * so the frame bytes start at the place. Every frame: the oldest FREE place is marked WRITING,
+ * WM0_IMAGE_ADDR gets its IOVA, WM0 is on, IFE_REG_UPDATE is 0x2 and the bus's status1 bit 0 is
+ * cleared; the loop sleeps 2 ms at a time for it, at most 3 frame times + 100 ms, invalidates the
+ * place's cache lines, marks it READY with the next sequence and the times and wakes the readers.
+ * Every 100 frames one line; an SMMU fault or three consecutive frame timeouts ends the session.
+ * The session ends after 1 s without reads, the last close, a SENSOR command or a failure: the
+ * vendor off block and its 30 ms, then step 4's teardown order, then one line with the counts. A
+ * failure tears everything down and makes the session's reads EIO, but not the node: one later
+ * session may retry, and the second failed session ends it.
  * Step 1 is NOT run for 6 (as for 5), except GCC and camcc are mapped and g_camcc_ok is set from
  * camera_ahb exactly as step 1 does; vayu_camera_xnu_tlmm=1 is required (as for step 4) and
- * vayu_camera_clk is forced to 1 (the CSIPHY timer runs from PLL0). EXPOSURE commands are
- * accepted and ignored (logged once per session), FOCUS is ignored. Step 1-5 behaviour and log
+ * vayu_camera_clk is forced to 1 (the CSIPHY timer runs from PLL0). EXPOSURE commands go to the
+ * session thread between frames (0x0202/0x0204 only; the frame length stays the mode's), FOCUS to
+ * the rear DW9800 with vayu_camera_af=1 and is ignored otherwise. Step 1-5 behaviour and log
  * lines are unchanged: cam_stream_up()/cam_stream_down() are step 4's bring-up and teardown
  * factored out, and the node, ring, read, write and session code is step 5's with the frame source
  * pluggable.
@@ -201,7 +216,8 @@
  *     and its lock is its own; vayu_camera_quiesce() has nothing of step 5 to take down;
  *   - step 6 reuses step 4's sensor rules unchanged (the vendor blocks, the off block, the ID
  *     MATCH) and adds only 0x0340/0x0202/0x0204, from the selected camera row, at every session
- *     start (the fixed exposure); every wait is bounded (2 ms polls, 3 frame times + 100 ms per
+ *     start in mode 0 (the fixed exposure; mode 1 writes none of them at bring-up, and AE writes
+ *     only 0x0202/0x0204); every wait is bounded (2 ms polls, 3 frame times + 100 ms per
  *     frame, 3 timeouts, 1 s of idle, 1 ms for PLL0's lock as step 4), the ring's places are
  *     re-armed one at a time, and a failure tears the session down without touching the node's
  *     memory: the first failure is retried once, the second ends the node.
@@ -257,17 +273,20 @@
  *               one match register covers all eight. IOVA 0x40000000 is inside the DT's IFE pool
  *               (0x7400000 + 0xd8c00000).
  *   step 6      step 5's ring, the whole of it mapped in that SMMU: place p's IOVA is
- *               FRAME_ADDRESSES + p * place_bytes (place_bytes is round_page of the largest
- *               sensor's stride * height), and the frame's first byte is the place's first byte
- *               (no header). WM0_IMAGE_ADDR is written per frame, WM0_FRAME_INC stays 0 so a late
- *               frame overwrites the place it just finished rather than running into the next
- *               one, and IFE_REG_UPDATE 0x2 (0x4ac) makes the new address take. The camera row's
- *               0x0340 frame length is 4x the mode's (1262*4 = 5048 rear, 992*4 = 3968 front),
- *               its 0x0202 exposure the frame minus 48 lines (5000 / 3920), its 0x0204 gain 0x300
- *               (Sony's own code for 4x: 1024 - 1024/4) / 0x80 (Samsung's 0x20 unity: 4x), the
- *               same numbers as vayu_camera_ae=1; the ABI header reports that 4x linearly, 4 *
- *               gain_unity (0x400 rear, 0x80 front). The header's line_ns is 1e9 / (fps *
- *               frame_lines): 13190 ns rear (15.02 fps), 8375 ns front (30.10 fps).
+ *               FRAME_ADDRESSES + p * place_bytes (place_bytes is round_page of the largest mode's
+ *               stride * height, so 15,024,128 bytes: mode 1's 4000x3000), and the frame's first
+ *               byte is the place's first byte (no header). WM0_IMAGE_ADDR is written per frame,
+ *               WM0_FRAME_INC stays 0 so a late frame overwrites the place it just finished rather
+ *               than running into the next one, and IFE_REG_UPDATE 0x2 (0x4ac) makes the new
+ *               address take. Mode 0's 0x0340 frame length is 4x the mode's (1262*4 = 5048 rear,
+ *               992*4 = 3968 front), its 0x0202 exposure the frame minus 48 lines (5000 / 3920),
+ *               its 0x0204 gain 0x300 (Sony's own code for 4x: 1024 - 1024/4) / 0x80 (Samsung's
+ *               0x20 unity: 4x), the same numbers as vayu_camera_ae=1; the ABI header reports that
+ *               4x linearly, 4 * gain_unity (0x400 rear, 0x80 front). The header's line_ns is 1e9 /
+ *               (fps * frame_lines): 13190 ns rear (15.02 fps), 8375 ns front (30.10 fps). Mode 1
+ *               writes none of the three: the vendor res1 block's own 0x0340 (3054 lines rear at
+ *               10903 ns, 2064 front at 16080 ns) and 0x0202/0x0204 are the sensor's, and the
+ *               header reports them.
  *   CAMNOC/CPAS step 3 programs nothing there: HYPOTHESIS, their reset defaults pass one small
  *               frame, and the run's log (show_paths()) is what will say.
  *   TLMM        cfg at tile + 0x1000 * pin: [1:0] pull (0 none, 1 down, 3 up), [5:2] function,
@@ -725,20 +744,33 @@ static const struct cam_sensor cam_sensors[] = {
 /* ---- step 4's per-camera configuration --------------------------------------------------------- */
 
 /*
- * One row per camera that step 4 can stream. The rows differ in the sensor, its table and mode
- * block, the frame size and rate, and which CSIPHY and camcc PHY clocks carry it; both use four
- * lanes and lane assignment 0x3210. Sources: the modules' streamConfiguration (the modes), vendor
- * sm8150-camera.dtsi:47-100 (CSIPHY1/2), camcc-sm8150.c:678/:698, :1511/:1529 and :1583/:1601
- * (the timers and their branches). CSID's phy_sel is the CSIPHY's index (INFERENCE: camera_v3
- * cam_ife_csid_core.c:831).
+ * One mode of a camera, as the module's resolutionData has it. `block' is the mode's block in
+ * fw/camera-*.tab (one block per mode, not in git); `fps_milli' is frames a second in thousandths
+ * (60080 = 60.08). Mode 0 is the one step 4 streams and the one step 6 starts with; mode 1 is the
+ * vendor's full 4:3 stills mode, which only step 6 uses, chosen by HAKIOS_CAMERA_SENSOR's b.
+ */
+struct cam_mode {
+	const char *name;               /* "usual" / "full" (for the logs) */
+	const char *block;              /* the mode block's name in the table: res3 / res2 / res1 */
+	uint32_t width, height;
+	uint32_t fps_milli;             /* 60080 = 60.08 fps; 30030 = 30.03, 30130 = 30.13 */
+};
+
+/*
+ * One row per camera that step 4 can stream. The rows differ in the sensor, its table, its modes,
+ * and which CSIPHY and camcc PHY clocks carry it; both use four lanes and lane assignment 0x3210.
+ * Sources: the modules' streamConfiguration and resolutionData (the modes: IMX582 res3 1920x1080
+ * 60.08 fps and res1 4000x3000 30.03 fps; S5K3T2 res2 1280x720 120.41 fps and res1 2592x1940
+ * 30.13 fps, both mode 1 entries dt 0x2b, laneAssign 0x3210), vendor sm8150-camera.dtsi:47-100
+ * (CSIPHY1/2), camcc-sm8150.c:678/:698, :1511/:1529 and :1583/:1601 (the timers and their
+ * branches). CSID's phy_sel is the CSIPHY's index (INFERENCE: camera_v3 cam_ife_csid_core.c:831).
  */
 struct cam_stream_cfg {
 	const char *name;               /* the summary label and the log prefix: imx582 / s5k3t2 */
 	unsigned sensor;                /* index into cam_sensors[] */
 	const char *tab;                /* the table in fw/ (built on the host, not in git) */
-	const char *mode;               /* the mode block's name: res3 / res2 */
-	uint32_t width, height;
-	const char *fps;                /* text only */
+	unsigned mode_count;            /* two: the usual mode and the full one */
+	struct cam_mode modes[2];       /* mode 0 first, mode 1 second */
 	unsigned lanes;
 	uint32_t lane_cfg;
 	unsigned csiphy;                /* 1 or 2 */
@@ -750,9 +782,10 @@ struct cam_stream_cfg {
 	uint32_t bayer;                 /* the frame header's: 0 RGGB */
 	const char *header;             /* the header's sensor name: IMX582 / S5K3T2 */
 	/*
-	 * vayu_camera_ae=1 (the maintainers' ruling 2026-10-25: 0x0202/0x0204/0x0340 before stream-on): a
-	 * long frame, a long exposure and a moderate gain, ~16x the light of the vendor mode, so one
-	 * run tells "the scene is dark" from "the exposure is the problem".
+	 * Mode 0 only. vayu_camera_ae=1 (the maintainers' ruling 2026-10-25: 0x0202/0x0204/0x0340 before
+	 * stream-on): a long frame, a long exposure and a moderate gain, ~16x the light of the vendor
+	 * mode, so one run tells "the scene is dark" from "the exposure is the problem". Step 6 mode 1
+	 * writes none of these: its frame length, exposure and gain are the vendor block's own.
 	 */
 	uint16_t ae_frame_lines;        /* 0x0340: 4x the mode's (IMX582 res3 0x04ee, S5K3T2 res2 0x03e0) */
 	uint16_t ae_lines;              /* 0x0202: frame lines - 48 (the vendor's own margin in res3: 0x04ee - 0x04be) */
@@ -761,16 +794,26 @@ struct cam_stream_cfg {
 
 static const struct cam_stream_cfg cam_streams[] = {
 	{
-		.name = "imx582", .sensor = 0, .tab = "camera-imx582.tab", .mode = "res3",
-		.width = 1920, .height = 1080, .fps = "60.08", .lanes = 4, .lane_cfg = 0x3210,
+		.name = "imx582", .sensor = 0, .tab = "camera-imx582.tab",
+		.mode_count = 2,
+		.modes = {
+			{ .name = "usual", .block = "res3", .width = 1920, .height = 1080, .fps_milli = 60080 },
+			{ .name = "full",  .block = "res1", .width = 4000, .height = 3000, .fps_milli = 30030 },
+		},
+		.lanes = 4, .lane_cfg = 0x3210,
 		.csiphy = 1, .csiphy_phys = 0x0ac66000UL, .phy_sel = 1,
 		.timer_cmd = 0x6028, .timer_cbcr = 0x6040, .phy_cbcr = 0x6044,
 		.bayer = 0, .header = "IMX582",       /* RGGB: colorFilterArrangement 3 in CamX's order (tools/camsensor.py:142) */
 		.ae_frame_lines = 0x13b8, .ae_lines = 0x1388, .ae_gain = 0x300,
 	},
 	{
-		.name = "s5k3t2", .sensor = 2, .tab = "camera-s5k3t2.tab", .mode = "res2",
-		.width = 1280, .height = 720, .fps = "120.41", .lanes = 4, .lane_cfg = 0x3210,
+		.name = "s5k3t2", .sensor = 2, .tab = "camera-s5k3t2.tab",
+		.mode_count = 2,
+		.modes = {
+			{ .name = "usual", .block = "res2", .width = 1280, .height = 720, .fps_milli = 120410 },
+			{ .name = "full",  .block = "res1", .width = 2592, .height = 1940, .fps_milli = 30130 },
+		},
+		.lanes = 4, .lane_cfg = 0x3210,
 		.csiphy = 2, .csiphy_phys = 0x0ac67000UL, .phy_sel = 2,
 		.timer_cmd = 0x604c, .timer_cbcr = 0x6064, .phy_cbcr = 0x6068,
 		.bayer = 2, .header = "S5K3T2",       /* GBRG: the module's colorFilterArrangement 1 in CamX's order (0 BGGR, 1 GBRG, 2 GRBG, 3 RGGB: tools/camsensor.py:31-32, :142); a tester's magenta selfie with RGGB (a test run) */
@@ -3212,6 +3255,46 @@ cam_tab_write_block(struct cam_bus *bus, const struct cam_sensor *s, const struc
 	return true;
 }
 
+/*
+ * The 16-bit value a block writes at `address', as the vendor blocks do it: the S5K3T2's one
+ * 2-byte write at 0x0340, or the IMX582's two 1-byte writes at 0x0340 (high) and 0x0341 (low).
+ * The last matching entry wins. False when the block does not write that register.
+ *
+ * (Step 6 mode 1 asks this of 0x0340: its frame length is the vendor block's, and the header's
+ * line_ns comes from it; nothing of ours is written to that register in mode 1.)
+ */
+static bool
+cam_tab_reg16(const struct cam_tab_block *block, uint16_t address, uint16_t *value)
+{
+	uint32_t high = 0, low = 0;
+	bool have_high = false, have_low = false, have_word = false;
+
+	for (uint32_t i = 0; i < block->count; i++) {
+		const uint8_t *e = block->entries + (uint64_t)i * CAM_TAB_ENTRY_BYTES;
+		uint16_t a = cam_le16(e), v = cam_le16(e + 2);
+
+		if (a == address && e[5] == 2) {
+			high = v;
+			have_word = true;
+		} else if (a == address && e[5] == 1) {
+			high = v & 0xff;
+			have_high = true;
+		} else if (a == address + 1 && e[5] == 1) {
+			low = v & 0xff;
+			have_low = true;
+		}
+	}
+	if (have_word) {
+		*value = (uint16_t)high;
+		return true;
+	}
+	if (have_high && have_low) {
+		*value = (uint16_t)((high << 8) | low);
+		return true;
+	}
+	return false;
+}
+
 /* ---- step 4: CSIPHY1 or CSIPHY2 (qcom,csiphy-v1.1) --------------------------------------------- */
 
 #define CSIPHY_SIZE             0x1000UL        /* both 0x0ac66000 and 0x0ac67000 (vendor dtsi:47-100) */
@@ -3390,9 +3473,11 @@ csiphy_down(void)
 /* ---- steps 4 and 6: one camera's stream, up and down ------------------------------------------- */
 
 /*
- * Step 5's ring: three places of contiguous kernel memory, each round_page()d to the largest
- * sensor's frame. Step 6's IFE writes into them and cam_stream_up() maps the whole ring, so the
- * variables are declared before it; cam_fake_ring_alloc() (with the node's code below) fills them.
+ * Step 5's ring: three places of kernel memory, each round_page()d to the largest mode's frame.
+ * The memory is kmem_alloc()ed, not contiguous: step 6's SMMU tables map it a 4 KB page at a time
+ * through kvtophys(), so only the virtual range has to be contiguous. Step 6's IFE writes into it
+ * and cam_stream_up() maps the whole ring, so the variables are declared before it;
+ * cam_fake_ring_alloc() (with the node's code below) fills them.
  */
 static vm_offset_t cam_fake_ring;
 static uint64_t cam_fake_ring_bytes;
@@ -3411,42 +3496,54 @@ struct cam_stream_state {
 
 /*
  * Step 4's bring-up, shared by step 6.
+ * `mode' is the camera row's mode to bring up: its block supplies the table's mode block and its
+ * size the frame. Step 4 passes mode 0; step 6 passes the mode its ABI row names.
  * `ring' is 0 for step 4: its own frames are allocated (a 4 KB header, then two frames) and RDI 0
  * is left halted for vayu_camera_skip_ms. Non-zero is step 6's ring: the whole ring is mapped in
- * the SMMU, the pause is 0, the camera row's 4x frame/exposure/gain are written ALWAYS, and RDI 0
- * runs from the start. `step' is "step 4"/"step 6" for the lines that have one.
+ * the SMMU, the pause is 0, the camera row's 4x frame/exposure/gain are written ALWAYS in mode 0,
+ * mode 1 writes none of them (its frame and exposure are the vendor block's), and RDI 0 runs from
+ * the start. `step' is "step 4"/"step 6" for the lines that have one.
  *
  * The caller tears down through cam_stream_down() on any false; st->teardown says whether a
  * teardown is due (false only for the tab and rail refusals, which write nothing).
  */
 static bool
-cam_stream_up(const struct cam_stream_cfg *cfg, vm_offset_t ring, const char *step,
-    struct cam_stream_state *st)
+cam_stream_up(const struct cam_stream_cfg *cfg, const struct cam_mode *mode, vm_offset_t ring,
+    const char *step, struct cam_stream_state *st)
 {
 	const struct cam_sensor *s = &cam_sensors[cfg->sensor];
 	uint8_t data[2] = { 0, 0 };
 	char detail[192], bytes[32];
-	uint32_t width = cfg->width, height = cfg->height;
-	uint32_t stride = RAW10_STRIDE(width), frame_bytes = stride * height;
+	uint32_t width, height, stride, frame_bytes;
 	uint32_t id = 0;
 	bool real = ring != 0;
+	bool full = real && mode != NULL && mode != &cfg->modes[0];  /* mode 1: the vendor's own frame length and exposure */
 
 	memset(st, 0, sizeof(*st));
 	st->cfg = cfg;
 	st->s = s;
 	g_stream = cfg;
 
-	if (!cam_tab_load(cfg->tab, cfg->mode, step) || !cam_rails_lookup(step, true)) {
+	if (mode == NULL || mode->block == NULL) {
+		printf("vayu-camera: %s: the camera row has no such mode: not done\n", step);
+		return false;
+	}
+	width = mode->width;
+	height = mode->height;
+	stride = RAW10_STRIDE(width);
+	frame_bytes = stride * height;
+	if (!cam_tab_load(cfg->tab, mode->block, step) || !cam_rails_lookup(step, true)) {
 		return false;
 	}
 	if (real) {
-		printf("vayu-camera: step 6: a %s frame %ux%u RAW10, four lanes, through CSIPHY%u, "
+		printf("vayu-camera: step 6: a %s frame %ux%u RAW10, mode %u (%s), four lanes, through CSIPHY%u, "
 		    "CSID-lite 0 RDI 0 and IFE-lite 0 WM0 (camcc PLL0, settle %#x)\n", cfg->header,
-		    width, height, cfg->csiphy, g_settle & 0xff);
+		    width, height, (unsigned)(mode - cfg->modes), mode->name, cfg->csiphy, g_settle & 0xff);
 	} else {
-		printf("vayu-camera: step 4: one %s frame %ux%u RAW10, four lanes, %s fps, through CSIPHY%u, "
+		printf("vayu-camera: step 4: one %s frame %ux%u RAW10, four lanes, %u.%02u fps, through CSIPHY%u, "
 		    "CSID-lite 0 RDI 0 and IFE-lite 0 WM0 (camcc PLL0, settle %#x, %u ms for the frame)\n",
-		    cfg->header, width, height, cfg->fps, cfg->csiphy, g_settle & 0xff, g_frames_ms);
+		    cfg->header, width, height, mode->fps_milli / 1000, (mode->fps_milli % 1000) / 10,
+		    cfg->csiphy, g_settle & 0xff, g_frames_ms);
 	}
 	printf("vayu-camera: about to write (rails, camcc, TLMM, I2C, CSIPHY, SMMU, CSID, IFE) in %u ms\n",
 	    real ? 0 : g_pause_ms);
@@ -3519,10 +3616,12 @@ cam_stream_up(const struct cam_stream_cfg *cfg, vm_offset_t ring, const char *st
 	}
 	/*
 	 * 0x0340/0x0202/0x0204, the camera row's values. Step 4 writes them only when asked
-	 * (vayu_camera_ae, or an exposure/gain boot-arg); step 6 writes them at every session start,
-	 * because its exposure is fixed. Volatile registers: the power-down resets them.
+	 * (vayu_camera_ae, or an exposure/gain boot-arg); step 6 mode 0 writes them at every session
+	 * start, because its exposure is fixed. Mode 1 writes none of them: the vendor's mode block
+	 * already set the sensor's own, its frame length stays the vendor's, and AE later writes only
+	 * 0x0202/0x0204. Volatile registers: the power-down resets them.
 	 */
-	if (real) {
+	if (real && !full) {
 		uint32_t frame_lines = cfg->ae_frame_lines, lines = cfg->ae_lines, gain = cfg->ae_gain;
 		bool ok = cam_i2c_write_reg(&st->bus, s->addr7, 0x0340, 2, (uint16_t)frame_lines, 2) &&
 		    cam_i2c_write_reg(&st->bus, s->addr7, 0x0202, 2, (uint16_t)lines, 2) &&
@@ -3533,6 +3632,9 @@ cam_stream_up(const struct cam_stream_cfg *cfg, vm_offset_t ring, const char *st
 		if (!ok) {
 			return false;
 		}
+	} else if (real) {
+		printf("vayu-camera: %s: mode 1: the vendor mode block's own 0x0340/0x0202/0x0204, nothing of ours written\n",
+		    s->name);
 	} else if (g_ae || g_exposure != 0 || g_gain != 0) {
 		uint32_t frame_lines = g_ae ? cfg->ae_frame_lines : 0;
 		uint32_t lines = g_exposure != 0 ? g_exposure : g_ae ? cfg->ae_lines : 0;
@@ -3640,10 +3742,11 @@ static void
 cam_step4(void)
 {
 	const struct cam_stream_cfg *cfg = &cam_streams[g_cam];
+	const struct cam_mode *mode = &cfg->modes[0];
 	const struct cam_sensor *s = &cam_sensors[cfg->sensor];
 	struct cam_stream_state st;
 	struct cam_header *h;
-	uint32_t width = cfg->width, height = cfg->height;
+	uint32_t width = mode->width, height = mode->height;
 	uint32_t stride = RAW10_STRIDE(width);
 	uint32_t rx = 0;
 	bool done_frame = false;
@@ -3658,7 +3761,7 @@ cam_step4(void)
 		printf("vayu-camera: the camera AHB clock was not enabled in step 1: step 4 not done\n");
 		return;
 	}
-	if (!cam_stream_up(cfg, 0, "step 4", &st)) {
+	if (!cam_stream_up(cfg, mode, 0, "step 4", &st)) {
 		if (!st.teardown) {
 			return;
 		}
@@ -4038,18 +4141,24 @@ struct cam_frame_out {
 enum { CAM_FRAME_STOP = 0, CAM_FRAME_DONE = 1, CAM_FRAME_RETRY = 2, CAM_FRAME_FAIL = -1 };
 
 /*
- * One row per sensor of the ABI, for both sources. 1 is the rear IMX582, 2 the front S5K3T2.
- * cam_fake_sensors[] is step 5's synthetic source: its frame lengths are the modes' shortest
- * (1e9 / (1262 * 13190) = 60.08 frames a second rear, 1e9 / (830 * 10000) = 120.48 front), the
- * margins leave room for the sensor's own blanking, and gain_unity/gain_max are the sensor's 1x
- * and maximum register values. Those values are HYPOTHESES for the synthetic source only.
- * cam_real_sensors[] is step 6's: the header describes the camera row's 4x frame (5048 lines rear,
- * 3968 front), whose line times are 13190 ns (15.02 fps) and 8375 ns (30.10 fps); the gain is in
- * the sensors' linear scale (Sony 0x100 = 1x, 0x400 = 4x; Samsung 0x20 = 1x, 0x80 = 4x), and the
- * margin is the row's own 48 lines. stream is the cam_streams[] row the source brings up.
+ * One row per sensor and mode of the ABI, for both sources. 1 is the rear IMX582, 2 the front
+ * S5K3T2; mode 0 is the usual one (step 4's and step 5's), mode 1 the vendor's full stills one
+ * (step 6 only). cam_fake_sensors[] is step 5's synthetic source: its frame lengths are the
+ * modes' shortest (1e9 / (1262 * 13190) = 60.08 frames a second rear, 1e9 / (830 * 10000) =
+ * 120.48 front), the margins leave room for the sensor's own blanking, and gain_unity/gain_max are
+ * the sensor's 1x and maximum register values. Those values are HYPOTHESES for the synthetic
+ * source only.
+ * cam_real_sensors[] is step 6's: mode 0's header describes the camera row's 4x frame (5048 lines
+ * rear, 3968 front), whose line times are 13190 ns (15.02 fps) and 8375 ns (30.10 fps); the gain
+ * is in the sensors' linear scale (Sony 0x100 = 1x, 0x400 = 4x; Samsung 0x20 = 1x, 0x80 = 4x), and
+ * the margin is the row's own 48 lines. Mode 1's rows start with width/height (4000x3000 and
+ * 2592x1940, the vendor's res1 blocks); cam_real_start() fills their line_ns and frame length from
+ * the loaded vendor block (0x0340) and the mode table's fps, because those are the block's, not
+ * ours. stream is the cam_streams[] row the source brings up, mode which of its modes.
  */
 struct cam_abi_sensor {
 	uint32_t        sensor;         /* the frame header's sensor number: 1 rear, 2 front */
+	uint32_t        mode;           /* 0: the usual mode; 1: the full stills mode */
 	const char      *name;
 	uint32_t        width, height;
 	uint32_t        bayer;
@@ -4064,16 +4173,20 @@ struct cam_abi_sensor {
 };
 
 static const struct cam_abi_sensor cam_fake_sensors[] = {
-	{ 1, "IMX582", 1920, 1080, 0, 64, 13190, 1262, 65535, 22, 0x100, 0x3c0, NULL },
-	{ 2, "S5K3T2", 1280, 720,  2, 64, 10000,  830, 65535,  8, 0x020, 0x200, NULL },
+	{ 1, 0, "IMX582", 1920, 1080, 0, 64, 13190, 1262, 65535, 22, 0x100, 0x3c0, NULL },
+	{ 2, 0, "S5K3T2", 1280, 720,  2, 64, 10000,  830, 65535,  8, 0x020, 0x200, NULL },
 };
 #define CAM_FAKE_SENSOR_COUNT   (sizeof(cam_fake_sensors) / sizeof(cam_fake_sensors[0]))
 
-static const struct cam_abi_sensor cam_real_sensors[] = {
+static struct cam_abi_sensor cam_real_sensors[] = {
 	/* the IMX582's res3 frame made 4x long: 4 * 1262 lines at 13190 ns; 0x0204 = 0x300 (Sony's 4x code) */
-	{ 1, "IMX582", 1920, 1080, 0, 64, 13190, 0x13b8, 0x13b8, 48, 0x100, 0x1000, &cam_streams[0] },    /* gain 1x..16x (module max 64x: sensorDriverData +0x150 = 64.0, INFERENCE) */
+	{ 1, 0, "IMX582", 1920, 1080, 0, 64, 13190, 0x13b8, 0x13b8, 48, 0x100, 0x1000, &cam_streams[0] },    /* gain 1x..16x (module max 64x: sensorDriverData +0x150 = 64.0, INFERENCE) */
+	/* the IMX582's res1: 4000x3000 at 30.03 fps; line_ns and the frame length are the vendor block's (filled at start) */
+	{ 1, 1, "IMX582", 4000, 3000, 0, 64,     0,      0,      0, 48, 0x100, 0x1000, &cam_streams[0] },
 	/* the S5K3T2's res2 frame made 4x long: 4 * 992 lines at 8375 ns; 0x0204 = 0x80 (4x of 0x20) */
-	{ 2, "S5K3T2", 1280, 720,  2, 64,  8375, 0x0f80, 0x0f80, 48, 0x020, 0x200, &cam_streams[1] },     /* gain 1x..16x (module max 16x: sensorDriverData +0x150 = 16.0, INFERENCE) */
+	{ 2, 0, "S5K3T2", 1280, 720,  2, 64,  8375, 0x0f80, 0x0f80, 48, 0x020, 0x200, &cam_streams[1] },     /* gain 1x..16x (module max 16x: sensorDriverData +0x150 = 16.0, INFERENCE) */
+	/* the S5K3T2's res1: 2592x1940 at 30.13 fps; line_ns and the frame length are the vendor block's (filled at start) */
+	{ 2, 1, "S5K3T2", 2592, 1940, 2, 64,     0,      0,      0, 48, 0x020, 0x200, &cam_streams[1] },
 };
 #define CAM_REAL_SENSOR_COUNT   (sizeof(cam_real_sensors) / sizeof(cam_real_sensors[0]))
 
@@ -4086,7 +4199,7 @@ static const struct cam_abi_sensor cam_real_sensors[] = {
 struct cam_source {
 	const char      *step;          /* "step 5" / "step 6" in the session lines */
 	bool            fixed_exposure; /* step 6: EXPOSURE goes to cam_real_ae(), not to the synthetic exposure model */
-	const struct cam_abi_sensor *(*find)(uint32_t sensor);
+	const struct cam_abi_sensor *(*find)(uint32_t sensor, uint32_t mode);
 	bool            (*start)(const struct cam_abi_sensor *s, uint32_t lines, uint32_t gain,
 	                    uint32_t frame_lines);
 	int             (*frame)(const struct cam_abi_sensor *s, int place, struct cam_frame_out *out);
@@ -4120,7 +4233,14 @@ static uint64_t cam_fake_last_read, cam_fake_frames_done, cam_fake_frames_given,
 static uint64_t cam_fake_given_sequence;
 static struct { uint32_t lines, gain, frame_lines; bool pending; } cam_fake_ask;
 static struct { uint32_t lines, gain, frame_lines; uint64_t from; } cam_fake_at, cam_fake_next;
-static volatile uint32_t cam_fake_switch_to;    /* the sensor a write asked for: 1 or 2, 0 none */
+/*
+ * A sensor command's request, encoded in one word so the session thread and the server cannot see
+ * half of it: 0 none, else sensor | mode << 8 (sensor 1 or 2, mode 0 or 1).
+ */
+#define CAM_SWITCH(sensor, mode)        ((uint32_t)(sensor) | ((uint32_t)(mode) << 8))
+#define CAM_SWITCH_SENSOR(value)        ((value) & 0xffu)
+#define CAM_SWITCH_MODE(value)          ((value) >> 8)
+static volatile uint32_t cam_fake_switch_to;    /* the sensor+mode a write asked for, 0 none */
 
 static uint64_t
 cam_fake_ms(void)
@@ -4131,9 +4251,14 @@ cam_fake_ms(void)
 	return ns / NSEC_PER_MSEC;
 }
 
+/*
+ * Step 5's synthetic source has one mode per sensor: mode 0's row answers whatever mode was asked
+ * (the ABI's b is only meaningful for step 6's real sensors).
+ */
 static const struct cam_abi_sensor *
-cam_fake_find(uint32_t sensor)
+cam_fake_find(uint32_t sensor, uint32_t mode)
 {
+	(void)mode;
 	for (unsigned i = 0; i < CAM_FAKE_SENSOR_COUNT; i++) {
 		if (cam_fake_sensors[i].sensor == sensor) {
 			return &cam_fake_sensors[i];
@@ -4160,10 +4285,13 @@ cam_fake_limits(const struct cam_abi_sensor *s, uint32_t *lines, uint32_t *gain,
 }
 
 /*
- * The ring: three places in one piece of contiguous kernel memory, as step 3's frames are. The
- * largest sensor's frame sets the place's size, so a switch between the two needs no new memory;
- * the ring stays for the rest of the run (nothing of it is handed to the loader). Step 5 sizes it
- * from its synthetic table, step 6 from the real one; both tables agree on the two sizes.
+ * The ring: three places in one piece of kernel memory, page by page (kmem_alloc, not
+ * kmem_alloc_contig: the SMMU's tables map every 4 KB page through kvtophys(), so the pages need
+ * not be physically contiguous). The largest mode's frame sets the place's size, so a switch
+ * between the sensors or the modes needs no new memory; the ring stays for the rest of the run
+ * (nothing of it is handed to the loader). Step 5 sizes it from its synthetic table, step 6 from
+ * the real one, whose mode 1 rows make the IMX582's 4000x3000 frame (5008 * 3000 = 15,024,000
+ * bytes, 15,000,000 before the line's 16-byte rounding) the largest.
  */
 static bool
 cam_fake_ring_alloc(const struct cam_abi_sensor *rows, unsigned count, const char *step)
@@ -4177,7 +4305,7 @@ cam_fake_ring_alloc(const struct cam_abi_sensor *rows, unsigned count, const cha
 	}
 	cam_fake_place_bytes = round_page(largest);
 	cam_fake_ring_bytes = (uint64_t)CAM_FAKE_RING * cam_fake_place_bytes;
-	if (kmem_alloc_contig(kernel_map, &cam_fake_ring, cam_fake_ring_bytes, PAGE_MASK, 0, 0,
+	if (kmem_alloc(kernel_map, &cam_fake_ring, cam_fake_ring_bytes,
 	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		printf("vayu-camera: %s: no memory for %u frames (%llu KB)\n", step, CAM_FAKE_RING,
 		    (unsigned long long)(cam_fake_ring_bytes >> 10));
@@ -4194,18 +4322,19 @@ cam_fake_ring_alloc(const struct cam_abi_sensor *rows, unsigned count, const cha
 	return true;
 }
 
-/* the sensor selection, its first exposure: a room's, until the program asks for its own */
+/* the sensor+mode selection, its first exposure: a room's, until the program asks for its own */
 static bool
-cam_fake_select(uint32_t sensor)
+cam_fake_select(uint32_t sensor, uint32_t mode)
 {
-	const struct cam_abi_sensor *s = cam_fake_source->find(sensor);
+	const struct cam_abi_sensor *s = cam_fake_source->find(sensor, mode);
 
 	if (s == NULL) {
 		return false;
 	}
 	lck_mtx_lock(&cam_fake_lock);
 	cam_fake_now = s;
-	cam_fake_ask.lines = s->frame_lines_min - s->margin;
+	/* (mode 1's frame length is the vendor block's, known only once its session has loaded it) */
+	cam_fake_ask.lines = s->frame_lines_min > s->margin ? s->frame_lines_min - s->margin : 0;
 	cam_fake_ask.gain = s->gain_unity;
 	cam_fake_ask.frame_lines = 0;
 	cam_fake_ask.pending = false;
@@ -4314,7 +4443,8 @@ static int cam_real_writing, cam_real_next;     /* the place the frame in flight
 static uint32_t cam_real_late;                  /* SOFs with no address waiting */
 /*
  * AE (the maintainers' ruling 2026-10-25: 0x0202 / 0x0204 / 0x0340): the ISP in mediaserverd asks for an exposure in lines and a
- * LINEAR gain (gain_unity = 1x); the session thread writes it between frames. The frame length stays the row's 4x value.
+ * LINEAR gain (gain_unity = 1x); the session thread writes it between frames. The frame length is
+ * the mode's own -- 4x in mode 0, the vendor block's in mode 1 -- and AE never writes 0x0340.
  */
 static struct { uint32_t lines, gain; bool pending; } cam_real_ask;
 static uint32_t cam_real_lines, cam_real_gain;  /* what the sensor has now (linear gain) */
@@ -4323,20 +4453,53 @@ static void cam_af_up(void);
 static void cam_af_frame(void);
 
 static const struct cam_abi_sensor *
-cam_real_find(uint32_t sensor)
+cam_real_find(uint32_t sensor, uint32_t mode)
 {
 	for (unsigned i = 0; i < CAM_REAL_SENSOR_COUNT; i++) {
-		if (cam_real_sensors[i].sensor == sensor) {
+		if (cam_real_sensors[i].sensor == sensor && cam_real_sensors[i].mode == mode) {
 			return &cam_real_sensors[i];
 		}
 	}
 	return NULL;
 }
 
+/*
+ * The linear ABI gain a 0x0204 code means: Sony's code is 1024 - 1024 / gain (0 is 1x), so
+ * gain = 1024 * gain_unity / (1024 - code); Samsung's is linear with 0x20 = 1x, so the code is
+ * already in gain_unity's units. Clamped to the row's unity and maximum.
+ */
+static uint32_t
+cam_real_gain_from_code(const struct cam_stream_cfg *cfg, const struct cam_abi_sensor *s, uint32_t code)
+{
+	uint32_t gain;
+
+	if (cfg == &cam_streams[0]) {
+		if (code >= 1024) {
+			return s->gain_unity;
+		}
+		gain = (uint32_t)(((uint64_t)1024 * s->gain_unity) / (1024 - code));
+	} else {
+		gain = code;
+	}
+	if (gain < s->gain_unity) {
+		return s->gain_unity;
+	}
+	return gain > s->gain_max ? s->gain_max : gain;
+}
+
 static bool
 cam_real_start(const struct cam_abi_sensor *s, uint32_t lines, uint32_t gain, uint32_t frame_lines)
 {
 	const struct cam_stream_cfg *cfg = s->stream;
+	const struct cam_mode *mode;
+	/*
+	 * Mode 1's line time and frame length are the vendor block's: they are filled into its row
+	 * (the table is ours and mutable; find() hands it out const because step 5's is const).
+	 */
+	struct cam_abi_sensor *row = (struct cam_abi_sensor *)s;
+	uint16_t vendor_frame_lines = 0, vendor_exposure = 0, vendor_gain = 0;
+	uint32_t most;
+	bool full;
 
 	(void)lines;
 	(void)gain;
@@ -4349,23 +4512,56 @@ cam_real_start(const struct cam_abi_sensor *s, uint32_t lines, uint32_t gain, ui
 	 */
 	g_smmu_bad = false;
 	g_smmu_said = false;
-	if (cfg == NULL || cam_fake_ring == 0 || cam_fake_ring_bytes == 0) {
-		printf("vayu-camera: step 6: sensor %u has no camera row or the ring is not there\n", s->sensor);
+	if (cfg == NULL || s->mode >= cfg->mode_count || cam_fake_ring == 0 || cam_fake_ring_bytes == 0) {
+		printf("vayu-camera: step 6: sensor %u mode %u has no camera row or the ring is not there\n",
+		    s->sensor, s->mode);
 		return false;
+	}
+	mode = &cfg->modes[s->mode];
+	full = s->mode != 0;
+	if (!cam_stream_up(cfg, mode, cam_fake_ring, "step 6", &cam_real_stream)) {
+		printf("vayu-camera: step 6: session on sensor %u (%s) mode %u: the bring-up failed: the session ends\n",
+		    s->sensor, s->name, s->mode);
+		return false;
+	}
+	/*
+	 * Mode 1: the vendor block just written set the sensor's own frame length, exposure and gain.
+	 * Its 0x0340 gives the header its frame lines (IMX582: 1-byte writes at 0x0340 high and 0x0341
+	 * low; S5K3T2: one 2-byte write at 0x0340) and line_ns = 1e9 / (fps * frame_lines); 0x0202 and
+	 * 0x0204 (the mode block's, else the init block's) give the session's first exposure and gain.
+	 * Neither register was written by us.
+	 */
+	if (full) {
+		if (!cam_tab_reg16(&cam_tab[CAM_TAB_MODE], 0x0340, &vendor_frame_lines) ||
+		    vendor_frame_lines == 0 || mode->fps_milli == 0) {
+			printf("vayu-camera: step 6: %s mode 1: the vendor block has no 0x0340 frame length: "
+			    "the session ends\n", s->name);
+			return false;
+		}
+		row->frame_lines_min = vendor_frame_lines;
+		row->frame_lines_max = vendor_frame_lines;
+		row->line_ns = (uint32_t)(1000000000000ull /
+		    ((uint64_t)mode->fps_milli * vendor_frame_lines));
+		most = vendor_frame_lines > row->margin ? vendor_frame_lines - row->margin : vendor_frame_lines;
+		/* the session's first exposure is the vendor block's 0x0202 (mode block first, then init) */
+		cam_real_lines = most;
+		if ((cam_tab_reg16(&cam_tab[CAM_TAB_MODE], 0x0202, &vendor_exposure) ||
+		    cam_tab_reg16(&cam_tab[CAM_TAB_INIT], 0x0202, &vendor_exposure)) && vendor_exposure != 0) {
+			cam_real_lines = vendor_exposure > most ? most : vendor_exposure;
+		}
+		cam_real_gain = (cam_tab_reg16(&cam_tab[CAM_TAB_MODE], 0x0204, &vendor_gain) ||
+		    cam_tab_reg16(&cam_tab[CAM_TAB_INIT], 0x0204, &vendor_gain)) && vendor_gain != 0 ?
+		    cam_real_gain_from_code(cfg, s, vendor_gain) : s->gain_unity;
+	} else {
+		cam_real_lines = cfg->ae_lines;
+		cam_real_gain = 4u * s->gain_unity;
 	}
 	cam_real_frame_ns = (uint64_t)s->line_ns * s->frame_lines_min;
 	cam_real_timeout_ms = (uint32_t)((3 * cam_real_frame_ns + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC) + 100;
-	if (!cam_stream_up(cfg, cam_fake_ring, "step 6", &cam_real_stream)) {
-		printf("vayu-camera: step 6: session on sensor %u (%s): the bring-up failed: the session ends\n",
-		    s->sensor, s->name);
-		return false;
-	}
 	/* ife_config() gave WM0 place 0's address (FRAME_ADDRESSES): it is taken at the first SOF */
 	cam_real_writing = 0;
 	cam_real_next = 0;
 	cam_real_late = 0;
-	cam_real_lines = cfg->ae_lines;
-	cam_real_gain = 4u * s->gain_unity;
 	cam_real_ask.pending = false;
 	cam_real_ae_writes = 0;
 	cam_af_up();
@@ -4376,9 +4572,10 @@ cam_real_start(const struct cam_abi_sensor *s, uint32_t lines, uint32_t gain, ui
 	wr(g_ife_va + BUS_IRQ_CLEAR1, 1);
 	wr(g_ife_va + BUS_IRQ_GLOBAL_CLEAR, 1);
 	(void)cam_blk_put(g_csid_va, "CSID", CSID_RDI0_CTRL, 1, true);
-	printf("vayu-camera: step 6: session started on sensor %u (%s): %ux%u RAW10, line %u ns, frame %u lines, "
-	    "exposure %u lines, 0x0204 gain %#x, %u ms timeout\n", s->sensor, s->name, s->width, s->height,
-	    s->line_ns, s->frame_lines_min, cfg->ae_lines, cfg->ae_gain, cam_real_timeout_ms);
+	printf("vayu-camera: step 6: session started on sensor %u (%s) mode %u (%s): %ux%u RAW10, line %u ns, "
+	    "frame %u lines, exposure %u lines, gain %#x (linear, unity %#x), %u ms timeout\n", s->sensor,
+	    s->name, s->mode, mode->name, s->width, s->height, s->line_ns, s->frame_lines_min, cam_real_lines,
+	    cam_real_gain, s->gain_unity, cam_real_timeout_ms);
 	return true;
 }
 
@@ -4388,21 +4585,24 @@ cam_real_start(const struct cam_abi_sensor *s, uint32_t lines, uint32_t gain, ui
  * 100 ms. The place's cache lines are invalidated once the IFE has written past them. A timeout
  * asks for another place; the third in a row fails the session, as an SMMU fault does.
  *
- * The header's exposure/gain are the fixed ones this session wrote, but the gain is the ABI's
- * LINEAR one, not the sensor's code: the row's fixed gain is 4x, and 0x0204 took the sensor's
- * own code (IMX582 0x300, S5K3T2 0x80) while the ABI says 4 * gain_unity (0x400 / 0x80).
+ * The header's exposure/gain are the ones this session has, but the gain is the ABI's LINEAR one,
+ * not the sensor's code: mode 0's fixed gain is 4x, and 0x0204 took the sensor's own code (IMX582
+ * 0x300, S5K3T2 0x80) while the ABI says 4 * gain_unity (0x400 / 0x80); mode 1 starts from the
+ * vendor block's own values. The frame length is the row's own (mode 0: 4x; mode 1: the vendor's),
+ * and AE never writes 0x0340.
  */
 /*
  * A pending AE request written to the sensor, between two frames (the frame that follows takes it,
  * or the one after: the header says what the sensor has from now on). Linear gain to the sensor's
  * code: the IMX582's analog gain is Sony's code = 1024 - 1024 / gain (gain 1x..16x: code 0..960); the
- * S5K3T2's is linear with 0x20 = 1x (HYPOTHESIS, as cam6). Only 0x0202 and 0x0204 are written.
+ * S5K3T2's is linear with 0x20 = 1x (HYPOTHESIS, as cam6). Only 0x0202 and 0x0204 are written; the
+ * frame length stays what the mode is (mode 0's 4x, mode 1's vendor block's).
  */
 static void
 cam_real_ae(const struct cam_abi_sensor *s)
 {
 	const struct cam_stream_cfg *cfg = s->stream;
-	uint32_t lines, gain, code;
+	uint32_t lines, gain, code, most;
 	bool ok;
 
 	lck_mtx_lock(&cam_fake_lock);
@@ -4414,10 +4614,11 @@ cam_real_ae(const struct cam_abi_sensor *s)
 	gain = cam_real_ask.gain;
 	cam_real_ask.pending = false;
 	lck_mtx_unlock(&cam_fake_lock);
+	most = s->frame_lines_min > s->margin ? s->frame_lines_min - s->margin : s->frame_lines_min;
 	if (lines < 4) {
 		lines = 4;
-	} else if (lines > (uint32_t)cfg->ae_frame_lines - 48) {
-		lines = cfg->ae_frame_lines - 48;
+	} else if (lines > most) {
+		lines = most;
 	}
 	if (gain < s->gain_unity) {
 		gain = s->gain_unity;
@@ -4444,14 +4645,13 @@ cam_real_ae(const struct cam_abi_sensor *s)
 static int
 cam_real_frame(const struct cam_abi_sensor *s, int p, struct cam_frame_out *out)
 {
-	const struct cam_stream_cfg *cfg = s->stream;
 	uint64_t start;
 	vm_offset_t at;
 
 	(void)p;
 	out->exposure_lines = cam_real_lines;
 	out->gain = cam_real_gain;      /* (linear: gain_unity = 1x; the sensor's code is written by cam_real_ae()) */
-	out->frame_lines = cfg->ae_frame_lines;
+	out->frame_lines = s->frame_lines_min;
 
 	/*
 	 * redwood's ios_session() scheme: WM0's address and the IFE's register update are taken at the
@@ -4713,7 +4913,13 @@ cam_session(const struct cam_abi_sensor *s, const struct cam_source *src)
 	gain = cam_fake_ask.gain;
 	frame_lines = cam_fake_ask.frame_lines;
 	cam_fake_ask.pending = false;
-	cam_fake_limits(s, &lines, &gain, &frame_lines);
+	/*
+	 * (mode 1's frame length is only known once the vendor block is loaded: before its first
+	 * session the row's frame_lines_min is 0, and step 6 ignores these values anyway.)
+	 */
+	if (s->frame_lines_min > s->margin) {
+		cam_fake_limits(s, &lines, &gain, &frame_lines);
+	}
 	cam_fake_at.lines = cam_fake_next.lines = lines;
 	cam_fake_at.gain = cam_fake_next.gain = gain;
 	cam_fake_at.frame_lines = cam_fake_next.frame_lines = frame_lines;
@@ -4804,7 +5010,7 @@ cam_session(const struct cam_abi_sensor *s, const struct cam_source *src)
 			failed = true;
 			break;
 		} else {
-			break;          /* (closed or another sensor asked for: the loop's condition says which) */
+			break;          /* (closed or another sensor/mode asked for: the loop's condition says which) */
 		}
 	}
 
@@ -4922,7 +5128,7 @@ cam_fake_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 			return EAGAIN;
 		}
 		if (!cam_fake_streaming && !cam_fake_wanted) {
-			cam_fake_wanted = true;         /* (the frames stopped meanwhile: another sensor) */
+			cam_fake_wanted = true;         /* (the frames stopped meanwhile: another sensor/mode) */
 			wakeup(&cam_fake_open);
 		}
 		struct timespec ts = { 0, 100 * NSEC_PER_MSEC };
@@ -4962,6 +5168,7 @@ cam_fake_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	f.frame_lines_max = s->frame_lines_max;
 	f.margin = s->margin;
 	f.sensor = s->sensor;
+	f.mode = s->mode;               /* (the mode these frames were taken in: 0 usual, 1 full stills) */
 	f.focus = cam_fake_source == &cam_fake_real ? cam_af_pos : HAKIOS_CAMERA_NO_FOCUS;
 	lck_mtx_unlock(&cam_fake_lock);
 
@@ -5019,12 +5226,36 @@ cam_fake_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		return 0;
 	}
 	if (c.command == HAKIOS_CAMERA_SENSOR) {
+		const struct cam_abi_sensor *want;
+		uint32_t mode;
+		bool announce = cam_fake_source->fixed_exposure;     /* (step 6 logs; step 5 keeps its old, silent restart) */
+
 		if (c.a != 1 && c.a != 2) {
 			return EINVAL;
 		}
+		/* b: ~0 and 0 are the usual mode, 1 the full one; anything else is not a mode */
+		if (c.b == 0 || c.b == ~0u) {
+			mode = 0;
+		} else if (c.b == 1) {
+			mode = 1;
+		} else {
+			return EINVAL;
+		}
+		if (!cam_fake_source->fixed_exposure) {
+			mode = 0;       /* (step 5's synthetic source has one mode per sensor: b is ignored) */
+		}
+		want = cam_fake_source->find(c.a, mode);
+		if (want == NULL) {
+			return EINVAL;
+		}
 		lck_mtx_lock(&cam_fake_lock);
-		cam_fake_switch_to = c.a;       /* (b, the mode, is ignored: each sensor has one) */
+		/* (every sensor command is a switch, as before: the latest one wins) */
+		cam_fake_switch_to = CAM_SWITCH(c.a, mode);
 		lck_mtx_unlock(&cam_fake_lock);
+		if (announce) {
+			printf("vayu-camera: %s: sensor %u mode %u asked (%ux%u)\n", cam_fake_source->step,
+			    c.a, mode, want->width, want->height);
+		}
 		wakeup(&cam_fake_open);
 		return 0;
 	}
@@ -5059,7 +5290,7 @@ cam_fake_dev_make(void)
 	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-camera") != NULL;
 }
 
-/* a session whenever a read wants frames, another sensor whenever one is asked for, until a fault */
+/* a session whenever a read wants frames, another sensor or mode whenever one is asked for, until a fault */
 static void
 cam_fake_serve(void)
 {
@@ -5079,8 +5310,11 @@ cam_fake_serve(void)
 			break;
 		}
 		if (to != 0) {
-			if (!cam_fake_select(to)) {
-				printf("vayu-camera: %s: sensor %u is not one of the two\n", cam_fake_source->step, to);
+			uint32_t sensor = CAM_SWITCH_SENSOR(to), mode = CAM_SWITCH_MODE(to);
+
+			if (!cam_fake_select(sensor, mode)) {
+				printf("vayu-camera: %s: sensor %u mode %u is not in the table\n",
+				    cam_fake_source->step, sensor, mode);
 				cam_fake_broken = true;
 				break;
 			}
@@ -5102,7 +5336,7 @@ static void
 cam_step5(void)
 {
 	cam_fake_source = &cam_fake_synthetic;
-	if (!cam_fake_select(1)) {
+	if (!cam_fake_select(1, 0)) {
 		printf("vayu-camera: step 5: no sensor table\n");
 		return;
 	}
@@ -5131,7 +5365,7 @@ cam_step6(void)
 {
 	cam_fake_source = &cam_fake_real;
 	printf("vayu-camera: step 6: /dev/hakios-camera, fed by the real sensors (1 = rear IMX582, "
-	    "2 = front S5K3T2)\n");
+	    "2 = front S5K3T2; mode 0 usual, mode 1 full)\n");
 	if (!g_xnu_tlmm) {
 		printf("vayu-camera: step 6 needs vayu_camera_xnu_tlmm=1 (TLMM writes): not done\n");
 		return;
@@ -5140,7 +5374,7 @@ cam_step6(void)
 		printf("vayu-camera: the camera AHB clock was not enabled: step 6 not done\n");
 		return;
 	}
-	if (!cam_fake_select(1)) {
+	if (!cam_fake_select(1, 0)) {
 		printf("vayu-camera: step 6: no sensor table\n");
 		return;
 	}
