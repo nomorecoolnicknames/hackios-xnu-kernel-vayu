@@ -1246,6 +1246,51 @@ load_tweaks(void)
 	}
 }
 
+/*
+ * Boot-arg fb_120=1: CoreAnimation's 16.7 ms minimum frame duration, off for this process too.
+ * QuartzCore reads the switch as an Info.plist key (CADeviceInfo, 20F66: the CFString at
+ * 0x1d5b6b1b8 passed to CFBundleGetValueForInfoDictionaryKey at 0x1884c2e2c; the spelling without
+ * "...OnPhone" at 0x1d5b6b198/0x1884c2d70), not from the environment. The replacement answers both
+ * with true when the boot arg asks for 120 and passes every other key through.
+ */
+static int
+fb120_wanted(void)
+{
+	static int wanted = -1;
+
+	if (wanted < 0) {
+		char arguments[4096] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+		    strstr(arguments, "fb_120=1") != NULL;
+	}
+	return wanted;
+}
+
+static CFTypeRef
+fb120_info_value(CFBundleRef bundle, CFStringRef key)
+{
+	static CFTypeRef (*original)(CFBundleRef, CFStringRef);
+
+	if (original == NULL) {
+		original = (CFTypeRef (*)(CFBundleRef, CFStringRef))dlsym(RTLD_NEXT, "CFBundleGetValueForInfoDictionaryKey");
+	}
+	if (fb120_wanted() && key != NULL &&
+	    (CFEqual(key, CFSTR("CADisableMinimumFrameDurationOnPhone")) ||
+	     CFEqual(key, CFSTR("CADisableMinimumFrameDuration")))) {
+		return kCFBooleanTrue;
+	}
+	return original != NULL ? original(bundle, key) : NULL;
+}
+
+#define HAKIOS_INTERPOSE(replacement, replacee) \
+	__attribute__((used)) static struct { const void *replacement; const void *replacee; } \
+	_hakios_interpose_##replacee __attribute__((section("__DATA,__interpose"))) = \
+	    { (const void *)(uintptr_t) &replacement, (const void *)(uintptr_t) &replacee }
+
+HAKIOS_INTERPOSE(fb120_info_value, CFBundleGetValueForInfoDictionaryKey);
+
 __attribute__((constructor))
 static void
 hakios_springboard_init(void)
@@ -1271,6 +1316,18 @@ hakios_springboard_init(void)
 			layers();
 		});
 		return;
+	}
+	/*
+	 * Boot-arg fb_120=1 (the display driver, MiniIOMobileFramebuffer.cpp): CoreAnimation's 16.7 ms
+	 * minimum frame duration, off for this process. The window server having it off is not enough:
+	 * an animation's frames are committed from here, and a compositor that keeps to 60 a second
+	 * makes the panel's 120 Hz invisible however often the driver is told to refresh it (run
+	 * 022501: 120 refreshes a second told, 29-59 frames a second shown, median 48). The switch is
+	 * the Info.plist key answered by the interposer above (src/inject.c has the same for
+	 * backboardd) -- not an environment variable, which QuartzCore does not read for it.
+	 */
+	if (fb120_wanted()) {
+		say("hakios: fb_120=1: CoreAnimation's 16.7 ms minimum frame duration is off for SpringBoard\n");
 	}
 	/*
 	 * The tweaks of the package manager's prefix, if one is installed: ElleKit's loader

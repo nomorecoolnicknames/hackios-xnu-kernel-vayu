@@ -1077,6 +1077,57 @@ opengl_es(void)
 	gl_function_refused = (void (*)(unsigned))dlsym(library, "hakios_gl_function_refused");
 }
 
+/*
+ * Boot-arg fb_120=1: CoreAnimation's 16.7 ms minimum frame duration, off for this process. The
+ * display driver (MiniIOMobileFramebuffer.cpp) tells iOS of a refresh every panel frame; this is
+ * the other half, the window server's own clock.
+ *
+ * QuartzCore reads the switch as an Info.plist key, not from the environment. In the 20F66
+ * CADeviceInfo code, CADisableMinimumFrameDurationOnPhone is the CFString at 0x1d5b6b1b8 and is
+ * passed to CFBundleGetValueForInfoDictionaryKey at 0x1884c2e2c; the spelling without "...OnPhone"
+ * is 0x1d5b6b198 at 0x1884c2d70, with a CFPreferences fallback. The only key in that code that is
+ * read with getenv() is CA_FORCE_TIMER (0x188364624). So setenv("CADisableMinimumFrameDuration")
+ * does nothing: the key has to be answered for the bundle. The replacement below answers both
+ * spellings with true when the boot arg asks for 120, and passes every other key through.
+ */
+static int
+fb120_wanted(void)
+{
+	static int wanted = -1;
+
+	if (wanted < 0) {
+		char arguments[4096] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+		    strstr(arguments, "fb_120=1") != NULL;
+	}
+	return wanted;
+}
+
+static CFTypeRef
+fb120_info_value(CFBundleRef bundle, CFStringRef key)
+{
+	static CFTypeRef (*original)(CFBundleRef, CFStringRef);
+
+	if (original == NULL) {
+		original = (CFTypeRef (*)(CFBundleRef, CFStringRef))dlsym(RTLD_NEXT, "CFBundleGetValueForInfoDictionaryKey");
+	}
+	if (fb120_wanted() && key != NULL &&
+	    (CFEqual(key, CFSTR("CADisableMinimumFrameDurationOnPhone")) ||
+	     CFEqual(key, CFSTR("CADisableMinimumFrameDuration")))) {
+		return kCFBooleanTrue;
+	}
+	return original != NULL ? original(bundle, key) : NULL;
+}
+
+#define HAKIOS_INTERPOSE(replacement, replacee) \
+	__attribute__((used)) static struct { const void *replacement; const void *replacee; } \
+	_hakios_interpose_##replacee __attribute__((section("__DATA,__interpose"))) = \
+	    { (const void *)(uintptr_t) &replacement, (const void *)(uintptr_t) &replacee }
+
+HAKIOS_INTERPOSE(fb120_info_value, CFBundleGetValueForInfoDictionaryKey);
+
 __attribute__((constructor))
 static void
 hakios_init(void)
@@ -1099,10 +1150,32 @@ hakios_init(void)
 		 * the phones with an A7 to A10, or when CA_FORCE_TIMER is in the environment
 		 * (CADeviceUseVBL()); on the iPhone X it runs a timer of its own instead (CADisplayTimer),
 		 * whose phase it would set from the frame timings of a display driver this one is not.
+		 *
+		 * Boot-arg fb_120=1 (the display driver, MiniIOMobileFramebuffer.cpp): the display is said to
+		 * be the panel's 120 Hz one, and the driver tells iOS of a refresh every panel frame.
+		 *
+		 * The clock is the other half, and it is not the one above: with the panel's timing armed
+		 * (a test run: fb_hz=120 vayu_vsync=2 fb_vsync_div=1 fb_fit=1) the driver was already telling
+		 * 120 refreshes a second and 29-59 frames a second (median 48) still reached the panel, 292 of 300
+		 * intervals 10-18 ms -- a steady 60 with the copy at 1.0 ms. QuartzCore keeps a minimum frame
+		 * duration (16.7 ms) on every display it does not take for a ProMotion one, and an iPhone X's
+		 * identity is not; CADisableMinimumFrameDuration is its switch for that floor (the
+		 * "...OnPhone" spelling is the same switch as an application's Info.plist key). The
+		 * interposer above answers it for this process's bundle; the key is not read from the
+		 * environment, so there is no setenv for it here. With the floor gone and the driver's
+		 * notifications taken below, the window server's clock can run at the mode's 120.
 		 */
-		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "ca_vbl=1") != NULL) {
-			setenv("CA_FORCE_TIMER", "1", 1);
-			say("hakios: ca_vbl=1: CoreAnimation is to take the display driver's refresh notifications\n");
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+			bool for120 = strstr(arguments, "fb_120=1") != NULL;
+
+			if (for120) {
+				say("hakios: fb_120=1: CoreAnimation's 16.7 ms minimum frame duration is off for the window server\n");
+			}
+			if (for120 || strstr(arguments, "ca_vbl=1") != NULL) {
+				setenv("CA_FORCE_TIMER", "1", 1);
+				say("hakios: %s: CoreAnimation is to take the display driver's refresh notifications\n",
+				    for120 ? "fb_120=1" : "ca_vbl=1");
+			}
 		}
 		/*
 		 * Boot-arg caenv=NAME=VALUE (as many as wanted): into the window server's environment, for
