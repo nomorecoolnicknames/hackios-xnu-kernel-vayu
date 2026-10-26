@@ -79,6 +79,7 @@
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
 #include <sys/vayu_cell.h>
+#include <sys/vayu_gnss.h>
 #include <sys/vayu_ipa.h>
 #include <sys/vayu_modem.h>
 #include <sys/vayu_pas.h>
@@ -277,6 +278,7 @@ step_link(void)
 	vayu_rmtfs_start(&qrtr);
 	vayu_ipa_start(&qrtr);
 	vayu_cell_start(&qrtr);		/* vayu_cell=N: SIM/network; changes gated by vayu_cell_* args */
+	vayu_gnss_start(&qrtr);		/* vayu_gnss=1: the modem's GNSS engine (bsd/dev/vayu_gnss.c) */
 	vayu_wifi_start(&qrtr, listen_s);
 	for (s = 1; s <= listen_s; s++) {
 		delay_for_interval(1, NSEC_PER_SEC);
@@ -305,6 +307,7 @@ step_link(void)
 	} else {
 		say("vayu-modem: 3: WLFW (0x45) is not there\n");
 	}
+	vayu_gnss_stop();
 	vayu_cell_stop();
 	vayu_wifi_stop();
 	vayu_ipa_stop();
