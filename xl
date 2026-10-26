@@ -59,7 +59,7 @@ PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone
 # one fastboot at a time (a run in one terminal, "xl screenshot" in another): each takes the lock for itself
 fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
 # does the loader answer while its kernel runs (0.5 and later)? an older one answers only when the run is over
-live_loader() { fb getvar version | grep -Eq 'version: 0\.([5-9]|[1-9][0-9])'; }
+live_loader() { fb getvar version | grep -Eq 'version: (0\.([5-9]|[1-9][0-9])|[1-9][0-9]*\.[0-9]+)'; }
 in_fastboot() { fastboot devices 2>/dev/null | grep -q fastboot; }
 is_loader() { in_fastboot && fb getvar product | grep -q 'product: xnuloader'; }
 state() {
@@ -84,7 +84,9 @@ enter() {
 		[ "$(state)" = absent ] && { echo "xl: phone not reachable"; return 1; }
 		enter; return ;;
 	esac
-	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L --usb >/dev/null &&
+	# DEVICE=<name> (default poco-x5-pro): devices/<name>/boot.conf may name the loader's PLATFORM
+	local platform; platform=$(sed -n 's/^PLATFORM=//p' "devices/${DEVICE:-poco-x5-pro}/boot.conf" 2>/dev/null | head -1)
+	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L --usb ${platform:+--platform $platform} >/dev/null &&
 		./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img >/dev/null || { echo "xl: image build failed"; return 1; }
 	# Right after the phone enters fastboot the first "boot" is sometimes not taken: try twice.
 	local try
@@ -173,6 +175,11 @@ run() { # run <oem command> <label>
 		wait_for android 120 && echo "xl: phone is back in Android" || echo "xl: phone did not come back (state: $(state))"
 		return 2
 	fi
+	# (loader 0.6 and later: "oem log" between runs stages the returned kernel log again -- a follow-loop "oem log"
+	# just after the return no longer leaves only the loader's own log to be fetched, runs 175145 and 204935)
+	case "$(FB_TIMEOUT=10 fb getvar version 2>&1)" in
+	*"version: 0."[6-9]*|*"version: "[1-9]*) fb oem log >/dev/null ;;
+	esac
 	fetch_log "$log"
 	ln -sf "$(basename "$log")" logs/last.log
 	echo "$result  [$log]"
