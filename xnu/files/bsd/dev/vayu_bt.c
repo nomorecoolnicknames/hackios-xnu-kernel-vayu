@@ -3608,6 +3608,8 @@ struct bt_vsc_rule {
 	uint8_t status;                 /* the status byte to report (0 success, 1 unknown, ...) */
 	uint8_t nparams;                /* bytes after the status in a CC, from params[] */
 	const uint8_t *params;
+	uint8_t subop;                  /* first payload byte, when has_subop */
+	bool has_subop;                 /* one opcode can carry many sub-commands (0xfce2 does) */
 };
 
 static struct bt_vsc_rule bt_vsc_rules[] = {
@@ -3635,6 +3637,23 @@ static struct bt_vsc_rule bt_vsc_rules[] = {
 	 * covers every vendor command not listed here.
 	 */
 	{ .opcode = 0xfd48, .action = BT_VSC_CC, .status = 0x01, .nparams = 0, .params = NULL },
+	/*
+	 * 0xfce2 is one opcode for every Olympic sub-command; the sub-opcode is the first payload
+	 * byte.  bt8 run 205056 shows bluetoothd sending three of them: 0x0b and 0x1c (handled, the
+	 * caller does not wait) and 0x15 = BD_VSC_OLYMPIC_ANTENNA_PREF_B, which it waits 15 s for
+	 * (log: "Sending: BD_VSC_OLYMPIC_ANTENNA_PREF_B" then "Invalid data size 0 (status=65535)"
+	 * then "timedout waiting for controller" then reason=3602).
+	 *
+	 * The chip's own answer is a Command Complete status 0x01 with no parameters, and bluetoothd
+	 * still times out on it: its VSC reply wrapper needs a non-empty body of a length this
+	 * experiment does not know.  So this rule is OFF unless vayu_bt_vsc_olympic=N (N = number of
+	 * zero bytes, 1..8) asks for it, and the answer is N zero bytes with status 0 -- a test of
+	 * "the caller only wanted a success with data", not a known-good protocol answer.  With N
+	 * unset (0) bt_vsc_find() never returns this entry, so the rule is as good as absent; it is
+	 * here so that the experiment is one boot-arg away instead of another kernel build.
+	 */
+	{ .opcode = 0xfce2, .action = BT_VSC_CC, .status = 0, .nparams = 0, .params = NULL,
+	    .subop = 0x15, .has_subop = 1 },
 };
 
 #define BT_VSC_RULE_COUNT       (sizeof(bt_vsc_rules) / sizeof(bt_vsc_rules[0]))
@@ -3642,6 +3661,8 @@ static struct bt_vsc_rule bt_vsc_rules[] = {
 static uint32_t g_vsc_mode;             /* vayu_bt_vsc: 0 off, 1 table, 2 answer every VSC */
 static uint32_t g_vsc_seen, g_vsc_passed, g_vsc_answered;
 static uint32_t g_vsc_logged;           /* per-command vsc lines printed so far */
+static uint8_t g_olympic_bytes;         /* vayu_bt_vsc_olympic: zero bytes in the 0x15 answer, 0 = rule off */
+static uint8_t g_olympic_zeros[8];      /* the answer's body while g_olympic_bytes is set */
 static bool g_bt_trace;                 /* vayu_bt_trace=1: every per-command vsc line, no cap */
 #define BT_VSC_LOG_FIRST        64      /* without vayu_bt_trace: the first 64 decisions, then summaries only */
 
@@ -3721,13 +3742,24 @@ bt_vsc_trace_synthetic(const uint8_t *event, uint32_t count)
 	}
 }
 
+/* payload is pkt+4 (after type, opcode and length); a sub-opcode rule needs its first byte. */
 static const struct bt_vsc_rule *
-bt_vsc_find(uint16_t opcode)
+bt_vsc_find(uint16_t opcode, const uint8_t *payload, uint32_t payload_len)
 {
 	for (uint32_t i = 0; i < BT_VSC_RULE_COUNT; i++) {
-		if (bt_vsc_rules[i].opcode == opcode) {
-			return &bt_vsc_rules[i];
+		const struct bt_vsc_rule *rule = &bt_vsc_rules[i];
+
+		if (rule->opcode != opcode) {
+			continue;
 		}
+		if (!rule->has_subop) {
+			return rule;
+		}
+		/* a sub-opcode rule is off (and must not shadow a plain one) while its knob is 0 */
+		if (payload_len < 1 || payload[0] != rule->subop || g_olympic_bytes == 0) {
+			continue;
+		}
+		return rule;
 	}
 	return NULL;
 }
@@ -3807,7 +3839,7 @@ bt_vsc_tx_filter(const uint8_t *pkt, uint32_t len)
 		return BT_VSC_PASS;
 	}
 	opcode = bt_le16(pkt + 1);
-	rule = bt_vsc_find(opcode);
+	rule = bt_vsc_find(opcode, pkt + 4, len - 4);
 	if ((opcode >> 10) != BT_VSC_OGF) {
 		/* a standard command: acted on only when the table lists it with an answer */
 		if (rule == NULL || (rule->action != BT_VSC_CC && rule->action != BT_VSC_CS) || opcode == 0) {
@@ -3824,6 +3856,11 @@ bt_vsc_tx_filter(const uint8_t *pkt, uint32_t len)
 		status = rule->status;
 		nparams = rule->nparams;
 		params = rule->params;
+		if (rule->has_subop && g_olympic_bytes != 0) {
+			/* vayu_bt_vsc_olympic=N: N zero bytes, the length still being the open question */
+			nparams = g_olympic_bytes;
+			params = g_olympic_zeros;
+		}
 	} else if (g_vsc_mode == 2) {
 		action = BT_VSC_CC;
 	} else {
@@ -4431,11 +4468,26 @@ vayu_bt_init(void)
 		}
 		g_vsc_mode = value;
 	}
+	value = 0;
+	if (PE_parse_boot_argn("vayu_bt_vsc_olympic", &value, sizeof(value))) {
+		if (value > sizeof(g_olympic_zeros)) {
+			printf("vayu-bt: vayu_bt_vsc_olympic=%u: at most %u answer bytes exist; "
+			    "using %u\n", (unsigned)value, (unsigned)sizeof(g_olympic_zeros),
+			    (unsigned)sizeof(g_olympic_zeros));
+			value = (uint32_t)sizeof(g_olympic_zeros);
+		}
+		g_olympic_bytes = (uint8_t)value;
+	}
 	if (g_vsc_mode != 0) {
 		printf("vayu-bt: vsc: mode %u (%s); vendor opcodes are OGF 0x3f, %u rule(s)\n",
 		    (unsigned)g_vsc_mode,
 		    g_vsc_mode == 1 ? "table answers, unlisted pass to the chip" :
 		    "table answers, unlisted get a CC status 0", (unsigned)BT_VSC_RULE_COUNT);
+		if (g_olympic_bytes != 0) {
+			printf("vayu-bt: vsc: 0xfce2/0x15 (Olympic antenna) answered with CC status 0 "
+			    "and %u zero byte(s): an experiment, see bt_vsc_rules\n",
+			    (unsigned)g_olympic_bytes);
+		}
 	}
 
 	if (kernel_thread_start(vayu_bt_thread, NULL, &thread) != KERN_SUCCESS) {
