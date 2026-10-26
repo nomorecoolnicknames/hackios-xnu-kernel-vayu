@@ -47,6 +47,14 @@ $DYN -dynamiclib -install_name /redwood/lib/libhakios.motion.dylib -framework Co
 INJECT="$INJECT
 /redwood/lib/libhakios.motion.dylib backboardd"
 
+# the ambient-light and proximity sensors to iOS, in backboardd beside the two above: a virtual HID
+# service each (ALS 0x20/0x41, proximity 0xFF00/0x08), fed from /dev/vayu-als and /dev/vayu-prox
+# (or /dev/vayu-motion v2). Nothing at all happens without those devices: vayu_slpi=6 vayu_ssc_als=1
+$DYN -dynamiclib -install_name /redwood/lib/libhakios.sensors.dylib -framework CoreFoundation -framework IOKit -lobjc \
+	-o obj/libhakios.sensors.dylib $V/sensors.c
+INJECT="$INJECT
+/redwood/lib/libhakios.sensors.dylib backboardd"
+
 # HakiosMP3.app: a minimal MP3 player of our own, to tell a player's bug from another app's; everything it
 # does is logged as "mp3play:". A plain directory of real files (a bundle of symbolic links is refused by
 # LaunchServices), copied into /Applications of the system image.
@@ -80,5 +88,5 @@ for size, scale in ((120, 2), (180, 3)):
 PY
 
 DEVICE_BIN="bluetool_stub vayu_irtest music_import media_import video_test play_test ls_rebuild run_migrator"
-DEVICE_LIB="libhakios.motion.dylib"
+DEVICE_LIB="libhakios.motion.dylib libhakios.sensors.dylib"
 DEVICE_APPS="HakiosMP3.app"

@@ -2284,7 +2284,7 @@ ssc_level6_wait(void)
  * at its own rate.
  */
 static int
-motion_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+sensor_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
 {
 	return 0;
 }
@@ -2334,27 +2334,121 @@ motion_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 }
 
 static const struct cdevsw motion_cdevsw = {
-	.d_open = motion_open, .d_close = motion_open, .d_read = motion_read, .d_write = eno_rdwrt,
+	.d_open = sensor_open, .d_close = sensor_open, .d_read = motion_read, .d_write = eno_rdwrt,
 	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 };
 
+/*
+ * /dev/vayu-als (level 6): the latest ambient-light sample on its own, struct vayu_als
+ * (sys/vayu_ssc.h): seq 0 means none yet, lux_milli is lux in thousandths, age_ms its age. A read
+ * of at least sizeof(struct vayu_als) gets the struct (a longer one gets just it too), a shorter
+ * one EINVAL. Never blocks.
+ */
+static int
+als_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	struct vayu_als a = { .version = VAYU_ALS_VERSION };
+	uint64_t now = ssc_now_ns();
+	size_t n;
+
+	if (uio_resid(uio) < (user_ssize_t)sizeof(a)) {
+		return EINVAL;
+	}
+	lck_spin_lock(&ssc_lock);
+	if (ssc.light_valid) {
+		a.seq = light_seq;
+		a.lux_milli = ssc.light_lux_milli;
+		a.age_ms = (uint32_t)((now > ssc.light_ns ? now - ssc.light_ns : 0) / 1000000ULL);
+	}
+	lck_spin_unlock(&ssc_lock);
+	n = (size_t)uio_resid(uio);
+	if (n > sizeof(a)) {
+		n = sizeof(a);
+	}
+	return uiomove((caddr_t)&a, n, uio);
+}
+
+static const struct cdevsw als_cdevsw = {
+	.d_open = sensor_open, .d_close = sensor_open, .d_read = als_read, .d_write = eno_rdwrt,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+/*
+ * /dev/vayu-prox (level 6): the latest proximity sample on its own, struct vayu_prox
+ * (sys/vayu_ssc.h): seq 0 means none yet, near 1 near / 0 far / -1 unknown, distance the sensor
+ * core's own figure, age_ms its age. Same read rules as /dev/vayu-als.
+ */
+static int
+prox_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	struct vayu_prox p = { .version = VAYU_PROX_VERSION, .near = -1 };
+	uint64_t now = ssc_now_ns();
+	size_t n;
+
+	if (uio_resid(uio) < (user_ssize_t)sizeof(p)) {
+		return EINVAL;
+	}
+	lck_spin_lock(&ssc_lock);
+	if (ssc.prox_valid) {
+		p.seq = prox_seq;
+		p.near = ssc.prox_near;
+		p.distance = ssc.prox_distance;
+		p.age_ms = (uint32_t)((now > ssc.prox_ns ? now - ssc.prox_ns : 0) / 1000000ULL);
+	}
+	lck_spin_unlock(&ssc_lock);
+	n = (size_t)uio_resid(uio);
+	if (n > sizeof(p)) {
+		n = sizeof(p);
+	}
+	return uiomove((caddr_t)&p, n, uio);
+}
+
+static const struct cdevsw prox_cdevsw = {
+	.d_open = sensor_open, .d_close = sensor_open, .d_read = prox_read, .d_write = eno_rdwrt,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+/* One 0444 character device, made with its own cdevsw; false (and said) when it cannot be made. */
 static bool
-motion_node(void)
+sensor_node(const struct cdevsw *sw, const char *name, const char *what)
+{
+	int major;
+
+	major = cdevsw_add(-1, sw);
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0444, "%s", name) == NULL) {
+		say("vayu-ssc: /dev/%s cannot be made\n", name);
+		return false;
+	}
+	say("vayu-ssc: /dev/%s (0444) is made: %s\n", name, what);
+	return true;
+}
+
+/*
+ * The level-6 nodes: /dev/vayu-motion (everything, struct vayu_motion) and one per sensor for a
+ * reader that wants only that sensor, which is what the two HID shims in userland (ambient light,
+ * proximity) read. Made once; one failing does not take the others down, and a phone whose sensor
+ * core did not come up just leaves them at seq 0.
+ */
+static bool
+sensor_nodes(void)
 {
 	static bool made;
-	int major;
+	bool motion;
 
 	if (made) {
 		return true;
 	}
-	major = cdevsw_add(-1, &motion_cdevsw);
-	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0444, "vayu-motion") == NULL) {
-		say("vayu-ssc: /dev/vayu-motion cannot be made\n");
-		return false;
+	motion = sensor_node(&motion_cdevsw, "vayu-motion",
+	    "the latest accelerometer, ambient-light and proximity samples, struct vayu_motion");
+	if (!motion) {
+		return false;           /* as before: no node, try again next time */
 	}
+	sensor_node(&als_cdevsw, "vayu-als", "the latest ambient-light sample, struct vayu_als");
+	sensor_node(&prox_cdevsw, "vayu-prox", "the latest proximity sample, struct vayu_prox");
 	made = true;
-	say("vayu-ssc: /dev/vayu-motion (0444) is made: the latest accelerometer, ambient-light and proximity samples, struct vayu_motion\n");
 	return true;
 }
 
@@ -2532,12 +2626,12 @@ vayu_ssc_run(const struct hakios_qrtr_ops *ops, uint32_t node, uint32_t port, ui
 			}
 			if (ssc_stream_start(q, node, port, t, low, high, rate, on_change)) {
 				started = true;
-				say("vayu-ssc: %s: STREAMING for iOS (/dev/vayu-motion) until the run ends\n",
+				say("vayu-ssc: %s: STREAMING for iOS (/dev/vayu-motion, /dev/vayu-als, /dev/vayu-prox) until the run ends\n",
 				    ssc_type_name[t]);
 			}
 		}
 		if (started) {
-			motion_node();
+			sensor_nodes();
 			ssc_level6_wait();
 		}
 	}

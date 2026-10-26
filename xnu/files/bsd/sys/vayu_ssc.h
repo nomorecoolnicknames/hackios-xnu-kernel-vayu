@@ -29,7 +29,8 @@ void vayu_ssc_quiesce(void);
  * stay where they were; v2 appends the light and proximity ones. seq counts samples; 0: none yet.
  * accel_mm_s2 is in mm/s^2, x y z in the sensor's frame (no mount matrix applied). lux_milli is
  * lux in thousandths. prox_near is 1 near, 0 far, -1 unknown. A reader asking for at least the v1
- * prefix gets it.
+ * prefix gets it. The same two samples are on /dev/vayu-als and /dev/vayu-prox as well, one small
+ * struct each (below), for a reader that wants only one of them.
  */
 #define VAYU_MOTION_VERSION     2
 struct vayu_motion {
@@ -44,6 +45,31 @@ struct vayu_motion {
 	int32_t  prox_near;
 	int32_t  prox_distance;
 	uint32_t prox_age_ms;
+};
+
+/*
+ * /dev/vayu-als and /dev/vayu-prox: the same ambient-light and proximity samples on devices of
+ * their own, so that the HID shims in userland can read one without knowing struct vayu_motion
+ * (and without caring when the accelerometer's sample changes). seq is the number of samples
+ * this sensor has produced; 0 means none yet, and the rest is then zero (near: -1, unknown).
+ * lux_milli is lux in thousandths; prox_near is 1 near, 0 far; prox_distance is the sensor
+ * core's own distance figure. age_ms is how old the sample was when the reader read it.
+ */
+#define VAYU_ALS_VERSION        1
+struct vayu_als {
+	uint32_t version;
+	uint32_t seq;
+	int32_t  lux_milli;
+	uint32_t age_ms;
+};
+
+#define VAYU_PROX_VERSION       1
+struct vayu_prox {
+	uint32_t version;
+	uint32_t seq;
+	int32_t  near;
+	int32_t  distance;
+	uint32_t age_ms;
 };
 
 /* The last accelerometer sample in mm/s^2 (x, y, z as SSC reports them) and its age; false if none yet. */
