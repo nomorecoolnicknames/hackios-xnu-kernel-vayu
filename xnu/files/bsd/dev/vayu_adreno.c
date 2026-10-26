@@ -57,6 +57,9 @@
  *   vayu_gpu_fence=1                 step 15 AHB fence range as GMU_FENCE_RANGE_MASK, 0x80a008a0 (adreno_a6xx_gmu.c:1001)
  *   vayu_gpu_ecp=1                   step 18's ECP feature control before "core firmware start" (kgsl_hfi.c:740)
  *   vayu_gpu_bw=N                    step 18's speed vote bus index N, 0..0xff; 0xff = INVALID_DCVS_IDX (kgsl_gmu.c:561)
+ *   vayu_gpu_idle=1                  after vayu_gpu_idle_ms (500) with no submission, vote the core
+ *                                    down to vayu_gpu_idle_speed (1: 257 MHz); a submission votes the
+ *                                    boot speed back. GX stays on. Off by default.
  *   vayu_nozap=1                     step 22 without zap files: write RBBM_SECVID_TRUST_CNTL = 0
  *
  * A step that does not find what it needs ends the sequence; the block is then stopped again
@@ -72,6 +75,7 @@
  */
 #include <machine/machine_routines.h>
 #include <kern/clock.h>
+#include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -2136,6 +2140,7 @@ static uint32_t hfi_number, core_speed, speed_levels;
 static bool staged;                     /* vayu_adreno=N: the step-by-step bring-up, not the default path */
 static uint32_t hfi_late, hfi_late_verdict = ~0u;   /* a message whose answer may still come */
 static bool core_is_on, core_space_is_on, core_programmed, core_runs, core_stuck, zap_is_loaded, unsecured;
+static uint32_t gpu_bus_index;          /* step 18's speed-vote bus index, for the runtime votes of vayu_gpu_idle */
 
 /* Everything waiting in a queue of the GMU's; true if the answer to the message numbered `number` was among it. */
 static bool
@@ -2673,6 +2678,7 @@ step_core_power(void)
 	if (PE_parse_boot_argn("vayu_gpu_bw", &bus_index, sizeof(bus_index)) && bus_index > HFI_NO_INDEX) {
 		bus_index = 0;                  /* only 0..0xff is a bus index: anything else leaves today's 0 */
 	}
+	gpu_bus_index = bus_index;              /* (the runtime votes of vayu_gpu_idle send the same one) */
 	snprintf(what, sizeof(what), "send the GMU its a640 tables (speeds and supply levels, bus votes), "
 	    "\"core firmware start\", \"start\", and the speed wanted; from here on it votes in RPMh by itself "
 	    "(bus index %u, vayu_gpu_bw)", bus_index);
@@ -3193,10 +3199,48 @@ static unsigned gpu_free_count, gpu_va_holes;
 static uint64_t gpu_va_used, gpu_va_lost;
 static uint32_t gpu_va_live, gpu_va_refused;
 
+/*
+ * Boot-arg vayu_gpu_idle=1 (default 0: the speed stays as step 18 asked, 499.2 MHz): after
+ * vayu_gpu_idle_ms (default 500, 50..10000) with no submission, the GMU is voted down to
+ * vayu_gpu_idle_speed (default 1: 257 MHz); the first submission votes the boot speed back before
+ * its commands go into the ring. GX stays on (there is no way back up from a GX collapse in this
+ * port); the GX rail's own clock gate is what the lower row gives. The vote is the same HFI
+ * message 30 the bring-up sent, and the tables the GMU already has. A vote the GMU does not answer
+ * leaves the speed where it is and stops the thread for the run.
+ */
+static bool gpu_idle_on, gpu_idle_refused;
+static uint32_t gpu_boot_speed, gpu_idle_speed = 1, gpu_idle_ms = 500;
+static uint64_t gpu_last_submit;
+
 bool
 vayu_gpu_kept(void)
 {
 	return gpu_kept;
+}
+
+/*
+ * A speed vote after the bring-up: { ack_type 1 (blocking), speed index, bus index }
+ * (a6xx_hfi.c:848-858), as step 18 sends it. Only a core this driver kept and runs is voted for.
+ */
+static bool
+gpu_vote_speed(uint32_t speed, const char *what)
+{
+	uint32_t message[4] = { 1, 0, 0, 0 };
+	uint32_t saved = step;
+	bool ok;
+
+	if (!gpu_kept || !gmu_talks || !core_runs || speed >= perf.gpu_levels) {
+		return false;
+	}
+	message[2] = speed;
+	message[3] = gpu_bus_index;
+	step = 0;                               /* (a vote after the bring-up is not a step) */
+	ok = hfi_send(what, HFI_GX_BW_PERF_VOTE, message, 4);
+	step = saved;
+	if (ok) {
+		core_speed = speed;
+	}
+	return ok;
 }
 
 /* A register of the 3D core (by its word number) written by command (a "type 4" packet). */
@@ -3454,6 +3498,18 @@ vayu_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
 {
 	uint32_t wanted = 26 + 4 * count, room = 0;
 
+	if (gpu_idle_on) {
+		if (core_speed != gpu_boot_speed) {
+			if (gpu_vote_speed(gpu_boot_speed, "the speed wanted (a submission comes)")) {
+				printf("vayu: gpu idle: a submission comes: %u MHz\n", core_speeds[core_speed].khz / 1000);
+			} else {
+				gpu_idle_refused = true;
+				printf("vayu: gpu idle: the GMU did not take the speed back; the core stays at %u MHz\n",
+				    core_speeds[core_speed].khz / 1000);
+			}
+		}
+		gpu_last_submit = mach_absolute_time();
+	}
 	for (int i = 0; i < 20000; i++) {
 		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
 		if (room >= wanted) {
@@ -3542,10 +3598,40 @@ vayu_gpu_stop(void)
 	vayu_block_stop();
 }
 
+/*
+ * The idle half of vayu_gpu_idle=1: every 100 ms, if no submission has come for gpu_idle_ms, one
+ * vote down to gpu_idle_speed. vayu_gpu_submit() votes the boot speed back before its commands.
+ */
+static void
+gpu_idle_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	for (;;) {
+		if (gpu_idle_on && gpu_kept && !gpu_idle_refused && core_speed != gpu_idle_speed) {
+			uint64_t now = mach_absolute_time(), after;
+
+			nanoseconds_to_absolutetime((uint64_t)gpu_idle_ms * NSEC_PER_MSEC, &after);
+			if (gpu_last_submit != 0 && now - gpu_last_submit >= after) {
+				if (gpu_vote_speed(gpu_idle_speed, "the speed wanted (idle)")) {
+					printf("vayu: gpu idle: no submission for %u ms: %u MHz\n", gpu_idle_ms,
+					    core_speeds[core_speed].khz / 1000);
+				} else {
+					gpu_idle_refused = true;
+					printf("vayu: gpu idle: the GMU did not take the idle speed; staying at %u MHz for this run\n",
+					    core_speeds[core_speed].khz / 1000);
+				}
+			}
+		}
+		delay_for_interval(100, NSEC_PER_MSEC);
+	}
+}
+
 /* Called by vayu_adreno_init() when step 22 has passed and vayu_keep=1 asks for it. */
 static bool
 gpu_keep(void)
 {
+	uint32_t idle = 0, speed = 1, ms = 500;
+	thread_t thread;
+
 	if (!unsecured || !core_runs) {
 		printf("vayu: not kept: the 3D core is not out of secure mode taking commands (step 22)\n");
 		return false;
@@ -3559,11 +3645,28 @@ gpu_keep(void)
 	/* hakios_adreno_init() returns before it reads these on vayu; they belong to hakios.gpu.cpp too */
 	PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
 	PE_parse_boot_argn("gpu_va", &gpu_va, sizeof(gpu_va));     /* before any client: spans must not change */
+	PE_parse_boot_argn("vayu_gpu_idle", &idle, sizeof(idle));
+	PE_parse_boot_argn("vayu_gpu_idle_speed", &speed, sizeof(speed));
+	PE_parse_boot_argn("vayu_gpu_idle_ms", &ms, sizeof(ms));
+	gpu_boot_speed = core_speed;
+	gpu_idle_on = idle != 0;
+	gpu_idle_speed = speed >= 1 && speed < core_speed ? speed : 1;
+	gpu_idle_ms = ms < 50 ? 50 : ms > 10000 ? 10000 : ms;
 	gpu_kept = true;
 	quiet = true;
 	printf("vayu: THE GPU STAYS ON for the system to draw with: the service HakiosGPU (Adreno 640, chip id %#x, %u MHz)\n",
 	    GMU_CHIP_ID, core_speeds[core_speed].khz / 1000);
 	HakiosGPUStart();
+	if (gpu_idle_on) {
+		printf("vayu: gpu idle: on: %u MHz after %u ms with no submission (vayu_gpu_idle_speed=%u, the boot speed %u)\n",
+		    core_speeds[gpu_idle_speed].khz / 1000, gpu_idle_ms, gpu_idle_speed, core_speeds[gpu_boot_speed].khz / 1000);
+		if (kernel_thread_start(gpu_idle_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			printf("vayu: gpu idle: cannot start the thread\n");
+			gpu_idle_on = false;
+		}
+	}
 	return true;
 }
 
