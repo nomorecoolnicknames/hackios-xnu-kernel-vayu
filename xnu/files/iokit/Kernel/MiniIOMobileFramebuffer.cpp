@@ -198,6 +198,15 @@ static TUNABLE(uint32_t, gFilter, "fb_filter", 1);
  */
 static TUNABLE(uint32_t, gFit, "fb_fit", 0);
 /*
+ * Boot-arg fb_crop=1 (default 0: unchanged): a picture larger than the panel by no more than 64
+ * pixels each way is put on the panel pixel for pixel from its middle -- iOS's 1125x2436 surface on
+ * the 1080x2400 panel, 22 columns and 18 rows cropped -- instead of being scaled. drawRows() then
+ * takes its "unscaled" path: rows memcpy'd, not a blend and a column lookup for every pixel. This
+ * is fb_fit's crop without changing the size the display reports (fb_fit needs fbwidth/fbheight for
+ * that); touch stays 1:1 with the panel, as the shown picture is.
+ */
+static TUNABLE(uint32_t, gCrop, "fb_crop", 0);
+/*
  * fb_zero=1 (vayu, with vayu_mdp=1 and the loader's fb_spare=N): a frame that is one 1125x2436 BGRA surface of
  * MiniIOSurface's scanout pool is not copied: the display controller's VIG0 is pointed at it (its centre 1080x2400,
  * vayu_mdp_scanout) and the flip is taken at the panel's next frame start. Anything else is copied as before, after
@@ -847,7 +856,23 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		return;
 	}
 	/* the rectangle on the panel */
-	if (gPictureFit && fWidth >= fPanelWidth && fHeight >= fPanelHeight) {
+	if (gCrop && sx == 0 && sy == 0 && sw == (int32_t) s->info.width && sh == (int32_t) s->info.height &&
+	    dx <= 0 && dy <= 0 && dx + dw >= fWidth && dy + dh >= fHeight &&
+	    sw >= (int32_t) fPanelWidth && sh >= (int32_t) fPanelHeight &&
+	    sw - (int32_t) fPanelWidth <= 64 && sh - (int32_t) fPanelHeight <= 64) {
+		static bool logged;
+		int32_t left = (sw - (int32_t) fPanelWidth) / 2, top = (sh - (int32_t) fPanelHeight) / 2;
+
+		px0 = sx - left;
+		py0 = sy - top;
+		px1 = px0 + sw;
+		py1 = py0 + sh;
+		if (!logged) {
+			logged = true;
+			IOLog("MiniIOMobileFramebuffer: fb_crop=1: the middle %ux%u of a %dx%d picture, pixel for pixel "
+			    "(%d columns and %d rows cropped)\n", fPanelWidth, fPanelHeight, sw, sh, left, top);
+		}
+	} else if (gPictureFit && fWidth >= fPanelWidth && fHeight >= fPanelHeight) {
 		int32_t left = (int32_t) (fWidth - fPanelWidth) / 2, top = (int32_t) (fHeight - fPanelHeight) / 2;
 
 		px0 = dx - left;
