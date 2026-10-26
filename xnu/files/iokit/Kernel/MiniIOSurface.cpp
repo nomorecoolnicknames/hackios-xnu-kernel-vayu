@@ -14,6 +14,7 @@
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
 #include <libkern/c++/OSSerialize.h>
 #include <libkern/c++/OSUnserialize.h>
 #include <libkern/c++/OSDictionary.h>
@@ -25,6 +26,7 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
 #include <kern/thread_call.h>
+#include <mach/vm_param.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
 
@@ -151,6 +153,27 @@ static thread_call_t    gSurfaceClearing;
 static uint32_t         gSurfacesGivenAgain;    /* for MiniIOSurfaceCost() */
 /* boot-arg surf_clear=0: kept memory is given out as it is (to see what the clearing costs; a surface is then not all zeroes) */
 static TUNABLE(uint32_t, gSurfaceClear, "surf_clear", 1);
+
+/*
+ * Boot-arg fb_zero=1: the pixels of the display's surfaces are frames the loader kept for it below
+ * 4 GB (boot-args fb_spare_pa and fb_spare_frames), outside XNU's memory. They are held as physical
+ * ranges mapped once, write-combined, and never given back: the display's driver can then take a
+ * frame as it is, without the pixels having to be copied anywhere first. Only CoreAnimation's own
+ * surfaces -- 1125 x 2436, BGRA, one plane -- are made that way, and only while a frame is free.
+ */
+#define SCANOUT_SLOT_BYTES      0xC00000u               /* 12 MiB: one frame the loader kept */
+#define SCANOUT_SLOTS           4
+static TUNABLE(uint32_t, gSurfaceZero, "fb_zero", 0);   /* boot-arg fb_zero=1 (default 0: nothing of this is used) */
+static struct {
+	IOMemoryDescriptor *    memory;         /* the whole frame: made at its first use and kept for the boot */
+	IOMemoryMap *           map;            /* ... and where it is here, write-combined, likewise kept */
+	uint64_t                phys;           /* where the frame is (fb_spare_pa + its number times its size) */
+	bool                    used;           /* a surface's pixels right now */
+	bool                    said;           /* the line about the first surface on it has been said */
+} gScanout[SCANOUT_SLOTS];
+static uint32_t         gScanoutSlots;          /* frames the loader kept (at most SCANOUT_SLOTS) */
+static IOLock *         gScanoutLock;           /* around gScanout[].used, and making a frame ready */
+static void             scanoutGive(int slot);
 
 void
 MiniIOSurfaceClearKept(void)
@@ -290,6 +313,12 @@ MiniIOSurface::free(void)
 		client->release();
 		client = NULL;
 	}
+	/* The pixels' frame goes back to the pool (it stays mapped); the state page goes back as before. */
+	OSSafeReleaseNULL(scanout);
+	if (scanoutSlot >= 0) {
+		scanoutGive(scanoutSlot);
+		scanoutSlot = -1;
+	}
 	if (memory != NULL) {
 		surfaceMemoryBack(memory);
 		memory = NULL;
@@ -314,6 +343,47 @@ MiniIOSurfaceCost(uint32_t * made, uint64_t * making, uint32_t * freed, uint64_t
 	absolutetime_to_nanoseconds(gSurfaceFreeing, &nanos);
 	*freeing = *freed ? nanos / NSEC_PER_USEC / *freed : 0;
 	gSurfaceMaking = gSurfaceFreeing = 0;
+}
+
+/*
+ * A surface whose pixels are a scanout frame (boot-arg fb_zero=1): where that frame is in physical
+ * memory, and how long one row of the pixels is. False for every other surface.
+ */
+bool
+MiniIOSurfaceScanout(MiniIOSurface * s, uint64_t * phys, uint32_t * bytesPerRow)
+{
+	if (s == NULL || s->scanout == NULL || s->scanoutSlot < 0 || (uint32_t) s->scanoutSlot >= gScanoutSlots) {
+		return false;
+	}
+	if (phys != NULL) {
+		*phys = gScanout[s->scanoutSlot].phys;
+	}
+	if (bytesPerRow != NULL) {
+		*bytesPerRow = s->info.bytesPerRow;
+	}
+	return true;
+}
+
+/* The scanout pool: how many frames the loader kept and how many surfaces have one now. */
+void
+MiniIOSurfacePoolInfo(uint32_t * slots, uint32_t * used)
+{
+	uint32_t all = 0, taken = 0;
+
+	if (gScanoutLock != NULL) {
+		IOLockLock(gScanoutLock);
+		all = gScanoutSlots;
+		for (uint32_t i = 0; i < all; i++) {
+			taken += gScanout[i].used;
+		}
+		IOLockUnlock(gScanoutLock);
+	}
+	if (slots != NULL) {
+		*slots = all;
+	}
+	if (used != NULL) {
+		*used = taken;
+	}
 }
 
 /* The values changed: a new seed, and how much room a client needs to fetch them. */
@@ -435,6 +505,126 @@ describeComponents(struct minisurf_plane * plane, uint32_t format)
 		plane->componentType[i] = 1;            /* unsigned integer */
 		plane->componentRange[i] = 1;           /* full range */
 	}
+}
+
+/* A boot-argument that is a number: "0x..." in hex, otherwise decimal. False if it is not there or is not a number. */
+static bool
+bootArgNumber(const char * name, uint64_t * value)
+{
+	char text[32];
+	uint64_t number = 0;
+	unsigned base = 10;
+	const char * at = text;
+
+	if (!PE_parse_boot_arg_str(name, text, sizeof(text)) || text[0] == 0) {
+		return false;
+	}
+	if (at[0] == '0' && (at[1] == 'x' || at[1] == 'X')) {
+		base = 16;
+		at += 2;
+	}
+	if (*at == 0) {
+		return false;
+	}
+	for (; *at != 0; at++) {
+		unsigned digit;
+
+		if (*at >= '0' && *at <= '9') {
+			digit = (unsigned) (*at - '0');
+		} else if (base == 16 && *at >= 'a' && *at <= 'f') {
+			digit = (unsigned) (*at - 'a' + 10);
+		} else if (base == 16 && *at >= 'A' && *at <= 'F') {
+			digit = (unsigned) (*at - 'A' + 10);
+		} else {
+			return false;
+		}
+		number = number * base + digit;
+	}
+	*value = number;
+	return true;
+}
+
+/* Called once at MiniIOSurfaceStart(): the frames the loader said it kept, if fb_zero is on. */
+static void
+scanoutSetup(void)
+{
+	uint64_t pa = 0, frames = 0;
+
+	if (!gSurfaceZero) {
+		return;
+	}
+	gScanoutLock = IOLockAlloc();
+	if (gScanoutLock == NULL || !bootArgNumber("fb_spare_pa", &pa) || !bootArgNumber("fb_spare_frames", &frames) ||
+	    pa == 0 || frames == 0) {
+		IOLog("MiniIOSurface: fb_zero=1 but no frames are kept for the display\n");
+		gScanoutSlots = 0;
+		return;
+	}
+	if (frames > SCANOUT_SLOTS) {
+		frames = SCANOUT_SLOTS;
+	}
+	for (uint32_t i = 0; i < frames; i++) {
+		gScanout[i].phys = pa + (uint64_t) i * SCANOUT_SLOT_BYTES;
+	}
+	gScanoutSlots = (uint32_t) frames;
+	IOLog("MiniIOSurface: %u frames of %u bytes kept for scanout at phys 0x%llx (fb_zero=1)\n", gScanoutSlots,
+	    SCANOUT_SLOT_BYTES, (unsigned long long) pa);
+}
+
+/* A free frame, taken for a surface's pixels; -1 if there is none. The frame's memory is made ready at its first use. */
+static int
+scanoutTake(void)
+{
+	int taken = -1;
+
+	if (gScanoutLock == NULL) {
+		return -1;
+	}
+	IOLockLock(gScanoutLock);
+	for (uint32_t i = 0; i < gScanoutSlots; i++) {
+		if (!gScanout[i].used) {
+			gScanout[i].used = true;
+			taken = (int) i;
+			break;
+		}
+	}
+	if (taken >= 0 && gScanout[taken].memory == NULL) {
+		uint64_t phys = gScanout[taken].phys;
+		IOMemoryDescriptor * memory = IOMemoryDescriptor::withPhysicalAddress(phys, SCANOUT_SLOT_BYTES, kIODirectionInOut);
+		IOMemoryMap * map = memory != NULL ? memory->map(kIOMapAnywhere | kIOMapWriteCombineCache) : NULL;
+
+		if (map == NULL) {
+			OSSafeReleaseNULL(memory);
+			IOLog("MiniIOSurface: the scanout frame at phys 0x%llx cannot be mapped\n", (unsigned long long) phys);
+			gScanout[taken].used = false;
+			taken = -1;
+		} else {
+			gScanout[taken].memory = memory;        /* (kept for the boot: the frame is not XNU's to free) */
+			gScanout[taken].map = map;
+		}
+	}
+	IOLockUnlock(gScanoutLock);
+	return taken;
+}
+
+/* Given back by a surface that is gone: the frame stays mapped, for the next surface. */
+static void
+scanoutGive(int slot)
+{
+	if (slot < 0 || (uint32_t) slot >= gScanoutSlots || gScanoutLock == NULL) {
+		return;
+	}
+	IOLockLock(gScanoutLock);
+	gScanout[slot].used = false;
+	IOLockUnlock(gScanoutLock);
+}
+
+/* Whether a surface being made is one of the display's own: CoreAnimation's, 1125 x 2436 BGRA, one plane. */
+static bool
+scanoutWanted(uint32_t width, uint32_t height, uint32_t format, uint32_t planeCount, uint32_t alloc)
+{
+	return gSurfaceZero != 0 && width == 1125 && height == 2436 && format == FOURCC('B', 'G', 'R', 'A') && planeCount <= 1 &&
+	    alloc <= SCANOUT_SLOT_BYTES;
 }
 
 /*
@@ -611,11 +801,39 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		/* (the memory is as big as its owner says, and not a byte of ours is added to it) */
 		alloc = dictNumber(props, "IOSurfaceAllocSize", (uint32_t) needed);
 	}
+	/*
+	 * The display's own surfaces get their pixels from a frame the loader kept, when fb_zero is on
+	 * and one is free; then `memory` is the page of shared state alone, as for a wrapped surface,
+	 * and the frame itself is `scanout`.
+	 */
+	if (wrapped == NULL && scanoutWanted(width, height, format, planeCount, alloc)) {
+		int slot = scanoutTake();
 
-	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc));
+		if (slot >= 0) {
+			s->scanout = IOSubMemoryDescriptor::withSubRange(gScanout[slot].memory, 0, round_page_64((uint64_t) alloc),
+			    kIODirectionInOut);
+			if (s->scanout != NULL) {
+				s->scanoutSlot = slot;
+			} else {
+				scanoutGive(slot);
+			}
+		}
+	}
+
+	if (s->scanout != NULL) {
+		/* (the pixels are the slot's own: `memory` is the page of shared state alone, as for a wrapped surface) */
+		s->memory = surfaceMemory(PAGE_SIZE);
+	} else {
+		s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc));
+	}
 	if (s->memory == NULL) {
 		IOLog("MiniIOSurface: no memory for %u bytes (%u surfaces, %llu MB in use)\n", alloc, gSurfaceCount,
 		    gSurfaceBytes >> 20);
+		OSSafeReleaseNULL(s->scanout);
+		if (s->scanoutSlot >= 0) {
+			scanoutGive(s->scanoutSlot);
+			s->scanoutSlot = -1;
+		}
 		s->release();
 		*error = kIOReturnNoMemory;
 		return NULL;
@@ -623,7 +841,10 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	s->kbase = (uint8_t *) s->memory->getBytesNoCopy();
 	s->values = OSDictionary::withCapacity(4);
 	s->kpixels = s->kbase + PAGE_SIZE;
-	if (wrapped != NULL) {
+	if (s->scanout != NULL) {
+		s->kpixels = (uint8_t *) gScanout[s->scanoutSlot].map->getVirtualAddress();
+		bzero(s->kpixels, alloc);               /* (a new surface is all zeroes, whoever makes it) */
+	} else if (wrapped != NULL) {
 		s->clientTask = current_task();
 		s->clientAddress = wrapped->unsigned64BitValue();
 		IOReturn held = kIOReturnNoMemory;
@@ -702,6 +923,21 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	sh->displayable = 1;
 	sh->sysMemOnly = (uint8_t) dictNumber(props, "IOSurfaceSysMemOnly", 0);
 	IOLockUnlock(gSurfaceLock);
+
+	if (s->scanout != NULL && s->scanoutSlot >= 0) {
+		uint64_t phys;
+		bool first;
+
+		IOLockLock(gScanoutLock);               /* (the first surface on a frame is said once: which frame it is) */
+		first = !gScanout[s->scanoutSlot].said;
+		gScanout[s->scanoutSlot].said = true;
+		phys = gScanout[s->scanoutSlot].phys;
+		IOLockUnlock(gScanoutLock);
+		if (first) {
+			IOLog("MiniIOSurface: surface %u (1125x2436 BGRA, %u bytes, %u per row) on scanout slot %d at phys 0x%llx\n",
+			    s->sid, s->info.allocSize, s->info.bytesPerRow, s->scanoutSlot, (unsigned long long) phys);
+		}
+	}
 
 	*error = kIOReturnSuccess;
 	return s;
@@ -842,6 +1078,7 @@ MiniIOSurfaceStart(IOService * provider)
 
 	gSurfaceLock = IOLockAlloc();
 	gSurfaceKeptLock = IOLockAlloc();
+	scanoutSetup();
 	if (!PE_parse_boot_arg_str("surftrace_of", gSurfaceTraceOf, sizeof(gSurfaceTraceOf))) {
 		gSurfaceTraceOf[0] = 0;
 	}
@@ -1017,7 +1254,19 @@ IOSurfaceRootUserClient::addRef(MiniIOSurface * surface)
 	bzero(ref, sizeof(*ref));
 	ref->surface = surface;
 	ref->map = map;
-	if (surface->client != NULL && surface->clientTask != fTask) {
+	if (surface->scanout != NULL) {
+		/*
+		 * The state page is all that could be mapped above: the pixels are a frame the loader kept,
+		 * and the client gets it as it is, write-combined (the GPU draws into it).
+		 */
+		ref->pixelMap = surface->scanout->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+		if (ref->pixelMap == NULL) {
+			IOLog("MiniIOSurface: cannot map the pixels of surface %u into the client\n", surface->sid);
+			OSSafeReleaseNULL(ref->map);
+			fRefCount--;
+			return NULL;
+		}
+	} else if (surface->client != NULL && surface->clientTask != fTask) {
 		ref->pixelMap = surface->client->createMappingInTask(fTask, 0, kIOMapAnywhere);
 	}
 	surfaceHold(surface);
@@ -1063,7 +1312,8 @@ IOSurfaceRootUserClient::returnSurface(struct minisurf_client_ref * ref, bool kn
 	memcpy(r + 1, s->planes, size - sizeof(*r));
 	r->shared = address;
 	r->aux = address + MINISURF_AUX_OFFSET;
-	r->base = known ? ~0ULL : s->client == NULL ? address + PAGE_SIZE :
+	/* (the pixels are after the state page, or where their own mapping -- another client's memory, a scanout frame -- put them) */
+	r->base = known ? ~0ULL : s->client == NULL && s->scanout == NULL ? address + PAGE_SIZE :
 	    ref->pixelMap != NULL ? ref->pixelMap->getAddress() : s->clientAddress;
 	args->structureOutputSize = size;
 	return kIOReturnSuccess;

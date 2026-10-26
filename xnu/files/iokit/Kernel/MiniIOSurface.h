@@ -116,6 +116,13 @@ public:
 	IOMemoryMap *                   clientMap;
 	task_t                          clientTask;     /* whose memory it is (not held: only compared) */
 	mach_vm_address_t               clientAddress;  /* ... and where it is there */
+	/*
+	 * ... or the pixels are a frame the loader kept below 4 GB for the display (boot-arg fb_zero=1):
+	 * then `memory` is the page of shared state alone, `scanout` is the frame's pixels and
+	 * `scanoutSlot` says which frame they are in (MiniIOSurface.cpp).
+	 */
+	IOMemoryDescriptor *            scanout;
+	int                             scanoutSlot;    /* -1: the pixels are not a scanout frame */
 	uint8_t *                       kpixels;        /* where the pixel memory starts in the kernel, either way */
 	uint32_t                        drawn;          /* the GPU's last submission that names the pixels (0: none; hakios.gpu.cpp) */
 	struct minisurf_result          info;           /* addresses not filled in */
@@ -128,6 +135,8 @@ public:
 	virtual bool
 	init(void) APPLE_KEXT_OVERRIDE
 	{
+		scanout = NULL;
+		scanoutSlot = -1;
 		return OSObject::init();
 	}
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
@@ -161,6 +170,13 @@ MiniIOSurface * MiniIOSurfaceCopy(uint32_t sid);
  * each; how many got memory that was kept from one before.
  */
 void            MiniIOSurfaceCost(uint32_t * made, uint64_t * making, uint32_t * freed, uint64_t * freeing, uint32_t * again);
+/*
+ * A surface whose pixels are a frame the loader kept for the display (boot-arg fb_zero=1): where
+ * the frame is in physical memory, and how long a row of the pixels is. False for any other surface.
+ */
+bool            MiniIOSurfaceScanout(MiniIOSurface * surface, uint64_t * phys, uint32_t * bytesPerRow);
+/* The scanout pool: how many frames the loader kept and how many surfaces have one now (for the framebuffer's log). */
+void            MiniIOSurfacePoolInfo(uint32_t * slots, uint32_t * used);
 /* Clear the memory that is kept of surfaces that are gone, for the next ones: when the caller has a moment. */
 void            MiniIOSurfaceClearKept(void);
 /* Wait, for so many milliseconds at most, until the GPU is done with a surface's pixels (hakios.gpu.cpp). */

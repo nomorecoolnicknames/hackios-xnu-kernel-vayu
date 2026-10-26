@@ -21,6 +21,9 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSBoolean.h>
+#include <libkern/c++/OSString.h>
+#include <libkern/c++/OSSymbol.h>
+#include <libkern/c++/OSCollectionIterator.h>
 #include <kern/thread_call.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
@@ -28,6 +31,7 @@
 #include <sys/systm.h>
 #include <sys/proc.h>
 
+#include <os/atomic_private.h>
 extern "C" {
 #include <console/video_console.h>
 extern struct vc_info vinfo;            /* the boot framebuffer, as the text console knows it */
@@ -38,6 +42,21 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include "MiniIOSurface.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
+static void fbLogProperty(const char * who, const OSSymbol * key, OSObject * value);
+
+/*
+ * The panel's backlight, if a driver has one (vayu: vayu_wled.c sets it with vayu_wled=2): called with false when
+ * iOS asks for the display to be powered down (RequestPowerChange, in[0] == 0) and true when it asks for it back.
+ */
+extern "C" { bool (*hakios_display_power)(bool on) = NULL; }
+/*
+ * The panel's own frame timing, if a driver can read it (vayu: vayu_vsync.c with vayu_vsync=2, from
+ * the display controller's line counter): the absolute time of the next frame start, and a frame's
+ * length. Without them refreshes are a timer at fb_hz, which beats against the panel's real rate.
+ */
+extern "C" { uint64_t (*hakios_vsync_next)(uint64_t now) = NULL; uint64_t (*hakios_vsync_frame)(void) = NULL; }
+/* the panel's brightness, 1..1000 of its full scale, if a driver has one (vayu: vayu_wled.c, vayu_wled=2) */
+extern "C" { bool (*hakios_display_brightness)(uint32_t permille) = NULL; }
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -151,8 +170,36 @@ static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
  * panel is worked out from the four of the picture around where it falls (bilinear).
  */
 static TUNABLE(uint32_t, gFilter, "fb_filter", 1);
+/*
+ * Boot-arg fb_fit=1: the picture is not scaled to the panel but put on it pixel for pixel, its middle
+ * 1080 x 2400 of 1125 x 2436 (22 columns cut on the left, 23 on the right, 18 rows top and bottom). A
+ * frame is then rows copied, not every pixel worked out from four (5.5-7.9 ms a frame scaled, run 194827:
+ * too slow for 120 a second). Touches are mapped to match (hakios_display_crop, hakios.input.c).
+ */
+static TUNABLE(uint32_t, gFit, "fb_fit", 0);
+/*
+ * fb_zero=1 (vayu, with vayu_mdp=1 and the loader's fb_spare=N): a frame that is one 1125x2436 BGRA surface of
+ * MiniIOSurface's scanout pool is not copied: the display controller's VIG0 is pointed at it (its centre 1080x2400,
+ * vayu_mdp_scanout) and the flip is taken at the panel's next frame start. Anything else is copied as before, after
+ * VIG0 is put back on the boot framebuffer. The surface shown is held until the next flip has been taken.
+ */
+static TUNABLE(uint32_t, gFbZero, "fb_zero", 0);
+extern "C" bool vayu_mdp_scanout(uint64_t phys, uint32_t stride, uint32_t x, uint32_t y);
+extern "C" void vayu_mdp_unscanout(void);
+/* for the touch screen with fb_fit=1: { left, top, picture width, picture height, panel width, panel height } */
+extern "C" { uint32_t hakios_display_crop[6] = { 0, 0, 0, 0, 0, 0 }; }
 static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
 static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
+/*
+ * With the panel's timing (vayu_vsync=2): refreshes told to iOS every N panel frames. 0 = by the drawing:
+ * the framebuffer's own copy takes 5.5-7.9 ms a frame here (run 194827: 49-56 frames a second, gaps of 10
+ * to 35 ms), so at 120 Hz frames land on every first or second refresh at random -- the jitter the owner
+ * sees. A steady 60 is smoother than a ragged 55: every second frame while the copy takes more than 60%
+ * of a frame, back to every frame below 45%.
+ */
+static TUNABLE(uint32_t, gVsyncDivisor, "fb_vsync_div", 0);
+static uint64_t gFBDrawAbs;                     /* the copy's time per frame, a running average */
+static uint32_t gFBDivisor = 1;
 /*
  * Boot-arg fb_threads=N (1 to 8): so many processors scale a frame onto the panel together (see
  * drawRows()). Three by default: a frame is in the panel's memory 3 ms after its turn instead of 9
@@ -234,6 +281,8 @@ public:
 	uint32_t        fSwapID;
 	uint32_t        fSwapsShown;
 	uint32_t        fLayersShown;           /* which layers the last swap had a surface in */
+	MiniIOSurface * fScanoutShown;          /* fb_zero: the pool surface VIG0 fetches now (held), or NULL */
+	uint32_t        fScanoutFlips, fScanoutFails, fScanoutCopies;   /* fb_zero: frames flipped, flips not taken, frames copied */
 	bool            fGraphics;              /* the text console has been told to stop */
 	/*
 	 * A frame goes to the panel when the GPU is done with it: a thread of ours waits for that
@@ -293,6 +342,7 @@ public:
 	bool            fRecWrapped;            /* (rec_ring) the memory has been full once: frames go over the oldest */
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
@@ -445,6 +495,16 @@ IOMobileFramebuffer::start(IOService * provider)
 	fDiffLeft = fDiffTop = ~0u;
 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
 	    fPanelWidth, fPanelHeight, fRowBytes);
+	if (gFit && fWidth >= fPanelWidth && fHeight >= fPanelHeight) {
+		hakios_display_crop[0] = (fWidth - fPanelWidth) / 2;
+		hakios_display_crop[1] = (fHeight - fPanelHeight) / 2;
+		hakios_display_crop[2] = fWidth;
+		hakios_display_crop[3] = fHeight;
+		hakios_display_crop[4] = fPanelWidth;
+		os_atomic_store(&hakios_display_crop[5], fPanelHeight, release);       /* (last: the touch screen reads it first) */
+		IOLog("MiniIOMobileFramebuffer: fb_fit=1: the picture's middle %ux%u, pixel for pixel (from %u, %u); no scaling\n",
+		    fPanelWidth, fPanelHeight, hakios_display_crop[0], hakios_display_crop[1]);
+	}
 
 	if (gRecSeconds != 0) {
 		/* one piece of physical memory: the loader will send it over USB as it lies */
@@ -614,8 +674,8 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 		}
 		to = (uint32_t *) (fBase + (size_t) y * fRowBytes);
 		if (job->unscaled) {
-			/* not scaled at all */
-			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
+			/* not scaled at all: the columns on the panel, cx0 to cx1 */
+			memcpy(to + cx0, pixels + (size_t) (sy + y - py0) * stride + (size_t) (sx + cx0 - px0) * 4, (size_t) (cx1 - cx0) * 4);
 			continue;
 		}
 		if (filter) {
@@ -739,10 +799,19 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		return;
 	}
 	/* the rectangle on the panel */
-	px0 = (int32_t) ((int64_t) dx * fPanelWidth / fWidth);
-	py0 = (int32_t) ((int64_t) dy * fPanelHeight / fHeight);
-	px1 = (int32_t) ((int64_t) (dx + dw) * fPanelWidth / fWidth);
-	py1 = (int32_t) ((int64_t) (dy + dh) * fPanelHeight / fHeight);
+	if (gFit && fWidth >= fPanelWidth && fHeight >= fPanelHeight) {
+		int32_t left = (int32_t) (fWidth - fPanelWidth) / 2, top = (int32_t) (fHeight - fPanelHeight) / 2;
+
+		px0 = dx - left;
+		py0 = dy - top;
+		px1 = dx + dw - left;
+		py1 = dy + dh - top;
+	} else {
+		px0 = (int32_t) ((int64_t) dx * fPanelWidth / fWidth);
+		py0 = (int32_t) ((int64_t) dy * fPanelHeight / fHeight);
+		px1 = (int32_t) ((int64_t) (dx + dw) * fPanelWidth / fWidth);
+		py1 = (int32_t) ((int64_t) (dy + dh) * fPanelHeight / fHeight);
+	}
 	if (px1 <= px0 || py1 <= py0) {
 		return;
 	}
@@ -796,7 +865,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.cx0 = cx0;
 	job.cx1 = cx1;
 	job.filter = filter;
-	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
+	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && cx1 > cx0;   /* (clipped to the panel in drawRows) */
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
 		drawRows(&job, py0, py1, fBlendRow);
 		return;
@@ -942,7 +1011,33 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();
-	if (gOnTheBeat) {
+	/* fb_zero: one surface of the scanout pool, the whole of it, in layer 0 alone */
+	uint64_t zero_phys = 0;
+	uint32_t zero_stride = 0;
+	bool zero = gFbZero && surfaces[0] != NULL && swapWord(swap, SWAP_SURFACE(1)) == 0 && swapWord(swap, SWAP_SURFACE(2)) == 0 &&
+	    swapWord(swap, SWAP_SURFACE(3)) == 0 && surfaces[0]->info.width == 1125 && surfaces[0]->info.height == 2436 &&
+	    MiniIOSurfaceScanout(surfaces[0], &zero_phys, &zero_stride);
+	uint64_t (*panel_next)(uint64_t) = os_atomic_load(&hakios_vsync_next, acquire);
+
+	uint64_t (*panel_frame)(void) = os_atomic_load(&hakios_vsync_frame, acquire);
+	uint64_t panel_period = panel_frame != NULL ? panel_frame() : 0, panel_beat = 0;
+
+	if (zero) {
+		/* (no beat to wait for: the flush is taken at the panel's next frame start by itself) */
+	} else if (gOnTheBeat && panel_next != NULL && panel_period != 0 && (panel_beat = panel_next(began)) != 0) {
+		/*
+		 * The copy starts as the panel starts a frame when that is less than half a frame away; later
+		 * than that it starts at once (a late frame is not held back a whole refresh, which would halve
+		 * the rate when drawing takes most of a frame).
+		 */
+		if (panel_beat - began < panel_period / 2) {
+			clock_delay_until(panel_beat);
+			fStatOnBeat++;
+			fStatBeatWait += mach_absolute_time() - began;
+			began = mach_absolute_time();
+		}
+		fBeat = panel_beat;
+	} else if (gOnTheBeat) {
 		uint64_t period, aim, next;
 
 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
@@ -1007,6 +1102,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		if (sid == 0) {
 			/* the bottom layer taken away: nothing is shown, the screen is black */
 			if (layer == 0 && (set & 1) && fGraphics) {
+				if (fScanoutShown != NULL) {
+					vayu_mdp_unscanout();   /* (the black goes into the boot framebuffer: VIG0 must show it) */
+					fScanoutShown->release();
+					fScanoutShown = NULL;
+				}
 				for (uint32_t y = 0; y < fPanelHeight; y++) {
 					bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
 				}
@@ -1026,6 +1126,37 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		if (s == NULL) {
 			continue;
+		}
+		if (zero && layer == 0) {
+			if (!fGraphics) {
+				fGraphics = true;
+				PE_initialize_console(NULL, kPEGraphicsMode);
+			}
+			if (vayu_mdp_scanout(zero_phys, zero_stride, (1125 - 1080) / 2, (2436 - 2400) / 2)) {
+				MiniIOSurface * was = fScanoutShown;
+
+				s->retain();
+				fScanoutShown = s;      /* held while VIG0 fetches it */
+				if (was != NULL) {
+					was->release(); /* (the flush is taken: VIG0 no longer reads it) */
+				}
+				if (fScanoutFlips++ == 0) {
+					IOLog("MiniIOMobileFramebuffer: fb_zero: surface %u flipped onto the panel, no copy (phys 0x%llx, %u a row, "
+					    "the centre 1080x2400)\n", sid, zero_phys, zero_stride);
+				}
+				continue;
+			}
+			if (fScanoutFails++ < 4) {
+				IOLog("MiniIOMobileFramebuffer: fb_zero: the flip to surface %u was not taken; copied instead\n", sid);
+			}
+		}
+		if (fScanoutShown != NULL) {
+			vayu_mdp_unscanout();   /* VIG0 back on the boot framebuffer before it is drawn into */
+			fScanoutShown->release();
+			fScanoutShown = NULL;
+		}
+		if (gFbZero) {
+			fScanoutCopies++;
 		}
 		if (s->info.bytesPerElement == 4 && s->info.planeCount == 0) {
 			if (!fGraphics) {
@@ -1058,6 +1189,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	/* every five seconds in which something was drawn: how many frames, and what each cost here */
 	fStatFrames++;
 	fStatDrawing += mach_absolute_time() - began;
+	gFBDrawAbs = (gFBDrawAbs * 7 + (mach_absolute_time() - began)) / 8;
 	if (fStatSince == 0) {
 		fStatSince = began;
 	}
@@ -1075,6 +1207,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate);
+		if (gFbZero) {
+			uint32_t slots = 0, used = 0;
+
+			MiniIOSurfacePoolInfo(&slots, &used);
+			IOLog("MiniIOMobileFramebuffer: fb_zero: %u frames flipped, %u copied, %u flips not taken (so far); pool %u of %u slots "
+			    "in use\n", fScanoutFlips, fScanoutCopies, fScanoutFails, used, slots);
+		}
 		fStatSwapsLate = 0;
 		for (different = 0; different < 8 && fStatSurfaces[different] != 0; different++) {
 		}
@@ -1149,6 +1288,82 @@ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void * securityID
 	}
 	fTask = owningTask;
 	return true;
+}
+
+/*
+ * What the brightness system (backboardd's CoreBrightness) sets on the framebuffer. IOService's own
+ * setProperties refuses everything, so until now each of these was turned away without a word. On an
+ * iPhone "DisplayBrightnessFactor" (CoreBrightness: ...FactorZero, ...FactorWithFade) goes to 0 when the
+ * display is to be dark and back up when it is lit: with a backlight driver (hakios_display_power) that
+ * switches it. Every key is kept as a property and logged (the first 200 sets; brightness-factor changes
+ * always), so the run shows what the slider sends.
+ */
+static unsigned gFBPropsLogged;
+static int64_t gFBFactor = -1;
+
+static void
+fbLogProperty(const char * who, const OSSymbol * key, OSObject * value)
+{
+	OSNumber * number = OSDynamicCast(OSNumber, value);
+	OSData * data = OSDynamicCast(OSData, value);
+
+	if (number != NULL) {
+		IOLog("MiniIOMobileFramebuffer: %s sets %s = %llu (%#llx)\n", who, key->getCStringNoCopy(),
+		    number->unsigned64BitValue(), number->unsigned64BitValue());
+	} else if (value == kOSBooleanTrue || value == kOSBooleanFalse) {
+		IOLog("MiniIOMobileFramebuffer: %s sets %s = %s\n", who, key->getCStringNoCopy(), value == kOSBooleanTrue ? "true" : "false");
+	} else if (data != NULL) {
+		IOLog("MiniIOMobileFramebuffer: %s sets %s = data of %u bytes\n", who, key->getCStringNoCopy(), data->getLength());
+	} else {
+		IOLog("MiniIOMobileFramebuffer: %s sets %s = a %s\n", who, key->getCStringNoCopy(),
+		    value != NULL ? value->getMetaClass()->getClassName() : "NULL");
+	}
+}
+
+IOReturn
+IOMobileFramebuffer::setProperties(OSObject * properties)
+{
+	OSDictionary * dict = OSDynamicCast(OSDictionary, properties);
+	OSCollectionIterator * keys;
+	OSObject * next;
+	char who[32] = "?";
+
+	if (dict == NULL) {
+		return kIOReturnBadArgument;
+	}
+	keys = OSCollectionIterator::withCollection(dict);
+	if (keys == NULL) {
+		return kIOReturnNoMemory;
+	}
+	proc_selfname(who, sizeof(who));
+	while ((next = keys->getNextObject()) != NULL) {
+		const OSSymbol * key = OSDynamicCast(OSSymbol, next);
+		OSObject * value = key != NULL ? dict->getObject(key) : NULL;
+		OSNumber * number = OSDynamicCast(OSNumber, value);
+		bool factor = key != NULL && key->isEqualTo("DisplayBrightnessFactor");
+
+		if (key == NULL || value == NULL) {
+			continue;
+		}
+		if (factor && number != NULL) {
+			int64_t now = (int64_t)number->unsigned64BitValue();
+
+			if ((now == 0) != (gFBFactor == 0) || gFBFactor < 0) {
+				bool (*display_power)(bool) = hakios_display_power;
+				bool on = now != 0, done = display_power != NULL && display_power(on);
+
+				IOLog("MiniIOMobileFramebuffer: %s: DisplayBrightnessFactor %lld -> %lld: display %s%s\n", who, gFBFactor, now,
+				    on ? "on" : "off", display_power == NULL ? " (no backlight driver)" : done ? "" : " (the backlight said no)");
+			}
+			gFBFactor = now;
+		} else if (gFBPropsLogged < 200) {
+			gFBPropsLogged++;
+			fbLogProperty(who, key, value);
+		}
+		setProperty(key, value);
+	}
+	keys->release();
+	return kIOReturnSuccess;
 }
 
 bool
@@ -1233,6 +1448,34 @@ IOMobileFramebufferUserClient::armVSync(void)
 	uint64_t period, now = mach_absolute_time();
 
 	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
+	uint64_t (*panel_next)(uint64_t) = os_atomic_load(&hakios_vsync_next, acquire);
+	uint64_t (*panel_frame)(void) = os_atomic_load(&hakios_vsync_frame, acquire);
+
+	if (panel_next != NULL && panel_frame != NULL && (period = panel_frame()) != 0) {
+		/* the next frame start the panel itself will make; a quarter frame at least after the last one told */
+		uint64_t next = panel_next(now);
+		uint32_t div = gVsyncDivisor;
+
+		if (div == 0) {
+			if (gFBDivisor == 1 && gFBDrawAbs * 10 > period * 6) {
+				gFBDivisor = 2;
+				IOLog("MiniIOMobileFramebuffer: the copy takes over 60%% of a panel frame: refreshes every 2nd frame\n");
+			} else if (gFBDivisor == 2 && gFBDrawAbs * 100 < period * 45) {
+				gFBDivisor = 1;
+				IOLog("MiniIOMobileFramebuffer: the copy takes under 45%% of a panel frame: refreshes every frame\n");
+			}
+			div = gFBDivisor;
+		}
+		div = div < 1 ? 1 : div > 4 ? 4 : div;
+		if (next != 0) {
+			while (next < fVSyncTime + period * div - period / 4) {
+				next += period;
+			}
+			fVSyncTime = next;
+			thread_call_enter_delayed(fVSyncCall, fVSyncTime);
+			return;
+		}
+	}
 	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
 	fVSyncTime += period;
 	if (fVSyncTime <= now || fVSyncTime > now + 2 * period) {
@@ -1355,10 +1598,18 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(mach_absolute_time()));
 		}
 		return kIOReturnSuccess;
+	case kFBMethodRequestPowerChange: {        /* in[0]: 0 = display off (backboardd's screen-off), else on */
+		bool on = args->scalarInputCount < 1 || in[0] != 0;
+		bool done = hakios_display_power != NULL && hakios_display_power(on);
+
+		IOLog("MiniIOMobileFramebuffer: power change asked (scalars %u in [0x%llx 0x%llx]): display %s%s\n",
+		    args->scalarInputCount, args->scalarInputCount > 0 ? in[0] : 0, args->scalarInputCount > 1 ? in[1] : 0,
+		    on ? "on" : "off", hakios_display_power == NULL ? " (no backlight driver)" : done ? "" : " (the backlight said no)");
+		return kIOReturnSuccess;
+	}
 	case kFBMethodSwapSignal:
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:
-	case kFBMethodRequestPowerChange:
 	case kFBMethodChangeFrameInfo:
 		return kIOReturnSuccess;
 
@@ -1512,6 +1763,212 @@ MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t hei
 	}
 }
 
+/* ---- AppleARMBacklight: what iOS's brightness system drives ------------------------------------------ */
+
+/*
+ * backboardd's BrightnessSystem (CoreBrightness) finds the built-in display's backlight by matching an
+ * IOService of the class AppleARMBacklight (strings of the iOS 16.5 dyld cache, 20F66: CBDisplayContaineriOS
+ * "AppleARMBacklight" next to "IOHIDDevice"; PLDisplayAgent IOServiceMatched "AppleARMBacklight",
+ * "IODisplayParameters", "backlight-control"). With none, it had no display to set: the mgr8 run logged
+ * "Set BrightnessSystem property:DisplayBrightnessFactor to:0" on the lock button and nothing reached the
+ * kernel. This service gives it one: the parameters an iPhone's has (brightness 0..65536, rawBrightness
+ * 0..4095, BrightnessMilliNits), every property set on it logged (the first 300) and kept, and what can be
+ * read as a level goes to the panel (hakios_display_brightness), 0 (or DisplayBrightnessFactor 0) turning
+ * the backlight off and anything else on (hakios_display_power). HYPOTHESIS until the log shows which
+ * keys CoreBrightness really sends.
+ */
+class AppleARMBacklight : public IOService
+{
+	OSDeclareDefaultStructors(AppleARMBacklight);
+public:
+	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
+	void publishParameters(uint32_t brightness);
+};
+
+OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+
+static unsigned gBacklightLogged;
+static int gBacklightOn = -1;
+
+static OSDictionary *
+backlightParameter(uint32_t min, uint32_t max, uint32_t value)
+{
+	OSDictionary * d = OSDictionary::withCapacity(3);
+	OSNumber * n;
+
+	if (d == NULL) {
+		return NULL;
+	}
+	if ((n = OSNumber::withNumber(min, 32)) != NULL) {
+		d->setObject("min", n);
+		n->release();
+	}
+	if ((n = OSNumber::withNumber(max, 32)) != NULL) {
+		d->setObject("max", n);
+		n->release();
+	}
+	if ((n = OSNumber::withNumber(value, 32)) != NULL) {
+		d->setObject("value", n);
+		n->release();
+	}
+	return d;
+}
+
+void
+AppleARMBacklight::publishParameters(uint32_t brightness)
+{
+	OSDictionary * params = OSDictionary::withCapacity(3), * d;
+
+	if (params == NULL) {
+		return;
+	}
+	if ((d = backlightParameter(0, 65536, brightness)) != NULL) {
+		params->setObject("brightness", d);
+		d->release();
+	}
+	if ((d = backlightParameter(0, 4095, (uint32_t)((uint64_t)brightness * 4095 / 65536))) != NULL) {
+		params->setObject("rawBrightness", d);
+		d->release();
+	}
+	if ((d = backlightParameter(0, 500000, (uint32_t)((uint64_t)brightness * 500000 / 65536))) != NULL) {
+		params->setObject("BrightnessMilliNits", d);
+		d->release();
+	}
+	setProperty("IODisplayParameters", params);
+	params->release();
+}
+
+/* a number, or a parameter dictionary's "value"; false if neither */
+static bool
+backlightNumber(OSObject * o, uint64_t * value, uint64_t * max)
+{
+	OSNumber * n = OSDynamicCast(OSNumber, o);
+	OSDictionary * d = OSDynamicCast(OSDictionary, o);
+
+	if (d != NULL) {
+		OSNumber * m = OSDynamicCast(OSNumber, d->getObject("max"));
+
+		n = OSDynamicCast(OSNumber, d->getObject("value"));
+		if (m != NULL && max != NULL) {
+			*max = m->unsigned64BitValue();
+		}
+	}
+	if (n == NULL) {
+		return false;
+	}
+	*value = n->unsigned64BitValue();
+	return true;
+}
+
+static void
+backlightApply(const char * who, const char * key, uint64_t value, uint64_t max)
+{
+	bool (*power)(bool) = hakios_display_power;
+	bool (*level)(uint32_t) = hakios_display_brightness;
+	uint32_t permille = max != 0 ? (uint32_t)(value * 1000 / max) : 0;
+	bool on = value != 0;
+
+	if (on != (gBacklightOn == 1)) {
+		bool done = power != NULL && power(on);
+
+		IOLog("AppleARMBacklight: %s: %s %llu: backlight %s%s\n", who, key, value, on ? "on" : "off",
+		    power == NULL ? " (no backlight driver)" : done ? "" : " (the backlight said no)");
+		gBacklightOn = on;
+	}
+	if (on && max != 0 && level != NULL) {
+		level(permille < 1 ? 1 : permille > 1000 ? 1000 : permille);
+	}
+}
+
+IOReturn
+AppleARMBacklight::setProperties(OSObject * properties)
+{
+	OSDictionary * dict = OSDynamicCast(OSDictionary, properties);
+	OSCollectionIterator * keys;
+	OSObject * next;
+	char who[32] = "?";
+
+	if (dict == NULL) {
+		return kIOReturnBadArgument;
+	}
+	keys = OSCollectionIterator::withCollection(dict);
+	if (keys == NULL) {
+		return kIOReturnNoMemory;
+	}
+	proc_selfname(who, sizeof(who));
+	while ((next = keys->getNextObject()) != NULL) {
+		const OSSymbol * key = OSDynamicCast(OSSymbol, next);
+		OSObject * value = key != NULL ? dict->getObject(key) : NULL;
+		uint64_t v = 0, max = 0;
+
+		if (key == NULL || value == NULL) {
+			continue;
+		}
+		if (gBacklightLogged < 300) {
+			gBacklightLogged++;
+			fbLogProperty(who, key, value);
+			if (OSDictionary * inner = OSDynamicCast(OSDictionary, value)) {
+				OSCollectionIterator * ik = OSCollectionIterator::withCollection(inner);
+				OSObject * in;
+
+				while (ik != NULL && (in = ik->getNextObject()) != NULL) {
+					const OSSymbol * k2 = OSDynamicCast(OSSymbol, in);
+
+					if (k2 != NULL) {
+						IOLog("AppleARMBacklight:   %s.", key->getCStringNoCopy());
+						fbLogProperty("", k2, inner->getObject(k2));
+					}
+				}
+				OSSafeReleaseNULL(ik);
+			}
+		}
+		if (key->isEqualTo("DisplayBrightnessFactor") || key->isEqualTo("DisplayBrightnessFactorWithFade")) {
+			if (backlightNumber(value, &v, NULL)) {
+				backlightApply(who, key->getCStringNoCopy(), v, 0);
+			}
+		} else if (key->isEqualTo("brightness") && backlightNumber(value, &v, &max)) {
+			backlightApply(who, "brightness", v, max ? max : 65536);
+		} else if (key->isEqualTo("rawBrightness") && backlightNumber(value, &v, &max)) {
+			backlightApply(who, "rawBrightness", v, max ? max : 4095);
+		} else if (key->isEqualTo("IODisplayParameters")) {
+			OSDictionary * p2 = OSDynamicCast(OSDictionary, value);
+
+			if (p2 != NULL && backlightNumber(p2->getObject("brightness"), &v, &max)) {
+				backlightApply(who, "IODisplayParameters.brightness", v, max ? max : 65536);
+			} else if (p2 != NULL && backlightNumber(p2->getObject("rawBrightness"), &v, &max)) {
+				backlightApply(who, "IODisplayParameters.rawBrightness", v, max ? max : 4095);
+			}
+			continue;               /* (our published parameters stay as they are) */
+		}
+		setProperty(key, value);
+	}
+	keys->release();
+	return kIOReturnSuccess;
+}
+
+static TUNABLE(uint32_t, gPublishBacklight, "fb_backlight", 1);      /* fb_backlight=0: no AppleARMBacklight */
+
+static void
+publishBacklight(IOService * provider)
+{
+	AppleARMBacklight * bl;
+
+	if (!gPublishBacklight) {
+		return;
+	}
+	bl = OSTypeAlloc(AppleARMBacklight);
+
+	if (bl != NULL && bl->init() && bl->attach(provider)) {
+		bl->setName("backlight");
+		bl->setProperty("backlight-control", kOSBooleanTrue);
+		bl->publishParameters(32768);
+		bl->registerService();
+		IOLog("AppleARMBacklight: published for the brightness system (%s)\n",
+		    hakios_display_power != NULL ? "a backlight driver is there" : "no backlight driver yet");
+	}
+	OSSafeReleaseNULL(bl);
+}
+
 void
 MiniIOMobileFramebufferStart(IOService * provider)
 {
@@ -1524,6 +1981,7 @@ MiniIOMobileFramebufferStart(IOService * provider)
 	if (fb->start(provider)) {
 		publishDisplayNode();
 		publishAccelerator(provider);
+		publishBacklight(provider);
 	} else {
 		fb->detach(provider);
 	}

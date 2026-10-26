@@ -771,9 +771,10 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
 
 /*
  * The memory of an IOSurface as a buffer: its pixels, from the page after the surface's shared
- * state on (MiniIOSurface.h). The surface is held for as long as the buffer is there. A surface
- * that is a buffer of this client's already is that buffer again, as with Linux's handles: so
- * the client must not be giving that buffer back at the same moment (freedreno asks under the
+ * state on (MiniIOSurface.h) -- or, for a surface whose pixels are a scanout frame (boot-arg
+ * fb_zero=1), from the frame itself. The surface is held for as long as the buffer is there. A
+ * surface that is a buffer of this client's already is that buffer again, as with Linux's handles:
+ * so the client must not be giving that buffer back at the same moment (freedreno asks under the
  * lock it gives buffers back under). Asked only to describe (kHakiosDescribe), no buffer is made.
  */
 IOReturn
@@ -793,7 +794,17 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface * request)
 		return kIOReturnUnsupported;
 	}
 	size = round_page_64(s->info.allocSize);
-	memory = IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut);
+	if (s->scanout != NULL) {
+		/*
+		 * The pixels are a frame the loader kept for the display (MiniIOSurface.cpp): `memory` of
+		 * the surface is the state page alone, so the buffer is made from the frame itself, from
+		 * its first byte, and seen from here where the surface sees it.
+		 */
+		memory = s->scanout;
+		memory->retain();
+	} else {
+		memory = IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut);
+	}
 	if (memory == NULL || size == 0 || size > GPU_BUFFER_MAX) {
 		OSSafeReleaseNULL(memory);
 		MiniIOSurfaceDrop(s);
@@ -824,9 +835,10 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface * request)
 	if (b != NULL) {
 		memory->release();
 		MiniIOSurfaceDrop(s);
-	} else if ((b = newBuffer(s->memory, PAGE_SIZE, size, 0, &request->handle)) != NULL) {
+	} else if ((b = newBuffer(s->scanout != NULL ? s->scanout : s->memory, s->scanout != NULL ? 0 : PAGE_SIZE, size, 0,
+	    &request->handle)) != NULL) {
 		b->memory = memory;
-		b->kernel = s->kbase + PAGE_SIZE;
+		b->kernel = s->scanout != NULL ? s->kpixels : s->kbase + PAGE_SIZE;
 		b->surface = s;
 		gGPUStat.surfaces++;
 	}

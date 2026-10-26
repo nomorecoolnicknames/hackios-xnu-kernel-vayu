@@ -33,9 +33,17 @@
  * recent part (a ring); room is left for what is appended on the way out (the kernel message
  * buffer, a panic's text). loader_log_linearize() puts the pieces in order before returning.
  */
-#define LOADER_LOG_SIZE (1536 * 1024)
-#define LOADER_LOG_HEAD (256 * 1024)
-#define LOADER_LOG_RING (1024 * 1024)
+/*
+ * 8 MB (512 KB from the boot's start, a 6.5 MB ring of the newest, 1 MB kept free for the kernel message buffer
+ * appended on the way out: a full ring had left it no room, and test sessions 231946/003059 came back without
+ * it); before that 7.5 MB of ring and no room; 1.5 MB (256 KB + 1 MB) until 2026-10-25, when
+ * userland logging filled the ring and runs lost their middle (the 151454 IR bursts 5-10). The loader stages up to
+ * 9 MB (loader 1.6).
+ */
+#define LOADER_LOG_SIZE (8 * 1024 * 1024)
+#define LOADER_LOG_HEAD (512 * 1024)
+#define LOADER_LOG_TAIL (1024 * 1024)   /* left free for what loader_return() appends: the kernel message buffer (msgbuf=, at most 1 MB) */
+#define LOADER_LOG_RING (LOADER_LOG_SIZE - LOADER_LOG_HEAD - LOADER_LOG_TAIL)
 
 #if defined(GENERIC_GIC_V3_IRQ)
 extern void gic_v3_irq_quiesce(void);
@@ -54,12 +62,22 @@ extern void hakios_adsp_quiesce(void);
 extern void hakios_mpss_stop(void);
 extern void hakios_mpss_quiesce(void);
 extern void hakios_ddr_quiesce(void);
+extern void vayu_cpufreq_quiesce(void);
 extern void hakios_haptic_quiesce(void);
 extern void hakios_torch_quiesce(void);
+extern void vayu_audio_quiesce(void);
+extern void vayu_modem_quiesce(void);
+extern void vayu_slpi_quiesce(void);
+extern void vayu_smmu_quiesce(void);        /* bsd/dev/vayu_pas.c: bypass stream matches given back */
+extern void vayu_mdp_quiesce(void);
+extern void vayu_haptic_quiesce(void);
+extern void vayu_camera_quiesce(void);
 extern void hakios_camera_quiesce(void);
 extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
 extern void hakios_var_save_on_return(void);   /* bsd/dev/hakios.ufs.c: the data volume into the flash */
+extern void vayu_ir_quiesce(void);              /* bsd/dev/vayu_ir.c: an IR transfer in flight, cancelled */
+extern void vayu_usbnet_quiesce(void);          /* bsd/dev/vayu_usbnet.c: the USB controller, if it took it */
 void loader_checkpoint(uint64_t n);
 
 /* Also referenced from the early exception vector in start.s. */
@@ -74,7 +92,6 @@ static uint64_t loader_l2[512] __attribute__((aligned(4096)));
 static uint32_t loader_log_ring_at;      /* where the next character goes in the ring */
 static bool     loader_log_wrapped;
 static bool     loader_log_linear;       /* the pieces have been put in order: only appending from now on */
-static char     loader_log_scratch[LOADER_LOG_RING];
 
 /*
  * Characters come from every processor, and from interrupt handlers on top of whatever was
@@ -154,12 +171,23 @@ loader_log_put_locked(char c)
 	}
 }
 
+static void
+loader_log_reverse(char *p, uint32_t n)
+{
+	for (uint32_t i = 0, j = n; i + 1 < j; i++, j--) {
+		char t = p[i];
+
+		p[i] = p[j - 1];
+		p[j - 1] = t;
+	}
+}
+
 /* Oldest first: the head, a note about what was dropped, then the ring from its oldest character. */
 static void
 loader_log_linearize(void)
 {
-	static const char note[] = "\n\n[... the log between the first 256 KB and the last 1 MB was dropped ...]\n\n";
-	uint32_t older = LOADER_LOG_RING - loader_log_ring_at, n = LOADER_LOG_HEAD;
+	static const char note[] = "\n\n[... the log between the first 512 KB and the last 6.5 MB was dropped ...]\n\n";
+	uint32_t n = LOADER_LOG_HEAD;
 
 	if (loader_log_linear) {
 		return;
@@ -168,12 +196,12 @@ loader_log_linearize(void)
 	if (!loader_log_wrapped) {
 		return;
 	}
-	__builtin_memcpy(loader_log_scratch, loader_log + LOADER_LOG_HEAD + loader_log_ring_at, older);
-	__builtin_memcpy(loader_log_scratch + older, loader_log + LOADER_LOG_HEAD, loader_log_ring_at);
+	/* the ring rotated in place so that its oldest character comes first: three reversals, no second buffer */
+	loader_log_reverse(loader_log + LOADER_LOG_HEAD, loader_log_ring_at);
+	loader_log_reverse(loader_log + LOADER_LOG_HEAD + loader_log_ring_at, LOADER_LOG_RING - loader_log_ring_at);
+	loader_log_reverse(loader_log + LOADER_LOG_HEAD, LOADER_LOG_RING);
 	/* the note takes the place of the oldest characters of the ring */
 	__builtin_memcpy(loader_log + n, note, sizeof(note) - 1);
-	n += sizeof(note) - 1;
-	__builtin_memcpy(loader_log + n, loader_log_scratch + sizeof(note) - 1, LOADER_LOG_RING - (sizeof(note) - 1));
 	loader_log_len = LOADER_LOG_HEAD + LOADER_LOG_RING;
 }
 
@@ -200,6 +228,9 @@ struct loader_live {
 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
 	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": the kernel has what follows */
+	volatile uint64_t usb_take;     /* ours: 1 = this kernel wants the USB controller (usb_handover=1) */
+	volatile uint64_t usb_given;    /* the loader's: 1 = it no longer touches USB in this run */
 };
 
 /*
@@ -215,7 +246,32 @@ struct loader_live loader_live = {
 	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
+	.magic3 = 0x334556494c554e58ULL, .usb_take = 0, .usb_given = 0,
 };
+
+/*
+ * The handover, for a driver that takes a controller the loader's UEFI also drives (bsd/dev/
+ * vayu_usbnet.c with usb_handover=1): the kernel writes usb_take = 1, the loader stops touching
+ * the device and writes usb_given = 1, and only then does the kernel program it. Here rather than
+ * in the driver so that the struct stays this file's.
+ */
+uint64_t
+loader_live_usb_take(void)
+{
+	return loader_live.usb_take;
+}
+
+void
+loader_live_usb_take_set(uint64_t value)
+{
+	loader_live.usb_take = value;
+}
+
+uint64_t
+loader_live_usb_given(void)
+{
+	return loader_live.usb_given;
+}
 
 /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
 static inline uint64_t
@@ -377,10 +433,20 @@ loader_return(void)
 	hakios_adsp_quiesce();         /* nor the audio DSP */
 	hakios_mpss_quiesce();         /* nor the modem */
 	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
+	vayu_cpufreq_quiesce();         /* vayu: the OSM core and L3 rows the firmware had left */
 	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
 	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
+	vayu_audio_quiesce();           /* vayu's speaker amplifiers into shutdown, if a step let them out */
+	vayu_modem_quiesce();           /* vayu's modem stopped through TrustZone, if the probe started it */
+	vayu_slpi_quiesce();            /* vayu's sensors DSP stopped through TrustZone, if the probe started it */
+	vayu_smmu_quiesce();            /* then the SMMU matches its DMA used, as found */
+	vayu_mdp_quiesce();             /* the boot framebuffer back on the panel, if vayu_mdp=2 flipped it */
+	vayu_haptic_quiesce();          /* vayu's PM8150B haptics: PLAY off, module off, if anything was written */
+	vayu_camera_quiesce();          /* vayu: a camera sensor this probe powered, off again */
 	hakios_camera_quiesce();       /* the camera powered down, if it was powered up */
 	hakios_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
+	vayu_ir_quiesce();              /* the IR blaster's transfer stopped, if one was in flight */
+	vayu_usbnet_quiesce();          /* the USB controller stopped, if vayu_usbnet=2/3 took it from the loader */
 	/*
 	 * A panic's text is first collected in the panic buffer and only later
 	 * flushed to the console; if the console itself is what failed, that

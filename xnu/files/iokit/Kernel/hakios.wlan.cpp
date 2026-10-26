@@ -31,6 +31,7 @@
 #include <libkern/c++/OSNumber.h>
 
 extern "C" void HakiosWLANStart(const char * interface, const uint8_t * address);
+extern "C" void HakiosEthernetStart(const char * interface, const uint8_t * address);
 
 class IO80211Controller : public IOService
 {
@@ -56,6 +57,25 @@ public:
 };
 
 OSDefineMetaClassAndStructors(HakiosWLAN, IONetworkInterface);
+
+/*
+ * A wired interface (vayu's USB network, en2, bsd/dev/vayu_usbnet.c): SystemConfiguration calls an
+ * IFT_ETHER interface whose parent is no radio (nor Bluetooth) plain Ethernet, and configd makes it a
+ * service (DHCP) like any other. Properties only, as above.
+ */
+class IOEthernetController : public IOService
+{
+	OSDeclareDefaultStructors(IOEthernetController);
+};
+
+OSDefineMetaClassAndStructors(IOEthernetController, IOService);
+
+class HakiosEthernet : public IONetworkInterface
+{
+	OSDeclareDefaultStructors(HakiosEthernet);
+};
+
+OSDefineMetaClassAndStructors(HakiosEthernet, IONetworkInterface);
 
 /* There is none (see the top); that somebody asked shows that the service was found. */
 IOReturn
@@ -132,6 +152,54 @@ HakiosWLANStart(const char * interface, const uint8_t * address)
 		IOLog("HakiosWLAN: the service did not start\n");
 	} else {
 		wlan->release();
+	}
+	controller->release();
+}
+
+/* Once, when a wired interface exists (named enN, N one digit). */
+void
+HakiosEthernetStart(const char * interface, const uint8_t * address)
+{
+	IOService * platform = IOService::getPlatform();
+	IOEthernetController * controller = OSTypeAlloc(IOEthernetController);
+	HakiosEthernet * ether = OSTypeAlloc(HakiosEthernet);
+	OSData * mac;
+	OSNumber * number;
+
+	if (platform == NULL || controller == NULL || ether == NULL || !controller->init() || !ether->init()) {
+		OSSafeReleaseNULL(controller);
+		OSSafeReleaseNULL(ether);
+		IOLog("HakiosEthernet: cannot create the services\n");
+		return;
+	}
+	if ((mac = OSData::withBytes(address, 6)) != NULL) {
+		controller->setProperty("IOMACAddress", mac);
+		mac->release();
+	}
+	controller->setProperty("IOBuiltin", true);
+	if ((controller = (IOEthernetController *) publish(controller, platform, "HakiosEthernetController")) == NULL) {
+		ether->release();
+		IOLog("HakiosEthernet: the controller did not start\n");
+		return;
+	}
+
+	ether->setProperty("IOInterfaceName", interface);
+	ether->setProperty("BSD Name", interface);
+	ether->setProperty("IOInterfaceNamePrefix", "en");
+	if ((number = OSNumber::withNumber(6ULL, 32)) != NULL) {        /* IFT_ETHER */
+		ether->setProperty("IOInterfaceType", number);
+		number->release();
+	}
+	if ((number = OSNumber::withNumber((unsigned long long) (interface[2] - '0'), 32)) != NULL) {
+		ether->setProperty("IOInterfaceUnit", number);
+		number->release();
+	}
+	ether->setProperty("IOBuiltin", true);
+	if (publish(ether, controller, "HakiosEthernet") == NULL) {
+		IOLog("HakiosEthernet: the service did not start\n");
+	} else {
+		ether->release();
+		IOLog("HakiosEthernet: %s published (configd may make a service of it)\n", interface);
 	}
 	controller->release();
 }
