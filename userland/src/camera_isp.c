@@ -299,17 +299,40 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
  * Green's mean towards 15 % of white, unless that would put 1 % of the picture into white. The
  * exposure, longest first: the frame's lines at the shortest frame, then gain to 16x, then frames up
  * to max_frame_lines, then gain to the most; beyond that, digital gain (up to 4x).
+ *
+ * A frame of another mode (its frame length or line time differ from the last one AE stepped from)
+ * starts the exposure from the vendor block's guess, so the first request after it is undamped: the
+ * measurement's ratio, not its 0.7th power, and no waiting for a change that is not in the frames.
+ * With isp->fixed_frame the frame length is the mode's own (the kernel's stills mode writes no
+ * 0x0340), so the ladder stops at the frame's lines and never asks for a longer frame.
  */
+void
+isp_mode_changed(struct isp *isp)
+{
+	isp->asked = false;
+	isp->mode_jump = true;
+}
+
 bool
 isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *s, struct hakios_camera_command *c)
 {
 	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
 	double target = 0.15 * WHITE, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
 	double bright = s->bright * isp->digital;
-	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
+	uint32_t fast = f->frame_lines_min > f->margin ? f->frame_lines_min - f->margin : f->frame_lines_min;
+	uint32_t longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
 	uint32_t lines, gain, frame_lines = 0;
 	double digital = 1;
 
+	if (isp->last_frame_lines != 0 &&
+	    (isp->last_frame_lines != f->frame_lines_min || isp->last_line_ns != f->line_ns)) {
+		isp_mode_changed(isp);          /* (the vendor block's exposure, not the one we asked for) */
+	}
+	isp->last_frame_lines = f->frame_lines_min;
+	isp->last_line_ns = f->line_ns;
+	if (isp->fixed_frame) {
+		longest = f->frame_lines_min;   /* (the mode's own: 0x0340 is never written for it) */
+	}
 	if (isp->asked && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain)) {
 		return false;                   /* (the last change not in the frames yet) */
 	}
@@ -318,11 +341,18 @@ isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_st
 	if (bright * ratio > 0.9 * WHITE && bright > 0) {
 		ratio = 0.9 * WHITE / bright > target / mean * 0.5 ? 0.9 * WHITE / bright : target / mean * 0.5;
 	}
-	ratio = ratio < 0.25 ? 0.25 : ratio > 4 ? 4 : ratio;
+	ratio = ratio < 0.25 ? 0.25 : ratio > (isp->mode_jump ? 4096 : 4) ? (isp->mode_jump ? 4096 : 4) : ratio;
 	if (ratio > 0.94 && ratio < 1.06) {
+		isp->mode_jump = false;
 		return false;
 	}
-	want = now * pow(ratio, 0.7);
+	want = now * (isp->mode_jump ? ratio : pow(ratio, 0.7));
+	isp->mode_jump = false;
+	if (!(want > 0)) {
+		want = 4;                       /* (a black frame: the shortest exposure) */
+	} else if (want > 4e9) {
+		want = 4e9;                     /* (the ladder saturates at the gain and the digital gain below) */
+	}
 	if (want <= fast) {
 		lines = want < 4 ? 4 : (uint32_t)want;
 		gain = f->gain_unity;
@@ -330,9 +360,11 @@ isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_st
 		lines = fast;
 		gain = (uint32_t)(want / fast * f->gain_unity);
 	} else {
+		uint32_t cap = isp->fixed_frame ? fast : longest > f->margin ? longest - f->margin : longest;
+
 		lines = (uint32_t)(want / 16);
-		lines = lines > longest - f->margin ? longest - f->margin : lines < fast ? fast : lines;
-		frame_lines = lines + f->margin;
+		lines = lines > cap ? cap : lines < fast ? fast : lines;
+		frame_lines = isp->fixed_frame ? 0 : lines + f->margin;
 		double g = want / lines;
 
 		if (g > (double)f->gain_max / f->gain_unity) {

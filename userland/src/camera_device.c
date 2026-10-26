@@ -27,6 +27,19 @@
  * (the time machine's TimeMachineSuspendNow/ResumeNow are taken and ignored). Focus, where there is
  * a lens motor (the wide camera's): by contrast, continuous, and on the window a tap gives (af_frame()).
  *
+ * The photograph's frame: the kernel's step 6 has two modes per camera -- the usual one (1920x1080
+ * rear, 1280x720 front) for the preview, and the full 4:3 one (4000x3000, 2592x1940) for a
+ * photograph. A photograph asks the kernel for the full mode (HAKIOS_CAMERA_SENSOR with b = 1); the
+ * kernel ends its session and brings the sensor up in that mode, and the frames' headers say which
+ * mode they are (mode 1). The first frames of the mode are dropped (cam_still_settle=, 2: the
+ * vendor block's exposure is a guess and AE has just been re-seeded for the new line time), the
+ * next one is the photograph, and the stream asks for the usual mode again for the preview. The
+ * preview is not served from the full mode (cam_still_preview=1 serves it too): a 12 Mpx picture
+ * made thirty times a second costs more than the preview can pay. A kernel that refuses the mode
+ * (EINVAL), answers the request with the usual mode, or fails the stills session, falls back: the
+ * photograph is then made from the preview's frame, as it was before. cam_still_mode=0 turns the
+ * whole handshake off.
+ *
  * Everything asked of the device and the streams that is not answered here is said in mediaserverd's
  * log ("hakios: camera: ..."), once per property.
  */
@@ -464,6 +477,20 @@ struct stream {
 	bool            worker_started;
 	int             torch;
 	uint64_t        frames, stills_given;
+	/*
+	 * The stills mode's handshake (see the top comment): the kernel gives one sensor's frames at a
+	 * time and one mode's, so a photograph is a session change. frame_mode is the mode of the frames
+	 * read last (FRAME_MODE_NONE until the first header); mode_asked the last mode asked for, for the
+	 * debounce (the kernel restarts its session on every SENSOR command, so one ask is enough).
+	 */
+	int             frame_mode;
+	int             mode_asked;
+	uint64_t        asked_at;       /* ms, the last ask */
+	uint64_t        still_since;    /* ms, the first stills ask not yet answered (0: none) */
+	uint32_t        mode_frames;    /* frames read of frame_mode */
+	bool            still_ok;       /* the kernel takes the stills mode (or has not been asked yet) */
+	bool            still_preview;  /* serve the preview from the stills mode's frames too (cam_still_preview=1) */
+	uint32_t        still_settle;   /* stills-mode frames dropped before the photograph (cam_still_settle=) */
 };
 
 static struct stream *
@@ -1401,11 +1428,20 @@ boot_number(const char *arguments, const char *name, float fallback)
 	return end == at + strlen(name) ? fallback : v;
 }
 
+/* ---- the stills mode's handshake: its constants, the ask, and whether the photograph can be given ------ */
+
+#define CAM_ASK_EVERY_MS        3000    /* (a mismatch this long after the ask is a stall, not a slow bring-up: ask again) */
+#define CAM_STILL_GRACE_MS      500     /* (a usual-mode frame this long after the stills ask: the kernel has no such mode) */
+
+enum { FRAME_MODE_NONE = -1, FRAME_MODE_USUAL = 0, FRAME_MODE_STILLS = 1 };
+
 /*
  * The fast paths' boot arguments: cam_preview_half=0 (the preview's full-resolution debayer, the way it
  * was), cam_neon=0 (the scalar inner loops), cam_still_async=0 (the photograph on the frame's thread, as
  * it was), cam_pieces=N (8). All of them on but the last's default, which is the 8 pieces this made
- * pictures in before.
+ * pictures in before. The stills handshake's: cam_still_mode=0 (photographs from the preview's frames, the
+ * way they were before the kernel had a stills mode), cam_still_settle=N (2 stills-mode frames dropped
+ * before the photograph), cam_still_preview=1 (the preview served from the stills mode's frames too).
  */
 static void
 load_fast(struct isp *isp, struct stream *s)
@@ -1414,23 +1450,35 @@ load_fast(struct isp *isp, struct stream *s)
 	char arguments[4096] = "";
 	size_t size = sizeof(arguments) - 1;
 	struct isp_fast fast = { true, true };
-	int pieces = 8, async = 1;
+	int pieces = 8, async = 1, settle = 2, stills = 1, still_preview = 0;
 
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 		fast.preview_half = boot_number(arguments, "cam_preview_half=", 0) != 0;
 		fast.neon = boot_number(arguments, "cam_neon=", 1) != 0;
 		async = boot_number(arguments, "cam_still_async=", 1) != 0;
 		pieces = (int)boot_number(arguments, "cam_pieces=", 8);
+		stills = boot_number(arguments, "cam_still_mode=", 1) != 0;
+		settle = (int)boot_number(arguments, "cam_still_settle=", 2);
+		still_preview = boot_number(arguments, "cam_still_preview=", 0) != 0;
 	}
 	pieces = pieces < 1 ? 1 : pieces > 32 ? 32 : pieces;
+	settle = settle < 0 ? 0 : settle > 10 ? 10 : settle;
 	isp_set_fast(isp, &fast);
 	s->pieces = (uint32_t)pieces;
 	s->still_async = async != 0 && s->still_queue != NULL;
+	s->still_ok = stills != 0;
+	s->still_settle = (uint32_t)settle;
+	s->still_preview = still_preview != 0;
+	s->frame_mode = FRAME_MODE_NONE;
+	s->mode_asked = FRAME_MODE_NONE;
 	if (!said) {
 		said = 1;
 		say("the fast paths: the preview at half resolution (%s), the NEON loops (%s), %d pieces, the photograph on %s",
 		    fast.preview_half ? "on" : "off", fast.neon ? "on" : "off", pieces,
 		    s->still_async ? "the capture queue" : "the frame's thread (cam_still_async=0)");
+		say("the stills mode: %s, %u frame(s) dropped before the photograph, the preview from the stills frames: %s",
+		    stills ? "asked for on every photograph" : "off (cam_still_mode=0)", s->still_settle,
+		    s->still_preview ? "yes (cam_still_preview=1)" : "no");
 	}
 }
 
@@ -1491,6 +1539,49 @@ load_tuning(struct isp *isp, uint32_t sensor)
 	}
 }
 
+/* ---- the stills mode's handshake: the ask, and whether the photograph can be given at all ---------- */
+
+static uint64_t
+now_ms(void)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return mach_absolute_time() * tb.numer / tb.denom / 1000000;
+}
+
+/* the kernel's SENSOR command: a the sensor, b its mode (0 usual, 1 full stills); false if it did not take it */
+static bool
+camera_ask_mode(int device, const struct stream *s, int mode)
+{
+	struct hakios_camera_command c = {
+		.command = HAKIOS_CAMERA_SENSOR,
+		.a = s->camera->sensor,
+		.b = mode == FRAME_MODE_STILLS ? 1u : 0u,
+	};
+
+	return write(device, &c, sizeof(c)) == (ssize_t)sizeof(c);
+}
+
+/*
+ * Whether this frame is a photograph's to take: the graph has asked for one (StillImageCaptureNow) and
+ * its StillImage output can take it (the delivery loop's own test: a handler, a configuration, and
+ * enabled). Without that, the stills mode would be entered for a photograph nobody can be given.
+ */
+static bool
+photograph_wanted(struct stream *s)
+{
+	struct output *out = &s->out[OUTPUTS - 1];      /* ("StillImage", as in output_names) */
+	bool wanted;
+
+	pthread_mutex_lock(&s->lock);
+	wanted = s->stills_wanted != 0 && out->handler != NULL && out->config != NULL && out->enabled;
+	pthread_mutex_unlock(&s->lock);
+	return wanted;
+}
+
 static void *
 worker(void *context)
 {
@@ -1501,8 +1592,8 @@ worker(void *context)
 	struct isp_stats st;
 	uint8_t *buffer = NULL;
 	size_t bytes = 0;
-	uint32_t tuned_for = ~0u;
-	bool switched = false;
+	uint32_t tuned_for = ~0u, tuned_mode = ~0u;
+	bool isp_seeded = false;        /* the ISP has seen a frame: the first one is not a mode change */
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
 	int device = open(HAKIOS_CAMERA_DEVICE, O_RDWR), failures = 0;
@@ -1516,10 +1607,37 @@ worker(void *context)
 	load_fast(&isp, s);
 	while (s->running && failures < 5) {
 		ssize_t n;
+		uint64_t now = now_ms();
+		/*
+		 * The mode this loop needs: the stills one while a photograph is waiting and the kernel has
+		 * it, the usual one otherwise (see the top comment). The graph's asks are under its lock.
+		 */
+		int want = s->still_ok && photograph_wanted(s) ? FRAME_MODE_STILLS : FRAME_MODE_USUAL;
 
+		if (buffer != NULL && want != s->frame_mode) {
+			/*
+			 * The mode changed under the buffer: drop it, so that the next read is a header and the
+			 * loop learns the new frame's size (the kernel ends its session on the SENSOR command and
+			 * brings the sensor up in the mode asked for; a full frame read into the old buffer would
+			 * be the wrong size).
+			 */
+			free(buffer);
+			buffer = NULL;
+		}
 		if (buffer == NULL) {
 			n = read(device, &head, sizeof(head));
 			if (n != (ssize_t)sizeof(head)) {
+				if (n < 0 && errno == EIO && want == FRAME_MODE_STILLS) {
+					/*
+					 * The stills session failed (its bring-up, or a frame timeout): not the node's
+					 * fault. The preview goes on in the usual mode, and the photograph is made from
+					 * its frame as it was before the stills mode existed.
+					 */
+					say("the stills session failed (EIO): the photographs come from the preview's frames");
+					s->still_ok = false;
+					s->still_since = 0;
+					continue;
+				}
 				failures += n < 0 && errno == EAGAIN ? 0 : 1;
 				if (n < 0 && errno == EIO) {
 					say("the kernel's camera has had a fault: no frames");
@@ -1527,25 +1645,74 @@ worker(void *context)
 				}
 				continue;
 			}
-			if (head.sensor != s->camera->sensor) {
-				/* another camera's frames (the kernel's last sensor): changed, and the next ones are this one's */
-				if (!switched) {
-					struct hakios_camera_command c = { .command = HAKIOS_CAMERA_SENSOR, .a = s->camera->sensor, .b = ~0u };
-
-					switched = true;
-					say("the kernel's frames are camera %u's: to %u, the %s", head.sensor, s->camera->sensor, s->camera->name);
-					(void)write(device, &c, sizeof(c));
+			now = now_ms();         /* (the read may have waited for the kernel's session) */
+			if (head.sensor != s->camera->sensor || head.mode != (uint32_t)want) {
+				/*
+				 * Another camera's frames, or the other mode's (the kernel gives one at a time): the
+				 * frames stop while its session goes down and comes up again in the one asked for.
+				 * One ask is enough (it restarts the session); a repeat is only a safety net.
+				 */
+				if (s->still_since == 0 && want == FRAME_MODE_STILLS) {
+					s->still_since = now;
+				}
+				/*
+				 * One ask is enough: it ends the kernel's session and the next one comes up in the
+				 * mode asked for. A repeat is only for a stall (a mismatch this long after an ask
+				 * the kernel took is not a bring-up any more), never for a slow bring-up.
+				 */
+				if (s->mode_asked != want || now - s->asked_at >= CAM_ASK_EVERY_MS) {
+					s->mode_asked = want;
+					s->asked_at = now;
+					if (!camera_ask_mode(device, s, want)) {
+						failures++;
+						s->mode_asked = FRAME_MODE_NONE;        /* (ask again at the next header) */
+						if (want == FRAME_MODE_STILLS && errno == EINVAL) {
+							s->still_ok = false;
+							s->still_since = 0;
+							say("the kernel does not take the stills mode (SENSOR b = 1): "
+							    "the photographs come from the preview's frames");
+						}
+					} else {
+						say("the kernel's frames are camera %u mode %u: to camera %u mode %d (%s)", head.sensor,
+						    head.mode, s->camera->sensor, want,
+						    want == FRAME_MODE_STILLS ? "the full stills mode" : "the usual mode");
+					}
+				}
+				/*
+				 * A kernel without the stills mode takes the command and stays where it was (it
+				 * ignores b). A usual-mode frame of this camera this long after the ask says so:
+				 * the photographs come from the preview's frames, as they did before.
+				 */
+				if (want == FRAME_MODE_STILLS && s->still_since != 0 &&
+				    now - s->still_since >= CAM_STILL_GRACE_MS &&
+				    head.sensor == s->camera->sensor && head.mode == FRAME_MODE_USUAL) {
+					s->still_ok = false;
+					s->still_since = 0;
+					say("the kernel stayed in the usual mode %u ms after the stills ask: "
+					    "the photographs come from the preview's frames", (unsigned)CAM_STILL_GRACE_MS);
 				}
 				continue;
 			}
+			s->frame_mode = (int)head.mode;
+			s->mode_frames = 0;
+			s->still_since = 0;
 			bytes = sizeof(head) + (size_t)head.stride * head.height;
 			buffer = malloc(bytes);
-			say("frames of %ux%u from the kernel (the %s)", head.width, head.height, s->camera->name);
+			say("frames of %ux%u from the kernel (%s mode, the %s)", head.width, head.height,
+			    head.mode == FRAME_MODE_STILLS ? "the full stills" : "the usual", s->camera->name);
 			continue;
 		}
 		n = read(device, buffer, bytes);
 		if (n != (ssize_t)bytes) {
 			if (n < 0 && errno == EIO) {
+				if (want == FRAME_MODE_STILLS) {
+					say("the stills session failed (EIO): the photographs come from the preview's frames");
+					s->still_ok = false;
+					s->still_since = 0;
+					free(buffer);
+					buffer = NULL;
+					continue;
+				}
 				say("the kernel's camera has had a fault: no more frames");
 				break;
 			}
@@ -1553,16 +1720,40 @@ worker(void *context)
 			continue;
 		}
 		failures = 0;
+		s->mode_frames++;
 
 		const struct hakios_camera_frame *f = (const void *)buffer;
 		const uint8_t *raw = buffer + f->header_bytes;
 		struct hakios_camera_command c;
+		bool stills_frame = f->mode == FRAME_MODE_STILLS;
+		bool settled = !stills_frame || s->mode_frames > s->still_settle;
 
 		isp_measure(&isp, f, raw, &st);
 		isp_awb(&isp, &st);
+		isp.fixed_frame = stills_frame;
 		if (f->sensor != tuned_for) {
 			tuned_for = f->sensor;
+			tuned_mode = ~0u;       /* (another sensor: the mode the last one was in means nothing here) */
 			load_tuning(&isp, f->sensor);
+		}
+		if (f->mode != tuned_mode) {
+			/*
+			 * The frames come from another mode (or another sensor): its line time and frame length
+			 * are not the ones AE's last request was made for, and the stills mode starts from the
+			 * vendor block's exposure (a guess). isp_mode_changed() makes the next AE step from the
+			 * measurement alone; isp.fixed_frame keeps it from asking for a longer frame than the
+			 * mode has (the kernel never writes 0x0340 for the stills mode). The stream's very first
+			 * frame is not a change: it gets the old damped steps (the first frames after stream-on
+			 * are dark, and an undamped first step would overshoot).
+			 */
+			tuned_mode = f->mode;
+			if (isp_seeded) {
+				isp_mode_changed(&isp);
+				say("the %s's frames in %s mode: line %u ns, frame %u lines, exposure %u lines (AE re-seeded)",
+				    s->camera->name, stills_frame ? "the full stills" : "the usual", f->line_ns, f->frame_lines_min,
+				    f->exposure_lines);
+			}
+			isp_seeded = true;
 		}
 		/*
 		 * Slowly, a second or so: the colour temperature is guessed from the white balance, the tuning it
@@ -1617,13 +1808,23 @@ worker(void *context)
 			if (out->handler == NULL || out->config == NULL || !(out->enabled || i == 0)) {
 				continue;
 			}
-			if (still && s->stills_wanted == 0) {
+			/*
+			 * The stills mode's frames are the photograph's: the preview stands still for the moment the
+			 * sensor is in its full mode (a 12 Mpx picture for the preview costs more than the preview
+			 * can pay; cam_still_preview=1 serves it too), and the first frames of the mode are dropped
+			 * before the photograph (the vendor block's exposure is a guess that AE has just re-seeded).
+			 */
+			if (stills_frame && !still && !s->still_preview) {
+				continue;
+			}
+			if (still && (s->stills_wanted == 0 || (stills_frame && !settled))) {
 				continue;
 			}
 			deliver(s, out, &isp, f, raw, metadata);
 			if (still) {
 				s->stills_wanted--;
-				say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
+				say("the photograph is given (%llu so far, %ux%u of the %s mode)", (unsigned long long)++s->stills_given,
+				    f->width, f->height, stills_frame ? "full stills" : "usual");
 			}
 		}
 		pthread_mutex_unlock(&s->lock);

@@ -39,9 +39,12 @@ struct hakios_camera_frame {
 	uint32_t        frame_lines_max; /* the longest frame it may be given */
 	uint32_t        margin;         /* exposure_lines is at most frame_lines - margin */
 	uint32_t        sensor;         /* which: 0 the macro, 1 the wide, 2 the front, 3 the ultra-wide camera */
+	uint32_t        mode;           /* which of the sensor's modes these frames are (0 the usual one, 1 the full stills one;
+	                                 * the vayu kernel's step 6: 0 res3/res2 1920x1080 / 1280x720, 1 res1 4000x3000 /
+	                                 * 2592x1940). It takes the place of the old reserved[0]: the layout is unchanged. */
 	uint32_t        focus;          /* the lens's position as last set, 0 (the furthest) to 1023: HAKIOS_CAMERA_NO_FOCUS where it
 	                                 * has no motor (or it does not answer) */
-	uint32_t        reserved[5];
+	uint32_t        reserved[4];
 };
 
 #define HAKIOS_CAMERA_NO_FOCUS 0xffffffffu
@@ -50,8 +53,9 @@ enum {
 	HAKIOS_CAMERA_EXPOSURE = 1,    /* a: lines, b: gain, c: frame lines (0: the shortest that holds the exposure) */
 	HAKIOS_CAMERA_KEEP = 2,        /* a picture for the host: a width, b height, c stride, d format (1 the frame's RAW10, 2 NV12,
 	                                 * 3 BGRA); bytes follow */
-	HAKIOS_CAMERA_SENSOR = 3,      /* another sensor: a which (as in the frames' header), b its mode (~0: the usual one);
-	                                 * the frames stop, everything goes down, and the next read starts the other one */
+	HAKIOS_CAMERA_SENSOR = 3,      /* another sensor: a which (as in the frames' header), b its mode (~0 or 0: the usual one,
+	                                 * 1: the full stills one; anything else is EINVAL); the frames stop, everything goes down,
+	                                 * and the next read starts the other one (one log line per switch) */
 	HAKIOS_CAMERA_FOCUS = 4,       /* the lens to a: 0 (the furthest) to 1023, from the next frame or so */
 };
 

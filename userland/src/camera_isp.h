@@ -122,6 +122,12 @@ struct isp {
 	struct isp_look look;           /* the stills' look, and the preview's sharpening (all off by default) */
 	uint32_t        asked_lines, asked_gain, asked_frame_lines;     /* what AE asked for last */
 	bool            asked;
+	bool            mode_jump;      /* the mode (or the sensor) changed: the next AE request may step as far as the
+	                                 * measurement says, and is not damped -- the vendor block's exposure is a guess */
+	bool            fixed_frame;    /* the sensor's frame length is the mode's own (the kernel's stills mode writes no
+	                                 * 0x0340): AE must not ask for a longer frame, only for lines and gain */
+	uint32_t        last_frame_lines, last_line_ns;  /* the frame the last AE step was made from (a change of either is a
+	                                 * mode change: isp_ae() takes the next step undamped) */
 	uint32_t        max_frame_lines;        /* the longest frame AE may ask for (0: twice the shortest) */
 	struct isp_tuning *tuning;              /* isp_load_tuning()'s, or none */
 	float           saturation;     /* applied to every colour matrix set (1: none) */
@@ -152,6 +158,14 @@ float isp_sharpness(const struct hakios_camera_frame *f, const uint8_t *raw, flo
 void isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, struct isp_stats *s);
 /* the exposure for the frames to come: true, and the command filled in, when it should change */
 bool isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *s, struct hakios_camera_command *c);
+/*
+ * The frames now come from another mode of the sensor (or another sensor): the exposure the sensor has
+ * is not the one AE asked for (the stills mode starts from the vendor block's own), so the next request
+ * is made from the measurement alone and may step as far as it says (no damping, no "the last change is
+ * not in the frames yet"). isp_ae() calls it itself for a frame whose frame length or line time changed;
+ * camera_device.c calls it when the kernel's mode changes.
+ */
+void isp_mode_changed(struct isp *isp);
 /*
  * The white balance: grey world -- of the nearly grey, when enough is -- kept to the line of the
  * tuning's reference lights when there is one, a little of the way at a time.
