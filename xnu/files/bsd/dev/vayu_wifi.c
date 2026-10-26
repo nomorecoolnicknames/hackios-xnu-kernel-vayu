@@ -3012,6 +3012,68 @@ out:
 	thread_terminate(current_thread());
 }
 
+/*
+ * The WCN3990's supplies, before the firmware is asked to apply the board data (vayu_wifi_rails=1).
+ *
+ * The stock device tree gives the icnss node four supplies (live.dts:11125-11128; the regulators
+ * are live.dts:17928-17945 and the PM8150L ones below it):
+ *
+ *   vdd-cx-mx    PM8150  L1    752 mV  (RPMh ldoa1)  -- nobody votes it in our boot
+ *   vdd-1.8-xo   PM8150  L7   1800 mV  (RPMh ldoa7)  -- vayu_bt votes it when vayu_bt >= 9
+ *   vdd-1.3-rfa  PM8150L L2   1304 mV  (RPMh ldoc2)  -- idem
+ *   vdd-3.3-ch0  PM8150L L11  3312 mV  (RPMh ldoc11) -- idem
+ *
+ * ath10k enables the same four (and vdd-3.3-ch1) plus the clocks "cxo_ref_clk_pin" and "qdss" in
+ * ath10k_hw_power_on() (snoc.c:48-55, :1022-1050), which our boot chain has no equivalent of.
+ * The vote is the one vayu_bt.c makes (vayu_bt.c:1873-1885): voltage, mode 7 (PMIC5 LDO high power
+ * mode), enable 1, at the cmd-db address and the two registers after it.
+ *
+ * Never given back: BT shares three of these rails and its vote is the same write; taking ours
+ * away would take away the one value both need.  The clocks are not voted here (RPMh clk, not a
+ * regulator) -- that is still missing and is listed in the report as the next piece.
+ */
+static const struct vayu_wifi_rail {
+	const char *id;
+	const char *name;
+	uint32_t mv;
+} vayu_wifi_rails[] = {
+	{ "ldoa1",  "pm8150 L1 (vdd-cx-mx 0.752 V)", 752 },
+	{ "ldoa7",  "pm8150 L7 (vdd-1.8-xo 1.8 V)", 1800 },
+	{ "ldoc2",  "pm8150l L2 (vdd-1.3-rfa 1.304 V)", 1304 },
+	{ "ldoc11", "pm8150l L11 (vdd-3.3-ch0 3.312 V)", 3312 },
+};
+
+static void
+vayu_wifi_rails_on(void)
+{
+	uint32_t enabled = 0;
+
+	PE_parse_boot_argn("vayu_wifi_rails", &enabled, sizeof(enabled));
+	if (enabled == 0) {
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(vayu_wifi_rails) / sizeof(vayu_wifi_rails[0]); i++) {
+		const struct vayu_wifi_rail *r = &vayu_wifi_rails[i];
+		uint32_t commands[3], values[3], address = vayu_rpmh_address(r->id);
+
+		if (address == 0) {
+			say("vayu-wifi: rails: no cmd-db address for %s (%s): not voted\n", r->id, r->name);
+			continue;
+		}
+		commands[0] = address;
+		commands[1] = address + 8;
+		commands[2] = address + 4;
+		values[0] = r->mv;
+		values[1] = 7;          /* PMIC5 LDO high power mode */
+		values[2] = 1;          /* enable */
+		say("vayu-wifi: rails: vote %s (%s) on: %u mV, mode 7, enable 1 at %#x\n", r->id, r->name,
+		    r->mv, address);
+		if (!vayu_rpmh_send(commands, values, 3, "vayu-wifi")) {
+			say("vayu-wifi: rails: the vote for %s did not report done\n", r->id);
+		}
+	}
+}
+
 /* ===================================================================================================
  * vayu_wifi_start / vayu_wifi_stop
  * =================================================================================================== */
@@ -3084,6 +3146,7 @@ vayu_wifi_start(struct vayu_qrtr *q, uint32_t listen_s)
 	}
 
 	if (wifi_level >= 2) {
+		vayu_wifi_rails_on();           /* vayu_wifi_rails=1: the WCN3990's supplies, before WLFW */
 		memset(&wlfw, 0, sizeof(wlfw));
 		snprintf(wlfw.summary, sizeof(wlfw.summary), "never appeared");
 		wlfw.running = true;
