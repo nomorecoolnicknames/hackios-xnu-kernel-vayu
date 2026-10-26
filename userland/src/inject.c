@@ -722,6 +722,24 @@ service_set_property(__unused void *target, void *refcon, __unused IOHIDServiceC
 		}
 		touch_mode = mode;
 	}
+	/*
+	 * A test run, boot 1, 21:50:20.992: right after the service is made and told 4166 us, the event
+	 * server sets "ReportInterval" = 0 and "BatchInterval" = 1. Zero there is a client's "no
+	 * preference", not a rate; keeping it would let the server treat the panel as a device that never
+	 * said how fast it is. Put our interval back into the dictionary copyProperty() answers from.
+	 */
+	if (key != NULL && value != NULL && CFEqual(key, CFSTR("ReportInterval")) && CFGetTypeID(value) == CFNumberGetTypeID()) {
+		long interval = 0;
+
+		CFNumberGetValue((CFNumberRef)value, kCFNumberLongType, &interval);
+		if (interval == 0 && report_interval_us > 0) {
+			CFNumberRef kept = number(report_interval_us);
+
+			CFDictionarySetValue(((struct service *)refcon)->properties, CFSTR("ReportInterval"), kept);
+			CFRelease(kept);
+			say("hakios: input: ReportInterval 0 from the event server: kept %d us\n", report_interval_us);
+		}
+	}
 	if (told == NULL) {
 		told = CFSetCreateMutable(NULL, 0, &kCFTypeSetCallBacks);
 	}

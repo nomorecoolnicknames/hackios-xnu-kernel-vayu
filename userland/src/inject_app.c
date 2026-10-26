@@ -11,9 +11,11 @@
 #include <dispatch/dispatch.h>
 #include <spawn.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <execinfo.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
@@ -22,6 +24,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
@@ -331,6 +334,54 @@ watch(const char *name, const char *selector, IMP ours, void *theirs)
 		*(IMP *)theirs = method_setImplementation(method, ours);
 	}
 }
+
+/*
+ * CoreAnimation's 16.7 ms floor, in an application.
+ *
+ * fb_120=1 was answered for backboardd and SpringBoard only (src/inject.c, src/inject_sb.c); the
+ * floor is per bundle, though -- QuartzCore in THIS process reads its own Info.plist through
+ * CFBundleGetValueForInfoDictionaryKey -- so scrolling inside Settings, Safari, Music or Files
+ * stayed at 60 a second while SpringBoard's animations ran at 120 (tester, TEST3: "120 fps is smooth
+ * but not while scrolling"). The port's identity is iPhone10,3, whose application bundles do not
+ * carry the key. Answer both spellings with true here too when the boot asked for 120.
+ */
+static int
+fb120_wanted(void)
+{
+	static int wanted = -1;
+
+	if (wanted < 0) {
+		char arguments[4096] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+		    strstr(arguments, "fb_120=1") != NULL;
+	}
+	return wanted;
+}
+
+static CFTypeRef
+fb120_info_value(CFBundleRef bundle, CFStringRef key)
+{
+	static CFTypeRef (*original)(CFBundleRef, CFStringRef);
+
+	if (original == NULL) {
+		original = (CFTypeRef (*)(CFBundleRef, CFStringRef))dlsym(RTLD_NEXT, "CFBundleGetValueForInfoDictionaryKey");
+	}
+	if (fb120_wanted() && key != NULL &&
+	    (CFEqual(key, CFSTR("CADisableMinimumFrameDurationOnPhone")) ||
+	     CFEqual(key, CFSTR("CADisableMinimumFrameDuration")))) {
+		return kCFBooleanTrue;
+	}
+	return original != NULL ? original(bundle, key) : NULL;
+}
+
+#define HAKIOS_INTERPOSE(replacement, replacee) \
+	__attribute__((used)) static struct { const void *replacement; const void *replacee; } \
+	_hakios_interpose_##replacee __attribute__((section("__DATA,__interpose"))) = \
+	    { (const void *)(uintptr_t) &replacement, (const void *)(uintptr_t) &replacee }
+
+HAKIOS_INTERPOSE(fb120_info_value, CFBundleGetValueForInfoDictionaryKey);
 
 __attribute__((constructor))
 static void
