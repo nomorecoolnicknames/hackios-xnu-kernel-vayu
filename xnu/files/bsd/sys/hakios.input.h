@@ -43,6 +43,8 @@ void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
  * a driver that spends a millisecond reading the controller stamps the read's start instead of its
  * end (bsd/dev/vayu_nvt.c, boot-arg touch_hz). 0 means "now". */
 void hakios_touch_post_at(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time);
+/* mach_absolute_time units since the last touch or button event; 0 while a finger is down; UINT64_MAX if never */
+uint64_t hakios_touch_idle_abs(void);
 void hakios_input_init(void);
 void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */

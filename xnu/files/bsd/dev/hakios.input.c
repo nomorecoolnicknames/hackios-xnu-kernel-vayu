@@ -146,10 +146,36 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time
 
 extern uint32_t hakios_display_crop[6];        /* MiniIOMobileFramebuffer.cpp, fb_fit=1 */
 
+/*
+ * How long the screen has been left alone, for fb_120_idle=1 (iokit/Kernel/MiniIOMobileFramebuffer.cpp: 120 Hz only
+ * while touched): the time of the last touch or button event, and the fingers that are down -- a finger held still
+ * posts nothing (the driver drops samples that did not move), but it is a touch all the same.
+ */
+static volatile uint64_t activity_abs;
+static volatile uint32_t activity_down;
+
+uint64_t
+hakios_touch_idle_abs(void)
+{
+	uint64_t last = os_atomic_load(&activity_abs, relaxed), now = mach_absolute_time();
+
+	if (os_atomic_load(&activity_down, relaxed) != 0) {
+		return 0;
+	}
+	return last == 0 || now < last ? ~0ULL : now - last;
+}
+
 void
 hakios_touch_post_at(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time)
 {
 	uint32_t panel_h = os_atomic_load(&hakios_display_crop[5], acquire);
+
+	os_atomic_store(&activity_abs, mach_absolute_time(), relaxed);
+	if (finger < 32 && type == HAKIOS_TOUCH_DOWN) {
+		os_atomic_or(&activity_down, 1u << finger, relaxed);
+	} else if (finger < 32 && type == HAKIOS_TOUCH_UP) {
+		os_atomic_andnot(&activity_down, 1u << finger, relaxed);
+	}
 
 	/*
 	 * With fb_fit=1 the panel shows the picture's middle pixel for pixel: a touch at a place on the

@@ -234,6 +234,18 @@ static TUNABLE(uint32_t, gVsyncDivisor, "fb_vsync_div", 0);
  * renderer cannot fill 120 frames anyway.
  */
 static TUNABLE(uint32_t, gFb120, "fb_120", 0);
+/*
+ * Boot-arg fb_120_idle=1 (with fb_120=1): 120 Hz only while the screen is touched. The refreshes told to iOS come
+ * every panel frame (120 a second) while a finger is down or was within fb_120_idle_ms (default 1000) ms, and every
+ * second panel frame (60 a second) after that: CoreAnimation's frames follow the refreshes, so the window server
+ * draws 60 where nothing is being touched (video, clock, an animation that runs on by itself) and the heat of the
+ * doubled frame work is spent only where the eye can see it. The mode iOS is told stays 120 (no mode switch).
+ */
+static TUNABLE(uint32_t, gFb120Idle, "fb_120_idle", 0);
+static TUNABLE(uint32_t, gFb120IdleMs, "fb_120_idle_ms", 1000);
+static bool gFb120Slow;                         /* the refreshes are now every 2nd panel frame (fb_120_idle) */
+static uint32_t gFb120Changes;                  /* ... and how often that changed, for the log */
+extern "C" uint64_t hakios_touch_idle_abs(void);       /* bsd/dev/hakios.input.c */
 static uint32_t gModeHz;                        /* the refresh the display is said to run at (fb_120: 120) */
 static bool gPictureFit;                        /* rows copied, not scaled: fb_fit, or a 120 Hz frame's cost */
 static uint32_t gVSyncsTold;                    /* refreshes told to user space since the last 5 s line (atomic) */
@@ -1540,6 +1552,23 @@ IOMobileFramebufferUserClient::armVSync(void)
 		/* the next frame start the panel itself will make; a quarter frame at least after the last one told */
 		uint64_t next = panel_next(now);
 		uint32_t div = gFb120 != 0 ? 1 : gVsyncDivisor;
+
+		if (gFb120 != 0 && gFb120Idle != 0) {
+			uint64_t limit, idle = hakios_touch_idle_abs();
+			bool slow;
+
+			nanoseconds_to_absolutetime((uint64_t)(gFb120IdleMs > 60000 ? 60000 : gFb120IdleMs) * NSEC_PER_MSEC, &limit);
+			slow = idle > limit;
+			if (slow != gFb120Slow) {
+				gFb120Slow = slow;
+				if (gFb120Changes++ < 40) {
+					IOLog("MiniIOMobileFramebuffer: fb_120_idle: %s (%u changes)\n", slow ?
+					    "nothing touched for a while: refreshes every 2nd panel frame (60 a second)" :
+					    "touched: refreshes every panel frame (120 a second)", gFb120Changes);
+				}
+			}
+			div = slow ? 2 : 1;
+		}
 
 		if (div == 0) {
 			if (gFBDivisor == 1 && gFBDrawAbs * 10 > period * 6) {
