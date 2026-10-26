@@ -183,6 +183,9 @@ int qmi_txn_init(struct qmi_handle *qmi, struct qmi_txn *txn, const struct qmi_e
  */
 int qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_txn *txn, int msg_id, size_t largest,
     const struct qmi_elem_info *ei, const void *structure);
+/* Send a host indication (QMI_INDICATION, transaction 0); no reply is expected. */
+int qmi_send_indication(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_txn *txn, int msg_id,
+    size_t largest, const struct qmi_elem_info *ei, const void *structure);
 /* Give a transaction up that will not be waited for. */
 void qmi_txn_cancel(struct qmi_txn *txn);
 /*

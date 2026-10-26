@@ -59,7 +59,9 @@
 #define RMS_FRAMES              9600            /* 0.2 s */
 #define FAST_FRAMES             144000          /* 3 s */
 #define SLOW_FRAMES             2880000         /* 60 s */
-#define RELEASE_SHIFT           11              /* the peak limiter lets go with a time constant of 2048 frames, 43 ms */
+#define RELEASE_SHIFT           11              /* the peak limiter lets go with a time constant of 2048 frames, 43 ms (the default) */
+static unsigned release_shift = RELEASE_SHIFT;
+static volatile uint32_t limited_total;           /* frames the peak limiter has turned down, never reset (hakios_guard_limited()) */  /* hakios_guard_set_release(): 11..14 (43 to 341 ms) */
 #define MAX_FRAMES              1024            /* the most frames processed at once (the feeder's period: 960) */
 
 /* 10^(-n/160), n = 0..47, in Q30: an attenuation of n eighths of a dB, as a factor of amplitude */
@@ -238,13 +240,14 @@ block(int16_t *frames, uint32_t count)
 		if ((uint64_t)(y[1] < 0 ? -y[1] : y[1]) > level) {
 			level = (uint64_t)(y[1] < 0 ? -y[1] : y[1]);
 		}
-		guard.envelope -= guard.envelope >> RELEASE_SHIFT;
+		guard.envelope -= guard.envelope >> release_shift;
 		if (level << 16 > guard.envelope) {
 			guard.envelope = level << 16;
 		}
 		if (guard.envelope > ceiling << 16) {
 			peak_gain = (ceiling << 32) / guard.envelope;
 			r->limited_frames++;
+			limited_total++;
 			if (peak_gain < r->least_peak_gain) {
 				r->least_peak_gain = (uint32_t)peak_gain;
 			}
@@ -312,4 +315,22 @@ hakios_guard_decibels(uint64_t ratio)
 		log2 = ((int64_t)top - 30) * 65536 + fraction[index] + (int64_t)(fraction[index + 1] - fraction[index]) * within / 4096;
 	}
 	return (int)(log2 * 30103 / 65536 / 1000);
+}
+
+/*
+ * The peak limiter's release, as a shift: 11 (43 ms, the default) to 14 (341 ms). A longer release cuts fewer
+ * peaks one by one -- tester, 2026-10-25 (vayu): a hot master through +12 dB of gain sounded distorted, and the
+ * limiter acting at every peak with a 43 ms recovery is one candidate (user space work, the bring-up notes).
+ */
+void
+hakios_guard_set_release(unsigned shift)
+{
+	release_shift = shift < 11 ? 11 : shift > 14 ? 14 : shift;
+}
+
+/* Frames the peak limiter has turned down since boot (a running count: the caller takes differences). */
+uint32_t
+hakios_guard_limited(void)
+{
+	return limited_total;
 }

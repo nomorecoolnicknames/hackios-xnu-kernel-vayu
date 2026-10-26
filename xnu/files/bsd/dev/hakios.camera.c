@@ -57,6 +57,10 @@
  *
  * Boot-arg cam_sensor=wide picks the wide sensor; without it, the macro one.
  *
+ * With vayu_camera=5 (or more) this driver never runs: on vayu, step 5 of vayu_camera.c owns
+ * /dev/hakios-camera with a synthetic frame source, and hakios_camera_init() prints one line
+ * and returns before it starts a thread, makes a node or maps anything.
+ *
  * Limits, whatever asks: Android's voltages only (the device tree's: 1.8 and 2.8 V for the macro
  * one, 1.0 and 1.8 V for the wide one, 1.2, 1.8 and 2.8 V for the front one, 1.8 and 2.8 V for the
  * ultra-wide one; nothing else is ever written to the LDOs' set points); only the registers named above are written (a list each, checked at every
@@ -1541,7 +1545,7 @@ rpmh_resource(const char *name, uint16_t *levels, unsigned max, unsigned *count)
 	if (!(cmd_db->magic[0] == 0xdb && cmd_db->magic[1] == 0x30 && cmd_db->magic[2] == 0x03 && cmd_db->magic[3] == 0x0c)) {
 		return 0;
 	}
-	strlcpy(id, name, sizeof(id));
+	memcpy(id, name, strnlen(name, sizeof(id)));   /* (a cmd-db id fills all 8 bytes with no NUL: "lnbclka2"; strlcpy kept 7) */
 	for (unsigned s = 0; s < 8; s++) {
 		const struct cmd_db_slave *slave = &cmd_db->slave[s];
 		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
@@ -4219,7 +4223,12 @@ void
 hakios_camera_init(void)
 {
 	thread_t thread;
+	uint32_t vayu_level = 0;
 
+	if (PE_parse_boot_argn("vayu_camera", &vayu_level, sizeof(vayu_level)) && vayu_level >= 5) {
+		say("hakios-camera: vayu_camera=%u owns /dev/hakios-camera: this driver stays off\n", vayu_level);
+		return;
+	}
 	if (!PE_parse_boot_argn("cam", &level, sizeof(level)) || level == 0) {
 		return;
 	}

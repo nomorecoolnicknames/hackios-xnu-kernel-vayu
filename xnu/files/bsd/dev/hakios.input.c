@@ -12,6 +12,16 @@
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
+#include <os/atomic_private.h>
+#include <sys/vayu_cpufreq.h>
+#include <sys/vayu_vsync.h>
+#include <sys/vayu_bt.h>
+#include <sys/vayu_camera.h>
+#include <sys/vayu_nfc.h>
+#include <sys/vayu_wled.h>
+#include <sys/vayu_mdp.h>
+#include <sys/vayu_ir.h>
+#include <sys/vayu_usbnet.h>
 #include <pexpert/pexpert.h>
 
 #define TOUCH_QUEUE     512             /* records; a power of two */
@@ -134,9 +144,23 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	wakeup(&touch_queue);
 }
 
+extern uint32_t hakios_display_crop[6];        /* MiniIOMobileFramebuffer.cpp, fb_fit=1 */
+
 void
 hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
 {
+	uint32_t panel_h = os_atomic_load(&hakios_display_crop[5], acquire);
+
+	/*
+	 * With fb_fit=1 the panel shows the picture's middle pixel for pixel: a touch at a place on the
+	 * panel is at that place plus the cut-off edge in the picture, not at the same fraction of it.
+	 */
+	if (panel_h != 0 && type != HAKIOS_BUTTON_DOWN && type != HAKIOS_BUTTON_UP) {
+		uint64_t px = (uint64_t)x * hakios_display_crop[4] / 65535, py = (uint64_t)y * panel_h / 65535;
+
+		x = (uint32_t)((px + hakios_display_crop[0]) * 65535 / hakios_display_crop[2]);
+		y = (uint32_t)((py + hakios_display_crop[1]) * 65535 / hakios_display_crop[3]);
+	}
 	touch_post(type, finger, x, y, true);
 }
 
@@ -215,6 +239,15 @@ hakios_input_init(void)
 	}
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
 	hakios_cpufreq_init();
+	vayu_cpufreq_init();            /* boot-args cpufreq=1 cpufreq_vayu=1: SM8150 OSM, L3, memory bandwidth */
+	vayu_vsync_init();              /* boot-arg vayu_vsync=1: a read-only look at the display controller's timing engine */
+	vayu_bt_init();                 /* boot-arg vayu_bt=1: a read-only look at the Bluetooth UART (QUP wrapper 2 SE3) */
+	vayu_camera_init();             /* boot-arg vayu_camera=1: a read-only look at the camera clocks, GDSC and sensor pins */
+	vayu_nfc_init();                /* boot-arg vayu_nfc=N: the PN553 NFC controller, steps 1-4 (see bsd/dev/vayu_nfc.c) */
+	vayu_wled_init();               /* boot-arg vayu_wled=1: the backlight looked at; =2: off/on with iOS's display power */
+	vayu_mdp_init();                /* boot-arg vayu_mdp=1: the display controller as UEFI left it, read only */
+	vayu_usbnet_init();             /* boot-arg vayu_usbnet=1: a read-only look at the USB controller as the loader's UEFI runs it */
+	vayu_ir_init();                 /* boot-arg vayu_ir=1: the IR blaster (QUP0 SE1 SPI), /dev/vayu-ir */
 	hakios_virtio_input_init();
 	hakios_goodix_init();
 	hakios_buttons_init();
@@ -222,6 +255,7 @@ hakios_input_init(void)
 	hakios_ufs_init();
 	hakios_net_init();
 	hakios_adreno_init();
+	vayu_adreno_init();             /* boot-args gpu=1 vayu_gpu=1: the Adreno 640 of vayu */
 	hakios_wifi_init();
 	hakios_adsp_init();
 	hakios_mpss_init();

@@ -69,6 +69,7 @@
  * Message layouts: the files above, and Linux's sound/soc/qcom/qdsp6/ (q6afe.c, q6adm.c,
  * q6asm.c); the SMMU: hakios.wifi.c, which does the same for the Wi-Fi's stream.
  */
+#include <machine/machine_routines.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
@@ -113,7 +114,9 @@ say(const char *format, ...)
 	for (const char *c = line; *c != 0; c++) {
 		loader_log_putc(*c);
 	}
-	printf("%s", line);
+	if (ml_get_interrupts_enabled()) {        /* (not on the way out: loader_return runs with interrupts off) */
+		printf("%s", line);
+	}
 	return length;
 }
 

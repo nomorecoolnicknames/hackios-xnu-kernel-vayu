@@ -91,6 +91,7 @@
  * cmd-db.c, drivers/firmware/qcom/qcom_scm{,-smc}.c, drivers/soc/qcom/mdt_loader.c. The phone's
  * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
  */
+#include <machine/machine_routines.h>
 #include <kern/clock.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -134,7 +135,7 @@ say(const char *format, ...)
 	for (const char *c = line; *c != 0; c++) {
 		loader_log_putc(*c);
 	}
-	return printf("%s", line);
+	return ml_get_interrupts_enabled() ? printf("%s", line) : (int)strlen(line);   /* (not with interrupts off) */
 }
 #define printf say
 
@@ -334,7 +335,7 @@ rpmh_resource(const char *name, uint16_t *levels, unsigned *level_count)
 	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
 		return 0;
 	}
-	strlcpy(id, name, sizeof(id));
+	memcpy(id, name, strnlen(name, sizeof(id)));   /* (a cmd-db id fills all 8 bytes with no NUL: "lnbclka2"; strlcpy kept 7) */
 	for (unsigned s = 0; s < 8; s++) {
 		const struct cmd_db_slave *slave = &db->slave[s];
 		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
@@ -3129,6 +3130,7 @@ gpu_block_stop(void)
 void
 hakios_adreno_quiesce(void)
 {
+	vayu_adreno_quiesce();          /* (nothing on redwood/QEMU: its flags are all false) */
 	if (cx_off) {
 		return;
 	}
@@ -3212,6 +3214,10 @@ static void gpu_block_stop(void);
 void
 hakios_gpu_stop(void)
 {
+	if (vayu_gpu_kept()) {
+		vayu_gpu_stop();
+		return;
+	}
 	if (gpu_kept) {
 		uint32_t waited = 0;
 
@@ -3238,6 +3244,11 @@ hakios_adreno_stop(void)
 {
 	uint32_t dirty = 0;
 
+	if (vayu_gpu_kept()) {          /* vayu's GPU kept for HakiosGPU (vayu_keep=1): the clients' lock, then vayu_gpu_stop() */
+		HakiosGPUStop();
+		return;
+	}
+	vayu_adreno_stop();             /* (nothing on redwood/QEMU: its flags are all false) */
 	if (gpu_kept && !(PE_parse_boot_argn("adreno_dirty", &dirty, sizeof(dirty)) && dirty)) {
 		HakiosGPUStop();
 	}
@@ -3246,6 +3257,9 @@ hakios_adreno_stop(void)
 bool
 hakios_gpu_ready(void)
 {
+	if (vayu_gpu_kept()) {
+		return true;
+	}
 	return gpu_kept;
 }
 
@@ -3253,6 +3267,9 @@ hakios_gpu_ready(void)
 bool
 hakios_gpu_parameter(uint32_t which, uint64_t *value)
 {
+	if (vayu_gpu_kept()) {
+		return vayu_gpu_parameter(which, value);
+	}
 	switch (which) {
 	case 0x01:                              /* GPU_ID: none, the chip ID says it */
 	case 0x06:                              /* GMEM_BASE */
@@ -3295,6 +3312,9 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 uint64_t
 hakios_gpu_address(uint64_t size)
 {
+	if (vayu_gpu_kept()) {
+		return vayu_gpu_address(size);
+	}
 	size = (size + 0xffff) & ~0xffffull;
 	for (unsigned i = 0; i < gpu_free_count; i++) {
 		if (gpu_free[i].size >= size) {
@@ -3314,6 +3334,10 @@ hakios_gpu_address(uint64_t size)
 void
 hakios_gpu_address_free(uint64_t address, uint64_t size)
 {
+	if (vayu_gpu_kept()) {
+		vayu_gpu_address_free(address, size);
+		return;
+	}
 	unsigned at;
 
 	size = (size + 0xffff) & ~0xffffull;
@@ -3339,18 +3363,29 @@ hakios_gpu_address_free(uint64_t address, uint64_t size)
 bool
 hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only)
 {
+	if (vayu_gpu_kept()) {
+		return vayu_gpu_map(address, phys, read_only);
+	}
 	return space_map(&core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
 }
 
 void
 hakios_gpu_mapped(void)
 {
+	if (vayu_gpu_kept()) {
+		vayu_gpu_mapped();
+		return;
+	}
 	space_commit(&core_space);
 }
 
 void
 hakios_gpu_unmap(uint64_t address, uint64_t size)
 {
+	if (vayu_gpu_kept()) {
+		vayu_gpu_unmap(address, size);
+		return;
+	}
 	uint32_t context = smmu_context(&core_space);
 
 	for (uint64_t offset = 0; offset < size; offset += 4096) {
@@ -3367,6 +3402,10 @@ hakios_gpu_unmap(uint64_t address, uint64_t size)
 void
 hakios_gpu_to_memory(void *start, uint64_t size)
 {
+	if (vayu_gpu_kept()) {
+		vayu_gpu_to_memory(start, size);
+		return;
+	}
 	to_memory((vm_offset_t)start, size);
 }
 
@@ -3374,6 +3413,9 @@ hakios_gpu_to_memory(void *start, uint64_t size)
 bool
 hakios_gpu_done(uint32_t fence)
 {
+	if (vayu_gpu_kept()) {
+		return vayu_gpu_done(fence);
+	}
 	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
 
 	to_memory((vm_offset_t)word, 4);
@@ -3383,6 +3425,9 @@ hakios_gpu_done(uint32_t fence)
 uint32_t
 hakios_gpu_last(void)
 {
+	if (vayu_gpu_kept()) {
+		return vayu_gpu_last();
+	}
 	return gpu_fence;
 }
 
@@ -3438,6 +3483,10 @@ gpu_times(void)
 void
 hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 {
+	if (vayu_gpu_kept()) {
+		vayu_gpu_worked(microseconds, submissions, by);
+		return;
+	}
 	gpu_times();
 	*microseconds = gpu_ticks * 10 / 192;
 	*submissions = gpu_timed_count;
@@ -3455,6 +3504,9 @@ hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 uint32_t
 hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
+	if (vayu_gpu_kept()) {
+		return vayu_gpu_submit(addresses, words, count);
+	}
 	uint32_t wanted = 26 + 4 * count, room = 0;
 
 	for (int i = 0; i < 20000; i++) {
@@ -3500,6 +3552,10 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 void
 hakios_gpu_report(const char *why)
 {
+	if (vayu_gpu_kept()) {
+		vayu_gpu_report(why);
+		return;
+	}
 	uint32_t context = smmu_context(&core_space);
 
 	printf("adreno: gpu: %s: submission %u is the last, the core has done %u; ring: read up to %u, written up to %u; status "
@@ -3753,9 +3809,18 @@ hakios_adreno_init(void)
 		"the GMU's address space", "the GMU's firmware", "the GMU's start", "the GMU's message queues", "the 3D core's power",
 		"the 3D core's address space", "the zap shader", "the 3D core's start", "the 3D core's first commands", "a frame"
 	};
-	uint32_t only = 0, done = 0, failed = 0, keep = 0;
+	uint32_t only = 0, done = 0, failed = 0, keep = 0, vayu = 0;
 	bool by_itself = false;
 
+	/*
+	 * On vayu the GPU is bsd/dev/vayu_adreno.c's (gpu=1 vayu_gpu=1). This file's addresses are
+	 * redwood's; not one of them is touched when that arg is present, so a vayu boot can never
+	 * fall into the a660 path here.
+	 */
+	if (PE_parse_boot_argn("vayu_gpu", &vayu, sizeof(vayu)) && vayu) {
+		printf("adreno: vayu_gpu is set: this phone's GPU is bsd/dev/vayu_adreno.c's, not this driver's\n");
+		return;
+	}
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();
 	}

@@ -62,6 +62,7 @@
  * Register layouts: the files above, and Linux's sound/soc/codecs/aw88261.c; pins:
  * drivers/pinctrl/qcom/pinctrl-yupik.c of the same kernel and the phone's own device tree.
  */
+#include <machine/machine_routines.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
@@ -96,7 +97,9 @@ say(const char *format, ...)
 		loader_log_putc(*c);
 	}
 	if (!leaving) {
-		printf("%s", line);
+		if (ml_get_interrupts_enabled()) {        /* (not on the way out: loader_return runs with interrupts off) */
+			printf("%s", line);
+		}
 	}
 	return length;
 }
@@ -1140,7 +1143,7 @@ rpmh_address(const char *name)
 	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
 		return 0;
 	}
-	strlcpy(id, name, sizeof(id));
+	memcpy(id, name, strnlen(name, sizeof(id)));   /* (a cmd-db id fills all 8 bytes with no NUL: "lnbclka2"; strlcpy kept 7) */
 	for (unsigned s = 0; s < 8; s++) {
 		const struct cmd_db_slave *slave = &db->slave[s];
 		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);

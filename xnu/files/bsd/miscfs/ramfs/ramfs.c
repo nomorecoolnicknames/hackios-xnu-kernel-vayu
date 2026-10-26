@@ -41,6 +41,7 @@
 #include <sys/ubc.h>
 #include <sys/uio.h>
 #include <sys/unistd.h>
+#include <sys/utfconv.h>
 #include <sys/vnode_internal.h>
 #include <sys/xattr.h>
 #include <uuid/uuid.h>
@@ -48,6 +49,7 @@
 #include <vm/vm_kern.h>
 
 #define RAMFS_MAX_NAME          255
+#define RAMFS_KEY_MAX           (3 * RAMFS_MAX_NAME + 1)        /* NFD can grow a name up to 3x, Hangul */
 #define RAMFS_MAX_XATTR         (16u * 1024 * 1024)
 #define RAMFS_ROOT_INO          2
 
@@ -59,6 +61,8 @@ struct ramfs_dirent {
 	struct ramfs_node *rd_node;
 	char              *rd_name;             /* rd_namelen bytes and a terminator */
 	uint32_t           rd_namelen;
+	char              *rd_key;              /* the NFD form, which is what lookups compare; the same pointer as rd_name when the name is ASCII or does not normalize */
+	uint32_t           rd_keylen;
 };
 
 /* An extended attribute: iOS keeps container metadata, ACLs and much else in them. */
@@ -346,21 +350,70 @@ ramfs_touch(struct ramfs_node *node, bool modified)
 	}
 }
 
+/*
+ * The name a lookup compares: the decomposed (NFD) form. Foundation hands a path to a system call in
+ * that form (fileSystemRepresentation), and a name can be stored here in either form -- a program that
+ * writes composed (NFC) characters stores those bytes. APFS matches either form on lookup, and what
+ * works on an APFS volume has to work here. rd_name keeps the name as it was created, and readdir
+ * returns that: the key is only for comparing.
+ *
+ * buf must hold RAMFS_KEY_MAX bytes. An ASCII name, or a name that is not valid UTF-8, is its own key:
+ * name is returned and the bytes are compared as they are.
+ */
+static const char *
+ramfs_name_key(const char *name, size_t len, char *buf, size_t *keylen)
+{
+	bool ascii = true;
+
+	for (size_t i = 0; i < len; i++) {
+		if ((unsigned char)name[i] >= 0x80) {
+			ascii = false;
+			break;
+		}
+	}
+	*keylen = len;
+	if (ascii) {
+		return name;
+	}
+	if (utf8_normalizestr((const u_int8_t *)name, len, (u_int8_t *)buf, keylen, RAMFS_KEY_MAX,
+	    UTF_DECOMPOSED | UTF_NO_NULL_TERM) != 0) {
+		*keylen = len;
+		return name;
+	}
+	return buf;
+}
+
 static struct ramfs_dirent *
 ramfs_dirent_alloc(const char *name, size_t len)
 {
 	struct ramfs_dirent *de = kalloc_type(struct ramfs_dirent, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+	char buf[RAMFS_KEY_MAX];
+	const char *key;
+	size_t keylen;
 
 	de->rd_name = kalloc_data(len + 1, Z_WAITOK | Z_NOFAIL);
 	memcpy(de->rd_name, name, len);
 	de->rd_name[len] = '\0';
 	de->rd_namelen = (uint32_t)len;
+
+	key = ramfs_name_key(de->rd_name, len, buf, &keylen);
+	if (key == de->rd_name) {
+		de->rd_key = de->rd_name;
+		de->rd_keylen = de->rd_namelen;
+	} else {
+		de->rd_key = kalloc_data(keylen, Z_WAITOK | Z_NOFAIL);
+		memcpy(de->rd_key, key, keylen);
+		de->rd_keylen = (uint32_t)keylen;
+	}
 	return de;
 }
 
 static void
 ramfs_dirent_free(struct ramfs_dirent *de)
 {
+	if (de->rd_key != de->rd_name) {
+		kfree_data(de->rd_key, de->rd_keylen);
+	}
 	kfree_data(de->rd_name, de->rd_namelen + 1);
 	kfree_type(struct ramfs_dirent, de);
 }
@@ -369,9 +422,13 @@ static struct ramfs_dirent *
 ramfs_dir_find(struct ramfs_node *dir, const char *name, size_t len)
 {
 	struct ramfs_dirent *de;
+	char buf[RAMFS_KEY_MAX];
+	const char *key;
+	size_t keylen;
 
+	key = ramfs_name_key(name, len, buf, &keylen);
 	TAILQ_FOREACH(de, &dir->rn_entries, rd_link) {
-		if (de->rd_namelen == len && memcmp(de->rd_name, name, len) == 0) {
+		if (de->rd_keylen == keylen && memcmp(de->rd_key, key, keylen) == 0) {
 			return de;
 		}
 	}
@@ -908,6 +965,10 @@ ramfs_rename(struct vnop_rename_args *ap)
 			victim->rn_nlink--;
 			ramfs_touch(victim, false);
 		}
+		/*
+		 * The entry keeps the name it was made with, and so its key: the lookup above matched
+		 * that name's NFD form against the new one. readdir goes on returning that name.
+		 */
 		tde->rd_node = node;
 		ramfs_touch(tdir, true);
 	} else {

@@ -87,6 +87,8 @@ struct hakios_guard_report {
 	uint64_t rms, fast, slow;       /* the averages now, the louder speaker's: Q30 of a full-scale square wave at Android's level */
 };
 #define HAKIOS_GUARD_MAX_GAIN  (12 * 8)        /* the most gain before the guard: 12 dB */
+uint32_t hakios_guard_limited(void);            /* frames the peak limiter turned down since boot */
+void hakios_guard_set_release(unsigned shift);   /* the peak limiter's release: 11 (43 ms, default) .. 14 (341 ms) */
 void hakios_guard_configure(bool hpf, uint32_t gain);         /* the high-pass filter; `gain' before everything */
 void hakios_guard_attenuation(uint32_t below);                 /* the amplifiers' level under Android's (or HAKIOS_GUARD_SILENT):
                                                                  * what the limits are reckoned from */

@@ -332,12 +332,18 @@ struct cmd_db_bcm {                             /* a BCM's auxiliary data (Linux
 	uint8_t vcd, reserved;
 };
 
-/* (the same condition as the cores' clocks: the addresses are this phone's) */
+/*
+ * (the same condition as the cores' clocks: the addresses are this phone's -- not when
+ * cpufreq_vayu=1 asks for bsd/dev/vayu_cpufreq.c instead)
+ */
 static bool
 cpufreq_wanted(void)
 {
-	uint32_t on = 0;
+	uint32_t on = 0, vayu = 0;
 
+	if (PE_parse_boot_argn("cpufreq_vayu", &vayu, sizeof(vayu)) && vayu != 0) {
+		return false;
+	}
 	return PE_parse_boot_argn("cpufreq", &on, sizeof(on)) && on != 0;
 }
 
@@ -444,7 +450,7 @@ cmd_db_address(const char *name)
 	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
 		return 0;
 	}
-	strlcpy(id, name, sizeof(id));
+	memcpy(id, name, strnlen(name, sizeof(id)));   /* (a cmd-db id fills all 8 bytes with no NUL: "lnbclka2"; strlcpy kept 7) */
 	for (unsigned s = 0; s < 8; s++) {
 		const struct cmd_db_slave *slave = &db->slave[s];
 		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
@@ -569,8 +575,7 @@ hakios_cpufreq_init(void)
 	} else if (enabled == 2 && cpufreq_wanted()) {
 		ddr_raise();
 	}
-	enabled = 0;
-	if (!PE_parse_boot_argn("cpufreq", &enabled, sizeof(enabled)) || !enabled) {
+	if (!cpufreq_wanted()) {
 		return;
 	}
 	for (unsigned int i = 0; i < topology->num_cpus; i++) {

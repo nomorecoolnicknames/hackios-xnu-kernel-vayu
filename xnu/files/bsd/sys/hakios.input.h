@@ -14,6 +14,7 @@
 #define _SYS_HAKIOS_INPUT_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define HAKIOS_TOUCH_DEVICE    "/dev/hakios-touch"
 
@@ -41,16 +42,20 @@ void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 void hakios_input_init(void);
 void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
+void vayu_nvt_init(void);            /* boot-args touchscreen=1 touch_driver=nvt: vayu's Novatek NT36672C */
 void hakios_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
 void hakios_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
 void hakios_ufs_report(const char *when); /* where reading the storage has spent its time so far */
 bool hakios_ufs_dev(dev_t dev);           /* one of the storage's devices */
 int hakios_ufs_read_partition(const char *name, uint64_t offset, uint8_t *dst, uint64_t len, uint64_t *bytes); /* for drivers */
+bool hakios_ufs_part(const char *name, uint32_t *part, uint64_t *bytes);   /* a GPT partition by name, for a kernel user */
+int hakios_ufs_part_read(uint32_t part, uint64_t offset, void *dst, uint64_t len);  /* read-only, through the same path */
 void hakios_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
 int hakios_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
 /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/hakios.buttons.c) */
 void hakios_spmi_lock(void);
 void hakios_spmi_unlock(void);
+bool hakios_spmi_peek(uint16_t id, uint8_t reg, uint8_t *value);    /* hakios.buttons.c: one PMIC register, read only */
 /*
  * How the battery is, as the audio DSP's battery manager says (bsd/dev/hakios.adsp.c, with adsp=1):
  * handed to bsd/dev/hakios.battery.c, which keeps it for the sysctls kern.hakios.battery_* and
@@ -77,6 +82,27 @@ void hakios_adreno_init(void);         /* boot-arg adreno=N: the first N steps o
 void hakios_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void hakios_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
 void hakios_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
+void vayu_adreno_init(void);            /* boot-args gpu=1 vayu_gpu=1: vayu's Adreno 640, steps 1..N */
+void vayu_adreno_quiesce(void);         /* the same two endings for the vayu GPU block */
+void vayu_adreno_stop(void);
+/* vayu's GPU kept for the service HakiosGPU (vayu_keep=1): hakios_gpu_...() hand over to these */
+bool vayu_gpu_kept(void);
+bool vayu_gpu_parameter(uint32_t which, uint64_t *value);
+uint64_t vayu_gpu_address(uint64_t size);
+void vayu_gpu_address_free(uint64_t address, uint64_t size);
+void vayu_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most, uint64_t *lost,
+    uint32_t *refused);
+bool vayu_gpu_map(uint64_t address, uint64_t phys, bool read_only);
+void vayu_gpu_mapped(void);
+void vayu_gpu_unmap(uint64_t address, uint64_t size);
+void vayu_gpu_to_memory(void *start, uint64_t size);
+uint32_t vayu_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+bool vayu_gpu_done(uint32_t fence);
+uint32_t vayu_gpu_last(void);
+void vayu_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
+void vayu_gpu_report(const char *why);
+bool vayu_gpu_recover(void);
+void vayu_gpu_stop(void);
 void hakios_wifi_init(void);           /* boot-arg wifi=1: the phone's Wi-Fi; wifi_step=N: the first N steps of it */
 void hakios_adsp_init(void);           /* boot-arg adsp=1: the phone's audio DSP started and linked; adsp_step=N: the first N steps */
 void hakios_mpss_init(void);           /* boot-arg modem=1: the phone's modem started and linked; modem_step=N: the first N steps */

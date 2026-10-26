@@ -169,7 +169,7 @@ rpmh_address(const char *name)
 		    db->magic[3]);
 		return 0;
 	}
-	strlcpy(id, name, sizeof(id));
+	memcpy(id, name, strnlen(name, sizeof(id)));   /* (a cmd-db id fills all 8 bytes with no NUL: "lnbclka2"; strlcpy kept 7) */
 	for (unsigned s = 0; s < 8; s++) {
 		const struct cmd_db_slave *slave = &db->slave[s];
 		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
@@ -1502,9 +1502,22 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 void
 hakios_goodix_init(void)
 {
-	uint32_t enabled = 0;
+	uint32_t enabled = 0, qup = 0;
+	char driver[16] = "";
 	thread_t thread;
 
+	/*
+	 * boot-arg touch_driver=nvt (the bit-banged Novatek path) or nvt_qup=1 /
+	 * touch_driver=nvt_qup (the QUPv3 path): vayu's panel, not this one
+	 * (bsd/dev/vayu_nvt.c).
+	 */
+	if (PE_parse_boot_argn("touch_driver", driver, sizeof(driver)) &&
+	    (strcmp(driver, "nvt") == 0 || strcmp(driver, "nvt_qup") == 0)) {
+		return;
+	}
+	if (PE_parse_boot_argn("nvt_qup", &qup, sizeof(qup)) && qup != 0) {
+		return;
+	}
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}

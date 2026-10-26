@@ -56,6 +56,7 @@
  *
  * What is asked for is given back at the end, and before the DSP is shut down (hakios_mic_dsp_down()).
  */
+#include <machine/machine_routines.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
@@ -104,7 +105,9 @@ say(const char *format, ...)
 	for (const char *c = line; *c != 0; c++) {
 		loader_log_putc(*c);
 	}
-	printf("%s", line);
+	if (ml_get_interrupts_enabled()) {        /* (not on the way out: loader_return runs with interrupts off) */
+		printf("%s", line);
+	}
 	strlcpy(kept[kept_count++ % KEPT_LINES], line, sizeof(kept[0]));
 	return length;
 }

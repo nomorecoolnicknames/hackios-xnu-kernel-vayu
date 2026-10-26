@@ -15,7 +15,7 @@
  * Read only wherever a write could do harm, by construction. The block devices never write: the
  * strategy routine refuses, so no filesystem mounted from one can write, and opening one for
  * writing is refused. With ufs_write=1 one character device alone takes writes -- /dev/rufs_darwin,
- * the port's own partition -- and in it only whole blocks from UFS_WRITE_FIRST on, past the iOS
+ * the port's own partition -- and in it only whole blocks from ufs_write_first on, past the iOS
  * volume and both cryptexes that the build writes from the computer (tools/darwin-write.py); that
  * is where the data volume of iOS is kept between runs (userland/src/var_store.c). The partition
  * has to be the one the port was set up with (its name, size, place and logical unit here; its
@@ -70,14 +70,15 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 #define BLOCK_OP_WRITE     1u
 
 /*
- * Where a write may go, and nowhere else: darwin, the port's own 20 GiB at the end of logical
- * unit 0, and in it only past what the build puts there from the computer -- the iOS volume
- * (blocks 0..1374207) and the two cryptexes behind it (..2042367). The loader keeps the same
- * bounds and the GUIDs of the partition besides (xnuloader/loader.c, BLOCK_WRITE_FIRST).
+ * Where a write may go, and nowhere else: darwin, the port's own partition, and in it only past what
+ * the build puts there from the computer (on redwood the iOS volume, blocks 0..1374207, and the two
+ * cryptexes behind it, ..2042367). The device's darwin is the loader's (struct darwin_identity in
+ * xnuloader/loader.c, which checks its GUIDs too); the loader puts it on this command line as
+ * ufs_darwin_first=, ufs_darwin_blocks= and ufs_write_first=, and the table it hands over has to agree
+ * with them. Without them -- a device with no darwin set up -- nothing is written.
  */
-#define UFS_WRITE_FIRST    2042368ULL                  /* darwin's blocks of 4096 */
-#define UFS_DARWIN_FIRST   25374720ULL                 /* its first LBA on the unit, as the GPT has it */
-#define UFS_DARWIN_BLOCKS  5242875ULL
+static uint64_t ufs_write_first = UINT64_MAX;          /* darwin's blocks of 4096 */
+static uint64_t ufs_darwin_first, ufs_darwin_blocks;    /* its first LBA on the unit, and its size */
 
 struct loader_block_part {
 	char name[36];
@@ -576,7 +577,7 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 	if (len == 0 || offset % nbs != 0 || len % nbs != 0) {
 		return EINVAL;          /* whole blocks only: nothing is read before a write */
 	}
-	if (offset / nbs < UFS_WRITE_FIRST || offset > ufs_part_bytes(part) ||
+	if (offset / nbs < ufs_write_first || offset > ufs_part_bytes(part) ||
 	    len > ufs_part_bytes(part) - offset) {
 		/* the iOS volume, the cryptexes, and anything past the partition's end: never */
 		ufs_write_refused++;
@@ -933,6 +934,18 @@ static const struct {
 	{ "tz", 3710976 }, { "hyp", 3653632 }, { "dsp", 67108864 }, { "modem", 214265856 },
 };
 
+/*
+ * ufs_check_whole=1: every reference partition hashed whole, not as far as the ROM's image goes -- for a
+ * device whose references are a read-only backup of whole partitions (vayu: a backup of the phone's own Android).
+ */
+static int ufs_check_whole;
+
+static uint64_t
+ufs_check_bytes(uint32_t part, unsigned r)
+{
+	return ufs_check_whole ? ufs_part_bytes(part) : ufs_references[r].bytes;
+}
+
 static bool
 ufs_is_reference(const char *name, const char *ref)
 {
@@ -961,7 +974,7 @@ ufs_check(void *arg, __unused wait_result_t wr)
 	for (uint32_t part = 0; chunk != NULL && part < ufs_parts; part++) {
 		for (unsigned r = 0; r < sizeof(ufs_references) / sizeof(ufs_references[0]); r++) {
 			uint64_t h = 0xcbf29ce484222325ULL, done = 0, started = mach_absolute_time(), ns;
-			uint64_t bytes = ufs_references[r].bytes;
+			uint64_t bytes = ufs_check_bytes(part, r);
 			int error = 0;
 
 			if (!ufs_is_reference((const char *)ufs_page->part[part].name, ufs_references[r].name)) {
@@ -1060,6 +1073,43 @@ ufs_entry(const char *name)
 		}
 	}
 	return BLOCK_MAX_PARTS;
+}
+
+/* A partition by its GPT name, for a kernel user (the rmtfs server): its index and size. */
+bool
+hakios_ufs_part(const char *name, uint32_t *part, uint64_t *bytes)
+{
+	uint32_t index;
+
+	if (!ufs_ready || ufs_page == NULL || name == NULL) {
+		return false;
+	}
+	index = ufs_entry(name);
+	if (index >= ufs_parts) {
+		return false;
+	}
+	*part = index;
+	*bytes = ufs_part_bytes(index);
+	return true;
+}
+
+/* Bytes [offset, offset + len) of a partition, read only, through the loader or this kernel's driver. */
+int
+hakios_ufs_part_read(uint32_t part, uint64_t offset, void *dst, uint64_t len)
+{
+	uint64_t bytes;
+
+	if (!ufs_ready || ufs_page == NULL || part >= ufs_parts) {
+		return ENXIO;
+	}
+	bytes = ufs_part_bytes(part);
+	if (offset > bytes || len > bytes - offset) {
+		return EINVAL;
+	}
+	if (len == 0) {
+		return 0;
+	}
+	return ufs_read(part, offset, dst, len);
 }
 
 /*
@@ -1325,7 +1375,7 @@ ufs_native_check(void)
 		}
 		for (unsigned r = 0; going && r < sizeof(ufs_references) / sizeof(ufs_references[0]); r++) {
 			if (ufs_is_reference((const char *)ufs_page->part[part].name, ufs_references[r].name)) {
-				going = ufs_compare(part, 0, ufs_part_bytes(part), ufs_references[r].bytes, "whole");
+				going = ufs_compare(part, 0, ufs_part_bytes(part), ufs_check_bytes(part, r), "whole");
 			}
 		}
 	}
@@ -1513,12 +1563,23 @@ hakios_ufs_init(void)
 		if (ufs_page->part[i].flags & BLOCK_PART_UNIT) {
 			continue;               /* the units are for this kernel's own driver to be checked against */
 		}
+		/*
+		 * A name may be on more than one unit (vayu: bk44 and others, run 014801: 100 nodes for 107
+		 * partitions); the second gets its unit after it, ufs_NAME_uN, so that every partition has a node.
+		 */
+		char suffix[8] = "";
+
 		snprintf(name, sizeof(name), "ufs_%s", ufs_page->part[i].name);
 		if (devfs_make_node(makedev(ufs_bmajor, i), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "%s", name) == NULL) {
-			printf("ufs: no node for %s (the same name twice?)\n", name);
-			continue;
+			snprintf(suffix, sizeof(suffix), "_u%u", (unsigned)ufs_page->part[i].unit);
+			snprintf(name, sizeof(name), "ufs_%s%s", ufs_page->part[i].name, suffix);
+			if (devfs_make_node(makedev(ufs_bmajor, i), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "%s",
+			    name) == NULL) {
+				printf("ufs: no node for %s\n", name);
+				continue;
+			}
 		}
-		snprintf(name, sizeof(name), "rufs_%s", ufs_page->part[i].name);
+		snprintf(name, sizeof(name), "rufs_%s%s", ufs_page->part[i].name, suffix);
 		(void)devfs_make_node(makedev(ufs_cmajor, i), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "%s", name);
 		made++;
 	}
@@ -1532,10 +1593,18 @@ hakios_ufs_init(void)
 	 * it; the loader looks at its GUIDs besides, and refuses the same bounds of its own accord.
 	 */
 	check = 0;
-	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
+	if (!PE_parse_boot_argn("ufs_darwin_first", &ufs_darwin_first, sizeof(ufs_darwin_first)) ||
+	    !PE_parse_boot_argn("ufs_darwin_blocks", &ufs_darwin_blocks, sizeof(ufs_darwin_blocks)) ||
+	    !PE_parse_boot_argn("ufs_write_first", &ufs_write_first, sizeof(ufs_write_first)) ||
+	    ufs_darwin_blocks == 0 || ufs_write_first == 0 || ufs_write_first >= ufs_darwin_blocks) {
+		ufs_write_first = UINT64_MAX;
+		ufs_darwin_first = ufs_darwin_blocks = 0;
+		printf("ufs: this device has no darwin in the loader: nothing will be written\n");
+	}
+	if (ufs_write_first != UINT64_MAX && PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
 		uint32_t offered = ufs_page->write_part_plus_one;
 
-		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != UFS_WRITE_FIRST) {
+		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != ufs_write_first) {
 			printf("ufs: the loader offers no partition to write into (ufs_write=1 on its command "
 			    "line too, and a loader that knows about writes)\n");
 		}
@@ -1554,9 +1623,9 @@ hakios_ufs_init(void)
 				 * has compared with the loader's reads; the device path this firmware gives
 				 * says no logical unit number at all, so part[].lun is 0xff for every unit */
 				why = "it is not on the first logical unit";
-			} else if (ufs_page->part[i].start_lba != UFS_DARWIN_FIRST) {
+			} else if (ufs_page->part[i].start_lba != ufs_darwin_first) {
 				why = "it does not begin where it did";
-			} else if (ufs_page->part[i].blocks != UFS_DARWIN_BLOCKS) {
+			} else if (ufs_page->part[i].blocks != ufs_darwin_blocks) {
 				why = "it is not the size it was";
 			} else if (ufs_page->part[i].block_size != 4096) {
 				why = "its blocks are not 4096 bytes";
@@ -1569,8 +1638,8 @@ hakios_ufs_init(void)
 		}
 		if (ufs_write_part >= 0) {
 			printf("ufs: /dev/rufs_darwin takes writes, whole blocks from %llu on (%llu MB of it); "
-			    "everything else of the storage is read only\n", UFS_WRITE_FIRST,
-			    (UFS_DARWIN_BLOCKS - UFS_WRITE_FIRST) * 4096 >> 20);
+			    "everything else of the storage is read only\n", ufs_write_first,
+			    (ufs_darwin_blocks - ufs_write_first) * 4096 >> 20);
 		} else {
 			printf("ufs: nothing takes writes: darwin is not among the partitions\n");
 		}
@@ -1637,6 +1706,7 @@ hakios_ufs_init(void)
 		ufs_bench(NULL, THREAD_AWAKENED);
 		loader_return();
 	}
+	(void)PE_parse_boot_argn("ufs_check_whole", &ufs_check_whole, sizeof(ufs_check_whole));
 	check = 0;
 	if (PE_parse_boot_argn("ufs_check", &check, sizeof(check)) && check == 2) {
 		/* right here, whichever way the partitions are read (ufs_native=), and back to the loader */

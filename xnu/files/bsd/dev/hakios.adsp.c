@@ -76,6 +76,7 @@
  * qcom,glink/adsp, qcom,ipcc@408000, power-controller@c300000, reserved-memory), layouts from
  * Linux (see hakios.wifi.c for the files).
  */
+#include <machine/machine_routines.h>
 #include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
@@ -146,7 +147,9 @@ say_line(const char *line, bool aloud)
 			loader_log_putc(*c);
 		}
 	}
-	printf("%s", line);
+	if (ml_get_interrupts_enabled()) {        /* (not on the way out: loader_return runs with interrupts off) */
+		printf("%s", line);
+	}
 	lck_mtx_unlock(&say_lock);
 }
 
@@ -833,7 +836,7 @@ rail_position(const char *name, uint32_t level, uint32_t *address)
 		printf("adsp: %u: the boot loader's command database is not there\n", step);
 		return -1;
 	}
-	strlcpy(id, name, sizeof(id));
+	memcpy(id, name, strnlen(name, sizeof(id)));   /* (a cmd-db id fills all 8 bytes with no NUL: "lnbclka2"; strlcpy kept 7) */
 	for (unsigned s = 0; s < 8; s++) {
 		const struct cmd_db_slave *slave = &cmd_db->slave[s];
 		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);

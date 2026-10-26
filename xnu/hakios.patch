@@ -62,16 +62,19 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..be702e28890d 100644
+index 44274016a4cf..26c917adee83 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,41 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,65 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
 +bsd/dev/hakios.input.c		standard
 +bsd/dev/hakios.virtio_input.c	standard
 +bsd/dev/hakios.goodix.c	standard
++bsd/dev/vayu_nvt.c		standard
++bsd/dev/vayu_qup_spi.c		standard
++bsd/dev/vayu_cpufreq.c		standard
 +bsd/dev/hakios.buttons.c	standard
 +bsd/dev/hakios.battery.c	standard
 +bsd/dev/hakios.ufs.c	standard
@@ -83,6 +86,7 @@ index 44274016a4cf..be702e28890d 100644
 +bsd/dev/hakios.apple80211.c	standard
 +bsd/dev/hakios.cpufreq.c	standard
 +bsd/dev/hakios.adreno.c	standard
++bsd/dev/vayu_adreno.c		standard
 +bsd/dev/hakios.audio.c		standard
 +bsd/dev/hakios.virtio_sound.c	standard
 +bsd/dev/hakios.speaker.c	standard
@@ -104,10 +108,30 @@ index 44274016a4cf..be702e28890d 100644
 +bsd/dev/hakios.wlfw.c		standard
 +bsd/dev/hakios.lx.c		standard
 +bsd/dev/hakios.sta.c		standard
++bsd/dev/vayu_audio.c		standard
++bsd/dev/vayu_pas.c		standard
++bsd/dev/vayu_haptic.c		standard
++bsd/dev/vayu_vsync.c		standard
++bsd/dev/vayu_modem.c		standard
++bsd/dev/vayu_rmtfs.c		standard
++bsd/dev/vayu_cell.c		standard
++bsd/dev/vayu_bt.c		standard
++bsd/dev/vayu_slpi.c		standard
++bsd/dev/vayu_ssc.c		standard
++bsd/dev/vayu_fastrpc.c		standard
++bsd/dev/vayu_camera.c		standard
++bsd/dev/vayu_wled.c		standard
++bsd/dev/vayu_mdp.c		standard
++bsd/dev/vayu_wifi.c		standard
++bsd/dev/vayu_jack.c		standard
++bsd/dev/vayu_nfc.c		standard
++bsd/dev/vayu_usbnet.c		standard
++bsd/dev/vayu_ir.c		standard
++bsd/dev/vayu_usbnet_ecm.c		standard
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +190,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +214,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -122,7 +146,7 @@ index 44274016a4cf..be702e28890d 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +404,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +428,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -130,7 +154,7 @@ index 44274016a4cf..be702e28890d 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +427,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +451,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -357,7 +381,7 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..4a6e0ccfc590 100644
+index 4df41ba1f61b..7b2359579504 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -147,6 +147,13 @@
@@ -383,11 +407,12 @@ index 4df41ba1f61b..4a6e0ccfc590 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +983,14 @@ bsd_init(void)
+@@ -976,6 +983,15 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
 +		hakios_input_init();           /* /dev/hakios-touch */
++		vayu_nvt_init();             /* boot-args touchscreen=1 touch_driver=nvt: vayu's panel */
 +		hakios_audio_init();           /* /dev/hakios-audio */
 +		hakios_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
 +		hakios_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
@@ -857,6 +882,29 @@ index ae4a5f33df1e..986b517dfd18 100644
  	struct uthread *uth;
  
  	target_act = (thread_t)port_name_to_thread(uap->thread_port,
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+index 9ba4ffbfef03..c0f752937989 100644
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2164,10 +2164,15 @@ sysctl_sysctl_bootargs
+ (__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+ {
+ 	int error;
+-	char buf[BOOT_LINE_LENGTH];
++	char *args = PE_boot_args();
+ 
+-	strlcpy(buf, PE_boot_args(), BOOT_LINE_LENGTH);
+-	error = sysctl_io_string(req, buf, BOOT_LINE_LENGTH, 0, NULL);
++	/*
++	 * redwood/vayu: the whole line, which can be longer than BOOT_LINE_LENGTH - 1 = 607 characters when
++	 * PE_boot_args() answers from /chosen "hakios-bootargs" (xnuloader 1.9; pexpert/arm/pe_bootargs.c): user
++	 * space reads its own arguments (gl*, motion_orient) from here, and those sit at the end of the line.  A
++	 * caller's buffer too small for it gets the line's beginning (trunc), not ENOMEM; read-only (CTLFLAG_RD).
++	 */
++	error = sysctl_io_string(req, args, strlen(args) + 1, 1, NULL);
+ 	return error;
+ }
+ 
 diff --git a/bsd/kern/kpi_socket.c b/bsd/kern/kpi_socket.c
 index 003cfb074a99..c597065f24f1 100644
 --- a/bsd/kern/kpi_socket.c
@@ -870,6 +918,27 @@ index 003cfb074a99..c597065f24f1 100644
  
  	if (sock == NULL) {
  		return EINVAL;
+diff --git a/bsd/kern/makesyscalls.sh b/bsd/kern/makesyscalls.sh
+index 52992d4cd0af..140fed3bcb71 100755
+--- a/bsd/kern/makesyscalls.sh
++++ b/bsd/kern/makesyscalls.sh
+@@ -671,14 +671,14 @@ s/\$//g
+ 		}
+ 
+ 		printf("#if CONFIG_REQUIRES_U32_MUNGING\n") > sysent
+-		printf("\t{ \(sy_call_t *\)(void (*)(void))%s, %s, %s, %s, %s},",
++		printf("\t{ (sy_call_t *)(void (*)(void))%s, %s, %s, %s, %s},",
+ 				tempname, munge32, munge_ret, argssize, size32) > sysent
+ 		linesize = length(tempname) + length(munge32) + \
+ 			length(munge_ret) + length(argssize) + length(size32) + 28
+ 		align_comment(linesize, 88, sysent)
+ 		printf("/* %d = %s%s*/\n", syscall_num, funcname, additional_comments) > sysent
+ 		printf("#else\n") > sysent
+-		printf("\t{ \(sy_call_t *\)(void (*)(void))%s, %s, %s, %s},\n",
++		printf("\t{ (sy_call_t *)(void (*)(void))%s, %s, %s, %s},\n",
+ 				tempname, munge_ret, argssize, size32) > sysent
+ 		printf("#endif\n") > sysent
+ 		
 diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
 index 4ca22ee4371a..e95e618b4cb6 100644
 --- a/bsd/kern/sys_generic.c
@@ -2041,6 +2110,25 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
+diff --git a/osfmk/arm/io_map.c b/osfmk/arm/io_map.c
+index 18ef2f02122f..55945dceb39f 100644
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,13 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++/*
++ * vayu: 64 MB, not 8. Every driver's ml_io_map() is permanent and lives here, and vayu's add up past
++ * 8 MB (TLMM tiles of 1 MB for touch and audio, the apps SMMU 1 MB, GCC 512 KB per driver, the GPU,
++ * the PMIC arbiter...): run 164539 panicked in touch's 1 MB map, kmem_alloc ... failed with 3
++ * (KERN_NO_SPACE) under KMA_NOFAIL, once the audio driver's maps were in.
++ */
++#define IO_MAP_SIZE            (64ul << 20)
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
 diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
 index 39daaf8db949..64ceb1a5f201 100644
 --- a/osfmk/arm/model_dep.c
@@ -3100,6 +3188,52 @@ index 8b46efb05c86..e161ca426b1a 100644
  extern kern_return_t
  kern_work_interval_set_workload_id(mach_port_name_t port_name,
      struct kern_work_interval_workload_id_args *workload_id_args);
+diff --git a/pexpert/arm/pe_bootargs.c b/pexpert/arm/pe_bootargs.c
+index c6b87b081d2f..584be7afd766 100644
+--- a/pexpert/arm/pe_bootargs.c
++++ b/pexpert/arm/pe_bootargs.c
+@@ -3,10 +3,41 @@
+  */
+ #include <pexpert/pexpert.h>
+ #include <pexpert/boot.h>
++#include <pexpert/device_tree.h>
++
++/*
++ * redwood/vayu: the boot arguments are the loader's whole command line when it has put one in the device tree as
++ * /chosen "hakios-bootargs" (xnuloader 1.9): boot_args.CommandLine holds only BOOT_LINE_LENGTH - 1 = 607
++ * characters, and a line of all the vayu drivers' arguments is longer (a test run, run 220922: cut at "vayu_cam", so
++ * the camera, Bluetooth, NFC and sensor arguments never reached the kernel). Until the device tree can be read, and
++ * with an older loader, boot_args' own copy is the answer, as before.
++ */
++static char hakios_bootargs[4096];
++static volatile int hakios_bootargs_state;     /* 0: not looked for yet; 1: the device tree's copy; -1: boot_args' */
+ 
+ char *
+ PE_boot_args(
+ 	void)
+ {
++	if (hakios_bootargs_state == 0) {
++		DTEntry chosen;
++		void const *value;
++		unsigned int size;
++
++		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess) {
++			if (SecureDTGetProperty(chosen, "hakios-bootargs", &value, &size) == kSuccess && size > 1) {
++				size = size < sizeof(hakios_bootargs) ? size : (unsigned int)sizeof(hakios_bootargs);
++				memcpy(hakios_bootargs, value, size);
++				hakios_bootargs[sizeof(hakios_bootargs) - 1] = 0;
++				__asm__ volatile ("dmb ish" ::: "memory");
++				hakios_bootargs_state = 1;
++			} else {
++				hakios_bootargs_state = -1;
++			}
++		}
++	}
++	if (hakios_bootargs_state == 1) {
++		return hakios_bootargs;
++	}
+ 	return (char *)((boot_args *)PE_state.bootArgs)->CommandLine;
+ }
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 index 3ad743fc3efb..ce036c5a2c26 100644
 --- a/pexpert/arm/pe_fiq.c

@@ -920,6 +920,50 @@ qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_tx
 	return error > 0 ? -error : error;
 }
 
+/*
+ * Send an indication to the server (the QMI "host indication" direction, as
+ * ath10k_qmi_msa_ready() uses).  No transaction and no reply; the QMI header
+ * type is QMI_INDICATION and the transaction id is 0.
+ */
+int
+qmi_send_indication(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_txn *txn, int msg_id,
+    size_t largest, const struct qmi_elem_info *ei, const void *structure)
+{
+	struct qmi_state *s = state_of(qmi);
+	uint32_t node, port;
+	bool connected;
+	size_t size = largest + QMI_HEADER_SIZE;
+	void *buffer;
+	int length, error;
+
+	if (s == NULL) {
+		return -EINVAL;
+	}
+	os_lock(&s->lock);
+	connected = s->connected;
+	node = s->peer_node;
+	port = s->peer_port;
+	os_unlock(&s->lock);
+	if (sq != NULL) {
+		node = sq->sq_node;
+		port = sq->sq_port;
+	} else if (!connected) {
+		return -ENOTCONN;
+	}
+	buffer = os_alloc(size);
+	if (buffer == NULL) {
+		return -ENOMEM;
+	}
+	length = hakios_qmi_encode(QMI_INDICATION, (uint16_t)msg_id, txn != NULL ? txn->id : 0, ei, structure, buffer, size);
+	if (length < 0) {
+		os_free(buffer, size);
+		return length;
+	}
+	error = s->transport->send(s->port, node, port, buffer, (size_t)length);
+	os_free(buffer, size);
+	return error > 0 ? -error : error;
+}
+
 void
 qmi_txn_cancel(struct qmi_txn *txn)
 {

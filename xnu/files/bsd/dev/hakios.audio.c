@@ -37,6 +37,10 @@
 #include <sys/errno.h>
 #include <sys/proc.h>
 #include <sys/hakios.audio.h>
+#include <sys/vayu_audio.h>
+#include <sys/vayu_haptic.h>
+#include <sys/vayu_modem.h>
+#include <sys/vayu_slpi.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 #include <vm/vm_kern.h>
@@ -348,6 +352,10 @@ hakios_audio_init(void)
 	audio_recording_init();
 	hakios_virtio_sound_init();
 	hakios_speaker_init();
+	vayu_audio_init();
+	vayu_haptic_init();             /* boot-arg vayu_haptic=1: a read-only look at the PM8150B haptics block */
+	vayu_modem_init();              /* boot-arg vayu_modem=1..3: the modem probe (load, start, QRTR services, stop) */
+	vayu_slpi_init();               /* boot-arg vayu_slpi=1..3: the sensors DSP probe (load, start, QRTR services, stop) */
 	hakios_haptic_init();
 	hakios_torch_init();
 	hakios_camera_init();

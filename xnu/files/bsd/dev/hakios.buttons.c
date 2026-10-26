@@ -7,6 +7,7 @@
  *   power        KPDPWR_N of the power-on block ("PON") of the PMK8350
  *   volume down  RESIN_N of the same block
  *   volume up    GPIO6 of the PM7325, pulled up; the key pulls it low
+ * On vayu: KPDPWR_N/RESIN_N of the PM8150's power-on block (0x0800) and GPIO6 of the PM8150 (0xc000).
  * Both chips sit on the SPMI bus (slaves 0 and 1), and the way to that bus is the SoC's "PMIC
  * arbiter": it owns the bus and gives each of the systems on the chip (this one, the modem, the
  * always-on processor, TrustZone...) a set of registers per PMIC peripheral -- a "channel" -- to
@@ -42,8 +43,10 @@
  * drivers/input/misc/pm8941-pwrkey.c (the "pmk8350" kind), drivers/pinctrl/qcom/pinctrl-spmi-gpio.c,
  * and the phone's own device tree (qcom,spmi@c440000, pon_hlos@1300, gpio_keys).
  */
+#include <machine/machine_routines.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <os/atomic_private.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -75,7 +78,7 @@ say(const char *format, ...)
 	for (const char *c = line; *c != 0; c++) {
 		loader_log_putc(*c);
 	}
-	return printf("%s", line);
+	return ml_get_interrupts_enabled() ? printf("%s", line) : (int)strlen(line);   /* (not with interrupts off) */
 }
 #define printf say
 
@@ -148,9 +151,17 @@ struct peripheral {
 	uint16_t        id;             /* slave << 8 | peripheral: the high byte of its register addresses */
 	uint16_t        channel;
 	bool            found;
+	uint8_t         subtype;        /* as read in step 3 */
 };
-static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
-static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
+extern bool (*hakios_display_power)(bool on);  /* MiniIOMobileFramebuffer.cpp: the backlight, if a driver has one */
+
+static struct peripheral pon = { .name = "the PM8150's power-on block", .id = 0x008 };            /* registers 0x0800 of slave 0 */
+/*
+ * GPIO6 is registers 0xc500, not 0xc000 (that is GPIO1): a PMIC GPIO is 0x100 of registers each from 0xc000
+ * (vendor pinctrl-spmi-gpio.c:1173, pad->base = start + i * 0x100), and the PM8150's gpio6 interrupt is
+ * peripheral 0xc5 (pm8150.dtsi:115,119). Before, volume up was read from GPIO1 and never changed.
+ */
+static struct peripheral pin = { .name = "GPIO6 of the PM8150", .id = 0x0c5 };                    /* registers 0xc500 of slave 0 */
 
 /* How the reads have gone: said once a minute. */
 static struct {
@@ -232,6 +243,50 @@ find_channel(struct peripheral *p, uint32_t channels)
 	}
 }
 
+/*
+ * One register of any peripheral, read through our observer channel, for other drivers (the battery's
+ * charger state): `id` = slave << 8 | peripheral. Read only; false until this driver has mapped the
+ * arbiter, or if no channel is that peripheral's. Channels are looked up once and kept (sixteen at most).
+ */
+bool
+hakios_spmi_peek(uint16_t id, uint8_t reg, uint8_t *value)
+{
+	static struct peripheral kept[16];       /* (battery 5, thermal 3, charger limits 2: more than 8) */
+	static unsigned count;
+	struct peripheral *p = NULL;
+	uint32_t channels;
+
+	if (arb_core == 0 || arb_observer == 0) {
+		return false;
+	}
+	for (unsigned i = 0; i < count; i++) {
+		if (kept[i].id == id) {
+			p = &kept[i];
+		}
+	}
+	if (p == NULL) {
+		if (count == sizeof(kept) / sizeof(kept[0])) {
+			return false;
+		}
+		channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
+		channels = channels == 0 || channels > ARB_MAX_CHANNELS ? ARB_MAX_CHANNELS : channels;
+		p = &kept[count];
+		p->name = "a peripheral asked for by another driver";
+		p->id = id;
+		p->found = false;
+		for (uint32_t n = 0; n < channels && !p->found; n++) {
+			uint32_t map = rd(arb_core + ARB_CHANNEL(n));
+
+			if (map != 0 && ((map >> 8) & 0xfff) == id) {
+				p->found = true;
+				p->channel = (uint16_t)n;
+			}
+		}
+		count++;                /* (kept even if not found: not looked for again) */
+	}
+	return p->found && spmi_read(p, reg, value, 1) == NULL;
+}
+
 /* ---- the two peripherals ------------------------------------------------------------------------- */
 
 /* every peripheral of these PMICs */
@@ -247,9 +302,20 @@ find_channel(struct peripheral *p, uint32_t channels)
 
 /* the power-on block, of the kind that is split in two ("generation 3"): this is its half for the operating system */
 #define PON_TYPE                0x01
-#define PON_SUBTYPE_HLOS        0x09
-#define PON_KPDPWR              0x80            /* in the status and in the interrupt registers */
-#define PON_RESIN               0x40
+#define PON_SUBTYPE_HLOS        0x04            /* vayu's PM8150 is 0x04; redwood's PMK8350 is 0x09 */
+#define PON_SUBTYPE_HLOS_END    0x09
+/*
+ * The keys' bits in the status (and interrupt) registers depend on the block's generation. The split
+ * "generation 3" HLOS half (redwood's PMK8350, subtype 0x09): KPDPWR bit 7, RESIN bit 6. The PM8150's
+ * PON_GEN2_PRIMARY (subtype 0x04, vayu; vendor qpnp-power-on.c:47-51) and the older ones: KPDPWR bit 0,
+ * RESIN bit 1, CBLPWR bit 2 (qpnp-power-on.c:121-123, read at :1112 and :1162-1168). Vayu's status read
+ * 0x04 at rest with USB in = CBLPWR (the bring-up notes), consistent with that map.
+ */
+#define PON_GEN3_KPDPWR         0x80
+#define PON_GEN3_RESIN          0x40
+#define PON_GEN2_KPDPWR         0x01
+#define PON_GEN2_RESIN          0x02
+static uint8_t PON_KPDPWR = PON_GEN3_KPDPWR, PON_RESIN = PON_GEN3_RESIN;
 
 /* a GPIO of the low or medium voltage kind */
 #define GPIO_TYPE               0x10
@@ -322,6 +388,18 @@ button_look(struct button *b, bool pressed)
 		absolutetime_to_nanoseconds(now - b->since, &held);
 		printf("buttons: %s released at %s, after %llu ms\n", b->name, when, held / NSEC_PER_MSEC);
 	}
+	/*
+	 * A press of power always gives the panel its backlight back (vayu_wled.c, vayu_wled=2): if iOS
+	 * powered the display down and never asks for it again, the screen must not stay dark. iOS's own
+	 * request that follows (off when it locks) is then honoured as usual.
+	 */
+	if (pressed && b == &power) {
+		bool (*display_power)(bool) = os_atomic_load(&hakios_display_power, acquire);
+
+		if (display_power != NULL) {
+			display_power(true);
+		}
+	}
 	hakios_touch_post(pressed ? HAKIOS_BUTTON_DOWN : HAKIOS_BUTTON_UP, b->record, 0, 0);
 }
 
@@ -371,6 +449,7 @@ identify(const struct peripheral *p, uint8_t type, uint8_t subtype_from, uint8_t
 		return false;
 	}
 	printf("buttons: %s says type %#x, subtype %#x (the read took %llu us)\n", p->name, is[0], is[1], bus.last_ns / 1000);
+	((struct peripheral *)(uintptr_t)p)->subtype = is[1];
 	if (is[0] != type || is[1] < subtype_from || is[1] > subtype_to) {
 		printf("buttons: ... which is not what this driver knows (type %#x, subtype %#x to %#x): left alone\n", type,
 		    subtype_from, subtype_to);
@@ -480,7 +559,15 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	}
 
 	printf("buttons: step 3: the first transfers on the SPMI bus\n");
-	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
+	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS_END);
+	if (pon_known && pon.subtype <= 0x05) {
+		PON_KPDPWR = PON_GEN2_KPDPWR;
+		PON_RESIN = PON_GEN2_RESIN;
+	}
+	if (pon_known) {
+		printf("buttons: power-on block subtype %#x: power is status bit %#x, volume down %#x\n", pon.subtype, PON_KPDPWR,
+		    PON_RESIN);
+	}
 	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
 	if (steps < 4) {
 		goto out;
