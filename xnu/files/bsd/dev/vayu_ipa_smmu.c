@@ -8,6 +8,7 @@
  * match register and a context are used only if they are free. Every write is read back.
  */
 #include <kern/kalloc.h>
+#include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -51,6 +52,7 @@
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void loader_log_putc(char c);
+extern lck_mtx_t hakios_smmu_lock;     /* QUP/Wi-Fi/audio/camera allocate the same SMRs/contexts */
 
 static int say(const char *format, ...) __printflike(1, 2);
 static int
@@ -88,29 +90,14 @@ wr(vm_offset_t at, uint32_t value)
 }
 
 static bool
-ipa_smmu_context_on(vm_offset_t base, uint32_t context, uint32_t pages, uint32_t page)
-{
-	return (rd(base + (pages + context) * page + SMMU_CB_SCTLR) & 1) != 0;
-}
-
-static bool
 ipa_smmu_find(struct ipa_smmu_stream *s, vm_offset_t base, uint32_t idr0, uint32_t idr1)
 {
 	bool used[256] = { false };
 	uint32_t matches = idr0 & 0xff, contexts = idr1 & 0xff, pages = 2U << ((idr1 >> 28) & 7);
 	uint32_t page = idr1 >> 31 ? 0x10000 : 0x1000;
-	int context = -1;
 
-	/*
-	 * From the TOP down, not the bottom up: vayu_qup_spi.c's GSI finds its match and context from 0
-	 * up, and both run on their own threads in the same second of the boot. A test run caught them
-	 * choosing the same context 4: the QUP's "write sctlr (+0) = 0" landed between this driver's
-	 * SCTLR=on and its read-back, which then failed ("SMMU did not accept SID 0x520 into context 4"),
-	 * and IPA never started. The top of both spaces is free and no bottom-up scan can reach it while
-	 * there are free low entries, so the two cannot collide even without a lock.
-	 */
 	s->match = ~0U;
-	for (uint32_t n = matches; n-- > 0; ) {
+	for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
 		uint32_t smr = rd(base + SMMU_SMR(n)), s2cr = rd(base + SMMU_S2CR(n));
 		if (smr >> 31) {
 			uint32_t stream = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
@@ -127,21 +114,19 @@ ipa_smmu_find(struct ipa_smmu_stream *s, vm_offset_t base, uint32_t idr0, uint32
 			s->match = n;
 		}
 	}
-	for (uint32_t n = contexts; n-- > 0; ) {
-		/* a bank with SCTLR.on is somebody's even if no valid SMR names it yet */
-		if (!used[n] && !ipa_smmu_context_on(base, n, pages, page)) {
-			context = (int)n;
-			break;
-		}
+	for (s->context = 0; s->context < contexts && used[s->context]; s->context++) {
 	}
-	if (s->match == ~0U || context < 0) {
+	if (s->match == ~0U || s->context >= contexts) {
 		say("vayu-ipa: SMMU: no free match register or context for SID %#x\n", s->sid);
 		return false;
 	}
-	s->context = (uint32_t)context;
 	s->base = base;
 	s->second = base + page;
 	s->context_base = base + (pages + s->context) * page;
+	if (rd(s->context_base + SMMU_CB_SCTLR) & 1) {
+		say("vayu-ipa: SMMU context %u is already on; leaving it alone\n", s->context);
+		return false;
+	}
 	s->found = true;
 	return true;
 }
@@ -211,9 +196,11 @@ ipa_smmu_on(struct ipa_smmu_stream *s)
 	if (rd(s->base + smr) != sees || (rd(s->base + s2cr) & 0x300ff) != s->context ||
 	    !(rd(context + SMMU_CB_SCTLR) & 1) || rd(context + SMMU_CB_TTBR0) != (uint32_t)root ||
 	    rd(context + SMMU_CB_TTBR0 + 4) != (uint32_t)(root >> 32)) {
-		say("vayu-ipa: SMMU did not accept SID %#x into context %u (read-back failed: smr %#x s2cr %#x sctlr %#x "
-		    "ttbr0 %#x/%#x)\n", s->sid, s->context, rd(s->base + smr), rd(s->base + s2cr),
-		    rd(context + SMMU_CB_SCTLR), rd(context + SMMU_CB_TTBR0), rd(context + SMMU_CB_TTBR0 + 4));
+		say("vayu-ipa: SMMU did not accept SID %#x into context %u (read-back failed): "
+		    "smr %#x s2cr %#x sctlr %#x ttbr %#x_%08x; wanted smr %#x s2cr %#x ttbr %#llx\n",
+		    s->sid, s->context, rd(s->base + smr), rd(s->base + s2cr), rd(context + SMMU_CB_SCTLR),
+		    rd(context + SMMU_CB_TTBR0 + 4), rd(context + SMMU_CB_TTBR0), sees, s->context,
+		    (unsigned long long)root);
 		return false;
 	}
 	say("vayu-ipa: SMMU SID %#x -> context %u, match %u, root %#llx; DDR/SMEM/IMEM identity map read back OK\n",
@@ -237,12 +224,17 @@ vayu_ipa_smmu_enable(void)
 		say("vayu-ipa: SMMU uses 16-bit stream IDs; this first context path is not for it\n");
 		return false;
 	}
+	/* Finding and programming is one transaction with the other SMMU users: a test run had the QUP's GSI
+	 * take match 6/7 and context 4/5 while this driver was taking context 4 too. */
+	lck_mtx_lock(&hakios_smmu_lock);
 	for (unsigned i = 0; i < 2; i++) {
 		ipa_smmu[i].sid = i == 0 ? 0x520 : 0x522;
 		if (!ipa_smmu_find(&ipa_smmu[i], base, idr0, idr1) || !ipa_smmu_on(&ipa_smmu[i])) {
 			say("vayu-ipa: SMMU enable failed for SID %#x\n", ipa_smmu[i].sid);
+			lck_mtx_unlock(&hakios_smmu_lock);
 			return false;
 		}
 	}
+	lck_mtx_unlock(&hakios_smmu_lock);
 	return true;
 }
