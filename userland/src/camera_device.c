@@ -1417,7 +1417,7 @@ load_fast(struct isp *isp, struct stream *s)
 	int pieces = 8, async = 1;
 
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
-		fast.preview_half = boot_number(arguments, "cam_preview_half=", 1) != 0;
+		fast.preview_half = boot_number(arguments, "cam_preview_half=", 0) != 0;
 		fast.neon = boot_number(arguments, "cam_neon=", 1) != 0;
 		async = boot_number(arguments, "cam_still_async=", 1) != 0;
 		pieces = (int)boot_number(arguments, "cam_pieces=", 8);
@@ -1460,7 +1460,7 @@ load_tuning(struct isp *isp, uint32_t sensor)
 			vayu_look.lcon = boot_number(arguments, "cam_lcon=", 0.15f);
 			vayu_look.vibrance = boot_number(arguments, "cam_vib=", 0.25f);
 			vayu_look.rolloff = 1.0f;
-			vayu_look.preview_sharp = vayu_look.sharpen > 0 ? 0.3f : 0;
+			vayu_look.preview_sharp = vayu_look.sharpen > 0 ? 0.45f : 0;
 		}
 	}
 	/* every session (isp_init() puts the plain curve back) */
