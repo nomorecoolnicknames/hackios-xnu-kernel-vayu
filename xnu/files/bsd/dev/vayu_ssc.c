@@ -1,6 +1,7 @@
 /*
  * The sensors' QMI service (SSC, service 0x190) on the sensors DSP (SLPI) of the POCO X3 Pro
- * (vayu, SM8150-AC): SUID lookups, sensor attributes, and an accelerometer/gyroscope stream.
+ * (vayu, SM8150-AC): SUID lookups, sensor attributes, and accelerometer, gyroscope, ambient-light
+ * and proximity streams.
  *
  * This file only speaks the wire protocol. vayu_slpi.c loads and starts the SLPI, opens GLINK's
  * IPCRTR channel and, when the QRTR service 0x190 is there, calls vayu_ssc_run() with its node
@@ -15,12 +16,19 @@
  *     the bring-up notes; the same shape appears in libssc's
  *     utils/strace.txt capture.
  *   - Protobuf message shapes, field numbers and wire types: libssc data/ssc-common.proto,
- *     data/ssc-sensor-suid.proto, data/ssc-sensor-accelerometer.proto and
- *     data/ssc-sensor-gyroscope.proto (proto2). The codec below is written here; no libssc code
+ *     data/ssc-sensor-suid.proto, data/ssc-sensor-accelerometer.proto,
+ *     data/ssc-sensor-gyroscope.proto, data/ssc-sensor-light.proto and
+ *     data/ssc-sensor-proximity.proto (proto2). The codec below is written here; no libssc code
  *     is copied.
  *   - Message ids 512 (SUID request), 768 (SUID/config answer), 513 (enable config),
- *     514, 10 (disable), 1 (attributes request), 128 (attributes answer) and 1025 (sensor
- *     sample): libssc src/libssc-common-private.h:30-37 and src/libssc-client-private.h:51-54.
+ *     514 (enable on-change), 10 (disable), 1 (attributes request), 128 (attributes answer),
+ *     1025 (sensor sample) and 769 (proximity sample, libssc-sensor-proximity.c:82-95):
+ *     libssc src/libssc-common-private.h:30-37 and src/libssc-client-private.h:51-54.
+ *   - The ambient-light payload is repeated float intensity (lux) field 1 and accuracy field 2
+ *     (data/ssc-sensor-light.proto:25-28); libssc uses intensity[0] (libssc-sensor-light.c:84-85).
+ *     The proximity payload is int32 near/distance/accuracy fields 1..3
+ *     (data/ssc-sensor-proximity.proto:26-30) with near 1 = NEAR, 0 = FAR
+ *     (libssc-sensor-proximity.c:26-27, 90-99).
  *   - A response to Control 0x0020 carries TLV 0x02 (result u16, error u16), TLV 0x10 (client
  *     id, 8 bytes seen; 4 accepted too) and TLV 0x11 (u32). Report Small 0x0021 and Report
  *     Large 0x0022 carry TLV 0x01 (client id u64) and TLV 0x02 (u16 length plus a protobuf
@@ -83,6 +91,7 @@ extern void IOSleep(unsigned int);
 #define SSC_MSG_ATTR_REQUEST	1
 #define SSC_MSG_ATTR_RESPONSE	128
 #define SSC_MSG_SENSOR_SAMPLE	1025
+#define SSC_MSG_PROXIMITY_SAMPLE	769	/* libssc src/libssc-common-private.h:36; libssc-sensor-proximity.c:82-95 */
 
 /* The SUID pseudo-sensor: low = high = 0xabababababababab. */
 #define SSC_SUID_LOW		0xababababababababULL
@@ -171,17 +180,32 @@ struct ssc_state {
 	} attr;
 
 	struct {
-		int type;		/* ssc_type or -1 */
+		int32_t stream_type;	/* attr 16; 1 = on-change (libssc src/libssc-common-private.h:72-73) */
+		bool has_stream_type;
+	} attrs[SSC_TYPES];
+
+	struct {
+		bool streaming;		/* this type's stream is on */
 		uint32_t count;
 		bool has;
-		int32_t last[3];
+		int32_t last[3];	/* accel x y z; light [0] milli-lux; proximity [0] near, [1] distance */
 		int32_t accuracy;
 		uint64_t timestamp;
-	} stream;
+	} stream[SSC_TYPES];
 
 	int32_t accel_mm[3];
 	uint64_t accel_ns;
 	bool accel_valid;
+
+	int32_t light_lux_milli;
+	uint64_t light_ns;
+	bool light_valid;
+
+	int32_t prox_near;
+	int32_t prox_distance;
+	uint64_t prox_ns;
+	bool prox_valid;
+	bool prox_msg_said;		/* the msg id proximity samples arrive on was logged */
 
 	uint32_t unknown_msg[SSC_UNKNOWN_MSGS];
 	unsigned unknown_msg_count;
@@ -193,6 +217,8 @@ static bool ssc_lock_ready;
 static struct ssc_state ssc;
 static volatile bool ssc_leaving;       /* vayu_ssc_quiesce(): level 6's endless stream ends */
 static uint32_t accel_seq;              /* accelerometer samples so far (under ssc_lock), for /dev/vayu-motion */
+static uint32_t light_seq;              /* ambient-light samples so far (under ssc_lock), for /dev/vayu-motion */
+static uint32_t prox_seq;               /* proximity samples so far (under ssc_lock), for /dev/vayu-motion */
 
 /* Static protocol buffers: the run thread owns all of them. */
 static uint8_t enc_uid[32];
@@ -245,7 +271,6 @@ ssc_reset(void)
 	lck_spin_lock(&ssc_lock);
 	memset(&ssc, 0, sizeof(ssc));
 	ssc.next_txn = 1;
-	ssc.stream.type = -1;
 	lck_spin_unlock(&ssc_lock);
 }
 
@@ -904,7 +929,7 @@ attr_print(int32_t id, const struct ssc_attr_values *v)
 
 /* SscAttrResponse{attr SscAttr = 1}; SscAttr{id int32 = 1; value_array = 2}. */
 static void
-ssc_attr_response(const uint8_t *p, uint32_t len)
+ssc_attr_response(int type, const uint8_t *p, uint32_t len)
 {
 	struct dbuf d;
 	uint32_t field;
@@ -963,6 +988,13 @@ ssc_attr_response(const uint8_t *p, uint32_t len)
 					ssc_bad();
 					return;
 				}
+			}
+			/* Attribute 16 STREAM_TYPE; libssc takes v[0]->i (libssc-sensor.c:403-405). */
+			if (type >= 0 && type < SSC_TYPES && id == 16) {
+				lck_spin_lock(&ssc_lock);
+				ssc.attrs[type].has_stream_type = v.ni != 0;
+				ssc.attrs[type].stream_type = v.ni != 0 ? (int32_t)v.i[0] : 0;
+				lck_spin_unlock(&ssc_lock);
 			}
 			attr_print(id, &v);
 		} else if (!db_skip(&d, wire)) {
@@ -1097,7 +1129,11 @@ ssc_config_response(uint64_t low, uint64_t high, const uint8_t *p, uint32_t len)
 	lck_spin_unlock(&ssc_lock);
 }
 
-/* SscAccelerometerResponse / SscGyroscopeResponse: repeated float = 1, accuracy int32 = 2. */
+/*
+ * SscAccelerometerResponse / SscGyroscopeResponse: repeated float = 1, accuracy int32 = 2.
+ * SscLightResponse: repeated float intensity = 1 (lux), accuracy = 2
+ * (data/ssc-sensor-light.proto:25-28); libssc takes intensity[0] (libssc-sensor-light.c:84-85).
+ */
 static void
 ssc_sample_response(int type, const uint8_t *p, uint32_t len, uint64_t timestamp)
 {
@@ -1135,6 +1171,41 @@ ssc_sample_response(int type, const uint8_t *p, uint32_t len, uint64_t timestamp
 			return;
 		}
 	}
+	if (type == SSC_LIGHT) {
+		int32_t lux;
+
+		if (nf < 1) {
+			ssc_bad();
+			return;
+		}
+		lux = f32_milli(bits[0]);
+		arrived = ssc_now_ns();
+
+		lck_spin_lock(&ssc_lock);
+		if (!ssc.stream[SSC_LIGHT].streaming) {
+			lck_spin_unlock(&ssc_lock);
+			return;
+		}
+		ssc.stream[SSC_LIGHT].count++;
+		ssc.stream[SSC_LIGHT].has = true;
+		ssc.stream[SSC_LIGHT].last[0] = lux;
+		ssc.stream[SSC_LIGHT].accuracy = accuracy;
+		ssc.stream[SSC_LIGHT].timestamp = timestamp;
+		no = ssc.stream[SSC_LIGHT].count;
+		ssc.light_lux_milli = lux;
+		ssc.light_ns = arrived;
+		ssc.light_valid = true;
+		light_seq++;
+		lck_spin_unlock(&ssc_lock);
+
+		if (no <= 5) {
+			char l[16];
+
+			fmt_milli(l, sizeof(l), lux);
+			say("vayu-ssc: ambient_light #%u: %s lux\n", no, l);
+		}
+		return;
+	}
 	if (nf < 3) {
 		ssc_bad();
 		return;
@@ -1145,18 +1216,18 @@ ssc_sample_response(int type, const uint8_t *p, uint32_t len, uint64_t timestamp
 	arrived = ssc_now_ns();
 
 	lck_spin_lock(&ssc_lock);
-	if (ssc.stream.type != type) {
+	if (!ssc.stream[type].streaming) {
 		lck_spin_unlock(&ssc_lock);
 		return;
 	}
-	ssc.stream.count++;
-	ssc.stream.has = true;
-	ssc.stream.last[0] = mm[0];
-	ssc.stream.last[1] = mm[1];
-	ssc.stream.last[2] = mm[2];
-	ssc.stream.accuracy = accuracy;
-	ssc.stream.timestamp = timestamp;
-	no = ssc.stream.count;
+	ssc.stream[type].count++;
+	ssc.stream[type].has = true;
+	ssc.stream[type].last[0] = mm[0];
+	ssc.stream[type].last[1] = mm[1];
+	ssc.stream[type].last[2] = mm[2];
+	ssc.stream[type].accuracy = accuracy;
+	ssc.stream[type].timestamp = timestamp;
+	no = ssc.stream[type].count;
 	if (type == SSC_ACCEL) {
 		ssc.accel_mm[0] = mm[0];
 		ssc.accel_mm[1] = mm[1];
@@ -1177,6 +1248,99 @@ ssc_sample_response(int type, const uint8_t *p, uint32_t len, uint64_t timestamp
 		    ssc_type_name[type], no, x, y, z,
 		    type == SSC_ACCEL ? "m/s^2" : "m/s", accuracy,
 		    (unsigned long long)timestamp);
+	}
+}
+
+/*
+ * SscProximityResponse{near int32 = 1; distance int32 = 2; accuracy int32 = 3}
+ * (data/ssc-sensor-proximity.proto:26-30), near 1 = NEAR, 0 = FAR
+ * (libssc-sensor-proximity.c:26-27, 90-99). Most devices carry it on msg 769; some use 1025
+ * (libssc-sensor-proximity.c:82-95, 102-103).
+ */
+static void
+ssc_proximity_response(const uint8_t *p, uint32_t len, uint64_t timestamp, uint32_t msg_id)
+{
+	struct dbuf d;
+	uint32_t field;
+	unsigned wire;
+	int32_t near = -1;
+	int32_t distance = 0;
+	int32_t accuracy = 0;
+	bool has_near = false;
+	uint32_t no;
+	uint64_t arrived;
+	bool first_msg;
+
+	db_init(&d, p, len);
+	while (d.off < d.len) {
+		if (!db_tag(&d, &field, &wire)) {
+			ssc_bad();
+			return;
+		}
+		if (field == 1 && wire == 0) {
+			uint64_t x;
+
+			if (!db_varint(&d, &x)) {
+				ssc_bad();
+				return;
+			}
+			near = (int32_t)x;
+			has_near = true;
+		} else if (field == 2 && wire == 0) {
+			uint64_t x;
+
+			if (!db_varint(&d, &x)) {
+				ssc_bad();
+				return;
+			}
+			distance = (int32_t)x;
+		} else if (field == 3 && wire == 0) {
+			uint64_t x;
+
+			if (!db_varint(&d, &x)) {
+				ssc_bad();
+				return;
+			}
+			accuracy = (int32_t)x;
+		} else if (!db_skip(&d, wire)) {
+			ssc_bad();
+			return;
+		}
+	}
+	if (!has_near) {
+		ssc_bad();
+		return;
+	}
+	arrived = ssc_now_ns();
+
+	lck_spin_lock(&ssc_lock);
+	if (!ssc.stream[SSC_PROXIMITY].streaming) {
+		lck_spin_unlock(&ssc_lock);
+		return;
+	}
+	ssc.stream[SSC_PROXIMITY].count++;
+	ssc.stream[SSC_PROXIMITY].has = true;
+	ssc.stream[SSC_PROXIMITY].last[0] = near;
+	ssc.stream[SSC_PROXIMITY].last[1] = distance;
+	ssc.stream[SSC_PROXIMITY].accuracy = accuracy;
+	ssc.stream[SSC_PROXIMITY].timestamp = timestamp;
+	no = ssc.stream[SSC_PROXIMITY].count;
+	ssc.prox_near = near;
+	ssc.prox_distance = distance;
+	ssc.prox_ns = arrived;
+	ssc.prox_valid = true;
+	prox_seq++;
+	first_msg = !ssc.prox_msg_said;
+	if (first_msg) {
+		ssc.prox_msg_said = true;
+	}
+	lck_spin_unlock(&ssc_lock);
+
+	if (first_msg) {
+		say("vayu-ssc: proximity: samples on msg %u\n", msg_id);
+	}
+	if (no <= 5) {
+		say("vayu-ssc: proximity #%u: near %d distance %d\n", no, near, distance);
 	}
 }
 
@@ -1224,7 +1388,8 @@ ssc_msg_known(uint32_t msg_id)
 	    msg_id == SSC_MSG_ATTR_RESPONSE ||
 	    msg_id == SSC_MSG_DISABLE ||
 	    msg_id == SSC_MSG_514 ||
-	    msg_id == SSC_MSG_SENSOR_SAMPLE;
+	    msg_id == SSC_MSG_SENSOR_SAMPLE ||
+	    msg_id == SSC_MSG_PROXIMITY_SAMPLE;
 }
 
 /* SscClientResponseBody{msg_id fixed32 = 1; timestamp fixed64 = 2; msg bytes = 3}. */
@@ -1307,7 +1472,7 @@ ssc_handle_body(uint64_t low, uint64_t high, const uint8_t *p, uint32_t len)
 		waiting = ssc.attr.waiting && ssc.attr.low == low && ssc.attr.high == high;
 		lck_spin_unlock(&ssc_lock);
 		if (waiting) {
-			ssc_attr_response(msg, msg_len);
+			ssc_attr_response(type, msg, msg_len);
 			lck_spin_lock(&ssc_lock);
 			if (ssc.attr.waiting && ssc.attr.low == low && ssc.attr.high == high) {
 				ssc.attr.seq++;
@@ -1316,11 +1481,16 @@ ssc_handle_body(uint64_t low, uint64_t high, const uint8_t *p, uint32_t len)
 		}
 		return;
 	}
-	if (msg_id == SSC_MSG_SENSOR_SAMPLE) {
+	if (msg_id == SSC_MSG_SENSOR_SAMPLE || msg_id == SSC_MSG_PROXIMITY_SAMPLE) {
 		lck_spin_lock(&ssc_lock);
-		waiting = ssc.stream.type == type;
+		waiting = ssc.stream[type].streaming;
 		lck_spin_unlock(&ssc_lock);
-		if (waiting) {
+		if (!waiting) {
+			return;
+		}
+		if (type == SSC_PROXIMITY) {
+			ssc_proximity_response(msg, msg_len, timestamp, msg_id);
+		} else if (msg_id == SSC_MSG_SENSOR_SAMPLE) {
 			ssc_sample_response(type, msg, msg_len, timestamp);
 		}
 		return;
@@ -1878,9 +2048,14 @@ ssc_attributes(struct ssc_link *q, uint32_t node, uint32_t port, unsigned type,
 	}
 }
 
-static void
-ssc_stream(struct ssc_link *q, uint32_t node, uint32_t port, unsigned type,
-    uint64_t low, uint64_t high, uint32_t hz, uint32_t secs, bool forever)
+/*
+ * Turn one stream on. A sampled stream gets msg 513 with SscEnableConfigRequest{sample_rate}
+ * (data/ssc-common.proto:149-155); an on-change stream gets msg 514 with no payload. The config
+ * answer is printed exactly as level 5 always has. True when the request went out.
+ */
+static bool
+ssc_stream_start(struct ssc_link *q, uint32_t node, uint32_t port, unsigned type,
+    uint64_t low, uint64_t high, uint32_t hz, bool on_change)
 {
 	struct pbuf b;
 	uint32_t seen;
@@ -1889,40 +2064,49 @@ ssc_stream(struct ssc_link *q, uint32_t node, uint32_t port, unsigned type,
 	char mode[32];
 	bool has_mode = false;
 	bool configured = false;
-	uint16_t txn, result, error;
-	uint32_t count;
-	int32_t last[3] = { 0, 0, 0 };
-	int32_t accuracy = 0;
-	uint64_t timestamp = 0;
-	bool has_latest = false;
+	uint16_t txn;
 	int err;
 
 	memset(mode, 0, sizeof(mode));
 
 	lck_spin_lock(&ssc_lock);
-	ssc.stream.type = (int)type;
-	ssc.stream.count = 0;
-	ssc.stream.has = false;
+	ssc.stream[type].streaming = true;
+	ssc.stream[type].count = 0;
+	ssc.stream[type].has = false;
 	seen = ssc.config.seq;
 	lck_spin_unlock(&ssc_lock);
+
+	if (on_change) {
+		/* On-change enable: msg 514 with no SscClientRequestBody.msg. */
+		err = ssc_send(q, node, port, low, high, SSC_MSG_514, NULL, 0, false, &txn);
+		if (err != 0) {
+			say("vayu-ssc: %s: on-change send failed (%d)\n", ssc_type_name[type], err);
+			lck_spin_lock(&ssc_lock);
+			ssc.stream[type].streaming = false;
+			lck_spin_unlock(&ssc_lock);
+			return false;
+		}
+		say("vayu-ssc: %s: enabled on-change (msg 514)\n", ssc_type_name[type]);
+		return true;
+	}
 
 	pb_init(&b, enc_leaf, sizeof(enc_leaf));
 	pb_fixed32(&b, 1, u32_to_f32_bits(hz));	/* SscEnableConfigRequest{sample_rate = 1} */
 	if (b.bad) {
 		say("vayu-ssc: %s: enable request too large\n", ssc_type_name[type]);
 		lck_spin_lock(&ssc_lock);
-		ssc.stream.type = -1;
+		ssc.stream[type].streaming = false;
 		lck_spin_unlock(&ssc_lock);
-		return;
+		return false;
 	}
 	err = ssc_send(q, node, port, low, high, SSC_MSG_ENABLE_CONFIG,
 	    b.data, b.len, true, &txn);
 	if (err != 0) {
 		say("vayu-ssc: %s: enable send failed (%d)\n", ssc_type_name[type], err);
 		lck_spin_lock(&ssc_lock);
-		ssc.stream.type = -1;
+		ssc.stream[type].streaming = false;
 		lck_spin_unlock(&ssc_lock);
-		return;
+		return false;
 	}
 
 	for (uint32_t waited = 0; ; waited += 10) {
@@ -1953,26 +2137,23 @@ ssc_stream(struct ssc_link *q, uint32_t node, uint32_t port, unsigned type,
 	} else {
 		say("vayu-ssc: %s: no config answer\n", ssc_type_name[type]);
 	}
+	return true;
+}
 
-	if (forever) {
-		/* level 6: the stream stays on for iOS (/dev/vayu-motion) until the run ends */
-		uint32_t said = 0;
+static void
+ssc_stream(struct ssc_link *q, uint32_t node, uint32_t port, unsigned type,
+    uint64_t low, uint64_t high, uint32_t hz, uint32_t secs)
+{
+	uint16_t txn, result, error;
+	uint32_t count;
+	int32_t last[3] = { 0, 0, 0 };
+	int32_t accuracy = 0;
+	uint64_t timestamp = 0;
+	bool has_latest = false;
+	int err;
 
-		say("vayu-ssc: %s: STREAMING for iOS (/dev/vayu-motion) until the run ends\n", ssc_type_name[type]);
-		for (uint32_t s = 1; !ssc_leaving; s++) {
-			IOSleep(1000);
-			if (s % 30 == 0 && said++ < 40) {
-				lck_spin_lock(&ssc_lock);
-				count = ssc.stream.count;
-				last[0] = ssc.stream.last[0];
-				last[1] = ssc.stream.last[1];
-				last[2] = ssc.stream.last[2];
-				lck_spin_unlock(&ssc_lock);
-				say("vayu-ssc: %s: +%u s: %u samples, latest %d %d %d mm/s^2\n", ssc_type_name[type], s, count,
-				    last[0], last[1], last[2]);
-			}
-		}
-		return;         /* (no disable: the SLPI is being stopped) */
+	if (!ssc_stream_start(q, node, port, type, low, high, hz, false)) {
+		return;
 	}
 	{
 		uint64_t t0 = ssc_now_ns();
@@ -1989,13 +2170,13 @@ ssc_stream(struct ssc_link *q, uint32_t node, uint32_t port, unsigned type,
 				IOSleep(10);
 			}
 			lck_spin_lock(&ssc_lock);
-			count = ssc.stream.count;
-			has_latest = ssc.stream.has;
-			last[0] = ssc.stream.last[0];
-			last[1] = ssc.stream.last[1];
-			last[2] = ssc.stream.last[2];
-			accuracy = ssc.stream.accuracy;
-			timestamp = ssc.stream.timestamp;
+			count = ssc.stream[type].count;
+			has_latest = ssc.stream[type].has;
+			last[0] = ssc.stream[type].last[0];
+			last[1] = ssc.stream[type].last[1];
+			last[2] = ssc.stream[type].last[2];
+			accuracy = ssc.stream[type].accuracy;
+			timestamp = ssc.stream[type].timestamp;
 			lck_spin_unlock(&ssc_lock);
 			if (has_latest) {
 				char x[16], y[16], z[16];
@@ -2015,7 +2196,7 @@ ssc_stream(struct ssc_link *q, uint32_t node, uint32_t port, unsigned type,
 	}
 
 	lck_spin_lock(&ssc_lock);
-	count = ssc.stream.count;
+	count = ssc.stream[type].count;
 	lck_spin_unlock(&ssc_lock);
 	say("vayu-ssc: %s: %u samples in %u s (≈%u Hz)\n", ssc_type_name[type], count, secs,
 	    secs != 0 ? (count + secs / 2) / secs : 0);
@@ -2032,13 +2213,75 @@ ssc_stream(struct ssc_link *q, uint32_t node, uint32_t port, unsigned type,
 	}
 
 	lck_spin_lock(&ssc_lock);
-	ssc.stream.type = -1;
+	ssc.stream[type].streaming = false;
 	lck_spin_unlock(&ssc_lock);
 }
 
+/* Level 6: one 30-s line for all streams that are on, until the run ends. */
+static void
+ssc_level6_wait(void)
+{
+	uint32_t said = 0;
+
+	for (uint32_t s = 1; !ssc_leaving; s++) {
+		IOSleep(1000);
+		if (s % 30 == 0 && said++ < 40) {
+			uint32_t accel_count, light_count, prox_count;
+			int32_t accel_last[3];
+			int32_t light_lux, prox_near, prox_distance;
+			bool light_has, prox_has;
+			bool light_on, prox_on;
+
+			lck_spin_lock(&ssc_lock);
+			accel_count = ssc.stream[SSC_ACCEL].count;
+			accel_last[0] = ssc.stream[SSC_ACCEL].last[0];
+			accel_last[1] = ssc.stream[SSC_ACCEL].last[1];
+			accel_last[2] = ssc.stream[SSC_ACCEL].last[2];
+			light_on = ssc.stream[SSC_LIGHT].streaming;
+			light_count = ssc.stream[SSC_LIGHT].count;
+			light_has = ssc.stream[SSC_LIGHT].has;
+			light_lux = ssc.stream[SSC_LIGHT].last[0];
+			prox_on = ssc.stream[SSC_PROXIMITY].streaming;
+			prox_count = ssc.stream[SSC_PROXIMITY].count;
+			prox_has = ssc.stream[SSC_PROXIMITY].has;
+			prox_near = ssc.stream[SSC_PROXIMITY].last[0];
+			prox_distance = ssc.stream[SSC_PROXIMITY].last[1];
+			lck_spin_unlock(&ssc_lock);
+
+			say("vayu-ssc: %s: +%u s: %u samples, latest %d %d %d mm/s^2",
+			    ssc_type_name[SSC_ACCEL], s, accel_count,
+			    accel_last[0], accel_last[1], accel_last[2]);
+			if (light_on) {
+				if (light_has) {
+					char l[16];
+
+					fmt_milli(l, sizeof(l), light_lux);
+					say(", ambient_light %u samples, latest %s lux",
+					    light_count, l);
+				} else {
+					say(", ambient_light %u samples, no sample yet",
+					    light_count);
+				}
+			}
+			if (prox_on) {
+				if (prox_has) {
+					say(", proximity %u samples, latest near %d distance %d",
+					    prox_count, prox_near, prox_distance);
+				} else {
+					say(", proximity %u samples, no sample yet",
+					    prox_count);
+				}
+			}
+			say("\n");
+		}
+	}
+}
+
 /*
- * /dev/vayu-motion (level 6): a read gives the latest accelerometer sample as struct vayu_motion
- * (sys/vayu_ssc.h); seq 0 means none yet. Never blocks: the reader polls at its own rate.
+ * /dev/vayu-motion (level 6): a read gives the latest accelerometer, ambient-light and proximity
+ * samples as struct vayu_motion (sys/vayu_ssc.h); seq 0 means none yet. A reader that asks for at
+ * least the v1 prefix gets it, a longer one gets up to the whole v2. Never blocks: the reader polls
+ * at its own rate.
  */
 static int
 motion_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
@@ -2050,8 +2293,13 @@ static int
 motion_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 {
 	struct vayu_motion m = { .version = VAYU_MOTION_VERSION };
+	bool asked_v1 = uio_resid(uio) < (user_ssize_t)sizeof(m);
 	uint64_t now = ssc_now_ns();
+	/* The v1 prefix: version, seq, accel_mm_s2[3], age_ms. */
+	size_t v1 = sizeof(m.version) + sizeof(m.seq) + sizeof(m.accel_mm_s2) + sizeof(m.age_ms);
+	size_t n;
 
+	m.prox_near = -1;			/* unknown until a proximity sample */
 	lck_spin_lock(&ssc_lock);
 	if (ssc.accel_valid) {
 		m.seq = accel_seq;
@@ -2060,11 +2308,29 @@ motion_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		m.accel_mm_s2[2] = ssc.accel_mm[2];
 		m.age_ms = (uint32_t)((now > ssc.accel_ns ? now - ssc.accel_ns : 0) / 1000000ULL);
 	}
+	if (ssc.light_valid) {
+		m.light_seq = light_seq;
+		m.lux_milli = ssc.light_lux_milli;
+		m.light_age_ms = (uint32_t)((now > ssc.light_ns ? now - ssc.light_ns : 0) / 1000000ULL);
+	}
+	if (ssc.prox_valid) {
+		m.prox_seq = prox_seq;
+		m.prox_near = ssc.prox_near;
+		m.prox_distance = ssc.prox_distance;
+		m.prox_age_ms = (uint32_t)((now > ssc.prox_ns ? now - ssc.prox_ns : 0) / 1000000ULL);
+	}
 	lck_spin_unlock(&ssc_lock);
-	if (uio_resid(uio) < (user_ssize_t)sizeof(m)) {
+	if (uio_resid(uio) < (user_ssize_t)v1) {
 		return EINVAL;
 	}
-	return uiomove((caddr_t)&m, sizeof(m), uio);
+	if (asked_v1) {
+		m.version = 1;          /* a reader of the v1 size (userland/src/motion.c) checks for version 1, and gets the v1 prefix */
+	}
+	n = (size_t)uio_resid(uio);
+	if (n > sizeof(m)) {
+		n = sizeof(m);
+	}
+	return uiomove((caddr_t)&m, n, uio);
 }
 
 static const struct cdevsw motion_cdevsw = {
@@ -2088,7 +2354,7 @@ motion_node(void)
 		return false;
 	}
 	made = true;
-	say("vayu-ssc: /dev/vayu-motion (0444) is made: the latest accelerometer sample, struct vayu_motion\n");
+	say("vayu-ssc: /dev/vayu-motion (0444) is made: the latest accelerometer, ambient-light and proximity samples, struct vayu_motion\n");
 	return true;
 }
 
@@ -2220,26 +2486,59 @@ vayu_ssc_run(const struct hakios_qrtr_ops *ops, uint32_t node, uint32_t port, ui
 			}
 			lck_spin_unlock(&ssc_lock);
 			if (have) {
-				ssc_stream(q, node, port, t, low, high, hz, secs, false);
+				ssc_stream(q, node, port, t, low, high, hz, secs);
 			}
 		}
 	}
 
 	if (level >= 6) {
-		uint64_t low = 0, high = 0;
-		bool have = false;
+		unsigned order[3] = { SSC_ACCEL, SSC_LIGHT, SSC_PROXIMITY };
+		unsigned wanted = 1;
+		uint32_t als = 0;
+		bool started = false;
 
-		lck_spin_lock(&ssc_lock);
-		if (ssc.suid[SSC_ACCEL].stored != 0) {
-			low = ssc.suid[SSC_ACCEL].low[0];
-			high = ssc.suid[SSC_ACCEL].high[0];
-			have = true;
+		/* vayu_ssc_als=1: also the ambient-light and proximity streams (default: the accelerometer alone, as before) */
+		PE_parse_boot_argn("vayu_ssc_als", &als, sizeof(als));
+		if (als != 0) {
+			wanted = 3;
 		}
-		lck_spin_unlock(&ssc_lock);
-		if (have && motion_node()) {
-			ssc_stream(q, node, port, SSC_ACCEL, low, high, hz, 0, true);
-		} else if (!have) {
-			say("vayu-ssc: 6: no accelerometer: nothing to stream for iOS\n");
+		for (unsigned k = 0; k < wanted; k++) {
+			uint64_t low = 0, high = 0;
+			bool have = false;
+			bool on_change = false;
+			uint32_t rate = hz;
+
+			t = order[k];
+			lck_spin_lock(&ssc_lock);
+			if (ssc.suid[t].stored != 0) {
+				low = ssc.suid[t].low[0];
+				high = ssc.suid[t].high[0];
+				have = true;
+			}
+			if (t == SSC_LIGHT) {
+				on_change = ssc.attrs[SSC_LIGHT].has_stream_type &&
+				    ssc.attrs[SSC_LIGHT].stream_type == 1;
+			}
+			lck_spin_unlock(&ssc_lock);
+			if (!have) {
+				say("vayu-ssc: 6: no %s: not streamed\n", ssc_type_name[t]);
+				continue;
+			}
+			if (t == SSC_LIGHT) {
+				rate = on_change ? 0 : 5;	/* 5 Hz when it is not on-change */
+			} else if (t == SSC_PROXIMITY) {
+				on_change = true;
+				rate = 0;
+			}
+			if (ssc_stream_start(q, node, port, t, low, high, rate, on_change)) {
+				started = true;
+				say("vayu-ssc: %s: STREAMING for iOS (/dev/vayu-motion) until the run ends\n",
+				    ssc_type_name[t]);
+			}
+		}
+		if (started) {
+			motion_node();
+			ssc_level6_wait();
 		}
 	}
 
