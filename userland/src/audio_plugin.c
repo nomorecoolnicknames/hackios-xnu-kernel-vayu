@@ -64,6 +64,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "hakios.audio.h"
@@ -1125,6 +1126,8 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 static int mic = -1;
 static UInt64 mic_frames, mic_heard, mic_short;
 static int mic_peak;
+static time_t mic_retry_at;
+static int mic_retry_said;
 
 static void
 codec_open(void)
@@ -1145,11 +1148,34 @@ codec_close(void)
 		close(mic);
 	}
 	mic = -1;
+	mic_retry_at = 0;
+	mic_retry_said = 0;
 }
 
 static void
 codec_read(int16_t *samples, UInt32 frames)
 {
+	/*
+	 * The node is made at boot, but start_io() can run before it exists (or the open can fail
+	 * once): the old code then gave zeros for the whole I/O cycle, because it retried only on
+	 * the next StartIO. Try again once a second while the input is running; one failure line,
+	 * not one a second.
+	 */
+	if (mic < 0) {
+		time_t now = time(NULL);
+
+		if (mic_retry_at == 0 || now - mic_retry_at >= 1) {
+			mic_retry_at = now;
+			mic = open("/dev/hakios-mic", O_RDONLY | O_NONBLOCK);
+			if (mic >= 0) {
+				say("hakios: audio: /dev/hakios-mic opened late: the input starts from here\n");
+			} else if (!mic_retry_said) {
+				mic_retry_said = 1;
+				say("hakios: audio: /dev/hakios-mic is not open (%s): the input is silent until it is\n",
+				    strerror(errno));
+			}
+		}
+	}
 	ssize_t got = mic >= 0 ? read(mic, samples, (size_t)frames * 2) : -1;
 	UInt32 have = got > 0 ? (UInt32)got / 2 : 0;
 
