@@ -55,6 +55,23 @@
  * coordinates as in the Goodix driver. nvt_spi_us=N sets the bit-bang half period
  * (1 us by default, about 500 kHz).
  *
+ * touch_hz=N instead samples the panel at N Hz (touch_hz=240: every 4166 us) and paces the
+ * reads by their own start, so that the period is the period and not the period plus the
+ * work. With the flag the page-set transfer is skipped while reports keep coming (the page
+ * cannot change by itself), the timestamp handed to hakios_touch_post_at() is the instant
+ * the read began rather than the instant it ended (0.85 ms earlier), and the minute line
+ * reports how many reads per second and how many *new* reports per second the chip really
+ * produces -- which is the number to compare with the 240 Hz Android sees. touch_hz also
+ * lifts the QUP clock (vayu_qup_spi.c) to 9.6 MHz, the 10 MHz of the panel's device tree,
+ * because at 960 kHz one 67-byte report costs 0.85 ms of a 4.17 ms period.
+ *
+ * nvt_cmd=0xNN sends one NVT host command (event buffer + 0x50, the register the firmware
+ * download already uses for 0xAE) after the download and prints the answer: the vendor's
+ * report-rate / game-mode command, if this firmware has one, is expected there.
+ * touch_tail=1 prints the five bytes that follow the ten six-byte records every 750 looks:
+ * they are unused by this driver, and a counter that moves at the panel's report rate would
+ * be a chip-side timestamp.
+ *
  * This file was written from the sources named above and has never run on the phone.
  * Code inspection says the addresses and the protocol are the vendor's; whether the
  * panel is already powered and out of reset when XNU starts, and whether the bit-banged
@@ -112,6 +129,10 @@ extern bool vayu_qup_nvt_resx(bool high);
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
 static bool nvt_qup;            /* boot arg nvt_qup=1 or touch_driver=nvt_qup */
+static uint32_t touch_hz;       /* boot arg touch_hz=N: sample at N Hz (0: touch_poll_us) */
+static uint32_t nvt_host_cmd;   /* boot arg nvt_cmd=0xNN: one host command, after the download */
+static bool touch_tail;         /* boot arg touch_tail=1: show the five bytes after the records */
+static bool page_held;          /* the event-buffer page is selected and the last look saw data */
 
 /* ---- pins (TLMM) ------------------------------------------------------------------------------- */
 
@@ -385,6 +406,28 @@ nvt_fw_info(uint32_t map, uint8_t *info)
 	x = (uint32_t)info[4] << 8 | info[5];
 	y = (uint32_t)info[6] << 8 | info[7];
 	return x >= 100 && x <= 10000 && y >= 100 && y <= 10000;
+}
+
+/*
+ * The whole 17-byte block, once per boot: this driver reads only the version pair and the panel
+ * size out of it. If the firmware states its report period anywhere, it is likely here (a byte
+ * 0x78 = 120 or 0xf0 = 240, a word 0x1046 = 4166 us = 240 Hz, 0x208d = 8333 us = 120 Hz).
+ */
+static void
+nvt_fw_info_dump(const uint8_t *info, unsigned length)
+{
+	char text[3 * 17 + 1];
+	char *p = text;
+
+	for (unsigned i = 0; i < length && i < 17; i++) {
+		*p++ = "0123456789abcdef"[info[i] >> 4];
+		*p++ = "0123456789abcdef"[info[i] & 0xf];
+		if (i + 1 < length && i + 1 < 17) {
+			*p++ = ' ';
+		}
+	}
+	*p = 0;
+	printf("nvt: fw info %s\n", text);
 }
 
 /* ---- firmware download: vayu's NT36675 is flashless ------------------------------------------- */
@@ -693,7 +736,9 @@ nvt_probe(void)
 				max_y = (uint32_t)info[6] << 8 | info[7];
 				printf("nvt: firmware already running (no reset): %u (type %#x), panel %u x %u, event buffer at %#x\n",
 				    info[0], info[13], max_x, max_y, event_map);
+				nvt_fw_info_dump(info, sizeof(info));
 				nvt_set_page(event_map);
+				page_held = true;
 				return true;
 			}
 		}
@@ -769,7 +814,9 @@ nvt_probe(void)
 				max_y = (uint32_t)info[6] << 8 | info[7];
 				printf("nvt: firmware %u (type %#x), panel %u x %u, event buffer at %#x\n", info[0],
 				    info[13], max_x, max_y, event_map);
+				nvt_fw_info_dump(info, sizeof(info));
 				nvt_set_page(event_map);        /* report reads start at offset 0 of this page */
+				page_held = true;
 				return true;
 			}
 		}
@@ -792,6 +839,7 @@ nvt_probe(void)
 	    "event buffer at %#x (chip %s); flashless chip -- no firmware download yet, expect blank reports\n", max_x, max_y,
 	    event_map, chip ? chip : "?");
 	nvt_set_page(event_map);
+	page_held = true;
 	return true;
 }
 
@@ -803,8 +851,11 @@ static struct {
 } contact[NVT_MAX_TOUCHES];
 
 static struct {
-	uint32_t polls, reports, touches, bad, last_x, last_y;
+	uint32_t polls, reports, fresh, touches, bad, last_x, last_y;
 } seen;
+
+/* The previous non-blank report: what differs from it is a *new* report from the chip (seen.fresh). */
+static uint8_t last_report[NVT_REPORT_SIZE];
 
 static uint32_t
 scale(uint32_t value, uint32_t maximum)
@@ -819,7 +870,7 @@ scale(uint32_t value, uint32_t maximum)
 }
 
 static void
-nvt_report(const uint8_t *report)
+nvt_report(const uint8_t *report, uint64_t time)
 {
 	bool present[NVT_MAX_TOUCHES] = { false };
 	static unsigned shown;
@@ -856,9 +907,9 @@ nvt_report(const uint8_t *report)
 		}
 		if (!contact[id - 1].down) {
 			contact[id - 1].down = true;
-			hakios_touch_post(HAKIOS_TOUCH_DOWN, id - 1, x, y);
+			hakios_touch_post_at(HAKIOS_TOUCH_DOWN, id - 1, x, y, time);
 		} else if (contact[id - 1].x != x || contact[id - 1].y != y) {
-			hakios_touch_post(HAKIOS_TOUCH_MOVE, id - 1, x, y);
+			hakios_touch_post_at(HAKIOS_TOUCH_MOVE, id - 1, x, y, time);
 		}
 		contact[id - 1].x = x;
 		contact[id - 1].y = y;
@@ -867,44 +918,68 @@ nvt_report(const uint8_t *report)
 	for (unsigned i = 0; i < NVT_MAX_TOUCHES; i++) {
 		if (contact[i].down && !present[i]) {
 			contact[i].down = false;
-			hakios_touch_post(HAKIOS_TOUCH_UP, i, contact[i].x, contact[i].y);
+			hakios_touch_post_at(HAKIOS_TOUCH_UP, i, contact[i].x, contact[i].y, time);
 		}
 	}
 }
 
 /* A blank report means no finger, and also that a reset must not leave one held down. */
 static void
-nvt_release_all(void)
+nvt_release_all(uint64_t time)
 {
 	for (unsigned i = 0; i < NVT_MAX_TOUCHES; i++) {
 		if (contact[i].down) {
 			contact[i].down = false;
-			hakios_touch_post(HAKIOS_TOUCH_UP, i, contact[i].x, contact[i].y);
+			hakios_touch_post_at(HAKIOS_TOUCH_UP, i, contact[i].x, contact[i].y, time);
 		}
 	}
 }
 
+/*
+ * One look at the event buffer, stamped with the time it began (at): the chip is a snapshot, not a
+ * queue, so the position it holds now was taken somewhere in the last report period, and the read
+ * itself takes 0.85 ms at 960 kHz -- stamping the end would add that to every sample.
+ *
+ * The page set (three bytes, a whole extra transfer) is skipped while the previous look found data:
+ * the page is a register the chip keeps, and a finger that keeps producing reports proves the chip
+ * did not reset. A blank look sets it again, so a reset or an ESD event costs one look, not the
+ * session. That is what makes a 4 ms period fit: 3 + 67 bytes became 67.
+ */
 static void
-nvt_poll(void)
+nvt_poll(uint64_t at)
 {
 	uint8_t report[NVT_REPORT_SIZE];
 	bool blank = true;
 
 	seen.polls++;
-	/* the page could have been lost to a reset or an ESD event; setting it is three bytes */
-	if (!nvt_set_page(event_map) || !nvt_read(0x00, report, sizeof(report))) {
+	if (!page_held && !nvt_set_page(event_map)) {
 		seen.bad++;
+		return;
+	}
+	if (!nvt_read(0x00, report, sizeof(report))) {
+		seen.bad++;
+		page_held = false;
 		return;
 	}
 	for (unsigned i = 0; i < sizeof(report); i++) {
 		blank &= report[i] == 0 || report[i] == 0xff;
 	}
 	if (blank) {                            /* no finger, or the chip reset: nothing may stay down */
-		nvt_release_all();
+		page_held = false;
+		nvt_release_all(at);
 		return;
 	}
+	page_held = true;
 	seen.reports++;
-	nvt_report(report);
+	if (memcmp(report, last_report, sizeof(report)) != 0) {
+		seen.fresh++;
+		memcpy(last_report, report, sizeof(report));
+	}
+	if (touch_tail && (seen.polls % 750) == 0) {
+		printf("nvt: tail %02x %02x %02x %02x %02x (after the ten records)\n", report[60], report[61],
+		    report[62], report[63], report[64]);
+	}
+	nvt_report(report, at);
 }
 
 /* ---- all of it together ------------------------------------------------------------------------- */
@@ -921,6 +996,32 @@ nvt_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	if (poll_us > 100000) {
 		poll_us = 100000;
+	}
+	/*
+	 * touch_hz=N: the sample rate, not the sleep. 240 Hz is 4166 us and is what Android sees from
+	 * this panel; the number the chip really produces is printed once a minute (see "new reports").
+	 * touch_hz wins over touch_poll_us when both are given.
+	 */
+	if (PE_parse_boot_argn("touch_hz", &touch_hz, sizeof(touch_hz))) {
+		if (touch_hz >= 30 && touch_hz <= 2000) {
+			poll_us = 1000000 / touch_hz;
+			if (poll_us < 500) {
+				poll_us = 500;
+			}
+		} else {
+			printf("nvt: touch_hz=%u is outside 30..2000; using touch_poll_us=%u\n", touch_hz, poll_us);
+			touch_hz = 0;
+		}
+	}
+	{
+		uint32_t tail = 0, command = 0;
+
+		if (PE_parse_boot_argn("touch_tail", &tail, sizeof(tail))) {
+			touch_tail = tail != 0;
+		}
+		if (PE_parse_boot_argn("nvt_cmd", &command, sizeof(command))) {
+			nvt_host_cmd = command & 0xff;
+		}
 	}
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
 	PE_parse_boot_argn("nvt_spi_us", &spi_half_us, sizeof(spi_half_us));
@@ -993,27 +1094,80 @@ nvt_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 		return;
 	}
-	printf("nvt: touch screen ready; the event buffer is read every %u us; interrupt line %s\n", poll_us,
+	printf("nvt: touch screen ready; the event buffer is read every %u us (%u Hz)%s; interrupt line %s\n", poll_us,
+	    poll_us != 0 ? 1000000 / poll_us : 0, touch_hz != 0 ? ", paced by the read's start" : "",
 	    nvt_qup ? "polled, not used" : (skip_rails ? "not used" : (gpio_get(PIN_INT) ? "high" : "low")));
 
+	/*
+	 * nvt_cmd=0xNN: one host command to the event buffer's command register (+0x50), the register the
+	 * firmware download writes 0xAE to; the vendor's report-rate / game-mode command, if this firmware
+	 * has one, goes here. Off unless asked for, and the answer is printed.
+	 */
+	if (nvt_host_cmd != 0) {
+		uint8_t command = (uint8_t)nvt_host_cmd, answer[5] = { 0 };
+
+		nvt_set_page(event_map | NVT_EVENT_MAP_HOST_CMD);
+		if (nvt_write(NVT_EVENT_MAP_HOST_CMD, &command, 1)) {
+			nvt_read(NVT_EVENT_MAP_HOST_CMD, answer, sizeof(answer));
+			printf("nvt: host command %02x sent; answer %02x %02x %02x %02x %02x\n", command, answer[0], answer[1],
+			    answer[2], answer[3], answer[4]);
+		} else {
+			printf("nvt: host command %02x not written\n", command);
+		}
+		nvt_set_page(event_map);
+		page_held = true;
+	}
+
+	uint64_t period = 0, next = mach_absolute_time(), status_at = next;
+	uint32_t status_polls = 0, status_fresh = 0;
+
+	if (touch_hz != 0) {
+		nanoseconds_to_absolutetime((uint64_t)poll_us * NSEC_PER_USEC, &period);
+	}
 	for (unsigned tick = 1;; tick++) {
 		uint64_t before = mach_absolute_time(), after;
 
-		nvt_poll();
+		nvt_poll(before);
 		after = mach_absolute_time();
 		reading += after - before;
 		reads++;
 		if (tick % status_every == 0) {
-			uint64_t ns;
+			uint64_t ns, span;
+			uint32_t looks = seen.polls - status_polls, fresh = seen.fresh - status_fresh;
 
 			absolutetime_to_nanoseconds(reading / reads, &ns);
-			printf("nvt: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
-			    "interrupt line %s; a report takes %llu us; %u us between reads\n", seen.reports, seen.polls,
-			    seen.bad, seen.touches, seen.last_x, seen.last_y,
+			absolutetime_to_nanoseconds(after - status_at, &span);
+			status_at = after;
+			status_polls = seen.polls;
+			status_fresh = seen.fresh;
+			printf("nvt: so far %u reports in %u looks (%u new, %u bad), %u finger positions, the last at %u, %u; "
+			    "interrupt line %s; a report takes %llu us; every %u us: %u looks/s, %u new reports/s%s\n",
+			    seen.reports, seen.polls, seen.fresh, seen.bad, seen.touches, seen.last_x, seen.last_y,
 			    nvt_qup ? "polled, not used" : (skip_rails ? "not used" : (gpio_get(PIN_INT) ? "high" : "low")),
-			    (unsigned long long)(ns / 1000), poll_us);
+			    (unsigned long long)(ns / 1000), poll_us,
+			    span != 0 ? (uint32_t)((uint64_t)looks * 1000000000ULL / span) : 0,
+			    span != 0 ? (uint32_t)((uint64_t)fresh * 1000000000ULL / span) : 0,
+			    touch_hz != 0 ? ", paced" : "");
 		}
-		sleep_us(poll_us);
+		if (touch_hz != 0) {
+			/*
+			 * The next look is due one period after the previous one was due, not one period after
+			 * the work ended: the sleep is short, but the wake is late, and at 4 ms both matter.
+			 */
+			next += period;
+			if (after < next) {
+				uint64_t wait;
+
+				absolutetime_to_nanoseconds(next - after, &wait);
+				if (wait >= 1000) {
+					sleep_us((uint32_t)(wait / 1000));
+				}
+			} else if (after - next > 4 * period) {
+				next = after;           /* a long stall: start again from here, do not burst */
+			}
+		} else {
+			sleep_us(poll_us);
+		}
 	}
 }
 

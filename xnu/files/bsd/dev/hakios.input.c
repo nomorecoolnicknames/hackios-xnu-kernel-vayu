@@ -117,7 +117,7 @@ count_fingers(uint32_t type, uint32_t finger)
 }
 
 static void
-touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
+touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time, bool from_driver)
 {
 	struct hakios_touch *t;
 
@@ -126,7 +126,7 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 		touch_head++;                   /* nobody reads: drop the oldest */
 	}
 	t = &touch_queue[touch_tail++ % TOUCH_QUEUE];
-	t->time = mach_absolute_time();
+	t->time = time != 0 ? time : mach_absolute_time();
 	if (latency_lines()) {
 		uint64_t ns;
 
@@ -147,7 +147,7 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 extern uint32_t hakios_display_crop[6];        /* MiniIOMobileFramebuffer.cpp, fb_fit=1 */
 
 void
-hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
+hakios_touch_post_at(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time)
 {
 	uint32_t panel_h = os_atomic_load(&hakios_display_crop[5], acquire);
 
@@ -161,7 +161,13 @@ hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
 		x = (uint32_t)((px + hakios_display_crop[0]) * 65535 / hakios_display_crop[2]);
 		y = (uint32_t)((py + hakios_display_crop[1]) * 65535 / hakios_display_crop[3]);
 	}
-	touch_post(type, finger, x, y, true);
+	touch_post(type, finger, x, y, time, true);
+}
+
+void
+hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
+{
+	hakios_touch_post_at(type, finger, x, y, mach_absolute_time());
 }
 
 static int
@@ -218,7 +224,7 @@ touch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		if (t.type < HAKIOS_TOUCH_DOWN || t.type > HAKIOS_BUTTON_UP) {
 			return EINVAL;
 		}
-		touch_post(t.type, t.finger, t.x, t.y, false);
+		touch_post(t.type, t.finger, t.x, t.y, 0, false);
 	}
 	return error;
 }

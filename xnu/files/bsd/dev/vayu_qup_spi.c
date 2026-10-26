@@ -2696,8 +2696,20 @@ qup_parse_args(void)
 		qup_os = value;
 	}
 	if (PE_parse_boot_argn("nvt_qup_speed", &value, sizeof(value))) {
-		if (value >= 100000 && value <= 4800000) {
+		if (value >= 100000 && value <= 10000000) {     /* the panel's device tree allows 10 MHz */
 			qup_speed_hz = value;
+		}
+	} else {
+		uint32_t hz = 0;
+
+		/*
+		 * touch_hz>=200 (bsd/dev/vayu_nvt.c): one 67-byte report costs 0.85 ms of a 4.17 ms period
+		 * at the default 960 kHz, so the sampling rate cannot be raised without raising this. 9.6 MHz
+		 * is the 19.2 MHz XO divided by 2 and is still under the panel's own spi-max-frequency (10 MHz,
+		 * DT ts_novatek). nvt_qup_speed=1000000 restores the old clock.
+		 */
+		if (PE_parse_boot_argn("touch_hz", &hz, sizeof(hz)) && hz >= 200 && hz <= 2000) {
+			qup_speed_hz = 9600000;
 		}
 	}
 }
