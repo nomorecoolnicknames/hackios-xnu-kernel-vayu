@@ -1,0 +1,52 @@
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+# TEST3 tester variant, with the 2026-10-26 fixes: the NFC kickstart is first, the Music import
+# starts at +5 s (not +60) and is repaired in the same pass, and nothing waits 120 s -- the
+# 215010 session's boots were 8-53 s long and none of the tail ever ran.
+/redwood/bin/hello_dyn started by launchd
+/redwood/bin/svc_test
+/redwood/bin/surf_test
+/bin/ps -A
+/redwood/bin/mg_test
+# the processors: how many, and -- once the system has settled -- whether they work at the same time
+/redwood/bin/cpu_test
+/redwood/bin/cpu_test 240 &
+# where iOS sends its sound, once SpringBoard is up
+/redwood/bin/sound_test springboard route &
+# nfcd for the NFC bridge (vayu_nfc_ios=2). FIRST, not last: the old line sat after music_import
+# --wait 60, media_import --wait 75 and sleep 120, and no boot in 215010-run.log lived long enough
+# to reach it (no nfcd process appears in the whole log). /bin/launchctl is iOS's own; the
+# prefix's /var/jb/bin/launchctl is the fallback of the old line.
+/bin/launchctl kickstart -p system/com.apple.nfcd
+# a tester's song into the Music library: 5 s, not 60 -- and in the foreground, so the repair
+# below runs after the row is in, not beside it
+/redwood/bin/music_import --wait 5 /redwood/share/music/Тёмный_принц-Отвратительный_король.mp3 RDWD.mp3
+/redwood/bin/music_import --repair RDWD.mp3
+/redwood/bin/music_import --ml3 RDWD.mp3
+# ... and into the Files app (On My iPhone) with its cover, and the cover into Photos
+/redwood/bin/media_import --wait 5 --files /redwood/share/music/Тёмный_принц-Отвратительный_король.mp3 /redwood/share/music/Отвратительный_король.jpg --photos /redwood/share/music/Отвратительный_король.jpg &
+# USB networking (USB networking; kernel vayu_usbnet=3 usb_handover=1 usbnet_delay=60, en2 by ~+62 s): OpenSSH from the prefix
+# on port 22, root/mobile, key only, keys in /var/<user>/.ssh (the prefix's own homes are /var/jb/var/<user>: a test run
+# refused the key with a home-relative AuthorizedKeysFile); and en2 into use at every boot: configd's own service,
+# else DHCP (net_test ensure), then what configd has and a name resolved
+/var/jb/usr/sbin/sshd -D -e -h /var/root/.ssh/ssh_host_ed25519_key -o UsePAM=no -o PasswordAuthentication=no -o PermitRootLogin=prohibit-password -o AuthorizedKeysFile=/var/%u/.ssh/authorized_keys -o SetEnv=PATH=/usr/local/sbin:/var/jb/usr/local/sbin:/usr/local/bin:/var/jb/usr/local/bin:/usr/sbin:/var/jb/usr/sbin:/usr/bin:/var/jb/usr/bin:/sbin:/var/jb/sbin:/bin:/var/jb/bin &
+/redwood/bin/net_test ensure en2 20 waitaddr en2 240 waitdns 30 store State:/Network/(Service/.*/IPv4|Interface/en2/.*|Global/IPv4|Global/DNS) resolve example.com tcp 1.1.1.1 80 &
+# Sileo (system-ru3 has the Procursus rootless prefix as /jb; init grafts it onto /var/jb): the preparation the
+# bootstrap wants once per boot, after SpringBoard is up (as rc.jobs.jb; no network on vayu yet, so no apt-get update)
+/redwood/bin/sound_test springboard
+# iOS's first-boot data migrators, which our boot never ran (src/run_migrator.m, as mobile): live 2026-10-25
+# LaunchServices knew no plug-in (Files' On My iPhone provider -2001) and Music's sort data was missing
+/redwood/bin/ls_rebuild --check
+/redwood/bin/run_migrator 00LaunchServicesMigrator SystemAppMigrator MediaLibrary
+/redwood/bin/ls_rebuild --check
+/var/jb/bin/sh /var/jb/prep.sh
+# Files' On My iPhone: the directories fileproviderd needs, the app groups, and the enable the toggle asks for
+/var/jb/bin/sh /redwood/etc/fp-dirs.sh
+/redwood/bin/fp_enable --trace
+/usr/bin/fileproviderctl domain list
+# fileproviderd's log onto the console (it is in a file on the phone; owner15 had no ssh to fetch it)
+/var/jb/bin/sh /redwood/etc/fp-log.sh
+# GPU-B: LS has the LocalStorage plug-in but NSExtension (pkd) does not find it: what pkd finds per extension point
+/redwood/bin/ls_rebuild --check
+# what nfcd made of the bridge: after the INIT the hwspoof line must be in the kernel log
+/var/jb/bin/sleep 5
+/bin/launchctl print system/com.apple.nfcd
