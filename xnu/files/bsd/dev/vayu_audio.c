@@ -789,6 +789,15 @@ apr_post(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const 
  *                 channels 135/136), a 3 s capture (vayu_mic_secs=N, 1..30) through ASM session 2 and an ADM live
  *                 recording path, the level (peak and integer RMS) of each channel every second. Needs vayu_jack=2
  *                 (the codec); the speaker amplifiers are never touched.
+ *   vayu_sound_diag=1  with sound: the feeder's own numbers (the ring's fill at each refill, the periods the
+ *                 ring could not fill and the zeros written for them, the frames the sink dropped, the longest
+ *                 pass of the feeder and of watch(), which carries the amplifier's I2C); what is played does not
+ *                 change, the existing lines do not either (tester, 2026-10-26: the speaker crackles)
+ *   vayu_audio_fade=0  with vayu_sound=5: the watcher's digital volume in one write of each chip instead of the
+ *                 2 dB steps (each step is three I2C transactions and 1 ms: a fade from -110 dB to index 52
+ *                 holds the feeder ~130 ms, most of the DSP's 8 x 20 ms queue); default 1, the steps
+ *   vayu_sound_quiet_ms=N  with vayu_sound=5: how long iOS writes silence before the amplifier is faded out and
+ *                 shut down (default 3000; 0: never while the feeder runs)
  */
 extern lck_mtx_t hakios_smmu_lock;     /* (the SMMU's match registers and contexts: the Wi-Fi's and the GPU's take it too) */
 
@@ -2219,6 +2228,20 @@ static volatile uint64_t last_sound;            /* mach_absolute_time() of the l
 static bool guarded;                            /* vayu_sound=5: every period goes through hakios.guard.c */
 #define SILENCE                 8               /* samples no larger than this are silence (as hakios.audio.c's) */
 
+/*
+ * vayu_sound_diag=1: the feeder's own numbers (tester, 2026-10-26: the speaker crackles while music plays).
+ * Nothing here changes what is played; it answers the questions that "0 underflows" cannot: did the feeder
+ * ever have less than a period in the ring (zeros written where sound should be), was the ring ever full
+ * (frames dropped by the sink), and how long did a pass of the loop or a call into watch() take (the
+ * amplifier's I2C runs on the feeder's thread). Default 0: the log lines stay as they were.
+ */
+static uint32_t diag;
+static uint64_t sink_lost;                      /* frames ios_sink was given and the ring had no room for */
+static uint64_t starved_periods, starved_frames;/* periods the ring could not fill, and the zeros written for them */
+static uint32_t ring_low = ~0u, ring_high;      /* the ring's fill when a period came back: the least and the most */
+static uint64_t feed_gap_max, watch_max;        /* ns: the longest pass of the feeder, and the longest watch() in it */
+static uint32_t fade_steps = 1;                 /* vayu_audio_fade=0: the digital volume in one write, not 2 dB steps */
+
 /* From the writer's thread, under hakios.audio.c's lock: never waits. */
 static uint32_t
 ios_sink(const int16_t *frames, uint32_t count)
@@ -2244,6 +2267,7 @@ ios_sink(const int16_t *frames, uint32_t count)
 	OSMemoryBarrier();
 	ring_head = head + taken;
 	ios_frames += taken;
+	sink_lost += count - taken;
 	if (sound) {
 		last_sound = mach_absolute_time();
 	}
@@ -2273,6 +2297,16 @@ period_fill_ios(unsigned period)
 	int16_t *samples = (int16_t *)(buffer + 4096 * period);
 	uint32_t tail = ring_tail, waiting = ring_head - tail, n = waiting < PERIOD_FRAMES ? waiting : PERIOD_FRAMES;
 
+	if (waiting < PERIOD_FRAMES) {                  /* (the DSP gets zeros where iOS's sound should be) */
+		starved_periods++;
+		starved_frames += PERIOD_FRAMES - waiting;
+	}
+	if (waiting < ring_low) {
+		ring_low = waiting;
+	}
+	if (waiting > ring_high) {
+		ring_high = waiting;
+	}
 	for (uint32_t i = 0; i < n; i++) {
 		int16_t left = ring[2 * ((tail + i) % RING_FRAMES)], right = ring[2 * ((tail + i) % RING_FRAMES) + 1];
 		uint32_t l = left < 0 ? (uint32_t)-(int32_t)left : (uint32_t)left, r = right < 0 ? (uint32_t)-(int32_t)right : (uint32_t)right;
@@ -2320,6 +2354,8 @@ period_fill_ios(unsigned period)
  */
 #define QUIET_BEFORE_OFF_NS     (3ull * NSEC_PER_SEC)
 
+static uint64_t quiet_before_off = QUIET_BEFORE_OFF_NS; /* vayu_sound_quiet_ms; 0: the amplifier is never stopped */
+
 static struct {
 	bool amp;                       /* vayu_audio_amp=1: the amplifier is really driven */
 	bool on, prepared, given_up, muted;
@@ -2356,6 +2392,24 @@ watch_fade(uint32_t to)
 {
 	if (audio_route_jack && vayu_jack_keep()) {
 		return;                         /* the dynamic route is on the headphones: the speaker amplifier is not ours to touch */
+	}
+	/*
+	 * vayu_audio_fade=0: the same end state in one write of each chip instead of 2 dB steps. The steps cost
+	 * about 2.5 ms each (three I2C transactions and 1 ms of sleep), so a fade from -110 dB to index 52 holds
+	 * the feeder for ~130 ms -- most of the DSP's 8 x 20 ms queue. Default 1: unchanged.
+	 */
+	if (!fade_steps) {
+		watcher.index = to;
+		if (watcher.amp && amp_ear_enabled && amp_ear.live && amp_ear.prepared &&
+		    !amp_dvc(&amp_ear, to < ear_dvc_index ? to : ear_dvc_index)) {
+			say("vayu-audio: 5: the earpiece's volume write failed at index %u: the earpiece is shut down\n", to);
+			amp_stop(&amp_ear);
+		}
+		if (watcher.amp && !amp_dvc(&amp_bottom, to)) {
+			say("vayu-audio: 5: the volume write failed at index %u: the amplifier is given up on\n", to);
+			watcher.given_up = true;
+		}
+		return;
 	}
 	while (watcher.index != to) {
 		watcher.index += watcher.index < to ? 1 : -1;
@@ -2482,7 +2536,7 @@ watch(void)
 		if (!watch_amp_up("iOS plays")) {
 			return;
 		}
-	} else if (watcher.on && since_sound > QUIET_BEFORE_OFF_NS) {
+	} else if (watcher.on && quiet_before_off != 0 && since_sound > quiet_before_off) {
 		say("vayu-audio: 5: what iOS wrote while it was on peaked at %u%% of full scale (%u)\n", ios_peak * 100 / 32768, ios_peak);
 		watch_stop("three seconds of silence", false);
 	} else if (watcher.on && watcher.amp) {
@@ -2666,10 +2720,22 @@ route_switch(bool to_jack)
 	return true;
 }
 
+/* The longer of a duration and *most, in nanoseconds: the feeder's own timings (vayu_sound_diag). */
+static void
+longest(uint64_t duration, uint64_t *most)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(duration, &ns);
+	if (ns > *most) {
+		*most = ns;
+	}
+}
+
 static bool
 feed(uint32_t secs)
 {
-	uint64_t began = mach_absolute_time(), last_report = began, last_level = began, last_route = began, last_switch = began, ns;
+	uint64_t began = mach_absolute_time(), last_report = began, last_level = began, last_route = began, last_switch = began, last_pass = began, ns;
 	uint32_t sent = 0, done_before = written_done, said = 0, levels_said = 0, limited_before = hakios_guard_limited();
 	bool ok = true;
 
@@ -2677,6 +2743,10 @@ feed(uint32_t secs)
 	ios_frames = fed_frames = silent_frames = 0;
 	ios_peak = fed_peak = 0;
 	sec_ios_peak = sec_ios_full = sec_out_peak = sec_out_full = 0;
+	sink_lost = starved_periods = starved_frames = 0;
+	ring_low = ~0u;
+	ring_high = 0;
+	feed_gap_max = watch_max = 0;
 	returned = 0;
 	hakios_audio_set_sink("the bottom speaker's stream (the audio DSP, vayu_audio.c; amplifiers off)", ios_sink);
 	crumb("4: the feeder runs for %u s: /dev/hakios-audio -> ring -> ASM periods (amplifiers off)", secs);
@@ -2688,6 +2758,9 @@ feed(uint32_t secs)
 		}
 		sent++;
 	}
+	starved_periods = starved_frames = 0;           /* (the ring starts empty: those first periods are silence on purpose) */
+	ring_low = ~0u;
+	ring_high = 0;
 	while (ok) {
 		uint32_t back = returned;
 
@@ -2708,7 +2781,12 @@ feed(uint32_t secs)
 			}
 		}
 		if (guarded) {
+			uint64_t began_watch = mach_absolute_time();
+
 			watch();
+			if (diag) {
+				longest(mach_absolute_time() - began_watch, &watch_max);
+			}
 		}
 		if (guarded && vayu_jack_keep()) {
 			uint64_t since_route;
@@ -2773,7 +2851,19 @@ feed(uint32_t secs)
 				    "%u periods, %u underflows, %u errors, route %s, %u switches\n", ns / NSEC_PER_SEC, ios_frames, ios_peak,
 				    fed_frames, silent_frames, written_done - done_before, sent, underflows, write_errors,
 				    audio_route_jack ? "headphones" : "speaker", route_switches);
+				if (diag) {
+					say("vayu-audio: 4: diag +%llu s: the ring %u..%u frames at a refill; %llu periods short (%llu frames of zeros); %llu "
+					    "frames dropped (the ring full); the feeder's longest pass %llu ms, watch() %llu ms\n", ns / NSEC_PER_SEC,
+					    ring_low == ~0u ? 0 : ring_low, ring_high, starved_periods, starved_frames, sink_lost,
+					    feed_gap_max / NSEC_PER_MSEC, watch_max / NSEC_PER_MSEC);
+				}
 			}
+		}
+		if (diag) {
+			uint64_t now = mach_absolute_time();
+
+			longest(now - last_pass, &feed_gap_max);        /* (a pass ends here: a stall shows up in this, not in watch()) */
+			last_pass = now;
 		}
 		delay_for_interval(2, NSEC_PER_MSEC);
 	}
@@ -2799,6 +2889,11 @@ feed(uint32_t secs)
 	    "%u given back (%u with an error), %u underflows: the DSP took %llu frames a second\n", ns / NSEC_PER_MSEC, ios_frames,
 	    ios_peak, fed_frames, fed_peak, silent_frames, sent, written_done - done_before, write_errors, underflows,
 	    ns ? (uint64_t)(written_done - done_before) * PERIOD_FRAMES * NSEC_PER_SEC / ns : 0);
+	if (diag) {
+		say("vayu-audio: 4: diag: the ring %u..%u frames at a refill; %llu periods short (%llu frames of zeros); %llu frames dropped (the "
+		    "ring full); the feeder's longest pass %llu ms, watch() %llu ms\n", ring_low == ~0u ? 0 : ring_low, ring_high,
+		    starved_periods, starved_frames, sink_lost, feed_gap_max / NSEC_PER_MSEC, watch_max / NSEC_PER_MSEC);
+	}
 	return ok;
 }
 
@@ -3256,11 +3351,16 @@ step_sound(uint32_t sound, uint32_t secs)
 		if (ok) {
 			pin_activity();
 			if (sound == 5) {
-				uint32_t gain = speaker_gain, amp = 0, release = 11, guard_gain;
+				uint32_t gain = speaker_gain, amp = 0, release = 11, guard_gain, quiet_ms = 3000, fade = 1;
 
 				PE_parse_boot_argn("vayu_sound_gain", &gain, sizeof(gain));
 				speaker_gain = gain > HAKIOS_GUARD_MAX_GAIN ? HAKIOS_GUARD_MAX_GAIN : gain;
 				PE_parse_boot_argn("vayu_guard_release", &release, sizeof(release));    /* 11 (43 ms) .. 14 (341 ms) */
+				PE_parse_boot_argn("vayu_sound_quiet_ms", &quiet_ms, sizeof(quiet_ms)); /* 0: the amplifier is never stopped */
+				PE_parse_boot_argn("vayu_audio_fade", &fade, sizeof(fade));             /* 0: the digital volume in one write */
+				quiet_ms = quiet_ms > 86400000 ? 86400000 : quiet_ms;
+				quiet_before_off = (uint64_t)quiet_ms * NSEC_PER_MSEC;
+				fade_steps = fade != 0;
 				hakios_guard_set_release(release);
 				PE_parse_boot_argn("vayu_audio_amp", &amp, sizeof(amp));
 				bzero(&watcher, sizeof(watcher));
@@ -3542,6 +3642,7 @@ vayu_audio_init(void)
 	PE_parse_boot_argn("vayu_audio_dvc_max", &dvc_most, sizeof(dvc_most));
 	PE_parse_boot_argn("vayu_audio_ear", &ear, sizeof(ear));
 	PE_parse_boot_argn("vayu_audio_ear_dvc", &ear_dvc_index, sizeof(ear_dvc_index));
+	PE_parse_boot_argn("vayu_sound_diag", &diag, sizeof(diag));
 	amp_ear_enabled = ear != 0;
 	ear_dvc_index = ear_dvc_index > EAR_DVC_TOP ? EAR_DVC_TOP : ear_dvc_index;
 	dvc_most = dvc_most > DVC_TOP ? DVC_TOP : dvc_most;
