@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	Info.plist of HakiosMP3.app (src/mp3_app.m); the shape is triangle_app.plist's,
+	because that is the bundle LaunchServices on this port already registers.
+
+	CFBundleExecutable, CFBundleIdentifier, CFBundleName, CFBundlePackageType,
+	MinimumOSVersion, UIDeviceFamily, UIRequiredDeviceCapabilities and
+	UISupportedInterfaceOrientations are the least LaunchServices needs to register a
+	bundle at all.
+
+	UILaunchScreen = { UILaunchScreen = {} } is the launch screen in a plist, not a
+	storyboard: iOS 16 wants one of the two and this machine has no ibtool.
+
+	CFBundleIcons -> AppIcon60x60 is Jellyfish.app's shape; the icon files sit beside it.
+
+	CFBundleURLTypes -> hakiosmp3 is how this port starts a track without tapping:
+	hakiosmp3://play?path=<percent-encoded absolute path>. SpringBoard learns the scheme
+	from LaunchServices, which walks /Applications at every boot.
+
+	UIStatusBarHidden is false and UIRequiresFullScreen is absent: this is an ordinary
+	player, so the status bar stays and the panel uses the safe area.
+
+	UIBackgroundModes = [ audio ] is what lets the playback category keep running when
+	the application goes to the background; UIFileSharingEnabled is false because the
+	the test setup puts files there itself and no document UI is wanted.
+
+	NO UIApplicationSceneManifest, deliberately: without it UIKit uses the application
+	delegate's own window, which is the lifecycle src/mp3_app.m implements.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>MP3 Test</string>
+	<key>CFBundleExecutable</key>
+	<string>HakiosMP3</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.hakios.mp3play</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>HakiosMP3</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>AppIcon60x60</string>
+			</array>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
+		</dict>
+	</dict>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.hakios.mp3play</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>hakiosmp3</string>
+			</array>
+		</dict>
+	</array>
+	<key>DTPlatformName</key>
+	<string>iphoneos</string>
+	<key>DTSDKName</key>
+	<string>iphoneos16.5</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>MinimumOSVersion</key>
+	<string>16.0</string>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+	</array>
+	<key>UIFileSharingEnabled</key>
+	<false/>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UILaunchScreen</key>
+		<dict/>
+	</dict>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UIStatusBarHidden</key>
+	<false/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<false/>
+</dict>
+</plist>

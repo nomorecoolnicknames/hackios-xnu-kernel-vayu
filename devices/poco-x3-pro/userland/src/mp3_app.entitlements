@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	What HakiosMP3.app is signed with, and why there is anything here at all.
+
+	Nothing in this port needs a signature to run: AMFI is a stand-in that accepts every
+	signature (libkern/amfi/miniamfi.c) and the kernel is built without
+	config_enforce_signed_code, so an unsigned binary executes. What a signature still
+	buys is ENTITLEMENTS: they are read out of it and nowhere else, so a process that
+	wants one has to be signed to hold it.
+
+	These are insurance for the one thing an application has that a /redwood/bin
+	program does not: it is started FOR SpringBoard, by RunningBoard, and the daemons on
+	that path ask about a bundle's identity and its container. Sileo and TrollStore
+	Helper both launch from /Applications here with a signature of exactly this shape,
+	so this is the known-good pairing rather than a guess.
+
+	  application-identifier               what LaunchServices and FrontBoard take a
+	                                       bundle's identity from; the same string as
+	                                       CFBundleIdentifier.
+	  com.apple.private.security.no-container
+	                                       says out loud what is true: there is no data
+	                                       container, because there is no installd in this
+	                                       recipe to make one.
+	  platform-application                 the other half of that pairing on a jailbroken
+	                                       device; nothing is confined in this kernel, so
+	                                       it changes what the daemons believe, not access.
+
+	  com.apple.private.security.no-sandbox, container-required = false
+	                                       Filza's pair. In a test run: RunningBoard gave this app a
+	                                       data container anyway (CFFIXED_USER_HOME under
+	                                       Containers/Data/Application) and it listed no files; the
+	                                       kernel's sandbox stand-in confines nothing, so these are a
+	                                       guess at what a daemon above it checks, not a measured need.
+
+	DELIBERATELY ABSENT: anything about audio, AVAudioSession or background playback.
+	Playback is a public AVAudioSession category and UIBackgroundModes is an Info.plist
+	key; no private entitlement is needed for either.
+-->
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>com.hakios.mp3play</string>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.private.security.container-required</key>
+	<false/>
+</dict>
+</plist>
