@@ -931,7 +931,16 @@ hakios_var_save_on_return(void)
 	}
 	PE_parse_boot_argn("var_save_ms", &ms, sizeof(ms));
 	if (ufs_var_save_early) {
-		printf("var_store: the run is ending: the data volume was asked for at the start of the shutdown; waiting for the saver\n");
+		/*
+		 * The volume was asked for at the first moment of the shutdown, while the saver lived. It has had
+		 * the whole teardown to answer; twenty more seconds of a frozen screen is what made a working
+		 * power-off look like a dead one (tester, TEST3: "power-off did NOT work"). Give it five.
+		 */
+		if (ms > 5000) {
+			ms = 5000;
+		}
+		printf("var_store: the run is ending: the data volume was asked for at the start of the shutdown; waiting for the saver (at most %u ms)\n",
+		    ms);
 	} else {
 		printf("var_store: the run is ending: the data volume is asked for\n");
 		ufs_var_save = VAR_SAVE_WANTED;
@@ -944,7 +953,8 @@ hakios_var_save_on_return(void)
 		/* what it made of it is in its own lines: this only says it answered */
 		printf("var_store: the saver has finished after %llu ms\n", waited);
 	} else {
-		printf("var_store: the saver did not answer in %u ms: the store keeps what it had\n", ms);
+		printf("var_store: the saver did not answer in %u ms (state %d): the store keeps what it had, and the end of the run goes on\n",
+		    ms, ufs_var_save);
 	}
 }
 

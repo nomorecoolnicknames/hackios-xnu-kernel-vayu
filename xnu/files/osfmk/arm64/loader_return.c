@@ -460,6 +460,8 @@ void
 loader_return(void)
 {
 #if defined(GENERIC_PSCI_SMP)
+	printf("loader: the end of the run is here (action %d: 0 loader, 1 SYSTEM_OFF, 2 SYSTEM_RESET)\n",
+	    loader_end_action);
 	/*
 	 * With more than one processor: the others switch themselves off first, and the rest of
 	 * this is done by the boot processor, the one the loader gave us. This call comes back
@@ -487,6 +489,9 @@ loader_return(void)
 	hakios_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
 	vayu_ir_quiesce();              /* the IR blaster's transfer stopped, if one was in flight */
 	vayu_usbnet_quiesce();          /* the USB controller stopped, if vayu_usbnet=2/3 took it from the loader */
+#if defined(GENERIC_PSCI_SMP)
+	printf("loader: the drivers are quiesced (action %d); the firmware is next\n", loader_end_action);
+#endif
 	/*
 	 * A panic's text is first collected in the panic buffer and only later
 	 * flushed to the console; if the console itself is what failed, that
@@ -595,6 +600,36 @@ loader_return_timer_init(void)
 	thread_call_enter_delayed(call, deadline);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
+
+/*
+ * halt_test=N: ask for the user's way out N seconds after boot, without iOS. It walks the same path a
+ * "slide to power off" should take -- loader_end_request(FALSE) -> halt_all_cpus(FALSE) ->
+ * loader_return() -> PSCI SYSTEM_OFF -- so the next run can tell "iOS never called reboot(2)" from
+ * "the kernel's end of the run is broken". On QEMU the VM simply goes away.
+ */
+static void
+loader_halt_test(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	printf("\n--- halt_test: the end of the run is asked for as a power-off ---\n");
+	loader_end_request(FALSE);
+	halt_all_cpus(FALSE);
+}
+
+__startup_func
+static void
+loader_halt_test_init(void)
+{
+	uint32_t seconds = 0;
+	uint64_t deadline;
+
+	if (!PE_parse_boot_argn("halt_test", &seconds, sizeof(seconds)) || seconds == 0) {
+		return;
+	}
+	thread_call_t call = thread_call_allocate(loader_halt_test, NULL);
+	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(call, deadline);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_halt_test_init);
 
 /*
  * A loader that watches from another core also listens to the host, and passes on a request to
