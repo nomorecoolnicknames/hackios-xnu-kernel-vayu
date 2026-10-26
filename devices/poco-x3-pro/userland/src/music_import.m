@@ -3,6 +3,13 @@
  * music_import [--wait SECONDS] SOURCE.mp3 [DEST_NAME] (defaults 0 and RDWD.mp3). Root copies
  * and hands the file to mobile, which reads the tags and inserts an ML3Track; a marker makes a
  * rerun a no-op.
+ *
+ * The insert is the only step that goes through medialibraryd, and it is a plain INSERT, which the
+ * daemon's authorizer allows. Everything after it -- the sort map, the item's orders and search keys,
+ * the library/in-library flags -- is SQL on the database file by this process, because a client's
+ * sort-map DDL over XPC is refused by that authorizer and the daemon asserts and dies, taking Music's
+ * own library service with it. See the comment above repair_local. With a song imported that way the
+ * rows are what MediaPlayer's queryWithLibrary: path wants, and medialibraryd stays up to serve it.
  */
 #import <Foundation/Foundation.h>
 #import <MediaPlayer/MediaPlayer.h>
@@ -60,7 +67,10 @@ extern NSString *const ML3TrackPropertyIsCurrentlyRestricted;
 #define UTF8(s) ((s) ? [(s) UTF8String] : "(none)")
 
 static int usage(void) {
-	fprintf(stderr, "music_import: usage: music_import [--wait SECONDS] SOURCE.mp3 [DEST_NAME] | --query [NAME] | --repair [NAME] | --ml3 [NAME]\n"); return 2;
+	fprintf(stderr, "music_import: usage: music_import [--wait SECONDS] SOURCE.mp3 [DEST_NAME] | --query [NAME] | --repair [NAME] | --ml3 [NAME]\n");
+	fprintf(stderr, "music_import: --query/--repair work on a running phone: rows, songs count, sort map (no import);\n");
+	fprintf(stderr, "music_import: --repair rebuilds the sort map and the orders here, in SQL, without medialibraryd\n");
+	return 2;
 }
 static int error(const char *path) {
 	fprintf(stderr, "music_import: %s: %s\n", path, strerror(errno)); return -1;
@@ -425,142 +435,353 @@ repair_entities(int64_t pid, NSString *artist, NSString *album)
 }
 
 /*
- * IR16B (15:18): every MediaPlayer predicate counts the track in ML3, yet MediaPlayer's own count is 0, and the
- * track's title_order (and every *_order) is 0 while updateSortMap says NO: its names never reached the sort map
- * (ML3's import session does that, _prepareTrackSortData; a plain ML3Track insert does not). Songs are listed in
- * title order with sections, which ties a track to its sort_map entry. So: the names into the sort map by ML3's
- * own call, the orders and sections and search keys from it, and the WAL checkpointed (the main file was 4 KB and
- * everything else in the WAL) so that every connection sees the same database.
+ * The repair, here and only here, in SQL on the library's own file.
+ *
+ * Why not through the library: every SQL statement a client sends to medialibraryd goes through
+ * -[ML3MediaLibraryWriter executeUntrustedUpdate:] with a sqlite3 authorizer (mld-re, 2026-10-26:
+ * -[ML3DatabaseConnection _distrustQueriesDuringBlock:] @ 0x1a9167bd8, authorizer 0x1a9168ee4).
+ * A client's sort-map update starts with DDL and reads sqlite_master, the authorizer refuses both
+ * ("Authorizer flagged suspicious query=CREATE TABLE IF NOT EXISTS sort_map_no_uniques ... action=18",
+ * "access to sqlite_master.name is prohibited"), and the daemon then asserts ("Authorizer failure should
+ * have caused executeUpdate: to return NO") and dies. Music.app talks to that same daemon, so every run
+ * of the old repair left Music with no library service at all: that is why the rows were right and the
+ * app was empty. Nothing here is sent over XPC: the file is opened directly, where there is no authorizer.
+ *
+ * The sort map is ML3's own table and ML3's own update fills it (MusicLibrary, __cstring):
+ *   UPDATE sort_map_new SET name_section = iPhoneSortSection(sort_key);
+ *   INSERT INTO sort_map_new_in_order (name) SELECT name FROM sort_map_new ORDER BY sort_key;
+ *   UPDATE sort_map_new SET name_order = (SELECT ROWID << 32 FROM sort_map_new_in_order WHERE ...);
+ *   INSERT OR REPLACE INTO sort_map_new (name, name_order, name_section, sort_key) VALUES ('', 0, %u, '');
+ * i.e. name_order is a dense rank shifted 32 bits, name_section is the section index, and the empty name
+ * is a row of its own. iPhoneSortKey()/iPhoneSortSection() are SQL functions registered on the library's
+ * connection; ours is a plain one, so the rank comes from our own collation (localizedStandardCompare:,
+ * the same case/number-insensitive order) and the section from the first letter. The exact integers are
+ * not load-bearing: Music needs a non-zero title_order, an entry the sectioned query can join, and the
+ * search keys. A later trusted update inside the daemon (if it ever runs) recomputes them exactly.
  */
+
+static BOOL
+table_exists(sqlite3 *h, const char *table)
+{
+	sqlite3_stmt *st = NULL;
+	BOOL found = NO;
+
+	if (sqlite3_prepare_v2(h, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", -1, &st, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(st, 1, table, -1, SQLITE_STATIC);
+		found = sqlite3_step(st) == SQLITE_ROW;
+	}
+	sqlite3_finalize(st);
+	return found;
+}
+
+static BOOL
+column_exists(sqlite3 *h, const char *table, const char *column)
+{
+	char sql[128];
+	sqlite3_stmt *st = NULL;
+	BOOL found = NO;
+
+	snprintf(sql, sizeof(sql), "SELECT 1 FROM pragma_table_info('%s') WHERE name = ?1", table);
+	if (sqlite3_prepare_v2(h, sql, -1, &st, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(st, 1, column, -1, SQLITE_STATIC);
+		found = sqlite3_step(st) == SQLITE_ROW;
+	}
+	sqlite3_finalize(st);
+	return found;
+}
+
+/* One statement with n integer bindings; the log line names it whether it worked or not. */
+static int
+run(sqlite3 *h, const char *what, const char *sql, int n, int64_t v1, int64_t v2, int64_t v3)
+{
+	sqlite3_stmt *st = NULL;
+	int rc = sqlite3_prepare_v2(h, sql, -1, &st, NULL);
+
+	if (rc == SQLITE_OK) {
+		if (n > 0) sqlite3_bind_int64(st, 1, v1);
+		if (n > 1) sqlite3_bind_int64(st, 2, v2);
+		if (n > 2) sqlite3_bind_int64(st, 3, v3);
+		rc = sqlite3_step(st);
+	}
+	fprintf(stderr, "music_import: local: %s: %s (%d changed)\n", what,
+	    rc == SQLITE_DONE || rc == SQLITE_ROW ? "done" : sqlite3_errmsg(h), sqlite3_changes(h));
+	sqlite3_finalize(st);
+	return rc;
+}
+
+/* A letter's place among the sections ("#" is 0), the way a name's first character sorts. */
+static int
+section_of(NSString *name)
+{
+	unichar c;
+
+	if ([name length] == 0) {
+		return 0;
+	}
+	c = [[name uppercaseString] characterAtIndex:0];
+	if (c >= 'A' && c <= 'Z') {
+		return (int)(c - 'A') + 1;
+	}
+	return 0;
+}
+
+/* Every name the library sorts by, as ML3's update collects them: the columns its own statements name. */
+static NSArray<NSString *> *
+collect_names(sqlite3 *h)
+{
+	static const struct { const char *table, *column; } sources[] = {
+		{ "item_extra", "title" }, { "item_extra", "sort_title" },
+		{ "item_artist", "item_artist" }, { "item_artist", "sort_item_artist" },
+		{ "item_artist", "series_name" }, { "item_artist", "sort_series_name" },
+		{ "album_artist", "album_artist" }, { "album_artist", "sort_album_artist" },
+		{ "album", "album" }, { "album", "sort_album" },
+		{ "composer", "composer" }, { "composer", "sort_composer" },
+		{ "genre", "genre" }, { "container", "name" },
+	};
+	NSMutableSet<NSString *> *names = [NSMutableSet set];
+
+	for (unsigned i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+		char sql[256];
+		sqlite3_stmt *st = NULL;
+
+		if (!table_exists(h, sources[i].table) || !column_exists(h, sources[i].table, sources[i].column)) {
+			continue;
+		}
+		snprintf(sql, sizeof(sql), "SELECT DISTINCT \"%s\" FROM \"%s\" WHERE \"%s\" IS NOT NULL AND \"%s\" <> ''",
+		    sources[i].column, sources[i].table, sources[i].column, sources[i].column);
+		if (sqlite3_prepare_v2(h, sql, -1, &st, NULL) != SQLITE_OK) {
+			sqlite3_finalize(st);
+			continue;
+		}
+		while (sqlite3_step(st) == SQLITE_ROW) {
+			const unsigned char *v = sqlite3_column_text(st, 0);
+			if (v != NULL) {
+				NSString *s = [NSString stringWithUTF8String:(const char *)v];
+				if (s != nil) {
+					[names addObject:s];
+				}
+			}
+		}
+		sqlite3_finalize(st);
+	}
+	return [[names allObjects] sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+		return [a localizedStandardCompare:b];
+	}];
+}
+
+/* The whole repair for one track: its row complete, the sort map built, its orders and search keys from
+ * it, and the WAL checkpointed so every connection (and the daemon) reads the same file. Idempotent. */
 static void
-repair_sort(ML3MusicLibrary *library, int64_t pid, NSString *title, NSString *artist, NSString *album)
+repair_local(int64_t pid, NSString *title, NSString *artist, NSString *album, long long file_size, double seconds)
 {
 	static const char *db = "/var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb";
-	static const char *orders =
-	    "UPDATE item SET "
-	    "title_order = IFNULL((SELECT name_order FROM sort_map WHERE name = ?2), 0), "
-	    "title_order_section = IFNULL((SELECT name_section FROM sort_map WHERE name = ?2), 0), "
-	    "item_artist_order = IFNULL((SELECT name_order FROM sort_map WHERE name = ?3), 0), "
-	    "item_artist_order_section = IFNULL((SELECT name_section FROM sort_map WHERE name = ?3), 0), "
-	    "album_artist_order = IFNULL((SELECT name_order FROM sort_map WHERE name = ?3), 0), "
-	    "album_artist_order_section = IFNULL((SELECT name_section FROM sort_map WHERE name = ?3), 0), "
-	    "album_order = IFNULL((SELECT name_order FROM sort_map WHERE name = ?4), 0), "
-	    "album_order_section = IFNULL((SELECT name_section FROM sort_map WHERE name = ?4), 0) "
-	    "WHERE item_pid = ?1";
-	static const char *search =
-	    "UPDATE item_search SET "
-	    "search_title = IFNULL((SELECT name_order FROM sort_map WHERE name = ?2), 0), "
-	    "search_artist = IFNULL((SELECT name_order FROM sort_map WHERE name = ?3), 0), "
-	    "search_album_artist = IFNULL((SELECT name_order FROM sort_map WHERE name = ?3), 0), "
-	    "search_album = IFNULL((SELECT name_order FROM sort_map WHERE name = ?4), 0) "
-	    "WHERE item_pid = ?1";
-	NSArray *names = @[ title ?: @"", artist ?: @"", album ?: @"" ];
+	NSArray<NSString *> *names;
 	sqlite3 *h = NULL;
+	int64_t now = (int64_t)CFAbsoluteTimeGetCurrent();   /* seconds since 2001, as ML3 keeps dates */
+	BOOL with_sort_key = NO;
 
-	if (pid == 0) return;
-	for (id target in @[ library, NSClassFromString(@"ML3SortMap") ?: [NSNull null] ]) {
-		if (target == [NSNull null]) continue;
-		if ([target respondsToSelector:@selector(insertStringsIntoSortMap:)]) {
-			@try {
-				fprintf(stderr, "music_import: sort: %s insertStringsIntoSortMap says %d\n", [NSStringFromClass([target class]) UTF8String],
-				    (int)((BOOL (*)(id, SEL, id))objc_msgSend)(target, @selector(insertStringsIntoSortMap:), names));
-			} @catch (NSException *exception) {
-				fprintf(stderr, "music_import: sort: insertStringsIntoSortMap: %s\n", [[exception reason] UTF8String]);
-			}
-			break;
-		}
-		fprintf(stderr, "music_import: sort: %s has no insertStringsIntoSortMap:\n", [NSStringFromClass([target class]) UTF8String]);
+	(void)artist;
+	(void)album;
+	if (pid == 0) {
+		return;
 	}
 	if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
-		fprintf(stderr, "music_import: sort: cannot open %s: %s\n", db, h ? sqlite3_errmsg(h) : "?");
+		fprintf(stderr, "music_import: local: cannot open %s: %s\n", db, h ? sqlite3_errmsg(h) : "?");
 		sqlite3_close(h);
 		return;
 	}
 	sqlite3_busy_timeout(h, 5000);
+	/* 1. the row itself: in the library, a file, not cloud, not shuffle-excluded, dated */
+	run(h, "base location", "INSERT OR IGNORE INTO base_location (base_location_id, path) "
+	    "VALUES (3840, 'iTunes_Control/Music/F00')", 0, 0, 0, 0);
+	run(h, "item", "UPDATE item SET in_my_library = 1, keep_local = 1, remote_location_id = 0, "
+	    "base_location_id = CASE base_location_id WHEN 0 THEN 3840 ELSE base_location_id END, "
+	    "exclude_from_shuffle = 0, date_added = CASE date_added WHEN 0 THEN ?2 ELSE date_added END "
+	    "WHERE item_pid = ?1", 2, pid, now, 0);
+	/* keep_local_status stays 0: keep_local = 1 is what "on this device" means, and a status made up
+	 * here could be read as a download request for a cloud asset we do not have */
+	run(h, "item_extra", "UPDATE item_extra SET file_size = CASE file_size WHEN 0 THEN ?2 ELSE file_size END, "
+	    "date_created = CASE date_created WHEN 0 THEN ?3 ELSE date_created END WHERE item_pid = ?1",
+	    3, pid, file_size, now);
+	/* significantAmountHasBeenPlayed is (total_time_ms - bookmark_time_ms < 30 s AND total_time_ms > 60 s) OR
+	 * (bookmark_time_ms >= .95 * total_time_ms) (MusicLibrary, _ML3TrackPropertySignificantAmountHasBeenPlayed);
+	 * with total_time_ms = 0 its second half is 0 >= 0 -- true -- and the provider's "not played" filter would
+	 * drop the track. The insert sets it; this covers a row repaired on its own. */
+	if (seconds > 0) {
+		run(h, "item_extra total time", "UPDATE item_extra SET total_time_ms = ?2 "
+		    "WHERE item_pid = ?1 AND (total_time_ms IS NULL OR total_time_ms = 0)", 2, pid,
+		    (int64_t)(seconds * 1000), 0);
+	}
+	if (table_exists(h, "item_stats")) {
+		run(h, "item_stats row", "INSERT OR IGNORE INTO item_stats (item_pid) VALUES (?1)", 1, pid, 0, 0);
+		run(h, "item_stats visible", "UPDATE item_stats SET hidden = 0, has_been_played = 0 "
+		    "WHERE item_pid = ?1", 1, pid, 0, 0);
+	}
+	/* hasNonPurgeableAsset, the filter the provider uses with no account (mp-re): a local, non-evictable asset */
+	if (table_exists(h, "purgeable_list") && column_exists(h, "purgeable_list", "is_purgeable")) {
+		run(h, "purgeable_list", "INSERT OR IGNORE INTO purgeable_list (item_pid, is_purgeable) VALUES (?1, 0)",
+		    1, pid, 0, 0);
+		run(h, "purgeable_list not purgeable", "UPDATE purgeable_list SET is_purgeable = 0 WHERE item_pid = ?1",
+		    1, pid, 0, 0);
+	}
+	if (table_exists(h, "item_extra") && column_exists(h, "item_extra", "sort_title")) {
+		run(h, "sort_title", "UPDATE item_extra SET sort_title = title "
+		    "WHERE item_pid = ?1 AND (sort_title IS NULL OR sort_title = '')", 1, pid, 0, 0);
+	}
+	/* 2. the sort map: every name the library has, ranked. Rows it already holds keep their orders --
+	 * the other tracks' title_order values point at them -- and only the missing names are appended
+	 * above the highest rank. On this port's fresh library this makes ranks 1..N, like ML3's own update. */
+	names = collect_names(h);
+	with_sort_key = column_exists(h, "sort_map", "sort_key");
 	{
-		sqlite3_stmt *st = NULL;
-		long long rows = -1;
-		if (sqlite3_prepare_v2(h, "SELECT COUNT(*) FROM sort_map WHERE name IN (?1, ?2, ?3)", -1, &st, NULL) == SQLITE_OK) {
-			for (int i = 0; i < 3; i++) sqlite3_bind_text(st, i + 1, [names[i] UTF8String], -1, SQLITE_TRANSIENT);
-			if (sqlite3_step(st) == SQLITE_ROW) rows = sqlite3_column_int64(st, 0);
-		}
-		sqlite3_finalize(st);
-		fprintf(stderr, "music_import: sort: %lld of the 3 names in sort_map\n", rows);
-	}
-	for (int k = 0; k < 2; k++) {
-		sqlite3_stmt *st = NULL;
-		int rc = sqlite3_prepare_v2(h, k ? search : orders, -1, &st, NULL);
+		sqlite3_stmt *max = NULL;
+		int64_t rank = 0;
+		unsigned long added = 0;
 
-		if (rc == SQLITE_OK) {
-			sqlite3_bind_int64(st, 1, pid);
-			for (int i = 0; i < 3; i++) sqlite3_bind_text(st, i + 2, [names[i] UTF8String], -1, SQLITE_TRANSIENT);
-			rc = sqlite3_step(st);
+		if (sqlite3_prepare_v2(h, "SELECT IFNULL(MAX(name_order), 0) FROM sort_map", -1, &max, NULL) == SQLITE_OK &&
+		    sqlite3_step(max) == SQLITE_ROW) {
+			rank = sqlite3_column_int64(max, 0) >> 32;
 		}
-		fprintf(stderr, "music_import: sort: %s: %s (%d changed)\n", k ? "search keys" : "orders",
-		    rc == SQLITE_DONE ? "done" : sqlite3_errmsg(h), sqlite3_changes(h));
-		sqlite3_finalize(st);
+		sqlite3_finalize(max);
+		fprintf(stderr, "music_import: local: %lu names for the sort map, its last rank %lld (title \"%s\")\n",
+		    (unsigned long)[names count], (long long)rank, UTF8(title));
+		{
+			char sql[256];
+			sqlite3_stmt *st = NULL;
+
+			snprintf(sql, sizeof(sql), "INSERT OR IGNORE INTO sort_map (name, name_order, name_section%s) "
+			    "VALUES (?1, ?2, ?3%s)", with_sort_key ? ", sort_key" : "", with_sort_key ? ", ?4" : "");
+			if (sqlite3_prepare_v2(h, sql, -1, &st, NULL) == SQLITE_OK) {
+				for (NSUInteger i = 0; i < [names count]; i++) {
+					NSString *name = names[i];
+					int64_t order = (++rank) << 32;
+
+					sqlite3_bind_text(st, 1, [name UTF8String], -1, SQLITE_TRANSIENT);
+					sqlite3_bind_int64(st, 2, order);
+					sqlite3_bind_int(st, 3, section_of(name));
+					if (with_sort_key) {
+						NSData *key = [name dataUsingEncoding:NSUTF8StringEncoding];
+						sqlite3_bind_blob(st, 4, [key bytes], (int)[key length], SQLITE_TRANSIENT);
+					}
+					if (sqlite3_step(st) != SQLITE_DONE) {
+						fprintf(stderr, "music_import: local: sort_map \"%s\": %s\n", [name UTF8String],
+						    sqlite3_errmsg(h));
+					} else {
+						added += (unsigned long)sqlite3_changes(h);
+					}
+					sqlite3_reset(st);
+				}
+				fprintf(stderr, "music_import: local: sort_map: %lu names, %lu new, now ending at rank %lld\n",
+				    (unsigned long)[names count], added, (long long)rank);
+			} else {
+				fprintf(stderr, "music_import: local: sort_map insert: %s\n", sqlite3_errmsg(h));
+			}
+			sqlite3_finalize(st);
+		}
 	}
+	/* the empty name: ML3's own INSERT ... INTO sort_map_new (name, name_order, name_section, sort_key) VALUES ('', 0, %u, '') */
+	run(h, "sort_map empty name", "INSERT OR IGNORE INTO sort_map (name, name_order, name_section) VALUES ('', 0, 0)",
+	    0, 0, 0, 0);
+
+	/* 3. the item's orders and sections, from the sort map, by the names it sorts by */
+	run(h, "item title order",
+	    "UPDATE item SET "
+	    "title_order = IFNULL((SELECT name_order FROM sort_map WHERE name = "
+	    "(SELECT title FROM item_extra WHERE item_pid = item.item_pid)), 0), "
+	    "title_order_section = IFNULL((SELECT name_section FROM sort_map WHERE name = "
+	    "(SELECT title FROM item_extra WHERE item_pid = item.item_pid)), 0) "
+	    "WHERE item_pid = ?1", 1, pid, 0, 0);
+	run(h, "item artist order",
+	    "UPDATE item SET "
+	    "item_artist_order = IFNULL((SELECT name_order FROM sort_map WHERE name = "
+	    "(SELECT item_artist FROM item_artist WHERE item_artist_pid = item.item_artist_pid)), 0), "
+	    "item_artist_order_section = IFNULL((SELECT name_section FROM sort_map WHERE name = "
+	    "(SELECT item_artist FROM item_artist WHERE item_artist_pid = item.item_artist_pid)), 0) "
+	    "WHERE item_pid = ?1", 1, pid, 0, 0);
+	run(h, "item album artist order",
+	    "UPDATE item SET "
+	    "album_artist_order = IFNULL((SELECT name_order FROM sort_map WHERE name = "
+	    "(SELECT album_artist FROM album_artist WHERE album_artist_pid = item.album_artist_pid)), 0), "
+	    "album_artist_order_section = IFNULL((SELECT name_section FROM sort_map WHERE name = "
+	    "(SELECT album_artist FROM album_artist WHERE album_artist_pid = item.album_artist_pid)), 0) "
+	    "WHERE item_pid = ?1", 1, pid, 0, 0);
+	run(h, "item album order",
+	    "UPDATE item SET "
+	    "album_order = IFNULL((SELECT name_order FROM sort_map WHERE name = "
+	    "(SELECT album FROM album WHERE album_pid = item.album_pid)), 0), "
+	    "album_order_section = IFNULL((SELECT name_section FROM sort_map WHERE name = "
+	    "(SELECT album FROM album WHERE album_pid = item.album_pid)), 0) "
+	    "WHERE item_pid = ?1", 1, pid, 0, 0);
+	/* ML3 keeps a sort_* copy of every name; a query that joins on it must find one too */
+	if (table_exists(h, "item_extra") && column_exists(h, "item_extra", "sort_title")) {
+		run(h, "sort_title", "UPDATE item_extra SET sort_title = title "
+		    "WHERE item_pid = ?1 AND (sort_title IS NULL OR sort_title = '')", 1, pid, 0, 0);
+	}
+	/* 4. the search keys, ML3's own statements, with our orders */
+	run(h, "item_search",
+	    "INSERT OR REPLACE INTO item_search (item_pid, search_title, search_album, search_artist, "
+	    "search_composer, search_album_artist) "
+	    "SELECT ?1, "
+	    "IFNULL((SELECT name_order FROM sort_map WHERE name = (SELECT title FROM item_extra WHERE item_pid = ?1)), 0), "
+	    "IFNULL((SELECT s.name_order FROM sort_map s JOIN album a ON s.name = a.album "
+	    "WHERE a.album_pid = (SELECT album_pid FROM item WHERE item_pid = ?1)), 0), "
+	    "IFNULL((SELECT s.name_order FROM sort_map s JOIN item_artist r ON s.name = r.item_artist "
+	    "WHERE r.item_artist_pid = (SELECT item_artist_pid FROM item WHERE item_pid = ?1)), 0), "
+	    "0, "
+	    "IFNULL((SELECT s.name_order FROM sort_map s JOIN album_artist r ON s.name = r.album_artist "
+	    "WHERE r.album_artist_pid = (SELECT album_artist_pid FROM item WHERE item_pid = ?1)), 0)",
+	    1, pid, 0, 0);
+	/* 5. one file for every connection: the main file was 4 KB with everything else in the WAL */
 	{
 		int log = -1, done = -1;
 		int rc = sqlite3_wal_checkpoint_v2(h, NULL, SQLITE_CHECKPOINT_TRUNCATE, &log, &done);
-		fprintf(stderr, "music_import: sort: checkpoint (truncate): %s, %d frames, %d done\n",
+
+		fprintf(stderr, "music_import: local: checkpoint (truncate): %s, %d frames, %d done\n",
 		    rc == SQLITE_OK ? "ok" : sqlite3_errmsg(h), log, done);
 	}
 	sqlite3_close(h);
-	if ([library respondsToSelector:@selector(notifyContentsDidChange)]) [library notifyContentsDidChange];
 }
 
-/*
- * Live run 2026-10-25 13:5x: the track's item row is complete but item_search has no row and title_order is 0.
- * The search keys are sort_map name orders, which ML3 fills in its sort map update; a plain ML3Track insert
- * skipped it. So: ask the library for the update, then the same item_search insert ML3 itself carries
- * (strings of MusicLibrary), for every column, for tracks still missing a row. Idempotent.
- */
+/* What the database says about the row after the repair: the fields MediaPlayer's songs query reads. */
 static void
-repair_search(ML3MusicLibrary *library)
+dump_songs(int64_t pid)
 {
 	static const char *db = "/var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb";
-	static const char *sql =
-	    "INSERT OR IGNORE INTO item_search (item_pid, search_title, search_album, search_artist, search_album_artist) "
-	    "SELECT e.item_pid, IFNULL((SELECT name_order FROM sort_map WHERE name = e.title), 0), "
-	    "IFNULL((SELECT s.name_order FROM sort_map s JOIN album a ON s.name = a.album WHERE a.album_pid = i.album_pid), 0), "
-	    "IFNULL((SELECT s.name_order FROM sort_map s JOIN item_artist r ON s.name = r.item_artist "
-	    "WHERE r.item_artist_pid = i.item_artist_pid), 0), "
-	    "IFNULL((SELECT s.name_order FROM sort_map s JOIN album_artist r ON s.name = r.album_artist "
-	    "WHERE r.album_artist_pid = i.album_artist_pid), 0) "
-	    "FROM item_extra e JOIN item i ON i.item_pid = e.item_pid";
+	static const char *q[] = {
+		"SELECT 'orders', title_order, title_order_section, item_artist_order, album_order, album_artist_order "
+		    "FROM item WHERE item_pid = ?1",
+		"SELECT 'search', search_title, search_album, search_artist, search_album_artist FROM item_search WHERE item_pid = ?1",
+		"SELECT 'sort_map rows', COUNT(*) FROM sort_map",
+		"SELECT 'songs rows', COUNT(*) FROM item WHERE (media_type & 1032) <> 0 AND in_my_library = 1",
+	};
 	sqlite3 *h = NULL;
-	char *message = NULL;
 
-	/* live 14:03: updateSortMap said NO and title_order stayed 0; MediaLibrary.migrator (which our boot never
-	 * runs) validates the database, and the ordering languages come before any sort order */
-	if ([library respondsToSelector:@selector(updateOrderingLanguagesForCurrentLanguage)]) {
-		[library updateOrderingLanguagesForCurrentLanguage];
-		fprintf(stderr, "music_import: repair: ordering languages updated\n");
-	}
-	if ([library respondsToSelector:@selector(validateDatabase)]) {
-		fprintf(stderr, "music_import: repair: validateDatabase says %d\n", (int)[library validateDatabase]);
-	} else fprintf(stderr, "music_import: repair: the library has no validateDatabase\n");
-	if ([library respondsToSelector:@selector(setNeedsToUpdateSortMap:)]) {
-		[library setNeedsToUpdateSortMap:YES];
-	}
-	if ([library respondsToSelector:@selector(updateSortMap)]) {
-		fprintf(stderr, "music_import: repair: updateSortMap says %d\n", (int)[library updateSortMap]);
-	} else fprintf(stderr, "music_import: repair: the library has no updateSortMap\n");
-	if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
-		fprintf(stderr, "music_import: repair: cannot open %s: %s\n", db, h ? sqlite3_errmsg(h) : "?");
+	if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+		fprintf(stderr, "music_import: songs: cannot open: %s\n", h ? sqlite3_errmsg(h) : "?");
 		sqlite3_close(h);
 		return;
 	}
-	sqlite3_busy_timeout(h, 5000);
-	if (sqlite3_exec(h, sql, NULL, NULL, &message) == SQLITE_OK) {
-		fprintf(stderr, "music_import: repair: item_search rows added %d\n", sqlite3_changes(h));
-	} else fprintf(stderr, "music_import: repair: item_search: %s\n", message ? message : "?");
-	sqlite3_free(message);
-	sqlite3_close(h);
-	if ([library respondsToSelector:@selector(notifyContentsDidChange)]) {
-		[library notifyContentsDidChange];
+	for (unsigned i = 0; i < sizeof(q) / sizeof(q[0]); i++) {
+		sqlite3_stmt *st = NULL;
+		char line[512];
+		int n;
+
+		if (sqlite3_prepare_v2(h, q[i], -1, &st, NULL) != SQLITE_OK) {
+			fprintf(stderr, "music_import: songs %u: %s\n", i, sqlite3_errmsg(h));
+			continue;
+		}
+		sqlite3_bind_int64(st, 1, pid);
+		while (sqlite3_step(st) == SQLITE_ROW) {
+			n = snprintf(line, sizeof(line), "music_import: songs:");
+			for (int c = 0; c < sqlite3_column_count(st) && n < (int)sizeof(line) - 2; c++) {
+				const unsigned char *v = sqlite3_column_text(st, c);
+				n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", v ? (const char *)v : "NULL");
+			}
+			fprintf(stderr, "%s\n", line);
+		}
+		sqlite3_finalize(st);
 	}
+	sqlite3_close(h);
 }
 
 /*
@@ -834,9 +1055,10 @@ static int import(int argc, char **argv) {
 		sqlite3_close(h);
 		fprintf(stderr, "music_import: query: %s is item %lld\n", name, (long long)pid);
 		dump_row(pid, "query");
+		dump_songs(pid);
 		if (repair) {
-			ML3MusicLibrary *lib;
-
+			/* no ML3MusicLibrary here on purpose: the repair is SQL on the file, and asking the library for the
+			 * sort map is what killed medialibraryd (see the comment above repair_local) */
 			if (getuid() == 0) {
 				(void)setgroups(0, NULL);
 				if (setgid(MOBILE_ID) != 0 || setuid(MOBILE_ID) != 0) {
@@ -845,22 +1067,25 @@ static int import(int argc, char **argv) {
 				setenv("HOME", "/var/mobile", 1);
 				setenv("CFFIXED_USER_HOME", "/var/mobile", 1);
 			}
-			lib = [ML3MusicLibrary autoupdatingSharedLibrary];
-			if (lib == nil) { fprintf(stderr, "music_import: no ML3MusicLibrary\n"); return 1; }
 			{
 				char path[4096];
+				struct stat status;
 				NSString *t = nil, *a = nil, *al = nil, *g = nil;
 				double secs = 0;
+				long long size = 0;
 
 				snprintf(path, sizeof(path), "%s/%s", MUSIC_DIR, name);
+				if (stat(path, &status) == 0) {
+					size = (long long)status.st_size;
+				}
 				read_metadata(path, [[NSString stringWithUTF8String:name] stringByDeletingPathExtension], &t, &a, &al,
 				    &g, &secs);
-				fprintf(stderr, "music_import: repair: artist \"%s\", album \"%s\"\n", UTF8(a), UTF8(al));
+				fprintf(stderr, "music_import: repair: artist \"%s\", album \"%s\", %lld bytes\n", UTF8(a), UTF8(al), size);
 				repair_entities(pid, a, al);
-				repair_search(lib);
-				repair_sort(lib, pid, t, a, al);
+				repair_local(pid, t, a, al, size, secs);
 			}
 			dump_row(pid, "after the repair");
+			dump_songs(pid);
 		}
 		if (ml3) {
 			ML3MusicLibrary *lib;
@@ -969,8 +1194,8 @@ static int import(int argc, char **argv) {
 	}
 	fix_rows([track persistentID], copied);
 	repair_entities([track persistentID], artist, album);
-	repair_search(library);
-	repair_sort(library, [track persistentID], title, artist, album);
+	repair_local([track persistentID], title, artist, album, copied, seconds);
+	dump_songs([track persistentID]);
 	fprintf(stderr, "music_import: the track says now: file path %s, playable %s, local %s, restricted %s\n",
 	    UTF8([[track valueForProperty:ML3TrackPropertyFilePath] description]),
 	    UTF8([[track valueForProperty:ML3TrackPropertyIsPlayable] description]),
