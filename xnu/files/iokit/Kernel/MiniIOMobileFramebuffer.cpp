@@ -53,6 +53,26 @@ extern "C" { bool (*hakios_display_power)(bool on) = NULL; }
  * The panel's own frame timing, if a driver can read it (vayu: vayu_vsync.c with vayu_vsync=2, from
  * the display controller's line counter): the absolute time of the next frame start, and a frame's
  * length. Without them refreshes are a timer at fb_hz, which beats against the panel's real rate.
+ *
+ * Boot-arg fb_120=1: the display is the panel's 120 Hz one, and iOS is told so. The mode's SyncRate
+ * (TimingElements, publishModes()) and the refresh timer are 120, a refresh is told to iOS every
+ * panel frame (no adaptive divisor of 2), and a frame is put on the panel as rows copied (the middle
+ * 1080x2400 of the picture, as fb_fit=1) rather than scaled: a scaled frame costs 5.5-7.9 ms of the
+ * 8.33 ms a 120 Hz frame has.
+ *
+ * That is this driver's half, and it was already done when a tester said 120 Hz was not visible:
+ * a test run had fb_hz=120 vayu_vsync=2 fb_vsync_div=1 fb_fit=1 fb_threads=6, and 48-59 frames a
+ * second with 292 of 300 intervals between 10 and 18 ms -- a steady 60, while the copy cost 1.0 ms
+ * and the GPU 0.7-7.7 ms. A test run had the panel's timing armed as well, and the same
+ * 301-302 frames in 5005-5013 ms: every one of ~300 swaps a window came more than a 120 Hz period
+ * after the one before. Nothing in this driver was the ceiling: the window server asked for 60
+ * frames a second. CoreAnimation keeps a 16.7 ms floor (its "minimum frame duration") on every
+ * display that is not a ProMotion one, and an iPhone X's identity is not; the port lifts it from
+ * user space, from this same boot-arg: src/inject.c (backboardd) and src/inject_sb.c (SpringBoard)
+ * answer CoreAnimation's CADisableMinimumFrameDuration[OnPhone] Info.plist key with true (the key
+ * is read through CFBundleGetValueForInfoDictionaryKey, not getenv; see inject.c). What this driver
+ * can do is tell the refreshes at the panel's rate and say in the log how many it told, so the next
+ * run shows whether the compositor took them.
  */
 extern "C" { uint64_t (*hakios_vsync_next)(uint64_t now) = NULL; uint64_t (*hakios_vsync_frame)(void) = NULL; }
 /* the panel's brightness, 1..1000 of its full scale, if a driver has one (vayu: vayu_wled.c, vayu_wled=2) */
@@ -95,7 +115,7 @@ enum {
 
 #define kFBNotifyVSync          5
 #define kFBNotifyTypes          8
-#define kFBRefreshHz            60                      /* unless boot-arg fb_hz says otherwise */
+#define kFBRefreshHz            60                      /* unless boot-arg fb_hz (or fb_120) says otherwise */
 
 #define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
 #define FRAME_PAUSE             90                      /* from so many on, nothing was moving: not a slow frame */
@@ -195,9 +215,19 @@ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
  * the framebuffer's own copy takes 5.5-7.9 ms a frame here (run 194827: 49-56 frames a second, gaps of 10
  * to 35 ms), so at 120 Hz frames land on every first or second refresh at random -- the jitter the owner
  * sees. A steady 60 is smoother than a ragged 55: every second frame while the copy takes more than 60%
- * of a frame, back to every frame below 45%.
+ * of a frame, back to every frame below 45%. fb_120=1 forces 1 (a refresh every panel frame).
  */
 static TUNABLE(uint32_t, gVsyncDivisor, "fb_vsync_div", 0);
+/*
+ * Boot-arg fb_120=1: iOS is told the display is the panel's 120 Hz one -- the mode's SyncRate, the
+ * refresh timer and the refreshes themselves (see the top of this file). Off by default: the display
+ * has been an iPhone X's 60 to iOS since the port began, and a window server with the software
+ * renderer cannot fill 120 frames anyway.
+ */
+static TUNABLE(uint32_t, gFb120, "fb_120", 0);
+static uint32_t gModeHz;                        /* the refresh the display is said to run at (fb_120: 120) */
+static bool gPictureFit;                        /* rows copied, not scaled: fb_fit, or a 120 Hz frame's cost */
+static uint32_t gVSyncsTold;                    /* refreshes told to user space since the last 5 s line (atomic) */
 static uint64_t gFBDrawAbs;                     /* the copy's time per frame, a running average */
 static uint32_t gFBDivisor = 1;
 /*
@@ -233,7 +263,9 @@ micros(uint64_t absolute)
 static inline uint32_t
 refreshHz(void)
 {
-	return gRefreshHz >= 1 && gRefreshHz <= 240 ? gRefreshHz : kFBRefreshHz;
+	uint32_t hz = gModeHz != 0 ? gModeHz : gRefreshHz;
+
+	return hz >= 1 && hz <= 240 ? hz : kFBRefreshHz;
 }
 static inline uint32_t
 recStep(void)
@@ -379,8 +411,8 @@ setNumber(OSDictionary * dict, const char * key, uint64_t value)
 /*
  * The modes of the display, the way CoreAnimation reads them (the properties TimingElements
  * and ColorElements; without a mode it draws nothing). One timing, the panel's size at
- * 60 Hz (boot-arg fb_hz=N: at N), with one colour mode, 8-bit RGB. The identifiers are what "the current mode"
- * (block 0x40) answers with.
+ * 60 Hz (boot-arg fb_hz=N: at N; fb_120=1: at 120), with one colour mode, 8-bit RGB. The
+ * identifiers are what "the current mode" (block 0x40) answers with.
  */
 #define kFBTimingID     1
 #define kFBColorID      1
@@ -493,17 +525,33 @@ IOMobileFramebuffer::start(IOService * provider)
 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
 	fDiff = gDiff != 0;
 	fDiffLeft = fDiffTop = ~0u;
+	/*
+	 * A 120 Hz display: the mode (and the refresh timer) at 120, and a frame put on the panel as
+	 * rows copied rather than scaled (a scaled frame does not fit in 8.33 ms). fb_fit=1 asks for
+	 * the same picture; with fb_zero=1 the flip has no copy at all and the crop is its own.
+	 */
+	gModeHz = gFb120 != 0 ? 120 : gRefreshHz;
+	gPictureFit = gFit != 0 || gFb120 != 0;
 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
 	    fPanelWidth, fPanelHeight, fRowBytes);
-	if (gFit && fWidth >= fPanelWidth && fHeight >= fPanelHeight) {
+	if (gFb120 != 0) {
+		IOLog("MiniIOMobileFramebuffer: fb_120=1: the display is said to be %u Hz; a refresh every panel frame; "
+		    "a frame copied as rows, not scaled%s\n", refreshHz(),
+		    gFbZero != 0 ? " (fb_zero=1: a whole surface is flipped, no copy at all)" : "");
+		if (!(fWidth >= fPanelWidth && fHeight >= fPanelHeight)) {
+			IOLog("MiniIOMobileFramebuffer: fb_120=1: the picture %ux%u is smaller than the panel: it is scaled, and "
+			    "120 frames a second are not to be expected\n", fWidth, fHeight);
+		}
+	}
+	if (gPictureFit && fWidth >= fPanelWidth && fHeight >= fPanelHeight) {
 		hakios_display_crop[0] = (fWidth - fPanelWidth) / 2;
 		hakios_display_crop[1] = (fHeight - fPanelHeight) / 2;
 		hakios_display_crop[2] = fWidth;
 		hakios_display_crop[3] = fHeight;
 		hakios_display_crop[4] = fPanelWidth;
 		os_atomic_store(&hakios_display_crop[5], fPanelHeight, release);       /* (last: the touch screen reads it first) */
-		IOLog("MiniIOMobileFramebuffer: fb_fit=1: the picture's middle %ux%u, pixel for pixel (from %u, %u); no scaling\n",
-		    fPanelWidth, fPanelHeight, hakios_display_crop[0], hakios_display_crop[1]);
+		IOLog("MiniIOMobileFramebuffer: %s: the picture's middle %ux%u, pixel for pixel (from %u, %u); no scaling\n",
+		    gFit != 0 ? "fb_fit=1" : "fb_120=1", fPanelWidth, fPanelHeight, hakios_display_crop[0], hakios_display_crop[1]);
 	}
 
 	if (gRecSeconds != 0) {
@@ -799,7 +847,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		return;
 	}
 	/* the rectangle on the panel */
-	if (gFit && fWidth >= fPanelWidth && fHeight >= fPanelHeight) {
+	if (gPictureFit && fWidth >= fPanelWidth && fHeight >= fPanelHeight) {
 		int32_t left = (int32_t) (fWidth - fPanelWidth) / 2, top = (int32_t) (fHeight - fPanelHeight) / 2;
 
 		px0 = dx - left;
@@ -1207,6 +1255,18 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate);
+		if (gFb120 != 0) {
+			/*
+			 * Whether the compositor is on this driver's clock at all: refreshes told to user space.
+			 * A window server that takes them asks every panel frame (120 a second); one on its own
+			 * timer never does, and this reads 0.
+			 */
+			uint32_t told = os_atomic_xchg(&gVSyncsTold, 0, relaxed);
+
+			IOLog("MiniIOMobileFramebuffer: fb_120: %u refreshes told to user space in %llu ms (%u a second)%s\n",
+			    told, nanos / NSEC_PER_MSEC, (uint32_t) ((uint64_t) told * NSEC_PER_SEC / nanos),
+			    told == 0 ? ": nobody is listening, the compositor is on its own clock" : "");
+		}
 		if (gFbZero) {
 			uint32_t slots = 0, used = 0;
 
@@ -1454,7 +1514,7 @@ IOMobileFramebufferUserClient::armVSync(void)
 	if (panel_next != NULL && panel_frame != NULL && (period = panel_frame()) != 0) {
 		/* the next frame start the panel itself will make; a quarter frame at least after the last one told */
 		uint64_t next = panel_next(now);
-		uint32_t div = gVsyncDivisor;
+		uint32_t div = gFb120 != 0 ? 1 : gVsyncDivisor;
 
 		if (div == 0) {
 			if (gFBDivisor == 1 && gFBDrawAbs * 10 > period * 6) {
@@ -1502,6 +1562,7 @@ IOMobileFramebufferUserClient::vsync(void)
 		fVSyncRunning = false;
 	} else {
 		fVSyncCount++;
+		os_atomic_inc(&gVSyncsTold, relaxed);
 		setAsyncReference64(ref, fPorts[kFBNotifyVSync], fCallbacks[kFBNotifyVSync], fRefcons[kFBNotifyVSync], fTask);
 		args[0] = (uint32_t) now;
 		args[1] = now >> 32;
