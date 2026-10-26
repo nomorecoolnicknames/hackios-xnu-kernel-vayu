@@ -49,6 +49,7 @@ struct boot_video {
 };
 
 #define BOOT_LINE_LENGTH 608
+#define FULL_CMD_LEN 4096      /* the whole command line, for /chosen hakios-bootargs (loader 1.9) */
 
 struct boot_args {
 	uint16_t revision;
@@ -292,25 +293,50 @@ find_log_partition(void)
  * last run. It is what gets written to the log partition and what the host
  * fetches over USB (fastboot get_staged).
  */
-static char out_buf[2 * 1024 * 1024];
+/*
+ * The staged log: 9 MB from UEFI on first use (loader 1.6: the kernel's log is 8 MB since 2026-10-25), else this 2 MB.
+ */
+static char out_buf_static[2 * 1024 * 1024];
+static char *out_buf = out_buf_static;
+static uint64_t out_cap = sizeof(out_buf_static);
+#define OUT_BUF_BIG     (9ULL * 1024 * 1024)
+
+static void
+out_buf_grow(void)
+{
+	static int tried;
+	uint64_t pa = 0;
+
+	if (tried) {
+		return;
+	}
+	tried = 1;
+	if (!EFI_ERROR(BS->allocate_pages(AllocateAnyPages, EfiLoaderData, OUT_BUF_BIG >> 12, &pa))) {
+		out_buf = (char *)(uintptr_t)pa;
+		out_cap = OUT_BUF_BIG;
+		memset(out_buf, 0, out_cap);
+	}
+}
 /* the storage's reads for the kernel land here (block_poll); also where the log is read back */
 #define BLOCK_BUFFER_SIZE  (4u << 20)
 static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
-static const char *staged_data = out_buf;   /* what "upload" sends: normally the log in out_buf */
+static const char *staged_data = out_buf_static;   /* what "upload" sends: normally the log in out_buf (set by compose_logs) */
 static uint64_t staged_len;
 
 static void
 compose_logs(const char *klog, uint64_t klog_len)
 {
 	static const char sep[] = "\n== KERNEL LOG ==\n", end[] = "\n== END OF LOG ==\n";
-	uint64_t n = log_len;
+	uint64_t n = log_len, was = staged_len;
 
+	out_buf_grow();
 	staged_data = out_buf;
-	memset(out_buf, 0, sizeof(out_buf));
+	/* (what the last staging left is cleared: the partition gets whole blocks, past the end too) */
+	memset(out_buf, 0, was + 65536 < out_cap ? was + 65536 : out_cap);
 	memcpy(out_buf, log_buf, log_len);
 	if (klog != NULL) {
-		if (klog_len > sizeof(out_buf) - n - 8192) {
-			klog_len = sizeof(out_buf) - n - 8192;
+		if (klog_len > out_cap - n - 8192) {
+			klog_len = out_cap - n - 8192;
 		}
 		memcpy(out_buf + n, sep, sizeof(sep) - 1);
 		n += sizeof(sep) - 1;
@@ -327,12 +353,72 @@ static int hc_log_skips;                /* logs not written this run (said twice
 static void hc_print_state(const char *when);
 static void hc_take_back(const char *when);
 
+/*
+ * The log the last kernel returned: "oem log" between runs stages it again instead of the loader's
+ * log alone. Before, an "oem log" from xl's follow loop (XL_FOLLOW) that came just after the kernel's
+ * return replaced the staged loader + kernel log with the loader's ~8 KB, and xl then fetched that as
+ * the run's log (runs 175145 and 204935: 1441823 bytes returned, 8 KB fetched).
+ */
+static const char *returned_klog;
+static uint64_t returned_klog_len;
+
+/*
+ * The log of the run before this boot (loader 1.8). A run whose log reached only logdump -- the 120 s idle reset after
+ * a return the host never fetched, a watchdog, a hard reset -- lost it here: the first thing a freshly started loader
+ * wrote to logdump was its own few KB (test run, 2026-10-25: a 339-byte log, "log: 4096 bytes written to logdump").
+ * Now, until a kernel is started in this session, logdump is read first and, if it holds a kernel's log, left as it
+ * is and kept in memory as well: "oem prevlog" stages it for get_staged.
+ */
+static char *prev_log;
+static uint64_t prev_log_len;
+static int prev_log_checked, kernel_started_this_session, logdump_force;  /* force: oem fbtouch writes regardless */
+
+static void
+prev_log_check(efi_block_io *bio)
+{
+	static const char mark[] = "== KERNEL LOG";
+	uint64_t bs, blocks, pa = 0, cap = 9ULL * 1024 * 1024, n;
+
+	prev_log_checked = 1;
+	if (bio == NULL || kernel_started_this_session) {
+		return;
+	}
+	bs = bio->media->block_size;
+	blocks = cap / bs;
+	if ((bio->media->last_block + 1) < blocks) {
+		blocks = bio->media->last_block + 1;
+	}
+	if (EFI_ERROR(BS->allocate_pages(AllocateAnyPages, EfiLoaderData, (blocks * bs + 0xfff) >> 12, &pa)) ||
+	    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 0, blocks * bs, (void *)(uintptr_t)pa))) {
+		return;
+	}
+	for (n = 0; n < blocks * bs && ((char *)(uintptr_t)pa)[n] != 0; n++) {
+	}
+	for (uint64_t i = 0; i + sizeof(mark) - 1 <= n; i++) {
+		if (memcmp((char *)(uintptr_t)pa + i, mark, sizeof(mark) - 1) == 0) {
+			prev_log = (char *)(uintptr_t)pa;
+			prev_log_len = n;
+			print("log: logdump holds the last run's log (%d bytes, a kernel's among it): kept, \"oem prevlog\" stages it\n", n);
+			return;
+		}
+	}
+	BS->free_pages(pa, (blocks * bs + 0xfff) >> 12);
+}
+
 static void
 write_logs(const char *klog, uint64_t klog_len)
 {
+	returned_klog = klog;
+	returned_klog_len = klog_len;
 	efi_block_io *bio = find_log_partition();
 
+	if (!prev_log_checked) {
+		prev_log_check(bio);
+	}
 	compose_logs(klog, klog_len);
+	if (prev_log != NULL && !kernel_started_this_session && !logdump_force) {
+		return;                 /* (logdump keeps the last run's log until a kernel runs in this session) */
+	}
 	if (bio == NULL) {
 		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
 		if (klog != NULL) {
@@ -346,6 +432,10 @@ write_logs(const char *klog, uint64_t klog_len)
 	}
 	uint64_t bs = bio->media->block_size;
 	uint64_t len = (staged_len + 1 + bs - 1) / bs * bs;
+
+	if (len > (bio->media->last_block + 1) * bs) {
+		len = (bio->media->last_block + 1) * bs;        /* (a partition smaller than the log: its start only) */
+	}
 	efi_status ws, rs = 0;
 	int same = 0;
 
@@ -513,6 +603,26 @@ dt_end(struct dt_writer *w)
 /* ------------------------------------------------------------------------ */
 /* Platform description                                                     */
 
+/*
+ * The port's own partition on a device, "darwin": the one place a write may reach (bsd/dev/hakios.ufs.c,
+ * tools/darwin-write.py). Everything about it is checked against this before anything is written; a
+ * device without one (none set up yet) gets no write at all. The kernel is handed the same numbers on its
+ * command line (ufs_darwin_first=, ufs_darwin_blocks=, ufs_write_first=) and checks the loader's table
+ * against them.
+ */
+struct darwin_identity {
+	uint64_t first_lba, last_lba;    /* on its unit, as the GPT has them; blocks of 4096 */
+	uint64_t write_first;            /* its first block a write may reach: past what the build writes there */
+	uint16_t unit;                   /* the unit it is on, by UEFI's order */
+	efi_guid type, uniq;             /* its GPT type and unique GUIDs */
+};
+
+/* a partition there is a reference image of, and how many of its bytes the image has (ufs=1, its hash) */
+struct ufs_reference {
+	const char *name;
+	uint64_t bytes;
+};
+
 struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
@@ -520,10 +630,49 @@ struct platform {
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
+	int hypervisor_wdt;              /* the Qualcomm hypervisor's virtual watchdog is behind SMC */
+	int charger;                     /* the UEFI charger stack can be queried on this platform */
 	int cores;                       /* at most this many processor cores, numbered from 0 ... */
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
+	uint64_t fb_base;                /* fallback identification: the framebuffer the firmware reports (GOP) */
+	const struct darwin_identity *darwin;      /* the port's partition; NULL: none, nothing is ever written */
+	const struct ufs_reference *ufs_refs;      /* ufs=1: the partitions hashed, and how far */
+	unsigned ufs_nrefs;
+};
+
+/*
+ * redwood: darwin is the port's own 20 GiB at the end of logical unit 0 (README, "The port's partition");
+ * what the build puts there from the computer (tools/darwin-write.py) is the iOS volume at its start and
+ * the two cryptexes behind it, so writes begin past both. The references are firmware-update/ of the
+ * ROM's fw.zip (tools/ufs-survey.py).
+ */
+static const struct darwin_identity darwin_redwood = {
+	.first_lba = 25374720, .last_lba = 30617594, .write_first = 2042368, .unit = 0,
+	.type = { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } },
+	.uniq = { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } },
+};
+static const struct ufs_reference ufs_refs_redwood[] = {
+	{ "bluetooth", 503808 }, { "abl", 208896 }, { "aop", 208896 }, { "xbl", 3706880 },
+	{ "tz", 3710976 }, { "hyp", 3653632 }, { "dsp", 67108864 }, { "modem", 214265856 },
+};
+/*
+ * vayu: darwin is entry 33 of unit 0 (sda33), 24 GiB at the end of the unit, with the GPT entry
+ * parsed from the phone's own partition table (type APFS, unique 1c213492-90d4-4921-869e-98ec2fa0497c,
+ * LBA 55871232..62162938). Nothing is written from the computer there yet; writes begin at block 2097152
+ * (8 GiB), where var_store's two slots are (userland/src/var_store.c STORE_AT), so the first 8 GiB stay
+ * free for an iOS volume on flash later. The references are whole partitions of a read-only backup of the
+ * phone's own Android; they are hashed with FNV-1a for comparison (ufs=1).
+ */
+static const struct darwin_identity darwin_vayu = {
+	.first_lba = 55871232, .last_lba = 62162938, .write_first = 2097152, .unit = 0,
+	.type = { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } },
+	.uniq = { 0x1c213492, 0x90d4, 0x4921, { 0x86, 0x9e, 0x98, 0xec, 0x2f, 0xa0, 0x49, 0x7c } },
+};
+static const struct ufs_reference ufs_refs_vayu[] = {
+	{ "bluetooth", 1048576 }, { "abl", 2097152 }, { "aop", 524288 }, { "xbl", 7340032 },
+	{ "tz", 4194304 }, { "hyp", 8388608 }, { "dsp", 67108864 }, { "modem", 335544320 },
 };
 
 static const struct platform platform_qemu_virt = {
@@ -541,7 +690,8 @@ static const struct platform platform_qemu_virt = {
 static const struct platform platform_redwood = {
 	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
 	.name = "redwood", .io_base = 0x00400000, .io_size = 0x3FC00000,
-	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1, .hypervisor_wdt = 1,
+	.charger = 1,
 	.cores = 8, .core_shift = 8,
 	/*
 	 * Cores 0-3 are Cortex-A55s (1.8 GHz at most), 4-7 Cortex-A78s (2.4 GHz): a big one is about
@@ -549,7 +699,53 @@ static const struct platform platform_redwood = {
 	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
 	 */
 	.small_cores = 0x0f,
+	.fb_base = 0xE1000000,
+	.darwin = &darwin_redwood,
+	.ufs_refs = ufs_refs_redwood, .ufs_nrefs = sizeof(ufs_refs_redwood) / sizeof(ufs_refs_redwood[0]),
 };
+
+static const struct platform platform_vayu = {
+	/* POCO X3 Pro (SM8150-AC / Snapdragon 860). Values from vayu.dtb + vayuPkg MemoryMapLib. */
+	.name = "vayu", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1, .hypervisor_wdt = 1,
+	.charger = 1,
+	.cores = 8, .core_shift = 8,
+	/* Cores 0-3 are Cortex-A55s; 4-7 are Cortex-A76s. */
+	.small_cores = 0x0f,
+	/* FACT: on the phone the loader printed "display 1080 x 2400 at 9c000000"; fallback only. */
+	.fb_base = 0x9C000000,
+	.darwin = &darwin_vayu,
+	.ufs_refs = ufs_refs_vayu, .ufs_nrefs = sizeof(ufs_refs_vayu) / sizeof(ufs_refs_vayu[0]),
+};
+
+/*
+ * The devices the loader knows. The image normally names one in its payload; the framebuffer base is the
+ * fallback for images built before that entry existed. A port to another device adds its description
+ * here (devices/poco-x3-pro/README.md lists where each value of vayu's came from);
+ * a display that matches none is QEMU's ramfb.
+ */
+static const struct platform *const platforms[] = {
+	&platform_redwood,
+	&platform_vayu,
+};
+
+/* The image can name its device in the payload ("platform=vayu"), so a wrong
+ * or changed framebuffer base cannot silently fall back to QEMU's platform. */
+static const struct platform *
+platform_by_name(const char *name, uint32_t len)
+{
+	if (len != 0 && name[len - 1] == '\0') {
+		len--;
+	}
+	for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++) {
+		const char *candidate = platforms[i]->name;
+
+		if (str_len(candidate) == len && memcmp(candidate, name, len) == 0) {
+			return platforms[i];
+		}
+	}
+	return 0;
+}
 
 /* ------------------------------------------------------------------------ */
 
@@ -862,6 +1058,9 @@ struct kernel_live {
 	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
 	uint64_t magic2;                /* "XNULIVE2": the kernel is new enough to have what follows */
 	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": the kernel has what follows (USB handover, USB networking) */
+	volatile uint64_t usb_take;     /* the kernel writes 1: it wants the USB controller (usb_handover=1) */
+	volatile uint64_t usb_given;    /* this loader writes 1: it has stopped touching USB for this run */
 };
 
 /*
@@ -921,6 +1120,13 @@ static struct loader_battery charger_shared __attribute__((aligned(0x2000))) = {
 static efi_charger_ex *CHARGER_EX;
 static efi_qcom_charger *QCOM_CHARGER;
 static int charger_enabled;
+/*
+ * loader_charger=0 on the payload command line: no charger polls while that kernel runs. The
+ * 3D stream's loader (charger only on redwood) serves live logs during vayu runs; this branch's
+ * (charger on vayu too, from vayu-battery-buttons) did not in runs 165651..T1'. HYPOTHESIS: the
+ * UEFI charger calls every 5 s starve the USB side; this switch tests it.
+ */
+static int charger_paused;
 
 /* The screen recording the last kernel left in memory, if it made one ("oem recording" stages it). */
 static const char *recording_data;
@@ -929,6 +1135,7 @@ static uint64_t recording_len;
 static const char *sound_data;
 static uint64_t sound_len;
 #define KERNEL_LIVE_MAGIC2      0x324556494c554e58ULL
+#define KERNEL_LIVE_MAGIC3      0x334556494c554e58ULL   /* "XNULIVE3" */
 #define KERNEL_LIVE_MAGIC       0x214556494c554e58ULL
 #define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
@@ -1004,9 +1211,10 @@ compose_live_log(const struct kernel_live *live, uint64_t slide)
 	uint32_t len = *(volatile uint32_t *)(live->log_len + slide);
 	uint32_t ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
 	int wrapped = *(volatile uint8_t *)(live->log_wrapped + slide);
-	uint64_t n, room = sizeof(out_buf) - 8192;
+	uint64_t n, room;
 
 	compose_logs(NULL, 0);
+	room = out_cap - 8192;
 	n = staged_len;
 #define PUT(from, size) do { \
 	uint64_t take = (size); \
@@ -1135,13 +1343,6 @@ charger_poll(void)
  * Only read_blocks is ever called here: nothing is written, flushed or reset. It runs before the
  * kernel is started, with UEFI's boot services whole and interrupts on.
  */
-static const struct {
-	const char *name;
-	uint64_t bytes;
-} ufs_references[] = {
-	{ "bluetooth", 503808 }, { "abl", 208896 }, { "aop", 208896 }, { "xbl", 3706880 },
-	{ "tz", 3710976 }, { "hyp", 3653632 }, { "dsp", 67108864 }, { "modem", 214265856 },
-};
 
 static uint8_t ufs_buffer[1024 * 1024] __attribute__((aligned(4096)));
 
@@ -1170,8 +1371,8 @@ ufs_name(const efi_partition_info *info, char *out, unsigned size)
 static int
 ufs_reference_of(const char *name)
 {
-	for (unsigned r = 0; r < sizeof(ufs_references) / sizeof(ufs_references[0]); r++) {
-		const char *a = ufs_references[r].name, *b = name;
+	for (unsigned r = 0; PLAT->ufs_refs != NULL && r < PLAT->ufs_nrefs; r++) {
+		const char *a = PLAT->ufs_refs[r].name, *b = name;
 
 		while (*a && *a == *b) {
 			a++;
@@ -1422,7 +1623,7 @@ ufs_survey(void)
 		print("ufs: part %s: lba %d..%d, %d KB\n", name, info->start_lba, info->end_lba,
 		    (bio->media->last_block + 1) * bio->media->block_size >> 10);
 		if ((r = ufs_reference_of(name)) >= 0) {
-			ufs_hash_partition(bio, name, ufs_references[r].bytes);
+			ufs_hash_partition(bio, name, PLAT->ufs_refs[r].bytes);
 		}
 		if (name[0] == 's' && name[1] == 'u' && name[2] == 'p' && name[3] == 'e' && name[4] == 'r' && name[5] == 0) {
 			ufs_dump_super(bio);
@@ -1477,11 +1678,7 @@ ufs_survey(void)
  * and a write is refused before that block. The identity is the whole of darwin-write.py's: the
  * same partition, named the same, of the same size, in the same place, on logical unit 0.
  */
-#define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
-#define BLOCK_DARWIN_FIRST 25374720ULL                 /* its first and last LBA of unit 0, as the GPT has them */
-#define BLOCK_DARWIN_LAST  30617594ULL
-#define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
-#define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
+/* (the identity itself is the platform's: struct darwin_identity, PLAT->darwin) */
 
 /*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
@@ -1821,7 +2018,7 @@ block_tables(void)
 static int
 block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
 {
-	static const efi_guid type = BLOCK_DARWIN_TYPE, uniq = BLOCK_DARWIN_UNIQ;
+	const struct darwin_identity *d = PLAT->darwin;
 	static const char name[] = "darwin";
 	const char *why = NULL;
 
@@ -1830,17 +2027,19 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 			return 0;               /* another partition: nothing to say about it */
 		}
 	}
-	if (memcmp(&info->type_guid, &type, sizeof(type)) != 0) {
+	if (d == NULL) {
+		why = "this device has no darwin set up in the loader (struct darwin_identity)";
+	} else if (memcmp(&info->type_guid, &d->type, sizeof(d->type)) != 0) {
 		why = "its type GUID is not the one it had";
-	} else if (memcmp(&info->unique_guid, &uniq, sizeof(uniq)) != 0) {
+	} else if (memcmp(&info->unique_guid, &d->uniq, sizeof(d->uniq)) != 0) {
 		why = "its unique GUID is not the one it had";
-	} else if (info->start_lba != BLOCK_DARWIN_FIRST || info->end_lba != BLOCK_DARWIN_LAST) {
+	} else if (info->start_lba != d->first_lba || info->end_lba != d->last_lba) {
 		why = "it does not begin and end where it did";
-	} else if (bp->unit != 0) {
+	} else if (bp->unit != d->unit) {
 		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
 		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
-		why = "it is not on the first logical unit";
-	} else if (bp->block_size != 4096 || bp->blocks != BLOCK_DARWIN_LAST - BLOCK_DARWIN_FIRST + 1) {
+		why = "it is not on its logical unit";
+	} else if (bp->block_size != 4096 || bp->blocks != d->last_lba - d->first_lba + 1) {
 		why = "its blocks are not what they were";
 	} else if (bio->media->read_only) {
 		why = "UEFI gives it out read only";
@@ -1849,8 +2048,8 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 		print("ufs: darwin: no write will be served: %s\n", why);
 		return 0;
 	}
-	print("ufs: darwin (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n",
-	    info->start_lba, info->end_lba, BLOCK_WRITE_FIRST);
+	print("ufs: darwin (LBA %d..%d of unit %d): its blocks from %d on may be written this run\n",
+	    info->start_lba, info->end_lba, (uint64_t)d->unit, d->write_first);
 	return 1;
 }
 
@@ -1973,7 +2172,7 @@ block_start(void)
 	block_writes = block_writes_refused = block_write_bytes = 0;
 	if (block_write_part >= 0) {
 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
-		block_shared.write_first = BLOCK_WRITE_FIRST;
+		block_shared.write_first = PLAT->darwin->write_first;   /* block_is_darwin() said yes: there is one */
 	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
@@ -2100,7 +2299,8 @@ block_poll(void)
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
 		} else if (op == BLOCK_OP_WRITE) {
-			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
+			if (block_write_part < 0 || PLAT->darwin == NULL || part != (uint32_t)block_write_part ||
+			    lba < PLAT->darwin->write_first) {
 				/* not darwin, or not past what the build writes from the computer: never */
 				if (block_writes_refused++ < 8) {
 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
@@ -2166,7 +2366,7 @@ charger_start(void)
 	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
 	efi_status ex_status, qcom_status, init_status = 0;
 
-	if (charger_enabled || PLAT != &platform_redwood) {
+	if (charger_enabled || !PLAT->charger) {
 		return;
 	}
 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
@@ -2253,6 +2453,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	int arrived = 0, watching_only = 0;
 
 	running_live = live;
+	kernel_started_this_session = 1;
 	running_slide = slide;
 	other_cpu_start.entry = entry;
 	other_cpu_start.boot_args = boot_args_pa;
@@ -2328,7 +2529,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			last_pet = READ_SYSREG(CNTVCT_EL0);
 		}
 		/* Qualcomm's UEFI charger stack owns the PMIC/GLINK side; keep XNU's cache live. */
-		if (charger_enabled && seconds_since(last_battery) >= 5 && hc_list_is_uefis()) {
+		if (charger_enabled && !charger_paused && seconds_since(last_battery) >= 5 && hc_list_is_uefis()) {
 			/* (not while the kernel's own transfer list is in: Qualcomm's DXEs are not to touch the storage) */
 			charger_poll();
 			last_battery = READ_SYSREG(CNTVCT_EL0);
@@ -2432,7 +2633,7 @@ wdt_arm(void)
 {
 	uint64_t ctl = 0, since = 0;
 
-	if (PLAT != &platform_redwood) {
+	if (!PLAT->hypervisor_wdt) {
 		return; /* SMC is not routed anywhere useful on QEMU virt */
 	}
 	uint64_t st = smc_call(VIRT_WDT_STATUS, 0, 0, &ctl, &since);
@@ -2483,11 +2684,707 @@ install_exception_hook(void)
 /* ------------------------------------------------------------------------ */
 /* Payload                                                                  */
 
+/* ------------------------------------------------------------------------ */
+/* vayu audio: the speaker amplifiers' pins, for XNU's bsd/dev/vayu_audio.c. */
+/*                                                                          */
+/* This port's rule: XNU does not write TLMM, the loader prepares the pins.   */
+/* Two TI amplifiers on QUP0 SE7's bus (GPIO 98 data, 99 clock, function    */
+/* qup7 = 1): TAS2562 at 0x4c (SDZ GPIO 92, IRQ 91) and TAS2564 at 0x4d     */
+/* (SDZ 89, IRQ 90); SDZ is their active-low hardware shutdown. 89-92 are   */
+/* in the NORTH tile, 98/99 in the SOUTH one (pinctrl-sm8150.c), registers  */
+/* +0x1000 * pin. Only when the payload's command line asks:                */
+/*   vayu_audio_pins=1  SDZ 89/92 driven high, pull kept (as the driver's   */
+/*                      tas256x_hw_reset() and gpio_direction_output), 20   */
+/*                      ms: the chips leave hardware shutdown for software  */
+/*                      shutdown, no output stage; XNU may then talk to them */
+/*   vayu_audio_pins=2  SDZ 89/92 driven low: both back in hardware shutdown */
+/*   vayu_audio_mi2s=1  MI2S 137-140 to qua_mi2s (dt active state); =2 sleep */
+/*   vayu_audio_ids=1   (with =1) the chip IDs read here, I2C by hand on    */
+/*                      98/99 (taken as GPIOs and given back as found):     */
+/*                      page 0x00, book 0x7f, ID 0x7d (0x10/0x20 TAS2562,   */
+/*                      0x00 TAS2564). No amplifier register is written.    */
+/* Every write is logged with its readback.                                 */
+/* ------------------------------------------------------------------------ */
+
+#define AUD_TLMM_NORTH  0x03900000ULL
+#define AUD_TLMM_SOUTH  0x03D00000ULL
+#define AUD_SDZ_LEFT    89      /* 0x4d */
+#define AUD_SDZ_RIGHT   92      /* 0x4c */
+#define AUD_SDA         98
+#define AUD_SCL         99
+#define AUD_CFG_OE      (1u << 9)
+
+static uint64_t
+aud_cfg(unsigned pin)
+{
+	return (pin >= 89 && pin <= 92 ? AUD_TLMM_NORTH : AUD_TLMM_SOUTH) + 0x1000ULL * pin;
+}
+
+static inline uint32_t
+aud_rd(uint64_t pa)
+{
+	return *(volatile uint32_t *)(uintptr_t)pa;
+}
+
+static inline void
+aud_wr(uint64_t pa, uint32_t v)
+{
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(uintptr_t)pa = v;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void
+aud_spin_us(uint64_t us)
+{
+	uint64_t frq = READ_SYSREG(CNTFRQ_EL0), start = READ_SYSREG(CNTPCT_EL0);
+
+	while (READ_SYSREG(CNTPCT_EL0) - start < us * frq / 1000000) {
+	}
+}
+
+static int
+aud_word(const char *cmdline, const char *word)
+{
+	for (const char *p = cmdline; *p; p++) {
+		const char *q = p, *w = word;
+
+		if (p != cmdline && p[-1] != ' ') {
+			continue;
+		}
+		while (*w && *q == *w) {
+			q++, w++;
+		}
+		if (*w == 0 && (*q == 0 || *q == ' ')) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void
+aud_show(const char *when, unsigned pin)
+{
+	uint32_t cfg = aud_rd(aud_cfg(pin)), io = aud_rd(aud_cfg(pin) + 4);
+
+	print("vayu-audio: %s gpio%d cfg %x io %x (function %d, pull %d, oe %d, reads %d)\n", when, (uint64_t)pin, (uint64_t)cfg,
+	    (uint64_t)io, (uint64_t)((cfg >> 2) & 0xf), (uint64_t)(cfg & 3), (uint64_t)((cfg >> 9) & 1), (uint64_t)(io & 1));
+}
+
+/* SDZ to a level: output enabled, everything else of the cfg kept. */
+static void
+aud_sdz(unsigned pin, int high)
+{
+	uint32_t cfg = aud_rd(aud_cfg(pin));
+
+	aud_wr(aud_cfg(pin) + 4, high ? 2 : 0);
+	aud_wr(aud_cfg(pin), cfg | AUD_CFG_OE);
+	print("vayu-audio: SDZ gpio%d -> %s: cfg %x (was %x), io %x\n", (uint64_t)pin, high ? "high" : "low",
+	    (uint64_t)aud_rd(aud_cfg(pin)), (uint64_t)cfg, (uint64_t)aud_rd(aud_cfg(pin) + 4));
+}
+
+/* I2C by hand (bsd/dev/hakios.speaker.c): a line pulled low or let go to the pull-ups. */
+static void
+aud_line(unsigned pin, int high)
+{
+	aud_wr(aud_cfg(pin) + 4, 0);
+	aud_wr(aud_cfg(pin), 3 | (high ? 0 : AUD_CFG_OE));
+}
+
+static int
+aud_high(unsigned pin)
+{
+	return aud_rd(aud_cfg(pin) + 4) & 1;
+}
+
+static int
+aud_bit(int out)
+{
+	int in;
+
+	aud_line(AUD_SDA, out);
+	aud_spin_us(5);
+	aud_line(AUD_SCL, 1);
+	for (int stretched = 0; !aud_high(AUD_SCL) && stretched < 100; stretched++) {
+		aud_spin_us(5);
+	}
+	aud_spin_us(5);
+	in = aud_high(AUD_SDA);
+	aud_line(AUD_SCL, 0);
+	return in;
+}
+
+static int
+aud_byte_out(uint8_t b)
+{
+	for (int bit = 7; bit >= 0; bit--) {
+		aud_bit((b >> bit) & 1);
+	}
+	return !aud_bit(1);
+}
+
+static void
+aud_start(void)
+{
+	aud_line(AUD_SDA, 1);
+	aud_line(AUD_SCL, 1);
+	aud_spin_us(5);
+	aud_line(AUD_SDA, 0);
+	aud_spin_us(5);
+	aud_line(AUD_SCL, 0);
+	aud_spin_us(5);
+}
+
+static void
+aud_stop(void)
+{
+	aud_line(AUD_SDA, 0);
+	aud_spin_us(5);
+	aud_line(AUD_SCL, 1);
+	aud_spin_us(5);
+	aud_line(AUD_SDA, 1);
+	aud_spin_us(5);
+}
+
+/* One register read; -1: no answer, -2: the bus not at rest. The two pins are given back as found. */
+static int
+aud_read(uint8_t address, uint8_t reg)
+{
+	uint32_t cfg[2] = { aud_rd(aud_cfg(AUD_SDA)), aud_rd(aud_cfg(AUD_SCL)) };
+	uint32_t io[2] = { aud_rd(aud_cfg(AUD_SDA) + 4), aud_rd(aud_cfg(AUD_SCL) + 4) };
+	int value = -1;
+
+	aud_line(AUD_SDA, 1);
+	aud_line(AUD_SCL, 1);
+	aud_spin_us(5);
+	if (!aud_high(AUD_SDA) || !aud_high(AUD_SCL)) {
+		value = -2;
+	} else {
+		aud_start();
+		if (aud_byte_out((uint8_t)(address << 1)) && aud_byte_out(reg)) {
+			aud_start();
+			if (aud_byte_out((uint8_t)(address << 1 | 1))) {
+				value = 0;
+				for (int bit = 7; bit >= 0; bit--) {
+					value = value << 1 | aud_bit(1);
+				}
+				aud_bit(1);     /* no acknowledge: the last byte */
+			}
+		}
+		aud_stop();
+	}
+	aud_wr(aud_cfg(AUD_SDA) + 4, io[0] & 2);
+	aud_wr(aud_cfg(AUD_SCL) + 4, io[1] & 2);
+	aud_wr(aud_cfg(AUD_SDA), cfg[0]);
+	aud_wr(aud_cfg(AUD_SCL), cfg[1]);
+	return value;
+}
+
+/*
+ * The quaternary MI2S pins (pinctrl-sm8150.c: 137-140 SOUTH, qua_mi2s = function 1): vayu_audio_mi2s=1
+ * as the phone's device tree's quat_mi2s_active / _sd0_active / _sd1_active (137 bit clock and 138 word
+ * select 8 mA, no pull, output-high; 139 data out and 140 data in 8 mA, no pull); =2 as its *_sleep
+ * states (GPIO, pull-down, 2 mA, input). The DSP drives them once its port runs.
+ */
+static void
+aud_mi2s(int on)
+{
+	for (unsigned pin = 137; pin <= 140; pin++) {
+		uint32_t cfg = aud_rd(aud_cfg(pin)), want;
+
+		if (on) {
+			want = (1u << 2) | (3u << 6) | (pin <= 138 ? AUD_CFG_OE : 0);
+			if (pin <= 138) {
+				aud_wr(aud_cfg(pin) + 4, 2);
+			}
+		} else {
+			want = 1u;              /* function 0, pull-down, 2 mA, input */
+		}
+		aud_wr(aud_cfg(pin), want);
+		print("vayu-audio: MI2S gpio%d -> cfg %x (was %x), io %x\n", (uint64_t)pin, (uint64_t)aud_rd(aud_cfg(pin)),
+		    (uint64_t)cfg, (uint64_t)aud_rd(aud_cfg(pin) + 4));
+	}
+}
+
+static void
+vayu_audio_pins(const char *cmdline)
+{
+	static const unsigned show[] = { AUD_SDZ_LEFT, 90, 91, AUD_SDZ_RIGHT, AUD_SDA, AUD_SCL };
+	static const uint8_t address[2] = { 0x4c, 0x4d };
+
+	for (unsigned i = 0; i < sizeof(show) / sizeof(show[0]); i++) {
+		aud_show("before", show[i]);
+	}
+	if (aud_word(cmdline, "vayu_audio_mi2s=1") || aud_word(cmdline, "vayu_audio_mi2s=2")) {
+		aud_mi2s(aud_word(cmdline, "vayu_audio_mi2s=1"));
+	}
+	if (!aud_word(cmdline, "vayu_audio_pins=1") && !aud_word(cmdline, "vayu_audio_pins=2")) {
+		return;
+	}
+	if (aud_word(cmdline, "vayu_audio_pins=2")) {
+		aud_sdz(AUD_SDZ_RIGHT, 0);
+		aud_sdz(AUD_SDZ_LEFT, 0);
+		return;
+	}
+	aud_sdz(AUD_SDZ_RIGHT, 1);
+	aud_sdz(AUD_SDZ_LEFT, 1);
+	aud_spin_us(20000);             /* (tas256x_hw_reset(): 20 ms before the first transfer) */
+	aud_show("after 20 ms", AUD_SDZ_RIGHT);
+	aud_show("after 20 ms", AUD_SDZ_LEFT);
+	if (!aud_word(cmdline, "vayu_audio_ids=1")) {
+		return;
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		int page = aud_read(address[i], 0x00), book = page >= 0 ? aud_read(address[i], 0x7f) : page;
+		int id = page == 0 && book == 0 ? aud_read(address[i], 0x7d) : -3;
+
+		print("vayu-audio: %x: page %x book %x id %x (%s)\n", (uint64_t)address[i], (uint64_t)(uint32_t)page,
+		    (uint64_t)(uint32_t)book, (uint64_t)(uint32_t)id, id == 0x10 || id == 0x20 ? "TAS2562" : id == 0 ? "TAS2564" :
+		    page == -2 ? "BUS NOT AT REST" : page == -1 ? "NO ANSWER" : id == -3 ? "book/page not 0" : "UNKNOWN");
+	}
+	aud_show("after", AUD_SDA);
+	aud_show("after", AUD_SCL);
+}
+
+/* ------------------------------------------------------------------------ */
+/* vayu jack: the WCD934x codec's reset pin, for XNU's bsd/dev/vayu_jack.c. */
+/*                                                                          */
+/* The codec hangs off the audio DSP's SLIMbus; its reset is TLMM GPIO 143  */
+/* (dt msm_cdc_pinctrl@143 qcom,cdc-rst-n-gpio = <&tlmm 143>, states        */
+/* cdc_reset_sleep / cdc_reset_active: function gpio, drive-strength 2 mA,  */
+/* bias-disable, output low / high; recovery-live.dts:13496-13530, 27528),  */
+/* SOUTH tile (pinctrl-sm8150.c), GPIO 123 its interrupt. As with the       */
+/* amplifiers, XNU does not write TLMM: only when the payload's command     */
+/* line asks:                                                              */
+/*   vayu_jack_pins=1  reset out of reset: 20 ms low, then high, 20 ms      */
+/*                     (wcd9xxx_reset: wcd9xxx-utils.c:715-731); the codec  */
+/*                     may then enumerate on the DSP's SLIMbus              */
+/*   vayu_jack_pins=2  reset driven low again: the codec back in reset      */
+/* Every write is logged with its readback; GPIO 123 is only shown.         */
+/* ------------------------------------------------------------------------ */
+
+#define AUD_JACK_RESET  143
+#define AUD_JACK_IRQ    123
+
+static void
+vayu_jack_pins(const char *cmdline)
+{
+	uint32_t cfg, was;
+
+	aud_show("before", AUD_JACK_RESET);
+	aud_show("before", AUD_JACK_IRQ);
+
+	/* the output level low first, so enabling the output cannot pulse the reset high */
+	aud_wr(aud_cfg(AUD_JACK_RESET) + 4, 0);
+	/* function 0 (GPIO), pull 0 (bias-disable), drive 0 (2 mA), output; the other bits are kept */
+	was = aud_rd(aud_cfg(AUD_JACK_RESET));
+	cfg = was & ~((3u << 0) | (0xfu << 2) | (7u << 6));
+	cfg |= AUD_CFG_OE;
+	aud_wr(aud_cfg(AUD_JACK_RESET), cfg);
+	print("vayu-jack: gpio%d -> cfg %x (was %x, function 0, 2 mA, bias-disable, output)\n", (uint64_t)AUD_JACK_RESET,
+	    (uint64_t)aud_rd(aud_cfg(AUD_JACK_RESET)), (uint64_t)was);
+	aud_show("after cfg, reset low", AUD_JACK_RESET);
+	if (aud_word(cmdline, "vayu_jack_pins=1")) {
+		aud_spin_us(20000);             /* wcd9xxx_reset(): low 20 ms */
+		aud_wr(aud_cfg(AUD_JACK_RESET) + 4, 2);
+		aud_show("after reset high", AUD_JACK_RESET);
+		aud_spin_us(20000);             /* ... and high 20 ms before the first transfer */
+		aud_show("after 20 ms", AUD_JACK_RESET);
+	}
+}
+
+/* vayu NFC: the PN553's pins for XNU's driver, plus a read-only NCI probe. */
+/*                                                                          */
+/* NXP PN553 at I2C 0x28 on QUP SE9's bus. From the phone's live DT: SDA    */
+/* GPIO39 and SCL GPIO40 (qup9 = function 1), bias-disable (board           */
+/* pull-ups), 2 mA, NORTH; IRQ GPIO47 input pull-up 2 mA, high = a packet,  */
+/* EAST; FIRM GPIO48 output, LOW in normal mode, pull-up 2 mA, EAST; VEN    */
+/* GPIO102 output, HIGH = chip on, pull-up 2 mA, NORTH. CLKREQ GPIO113      */
+/* (west tile) is never read or written: writes there wedged this phone.    */
+/* TLMM NORTH = 0x03900000 (39, 40, 102), EAST = 0x03500000 (47, 48);       */
+/* cfg = tile + 0x1000 * pin, io = cfg + 4; cfg [1:0] pull, [5:2] function, */
+/* [8:6] drive ((n+1)*2 mA), [9] output enable; io bit 0 in, bit 1 out.     */
+/*   vayu_nfc_pins=1: IRQ input, FIRM low, VEN power-cycled on, 39/40 left  */
+/*     as released plain GPIOs (function 0) for XNU.                        */
+/*   vayu_nfc_pins=2: FIRM and VEN low, the vendor's power-off sequence.    */
+/*   vayu_nfc_probe=1 (with =1): read-only NCI bring-up on 39/40; only      */
+/*     CORE_RESET_CMD and CORE_INIT_CMD are sent, no NVM write.             */
+/* Every pin-configuration write is logged with its readback (DID NOT TAKE  */
+/* on a mismatch); the I2C bit writes are not. FIRM is never raised, 113 is */
+/* never touched.                                                           */
+/* ------------------------------------------------------------------------ */
+
+#define NFC_TLMM_NORTH  0x03900000ULL
+#define NFC_TLMM_EAST   0x03500000ULL
+#define NFC_SDA         39
+#define NFC_SCL         40
+#define NFC_IRQ         47
+#define NFC_FIRM        48
+#define NFC_VEN         102
+#define NFC_CFG_OE      (1u << 9)
+#define NFC_CFG         0              /* nfc_reg_wr(): the cfg register */
+#define NFC_IO          1              /* nfc_reg_wr(): the io register */
+
+static uint64_t nfc_cfg(unsigned pin)
+{
+	return (pin == NFC_IRQ || pin == NFC_FIRM ? NFC_TLMM_EAST : NFC_TLMM_NORTH) + 0x1000ULL * pin;
+}
+
+static int nfc_high(unsigned pin)
+{
+	return aud_rd(nfc_cfg(pin) + 4) & 1;
+}
+
+static void
+nfc_show(const char *when, unsigned pin)
+{
+	uint32_t cfg = aud_rd(nfc_cfg(pin)), io = aud_rd(nfc_cfg(pin) + 4);
+
+	print("vayu-nfc: %s gpio%d cfg %x io %x (function %d, pull %d, oe %d, drive %d, out %d, in %d)\n", when,
+	    (uint64_t)pin, (uint64_t)cfg, (uint64_t)io, (uint64_t)((cfg >> 2) & 0xf), (uint64_t)(cfg & 3),
+	    (uint64_t)((cfg >> 9) & 1), (uint64_t)((cfg >> 6) & 7), (uint64_t)((io >> 1) & 1), (uint64_t)(io & 1));
+}
+
+/* One register write, its readback, and DID NOT TAKE when the fields differ. */
+static void
+nfc_reg_wr(const char *what, unsigned pin, int reg, uint32_t want)
+{
+	uint64_t pa = nfc_cfg(pin) + (reg == NFC_IO ? 4 : 0);
+	uint32_t mask = reg == NFC_IO ? 2u : 0x3ffu, back; /* io bit 0 is the input level, not written */
+
+	aud_wr(pa, want);
+	back = aud_rd(pa);
+	print("vayu-nfc: %s gpio%d %s <- %x, reads %x%s\n", what, (uint64_t)pin, reg == NFC_IO ? "io" : "cfg",
+	    (uint64_t)want, (uint64_t)back, (back & mask) == (want & mask) ? "" : " DID NOT TAKE");
+}
+
+/* print() has no field width: "%02x" bytes go through a tiny two-digit string. */
+static void
+nfc_hex_bytes(const uint8_t *p, int len)
+{
+	static const char digits[] = "0123456789abcdef";
+	char text[4] = { ' ', 0, 0, 0 };
+
+	for (int i = 0; i < len; i++) {
+		text[1] = digits[p[i] >> 4], text[2] = digits[p[i] & 0xf];
+		print("%s", text);
+	}
+}
+
+static void
+nfc_hex_line(const char *dir, const uint8_t *buf, int len)
+{
+	print("vayu-nfc: %s %d:", dir, (uint64_t)len);
+	nfc_hex_bytes(buf, len);
+	print("\n");
+}
+
+/* The bus pins as step 4 of vayu_nfc_pins() left them: their pull bits are kept. */
+static uint32_t nfc_sda_cfg, nfc_scl_cfg;
+
+static void
+nfc_line(unsigned pin, int high)
+{
+	uint32_t cfg = pin == NFC_SDA ? nfc_sda_cfg : nfc_scl_cfg;
+
+	aud_wr(nfc_cfg(pin) + 4, 0);
+	aud_wr(nfc_cfg(pin), (cfg & ~NFC_CFG_OE) | (high ? 0 : NFC_CFG_OE));
+}
+
+static int
+nfc_bit(int out)
+{
+	int in;
+
+	nfc_line(NFC_SDA, out); aud_spin_us(5);
+	nfc_line(NFC_SCL, 1);
+	for (int stretched = 0; !nfc_high(NFC_SCL) && stretched < 200; stretched++) aud_spin_us(5);
+	aud_spin_us(5);
+	in = nfc_high(NFC_SDA);
+	nfc_line(NFC_SCL, 0);
+	return in;
+}
+
+static int
+nfc_byte_out(uint8_t b)
+{
+	for (int bit = 7; bit >= 0; bit--) nfc_bit((b >> bit) & 1);
+	return !nfc_bit(1);
+}
+
+static int
+nfc_byte_in(int ack)
+{
+	int b = 0;
+
+	for (int bit = 7; bit >= 0; bit--) b = b << 1 | nfc_bit(1);
+	nfc_bit(!ack);                  /* 0 drives SDA low (ACK), 1 lets it go (NACK) */
+	return b;
+}
+
+/* Let both lines go: a transaction only starts with both pulled high. */
+static int
+nfc_bus_rest(void)
+{
+	nfc_line(NFC_SDA, 1); nfc_line(NFC_SCL, 1); aud_spin_us(5);
+	int sda = nfc_high(NFC_SDA), scl = nfc_high(NFC_SCL);
+
+	if (!sda || !scl) print("vayu-nfc: bus not at rest (sda %d scl %d)\n", (uint64_t)sda, (uint64_t)scl);
+	return sda && scl;
+}
+
+/* 0 = ACKed, -1 = address NACK, -2 = data NACK, -3 = bus not at rest. */
+static int
+nfc_i2c_write(const uint8_t *buf, int len)
+{
+	int ret = nfc_bus_rest() ? 0 : -3;
+
+	if (ret == 0) {
+		nfc_line(NFC_SDA, 1); nfc_line(NFC_SCL, 1); aud_spin_us(5);
+		nfc_line(NFC_SDA, 0); aud_spin_us(5); nfc_line(NFC_SCL, 0); aud_spin_us(5);
+		ret = nfc_byte_out(0x28 << 1) ? 0 : -1;
+		for (int i = 0; ret == 0 && i < len; i++) ret = nfc_byte_out(buf[i]) ? 0 : -2;
+		nfc_line(NFC_SDA, 0); aud_spin_us(5); nfc_line(NFC_SCL, 1); aud_spin_us(5);
+		nfc_line(NFC_SDA, 1); aud_spin_us(5);
+	}
+	return ret;
+}
+
+static int
+nfc_i2c_read(uint8_t *buf, int len)
+{
+	int ret = nfc_bus_rest() ? 0 : -3;
+
+	if (ret == 0) {
+		nfc_line(NFC_SDA, 1); nfc_line(NFC_SCL, 1); aud_spin_us(5);
+		nfc_line(NFC_SDA, 0); aud_spin_us(5); nfc_line(NFC_SCL, 0); aud_spin_us(5);
+		ret = nfc_byte_out(0x28 << 1 | 1) ? 0 : -1;
+		for (int i = 0; ret == 0 && i < len; i++) buf[i] = (uint8_t)nfc_byte_in(i != len - 1);
+		nfc_line(NFC_SDA, 0); aud_spin_us(5); nfc_line(NFC_SCL, 1); aud_spin_us(5);
+		nfc_line(NFC_SDA, 1); aud_spin_us(5);
+	}
+	return ret;
+}
+
+/* The first write after idle may NACK while the PN553 wakes up: three more tries. */
+static int
+nfc_write_retry(const uint8_t *buf, int len)
+{
+	int ret = nfc_i2c_write(buf, len);
+
+	for (int retry = 1; ret == -1 && retry <= 3; retry++) {
+		print("vayu-nfc: write NACKed, retry %d\n", (uint64_t)retry);
+		aud_spin_us(1000);
+		ret = nfc_i2c_write(buf, len);
+	}
+	return ret;
+}
+
+static int
+nfc_irq_wait(int ms)
+{
+	uint64_t frq = READ_SYSREG(CNTFRQ_EL0), start = READ_SYSREG(CNTPCT_EL0);
+	uint64_t ticks = (uint64_t)ms * frq / 1000;
+
+	for (;;) {
+		if (nfc_high(NFC_IRQ)) return 1;
+		if (READ_SYSREG(CNTPCT_EL0) - start >= ticks) return 0;
+		aud_spin_us(100);
+	}
+}
+
+/* One NCI packet: header, then its payload; both reads are logged as one line. */
+static int
+nfc_packet_read(uint8_t *buf, int max)
+{
+	int ret, len = 3, plen;
+
+	if ((ret = nfc_i2c_read(buf, 3)) < 0) {
+		print("vayu-nfc: header read failed (%d)\n", (uint64_t)(uint32_t)ret);
+		return ret;
+	}
+	if ((plen = buf[2]) > 0) {
+		if (plen > max - 3) {
+			print("vayu-nfc: payload %d clipped to %d\n", (uint64_t)plen, (uint64_t)(max - 3));
+			plen = max - 3;
+		}
+		if ((ret = nfc_i2c_read(buf + 3, plen)) < 0) {
+			print("vayu-nfc: payload read failed (%d)\n", (uint64_t)(uint32_t)ret);
+			return ret;
+		}
+		len += plen;
+	}
+	nfc_hex_line("rx", buf, len);
+	return len;
+}
+
+/* Send one command, wait for its answer, read it: -1 write, -2 IRQ, -3 read. */
+static int
+nfc_cmd(const uint8_t *cmd, int len, uint8_t *buf, int max)
+{
+	int ret;
+
+	nfc_hex_line("tx", cmd, len);
+	if (nfc_write_retry(cmd, len) < 0) return -1;
+	if (!nfc_irq_wait(100)) return -2;
+	ret = nfc_packet_read(buf, max);
+	return ret < 0 ? -3 : ret;
+}
+
+static const char *nfc_err(int ret)
+{
+	return ret == -1 ? "write failed" : ret == -2 ? "IRQ never rose" : "read failed";
+}
+
+static int
+nfc_probe(void)
+{
+	static uint8_t buf[260];
+	static const uint8_t reset[4] = { 0x20, 0x00, 0x01, 0x00 };
+	uint8_t init[5] = { 0x20, 0x01, 0x00, 0x00, 0x00 };
+	int len, major = 1, ok = -1;
+
+	nfc_sda_cfg = aud_rd(nfc_cfg(NFC_SDA));
+	nfc_scl_cfg = aud_rd(nfc_cfg(NFC_SCL));
+	/* 1. Packets left over from Android, if the controller still has some. */
+	for (int i = 0; i < 4 && nfc_irq_wait(5); i++) {
+		if (nfc_packet_read(buf, (int)sizeof(buf)) < 0) {
+			print("vayu-nfc: leftover packet read failed, probe aborted\n");
+			goto restore;
+		}
+	}
+	/* 2. CORE_RESET_CMD, reset type 0: keep the configuration. */
+	len = nfc_cmd(reset, 4, buf, (int)sizeof(buf));
+	if (len < 0 || buf[0] != 0x40 || buf[1] != 0x00 || buf[2] < 1) {
+		print("vayu-nfc: no answer to CORE_RESET (%s)\n", len < 0 ? nfc_err(len) : "bad response");
+		goto restore;
+	}
+	if (buf[2] == 3) {
+		print("vayu-nfc: NCI 1.0 style: status %x, NCI version %x (0x10 = 1.0, 0x20 = 2.0), config status %x\n",
+		    (uint64_t)buf[3], (uint64_t)buf[4], (uint64_t)buf[5]);
+		major = buf[4] >= 0x20 ? 2 : 1;
+	} else if (buf[2] == 1) {
+		print("vayu-nfc: NCI 2.0 style: status %x\n", (uint64_t)buf[3]);
+		major = 2;
+	} else {
+		print("vayu-nfc: no answer to CORE_RESET (length %d)\n", (uint64_t)buf[2]);
+		goto restore;
+	}
+	for (int i = 0; i < 3 && nfc_irq_wait(50); i++) {
+		if (nfc_packet_read(buf, (int)sizeof(buf)) < 0) {
+			print("vayu-nfc: CORE_RESET_NTF read failed, probe aborted\n");
+			goto restore;
+		}
+		if (buf[0] == 0x60 && buf[1] == 0x00 && buf[2] >= 5) {
+			int n = buf[7], avail = buf[2] - 5;
+
+			if (n > avail) n = avail;
+			print("vayu-nfc: CORE_RESET_NTF: trigger %x, config status %x, NCI version %x, manufacturer %x, "
+			    "info %d:", (uint64_t)buf[3], (uint64_t)buf[4], (uint64_t)buf[5], (uint64_t)buf[6],
+			    (uint64_t)n);
+			nfc_hex_bytes(buf + 8, n);
+			print("\n");
+		}
+	}
+	/* 3. CORE_INIT_CMD, in the flavour the reset announced. */
+	if (major == 2) init[2] = 2;
+	len = nfc_cmd(init, major == 2 ? 5 : 3, buf, (int)sizeof(buf));
+	if (len < 0) {
+		print("vayu-nfc: no answer to CORE_INIT (%s)\n", nfc_err(len));
+		goto restore;
+	}
+	if (major == 1 && buf[0] == 0x40 && buf[1] == 0x01 && buf[2] >= 6) {
+		uint8_t *p = buf + 3;
+		int plen = buf[2];
+
+		print("vayu-nfc: CORE_INIT_RSP status %x\n", (uint64_t)p[0]);
+		print("vayu-nfc: manufacturer %x, hw %x rom %x fw %x.%x (NXP layout)\n", (uint64_t)p[plen - 5],
+		    (uint64_t)p[plen - 4], (uint64_t)p[plen - 3], (uint64_t)p[plen - 2], (uint64_t)p[plen - 1]);
+	} else if (major == 1) {
+		print("vayu-nfc: unexpected CORE_INIT response\n");
+		goto restore;
+	}
+	print("vayu-nfc: probe done\n");
+	ok = 0;
+restore:
+	/* Back to step 4's state for XNU's driver. */
+	nfc_reg_wr("probe restore", NFC_SDA, NFC_CFG, nfc_sda_cfg);
+	nfc_reg_wr("probe restore", NFC_SDA, NFC_IO, 0);
+	nfc_reg_wr("probe restore", NFC_SCL, NFC_CFG, nfc_scl_cfg);
+	nfc_reg_wr("probe restore", NFC_SCL, NFC_IO, 0);
+	return ok;
+}
+
+/* VEN back to 0 (the lead's condition for exception 6): after the probe unless XNU's steps follow, on an
+ * error path, and after the kernel returns. FIRM stays low. */
+static int nfc_ven_on;
+
+static void
+nfc_ven_off(const char *why)
+{
+	if (!nfc_ven_on) {
+		return;
+	}
+	nfc_reg_wr(why, NFC_VEN, NFC_IO, 0);
+	nfc_ven_on = 0;
+}
+
+static void
+vayu_nfc_pins(const char *cmdline)
+{
+	static const unsigned pins[] = { NFC_SDA, NFC_SCL, NFC_IRQ, NFC_FIRM, NFC_VEN };
+	static const unsigned off[] = { NFC_FIRM, NFC_VEN };
+	uint32_t cfg;
+
+	for (unsigned i = 0; i < 5; i++) nfc_show("before", pins[i]);
+	if (aud_word(cmdline, "vayu_nfc_pins=2")) {
+		for (unsigned i = 0; i < 2; i++) {
+			cfg = aud_rd(nfc_cfg(off[i]));
+			nfc_reg_wr("power off", off[i], NFC_IO, 0);
+			nfc_reg_wr("power off", off[i], NFC_CFG, (cfg & (3u | (7u << 6))) | NFC_CFG_OE);
+			aud_spin_us(10000);
+		}
+		for (unsigned i = 0; i < 2; i++) nfc_show("after", off[i]);
+		return;
+	}
+	/* IRQ 47: input, pull-up, 2 mA. */
+	nfc_reg_wr("IRQ", NFC_IRQ, NFC_CFG, 3);
+	/* FIRM 48 stays low (normal mode); only the output buffer is enabled. */
+	cfg = aud_rd(nfc_cfg(NFC_FIRM));
+	nfc_reg_wr("FIRM", NFC_FIRM, NFC_IO, 0);
+	nfc_reg_wr("FIRM", NFC_FIRM, NFC_CFG, (cfg & 3) | NFC_CFG_OE);
+	aud_spin_us(10000);
+	/* VEN 102 (exception 6, loader-only): 0, 20 ms, 1, 20 ms; FIRM is already low. */
+	cfg = aud_rd(nfc_cfg(NFC_VEN));
+	nfc_reg_wr("VEN", NFC_VEN, NFC_IO, 0);
+	nfc_reg_wr("VEN", NFC_VEN, NFC_CFG, (cfg & 3) | NFC_CFG_OE);
+	aud_spin_us(20000);
+	nfc_reg_wr("VEN", NFC_VEN, NFC_IO, 2);
+	nfc_ven_on = 1;
+	aud_spin_us(20000);
+	/* 39/40: released plain GPIOs (function 0); the board pull-ups hold them high. */
+	for (unsigned pin = NFC_SDA; pin <= NFC_SCL; pin++) {
+		nfc_reg_wr("I2C", pin, NFC_CFG, aud_rd(nfc_cfg(pin)) & 3);
+		nfc_reg_wr("I2C", pin, NFC_IO, 0);
+	}
+	for (unsigned i = 0; i < 5; i++) nfc_show("after", pins[i]);
+	print("vayu-nfc: IRQ 47 reads %s\n", nfc_high(NFC_IRQ) ? "high" : "low");
+	if (aud_word(cmdline, "vayu_nfc_probe=1") && nfc_probe() < 0) {
+		nfc_ven_off("VEN off (probe failed)");
+	} else if (!aud_word(cmdline, "vayu_nfc_xnu_tlmm=1")) {
+		nfc_ven_off("VEN off (no XNU steps follow)");
+	} else {
+		print("vayu-nfc: VEN left on for XNU (vayu_nfc_xnu_tlmm=1); off again after the kernel returns\n");
+	}
+}
+
 struct payload_info {
 	const uint8_t *kernel;
 	const uint8_t *ramdisk;
 	uint32_t ramdisk_size;
 	const char *cmdline;
+	const char *platform;           /* optional: the device this image was built for */
+	uint32_t platform_size;
 	uint64_t checkpoint;
 	uint64_t forced_base;
 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
@@ -2536,6 +3433,9 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->kernel = p + sizeof(*e);
 		} else if (str_eq(e->name, "cmdline")) {
 			pi->cmdline = text;
+		} else if (str_eq(e->name, "platform")) {
+			pi->platform = text;
+			pi->platform_size = e->size;
 		} else if (str_eq(e->name, "physbase")) {
 			pi->forced_base = parse_number(text, 16); /* testing aid; must be free RAM */
 		} else if (str_eq(e->name, "rdres")) {
@@ -2622,6 +3522,86 @@ set_result(const char *what, uint64_t a, uint64_t b)
 	memcpy(last_result, log_buf + start, n);
 	last_result[n] = 0;
 	log_len = saved;
+}
+
+/*
+ * fb_spare (loader 1.7): the frames for the display controller, below 4 GB, kept for the loader session. MDP3 and MDP4
+ * (2026-10-25) hung the whole phone as soon as the kernel touched them; one candidate is a range UEFI calls free but the
+ * vendor reserves (secure or protected). So a piece that overlaps any of the vendor's reserved-memory nodes below 4 GB
+ * (vayu.dtb /reserved-memory, /tmp/vayu.dts: the 22 fixed regions) is given back and the next one is taken below it.
+ */
+static const struct { uint64_t base, size; const char *name; } vendor_reserved[] = {
+	{ 0x85700000, 0x600000, "hyp" }, { 0x85d00000, 0x100000, "xbl_dump" }, { 0x85e00000, 0x140000, "xbl_aop" },
+	{ 0x86000000, 0x200000, "smem" }, { 0x86200000, 0x5500000, "removed_regions" }, { 0x8b700000, 0x500000, "camera" },
+	{ 0x8bc00000, 0x180000, "pil_wlan" }, { 0x8bd80000, 0x80000, "pil_npu" }, { 0x8be00000, 0x2200000, "pil_adsp" },
+	{ 0x8e000000, 0x9600000, "modem" }, { 0x97600000, 0x500000, "pil_video" }, { 0x97b00000, 0x1400000, "pil_slpi" },
+	{ 0x98f00000, 0x17000, "pil_ipa/gpu" }, { 0x99000000, 0x100000, "pil_spss" }, { 0x99100000, 0x1400000, "cdsp" },
+	{ 0x9c000000, 0x2400000, "cont_splash" }, { 0x9e400000, 0x1400000, "qseecom" }, { 0xa4c00000, 0x3c00000, "cdsp_sec" },
+	{ 0xaf000000, 0x1000000, "ramdump_fb" }, { 0xb0000000, 0x800000, "ramoops" },
+};
+static uint64_t fb_spare_pa, fb_spare_count;
+
+/* The type of the UEFI map's descriptor that holds pa (or -1), for the log. */
+static int
+memory_type_at(uint64_t pa)
+{
+	static uint8_t map_buf[65536];
+	uint64_t map_size = sizeof(map_buf), map_key, desc_size;
+	uint32_t desc_ver;
+
+	if (EFI_ERROR(BS->get_memory_map(&map_size, map_buf, &map_key, &desc_size, &desc_ver))) {
+		return -1;
+	}
+	for (uint64_t off = 0; off < map_size; off += desc_size) {
+		efi_memory_descriptor *d = (efi_memory_descriptor *)(map_buf + off);
+
+		if (pa >= d->phys_start && pa < d->phys_start + (d->pages << 12)) {
+			return (int)d->type;
+		}
+	}
+	return -1;
+}
+
+/* N frames of 12 MiB in one piece below 4 GB and clear of the vendor's reserved ranges; 0 on failure. Kept once got. */
+static uint64_t
+fb_spare_get(uint64_t frames)
+{
+	uint64_t pages = frames * ((12ULL << 20) >> 12), max = 0xFFFFFFFFULL;
+
+	if (fb_spare_pa != 0 && fb_spare_count >= frames) {
+		return fb_spare_pa;
+	}
+	for (int tries = 0; tries < 12; tries++) {
+		uint64_t pa = max, end;
+		int hit = -1;
+
+		if (EFI_ERROR(BS->allocate_pages(AllocateMaxAddress, EfiLoaderData, pages, &pa))) {
+			print("fb_spare: no %d frames below %x\n", frames, max + 1);
+			return 0;
+		}
+		end = pa + (pages << 12);
+		for (unsigned r = 0; r < sizeof(vendor_reserved) / sizeof(vendor_reserved[0]); r++) {
+			if (pa < vendor_reserved[r].base + vendor_reserved[r].size && end > vendor_reserved[r].base) {
+				hit = (int)r;
+				break;
+			}
+		}
+		if (hit < 0) {
+			fb_spare_pa = pa;
+			fb_spare_count = frames;
+			print("fb_spare: %d frames of 12 MiB at %x - %x (UEFI type %d), clear of the vendor's reserved ranges\n", frames, pa,
+			    end, (uint64_t)memory_type_at(pa));
+			return pa;
+		}
+		print("fb_spare: %x - %x overlaps the vendor's %s (%x + %x): given back, the next below it\n", pa, end,
+		    vendor_reserved[hit].name, vendor_reserved[hit].base, vendor_reserved[hit].size);
+		BS->free_pages(pa, pages);
+		if (vendor_reserved[hit].base < (pages << 12) + 0x80000000ULL) {
+			return 0;
+		}
+		max = vendor_reserved[hit].base - 1;
+	}
+	return 0;
 }
 
 /* Every range of the firmware's memory map of 1 MB or more, and the total of each type. */
@@ -2713,12 +3693,802 @@ choose_window(const struct payload_info *pi)
 	return 1;
 }
 
+/* ------------------------------------------------------------------------ */
+/* NVT/QUP hand-over: pins and touch supply, for XNU's QUP SPI driver.       */
+/*                                                                          */
+/* XNU cannot write TLMM on this phone: the vendor pinctrl window at        */
+/* 0x03000000 ignores writes, and the first tile alias at 0x03100000 wedged */
+/* the bus (watchdog reset). The vendor pinctrl driver's four tiles are at  */
+/* 0x03000000 + 0x100000 west, +0x500000 east, +0x900000 north, +0xd00000   */
+/* south; a pin's registers are +0x1000 * pin from its tile. Pins 55-58 are */
+/* SOUTH and qup17 is function index 1 in their pinctrl group; reset GPIO12 */
+/* is NORTH; VDDIO GPIO100 and INT GPIO122 are SOUTH. UEFI can write these; */
+/* this runs only when the payload's command line asks for nvt_qup=1 or    */
+/* touch_driver=nvt_qup. It also enables the SE's GCC clocks; XNU checks   */
+/* them, sets up GENI and speaks NVT.                                       */
+/* ------------------------------------------------------------------------ */
+
+#define NVT_TLMM_NORTH  0x03900000ULL
+#define NVT_TLMM_SOUTH  0x03D00000ULL
+#define NVT_PIN_CFG(tile, pin) ((tile) + 0x1000ULL * (pin))
+#define NVT_PIN_IO(tile, pin)  (NVT_PIN_CFG(tile, pin) + 4)
+
+#define NVT_PIN_RESET   12
+#define NVT_PIN_INT     122
+#define NVT_PIN_VDDIO   100
+#define NVT_SPI_PIN0    55
+#define NVT_SPI_FUNC    1       /* qup17: the second entry (index 1) of pins 55-58's function list */
+
+static inline uint32_t
+nvt_rd(uint64_t pa)
+{
+	return *(volatile uint32_t *)(uintptr_t)pa;
+}
+
+static inline void
+nvt_wr(uint64_t pa, uint32_t v)
+{
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(uintptr_t)pa = v;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* A word on the payload command line, so "nvt_qup=1" does not match "xnvt_qup=1". */
+static int
+nvt_cmdline_word(const char *cmdline, const char *word)
+{
+	size_t n = 0;
+
+	while (word[n] != 0) {
+		n++;
+	}
+	for (const char *p = cmdline; *p != 0; ) {
+		while (*p == ' ') {
+			p++;
+		}
+		const char *q = p;
+		while (*q != 0 && *q != ' ') {
+			q++;
+		}
+		if ((size_t)(q - p) == n) {
+			size_t i = 0;
+			while (i < n && p[i] == word[i]) {
+				i++;
+			}
+			if (i == n) {
+				return 1;
+			}
+		}
+		p = q;
+	}
+	return 0;
+}
+
+static void
+nvt_pin_show(const char *when, uint64_t tile, unsigned pin, const char *name)
+{
+	uint32_t cfg = nvt_rd(NVT_PIN_CFG(tile, pin));
+	uint32_t io = nvt_rd(NVT_PIN_IO(tile, pin));
+
+	print("nvt-qup: %s %s gpio%x cfg %x io %x (mux %x, pull %x, drive %x, oe %x)\n", when, name, (uint64_t)pin,
+	    (uint64_t)cfg, (uint64_t)io, (uint64_t)((cfg >> 2) & 0xf), (uint64_t)(cfg & 3),
+	    (uint64_t)((cfg >> 6) & 7), (uint64_t)((cfg >> 9) & 1));
+}
+
+static void
+nvt_pin_set(uint64_t tile, unsigned pin, unsigned func, unsigned pull, unsigned ma, int output, int high)
+{
+	uint64_t cfg_pa = NVT_PIN_CFG(tile, pin), io_pa = NVT_PIN_IO(tile, pin);
+	uint32_t cfg = nvt_rd(cfg_pa);
+	uint32_t newcfg = cfg & ~((0xfu << 2) | 0x3u | (0x7u << 6) | (1u << 9));
+
+	if (output) {
+		nvt_wr(io_pa, high ? 2 : 0);
+	}
+	newcfg |= ((func & 0xf) << 2) | (pull & 3) | ((((ma / 2) - 1) & 7) << 6);
+	if (output) {
+		newcfg |= 1u << 9;
+	}
+	nvt_wr(cfg_pa, newcfg);
+	print("nvt-qup: pin %x -> cfg %x (was %x), io %x\n", (uint64_t)pin, (uint64_t)nvt_rd(cfg_pa),
+	    (uint64_t)cfg, (uint64_t)nvt_rd(io_pa));
+}
+
+/*
+ * GCC for SE17 (spi@c80000), from the vendor clock driver (MiCode
+ * Xiaomi_Kernel_OpenSource vayu-r-oss 0c9888aa, drivers/clk/qcom/):
+ *   gcc-sm8150.c:951-952   gcc_qupv3_wrap2_s0_clk_src cmd_rcgr 0x1e148
+ *   gcc-sm8150.c:60-61     parent map 0: P_BI_TCXO = 0; :627 F(19200000, XO, 1)
+ *   gcc-sm8150.c:2857-2862 gcc_qupv3_wrap2_s0_clk halt 0x1e144, vote 0x52014 bit 4
+ *   gcc-sm8150.c:3021-3026 gcc_qupv3_wrap_2_m_ahb_clk halt 0x1e004, vote bit 2
+ *   gcc-sm8150.c:3034-3041 gcc_qupv3_wrap_2_s_ahb_clk halt 0x1e008, vote bit 1,
+ *                          hwcg_reg 0x1e008 hwcg_bit 1
+ *   clk-rcg2.c:34-58       CMD_UPDATE 0, ROOT_EN 1, ROOT_OFF 31; CFG +4 (div
+ *                          [4:0], src [10:8], mode [13:12], HW_CLK_CTRL 20);
+ *                          DFSR +0x14, DFS_EN bit 0
+ *   clk-branch.c:29-39,86-91 a branch in hardware-gated mode (hwcg bit set)
+ *                          is not halt-checked: CLK_OFF stays 1 while idle.
+ * Mainline v6.6 gcc-sm8150.c:2402,2560,2573,666 has the same offsets.
+ *
+ * The s_ahb CBCR reads 0x80000002 (CLK_OFF + HW_CTL) on this phone both
+ * before and after the vote (run 150913), while the wrapper's HW_VER read
+ * through that clock returned 0x10030000; waiting for its CLK_OFF to clear
+ * was the wrong test.
+ */
+#define NVT_GCC          0x00100000ULL
+#define NVT_GCC_VOTE     0x52014
+#define NVT_VOTE_S_AHB   (1u << 1)
+#define NVT_VOTE_M_AHB   (1u << 2)
+#define NVT_VOTE_SE0     (1u << 4)
+#define NVT_HALT_M_AHB   0x1e004
+#define NVT_HALT_S_AHB   0x1e008
+#define NVT_HALT_SE0     0x1e144
+#define NVT_RCG_CMD      0x1e148
+#define NVT_RCG_CFG      0x1e14c
+#define NVT_RCG_DFS      0x1e15c
+#define NVT_RCG_UPDATE   (1u << 0)
+#define NVT_RCG_ROOT_EN  (1u << 1)
+#define NVT_RCG_ROOT_OFF (1u << 31)
+#define NVT_CLK_OFF      (1u << 31)
+#define NVT_CBCR_HW_CTL  (1u << 1)
+
+static void
+nvt_gcc_wr(uint32_t off, uint32_t v, const char *name)
+{
+	nvt_wr(NVT_GCC + off, v);
+	print("nvt-qup: gcc %s %x <- %x, reads %x\n", name, (uint64_t)off, (uint64_t)v,
+	    (uint64_t)nvt_rd(NVT_GCC + off));
+}
+
+/* 1 when the branch runs (or is hardware-gated and so has no halt to wait on). */
+static int
+nvt_gcc_branch_on(uint32_t off, const char *name, int hwcg)
+{
+	uint32_t v = 0;
+	int i;
+
+	for (i = 0; i < 1000; i++) {
+		v = nvt_rd(NVT_GCC + off);
+		if (hwcg && (v & NVT_CBCR_HW_CTL)) {
+			print("nvt-qup: gcc %s %x = %x: hardware-gated, not halt-checked\n", name, (uint64_t)off,
+			    (uint64_t)v);
+			return 1;
+		}
+		if ((v & NVT_CLK_OFF) == 0) {
+			print("nvt-qup: gcc %s %x = %x: on after %x us\n", name, (uint64_t)off, (uint64_t)v,
+			    (uint64_t)(i * 10));
+			return 1;
+		}
+		BS->stall(10);
+	}
+	print("nvt-qup: gcc %s %x = %x: still off after 10 ms\n", name, (uint64_t)off, (uint64_t)v);
+	return 0;
+}
+
+/* SE17 clocks: the RCG at XO/1 with the SE branch off, then AHB, then the SE. */
+static int
+nvt_gcc_setup(void)
+{
+	uint32_t v;
+	int i;
+
+	nvt_gcc_wr(NVT_GCC_VOTE, nvt_rd(NVT_GCC + NVT_GCC_VOTE) & ~NVT_VOTE_SE0, "vote (se0 off)");
+	BS->stall(10);
+
+	v = nvt_rd(NVT_GCC + NVT_RCG_CMD);
+	if (v & NVT_RCG_ROOT_OFF) {
+		nvt_gcc_wr(NVT_RCG_CMD, v | NVT_RCG_ROOT_EN, "rcg cmd (root en)");
+		for (i = 0; i < 100 && (nvt_rd(NVT_GCC + NVT_RCG_CMD) & NVT_RCG_ROOT_OFF); i++) {
+			BS->stall(10);
+		}
+	}
+	v = nvt_rd(NVT_GCC + NVT_RCG_DFS);
+	if (v & 1) {
+		nvt_gcc_wr(NVT_RCG_DFS, v & ~1u, "rcg dfs (off)");
+	}
+	v = nvt_rd(NVT_GCC + NVT_RCG_CFG);
+	nvt_gcc_wr(NVT_RCG_CFG, (v & ~((0x7u << 8) | 0x1fu | (0x3u << 12) | (1u << 20))) | 1u, "rcg cfg (xo/1)");
+	nvt_gcc_wr(NVT_RCG_CMD, nvt_rd(NVT_GCC + NVT_RCG_CMD) | NVT_RCG_UPDATE, "rcg cmd (update)");
+	for (i = 0; i < 100 && (nvt_rd(NVT_GCC + NVT_RCG_CMD) & NVT_RCG_UPDATE); i++) {
+		BS->stall(10);
+	}
+	v = nvt_rd(NVT_GCC + NVT_RCG_CMD);
+	print("nvt-qup: gcc rcg cmd %x cfg %x dfs %x (want root on, update clear, cfg 1)\n", (uint64_t)v,
+	    (uint64_t)nvt_rd(NVT_GCC + NVT_RCG_CFG), (uint64_t)nvt_rd(NVT_GCC + NVT_RCG_DFS));
+	if (v & (NVT_RCG_ROOT_OFF | NVT_RCG_UPDATE)) {
+		print("nvt-qup: gcc rcg did not take; SE clock stays off\n");
+		return 0;
+	}
+
+	nvt_gcc_wr(NVT_GCC_VOTE, nvt_rd(NVT_GCC + NVT_GCC_VOTE) | NVT_VOTE_M_AHB | NVT_VOTE_S_AHB, "vote (ahb)");
+	if (!nvt_gcc_branch_on(NVT_HALT_M_AHB, "m_ahb", 0) || !nvt_gcc_branch_on(NVT_HALT_S_AHB, "s_ahb", 1)) {
+		return 0;
+	}
+	nvt_gcc_wr(NVT_GCC_VOTE, nvt_rd(NVT_GCC + NVT_GCC_VOTE) | NVT_VOTE_SE0, "vote (se0)");
+	if (!nvt_gcc_branch_on(NVT_HALT_SE0, "se0", 0)) {
+		return 0;
+	}
+	print("nvt-qup: gcc on: vote %x halts m %x s %x se %x\n", (uint64_t)nvt_rd(NVT_GCC + NVT_GCC_VOTE),
+	    (uint64_t)nvt_rd(NVT_GCC + NVT_HALT_M_AHB), (uint64_t)nvt_rd(NVT_GCC + NVT_HALT_S_AHB),
+	    (uint64_t)nvt_rd(NVT_GCC + NVT_HALT_SE0));
+	return 1;
+}
+
+/* A GPIO (mux 0) output (OE, cfg bit 9) driving high (io bit 1): pinctrl-sm8150.c/pinctrl-msm.c layout. */
+static int
+nvt_pin_out_high(uint64_t tile, unsigned pin)
+{
+	uint32_t cfg = nvt_rd(NVT_PIN_CFG(tile, pin)), io = nvt_rd(NVT_PIN_IO(tile, pin));
+
+	return ((cfg >> 2) & 0xf) == 0 && ((cfg >> 9) & 1) && ((io >> 1) & 1);
+}
+
+static void
+nvt_qup_setup(const char *cmdline)
+{
+	int dry = nvt_cmdline_word(cmdline, "nvt_qup_dry=1");
+	uint32_t vote, halt_m, halt_s, halt_se, rcg_cfg, rcg_dfs, fw;
+	int i, keep, reset_up, vddio_up;
+
+	print("nvt-qup: preparing the touch bus%s\n", dry ? " (dry run: reads only)" : "");
+
+	/* What the bootloader left, before anything is written. */
+	nvt_pin_show("before", NVT_TLMM_NORTH, NVT_PIN_RESET, "reset");
+	nvt_pin_show("before", NVT_TLMM_SOUTH, NVT_PIN_VDDIO, "vddio");
+	nvt_pin_show("before", NVT_TLMM_SOUTH, NVT_PIN_INT, "int");
+	for (i = 0; i < 4; i++) {
+		nvt_pin_show("before", NVT_TLMM_SOUTH, NVT_SPI_PIN0 + i, "spi");
+	}
+
+	vote = nvt_rd(NVT_GCC + NVT_GCC_VOTE);
+	halt_m = nvt_rd(NVT_GCC + NVT_HALT_M_AHB);
+	halt_s = nvt_rd(NVT_GCC + NVT_HALT_S_AHB);
+	halt_se = nvt_rd(NVT_GCC + NVT_HALT_SE0);
+	rcg_cfg = nvt_rd(NVT_GCC + NVT_RCG_CFG);
+	rcg_dfs = nvt_rd(NVT_GCC + NVT_RCG_DFS);
+	print("nvt-qup: before gcc vote %x halts m %x s %x se %x rcg %x dfs %x\n", (uint64_t)vote, (uint64_t)halt_m,
+	    (uint64_t)halt_s, (uint64_t)halt_se, (uint64_t)rcg_cfg, (uint64_t)rcg_dfs);
+	print("nvt-qup: wrapper cc0004 hw %x\n", (uint64_t)nvt_rd(0xcc0004));
+	if ((halt_se & 0x80000000u) == 0) {
+		fw = nvt_rd(0xc80068);
+		print("nvt-qup: se fw %x protocol %x (1 = SPI); clk_sel %x m_clk_cfg %x\n", (uint64_t)fw,
+		    (uint64_t)((fw >> 8) & 0xff), (uint64_t)nvt_rd(0xc8007c), (uint64_t)nvt_rd(0xc80048));
+	} else {
+		print("nvt-qup: the SE clock is off; enabled below before the SE is read\n");
+	}
+
+	if (dry) {
+		print("nvt-qup: dry run: no TLMM, reset, VDDIO or GCC writes\n");
+		return;
+	}
+
+	/*
+	 * nvt_qup_keep_power (default 1; nvt_qup_keep_power=0 = the old cycle): the NT36675 is flashless and
+	 * keeps the firmware Android downloaded only while VDDIO stays on and RESX stays high. If both
+	 * already read as GPIO outputs driven high, they are not written and only 55-58 are muxed; the
+	 * kernel then finds the running firmware. Otherwise the power was dropped before the loader ran
+	 * (the firmware is gone already) and the old power-up runs so the chip at least answers.
+	 */
+	keep = !nvt_cmdline_word(cmdline, "nvt_qup_keep_power=0");
+	reset_up = nvt_pin_out_high(NVT_TLMM_NORTH, NVT_PIN_RESET);
+	vddio_up = nvt_pin_out_high(NVT_TLMM_SOUTH, NVT_PIN_VDDIO);
+	if (keep && reset_up && vddio_up) {
+		print("nvt-qup: keep power: reset and VDDIO already driven high; not touched (firmware kept)\n");
+	} else {
+		if (keep) {
+			print("nvt-qup: keep power: reset %s, VDDIO %s -- power/reset already dropped before the loader; "
+			    "the firmware is gone, powering up as before\n", reset_up ? "high" : "NOT high",
+			    vddio_up ? "high" : "NOT high");
+		}
+		keep = 0;
+		/* VDDIO on, reset held low, INT as an input; the DT gives VDDIO 4 ms. */
+		nvt_pin_set(NVT_TLMM_SOUTH, NVT_PIN_VDDIO, 0, 0, 2, 1, 1);
+		nvt_pin_set(NVT_TLMM_NORTH, NVT_PIN_RESET, 0, 3, 8, 1, 0);
+		nvt_pin_set(NVT_TLMM_SOUTH, NVT_PIN_INT, 0, 1, 8, 0, 0);
+		BS->stall(4000);
+	}
+
+	/* 55-58 to qup17, 6 mA, pull-down, peripheral owns the output. */
+	for (i = 0; i < 4; i++) {
+		nvt_pin_set(NVT_TLMM_SOUTH, NVT_SPI_PIN0 + i, NVT_SPI_FUNC, 1, 6, 0, 0);
+	}
+	for (i = 0; i < 4; i++) {
+		uint32_t cfg = nvt_rd(NVT_PIN_CFG(NVT_TLMM_SOUTH, NVT_SPI_PIN0 + i));
+
+		if (((cfg >> 2) & 0xf) != NVT_SPI_FUNC) {
+			print("nvt-qup: pin %x did not take qup17 (cfg %x); reset stays low\n",
+			    (uint64_t)(NVT_SPI_PIN0 + i), (uint64_t)cfg);
+			return;
+		}
+	}
+
+	if (keep) {
+		print("nvt-qup: 55-58 on qup17; reset and VDDIO left as found\n");
+	} else {
+		/* Release reset, then the DT's 10 ms before the first command. */
+		nvt_pin_set(NVT_TLMM_NORTH, NVT_PIN_RESET, 0, 3, 8, 1, 1);
+		BS->stall(10000);
+		print("nvt-qup: reset released, VDDIO on, 55-58 on qup17\n");
+	}
+
+	/*
+	 * The SE clock: only with nvt_qup_gcc=1 as well. Without it XNU runs the
+	 * same sequence itself (vayu_qup_spi.c), so a loader fault here can be
+	 * told apart from one in the pin work above.
+	 */
+	if (!nvt_cmdline_word(cmdline, "nvt_qup_gcc=1")) {
+		print("nvt-qup: gcc left to XNU (no nvt_qup_gcc=1)\n");
+		return;
+	}
+	print("nvt-qup: gcc setup (nvt_qup_gcc=1): vote %x rcg cmd %x\n", (uint64_t)nvt_rd(NVT_GCC + NVT_GCC_VOTE),
+	    (uint64_t)nvt_rd(NVT_GCC + NVT_RCG_CMD));
+	if (!nvt_gcc_setup()) {
+		print("nvt-qup: gcc setup failed; XNU will try its own sequence\n");
+		return;
+	}
+	print("nvt-qup: reading the SE fw revision at c80068 (first SE access)\n");
+	fw = nvt_rd(0xc80068);
+	print("nvt-qup: se fw %x protocol %x (1 = SPI); wrapper hw %x; XNU can use the SE\n", (uint64_t)fw,
+	    (uint64_t)((fw >> 8) & 0xff), (uint64_t)nvt_rd(0xcc0004));
+}
+
+/* ------------------------------------------------------------------------ */
+/* vayu camera: the camera pins, for XNU's camera probe.                    */
+/*                                                                          */
+/* As for touch and the amplifiers, XNU does not write TLMM on this phone:  */
+/* the loader owns the pin configuration. The camera probe only toggles     */
+/* output levels and, for its bit-banged CCI, the output-enable bit; it     */
+/* refuses to run unless the loader muxed the pins as below. This runs      */
+/* only when the payload's command line says vayu_cam_pins=1.               */
+/*                                                                          */
+/* Tiles and register layout (vendor pinctrl-sm8150.c:28-31 with the tlmm   */
+/* base 0x03000000, sm8150-pinctrl.dtsi:14-16): NORTH 0x03900000, EAST      */
+/* 0x03500000, SOUTH 0x03D00000, WEST 0x03100000. A pin's cfg register is   */
+/* at tile + 0x1000 * pin, io at cfg + 4: [1:0] pull (0 none, 1 down, 3     */
+/* up), [5:2] function, [8:6] drive ((mA / 2) - 1), [9] output enable; io   */
+/* bit 0 is the input level, bit 1 the output level.                        */
+/*                                                                          */
+/* The pins are the camera's (vayu-sm8150-camera-sensor-mtp.dtsi:156-503,   */
+/* vayu-pinctrl.dtsi:357-610, sm8150-pinctrl.dtsi:4328-4440,                */
+/* pinctrl-sm8150.c:1599-1780):                                             */
+/*   GPIO 13-16 NORTH  MCLK0-3: cam_mclk is function 1, bias-disable, 4 mA, */
+/*                     input (vayu-pinctrl.dtsi mclk*_active)               */
+/*   GPIO 17-20, 31-34 NORTH  CCI0/CCI1 SDA/SCL: function 0 (GPIO),         */
+/*                     pull-up, 2 mA, input; XNU bit-bangs them, low = OE 1 */
+/*                     with io 0, high = OE 0                               */
+/*   GPIO 23,28,30 EAST; 54,59,118 SOUTH                                    */
+/*                     sensor resets and vdig enables:                      */
+/*                     function 0, no pull, 2 mA, output, level low (io     */
+/*                     written before OE, as nvt_pin_set() does)            */
+/* Not touched: 27 (hi259 reset), 84 (hi259 standby; hi259 is not probed),  */
+/* 94 (vana enable) and 125 (ov02b1b standby): 27, 94 and 125 have a second */
+/* owner in the phone's live DT (panel ESD irq, msm_tspp tsif1, aqt1000),   */
+/* so they are outside TLMM exception 3 (the bring-up notes).         */
+/* Every write is read back and logged; a value that does not take is       */
+/* reported. No clock or other register is touched.                         */
+/* ------------------------------------------------------------------------ */
+
+#define CAM_TLMM_EAST   0x03500000ULL
+
+enum cam_pin_kind {
+	CAM_MCLK,
+	CAM_I2C,
+	CAM_OUT,
+};
+
+struct cam_pin {
+	unsigned pin;
+	uint64_t tile;
+	const char *role;
+	unsigned kind;
+};
+
+static const struct cam_pin cam_pins[] = {
+	{ 13,  NVT_TLMM_NORTH, "MCLK0 (s5k3t2 front)",                 CAM_MCLK },
+	{ 14,  NVT_TLMM_NORTH, "MCLK1 (imx582 rear)",                  CAM_MCLK },
+	{ 15,  NVT_TLMM_NORTH, "MCLK2 (ov02b1b depth)",                CAM_MCLK },
+	{ 16,  NVT_TLMM_NORTH, "MCLK3 (ov8856 ultra, hi259 macro)",    CAM_MCLK },
+	{ 17,  NVT_TLMM_NORTH, "CCI0 M0 SDA",                          CAM_I2C },
+	{ 18,  NVT_TLMM_NORTH, "CCI0 M0 SCL",                          CAM_I2C },
+	{ 19,  NVT_TLMM_NORTH, "CCI0 M1 SDA",                          CAM_I2C },
+	{ 20,  NVT_TLMM_NORTH, "CCI0 M1 SCL",                          CAM_I2C },
+	{ 31,  NVT_TLMM_NORTH, "CCI1 M0 SDA",                          CAM_I2C },
+	{ 32,  NVT_TLMM_NORTH, "CCI1 M0 SCL",                          CAM_I2C },
+	{ 33,  NVT_TLMM_NORTH, "CCI1 M1 SDA",                          CAM_I2C },
+	{ 34,  NVT_TLMM_NORTH, "CCI1 M1 SCL",                          CAM_I2C },
+	{ 23,  CAM_TLMM_EAST,  "ov02b1b reset",                        CAM_OUT },
+	{ 24,  CAM_TLMM_EAST,  "actuator VAF enable (gpio-regulator, BOB 2.8 V)", CAM_OUT },   /* exception 3, amendment 3 */
+	{ 28,  CAM_TLMM_EAST,  "ov8856 reset",                         CAM_OUT },
+	{ 30,  CAM_TLMM_EAST,  "imx582 reset",                         CAM_OUT },
+	{ 54,  NVT_TLMM_SOUTH, "s5k3t2 reset",                         CAM_OUT },
+	{ 59,  NVT_TLMM_SOUTH, "imx582 vdig enable",                   CAM_OUT },
+	{ 118, NVT_TLMM_SOUTH, "s5k3t2 vdig enable",                   CAM_OUT },
+};
+
+/* Program one pin, log old -> new with the readback, and say whether it took. */
+static int
+cam_pin_apply(const struct cam_pin *p)
+{
+	uint64_t cfg_pa = NVT_PIN_CFG(p->tile, p->pin), io_pa = NVT_PIN_IO(p->tile, p->pin);
+	uint32_t cfg = nvt_rd(cfg_pa), io = nvt_rd(io_pa), want, got;
+	unsigned func, pull, drive;
+	int output;
+
+	switch (p->kind) {
+	case CAM_MCLK:
+		func = 1;                       /* cam_mclk */
+		pull = 0;                       /* bias-disable */
+		drive = 4;
+		output = 0;
+		break;
+	case CAM_I2C:
+		func = 0;                       /* GPIO: XNU bit-bangs CCI */
+		pull = 3;                       /* pull-up */
+		drive = 2;
+		output = 0;
+		break;
+	default:                                /* CAM_OUT */
+		func = 0;
+		pull = 0;                       /* bias-disable */
+		drive = 2;
+		output = 1;
+		break;
+	}
+	want = (cfg & ~0x3ffu) | ((func & 0xf) << 2) | (pull & 3) | ((((drive / 2) - 1) & 7) << 6) |
+	    (output ? (1u << 9) : 0);
+	if (output) {
+		nvt_wr(io_pa, 0);               /* level low before OE, as nvt_pin_set() */
+	}
+	nvt_wr(cfg_pa, want);
+	got = nvt_rd(cfg_pa);
+	print("vayu-cam: gpio%d %s: cfg %x io %x -> cfg %x io %x (mux %x, pull %x, drive %x, oe %x)\n",
+	    (uint64_t)p->pin, p->role, (uint64_t)cfg, (uint64_t)io, (uint64_t)got, (uint64_t)nvt_rd(io_pa),
+	    (uint64_t)((got >> 2) & 0xf), (uint64_t)(got & 3), (uint64_t)((got >> 6) & 7), (uint64_t)((got >> 9) & 1));
+	if ((got & 0x3ffu) != (want & 0x3ffu)) {
+		print("vayu-cam: gpio%d DID NOT TAKE (wanted cfg %x)\n", (uint64_t)p->pin, (uint64_t)want);
+		return 0;
+	}
+	return 1;
+}
+
+static void
+vayu_cam_pins(const char *cmdline)
+{
+	unsigned n = 0, failed = 0;
+
+	/* The caller checks this too; any value but =1 must do nothing. */
+	if (!nvt_cmdline_word(cmdline, "vayu_cam_pins=1")) {
+		return;
+	}
+	print("vayu-cam: setting up the camera pins (vayu_cam_pins=1)\n");
+	for (unsigned i = 0; i < sizeof(cam_pins) / sizeof(cam_pins[0]); i++) {
+		if (!cam_pin_apply(&cam_pins[i])) {
+			failed++;
+		}
+		n++;
+	}
+	print("vayu-cam: camera pins done (%d pins, %d did not take)\n", (uint64_t)n, (uint64_t)failed);
+}
+
+/* vayu IR blaster: GPIO 114-117 for spi@884000 (QUP wrapper 0 SE1, irled@0 */
+/* "ir-spi"), TLMM exception 7 (maintainers, 2026-10-25), loader only, only    */
+/* with vayu_ir_pins=1. The DT's qupv3_se1_spi_active (vayu.dtb):           */
+/* function qup1 (index 1), 6 mA (drive code 2), bias-disable, all four in  */
+/* the SOUTH tile (pinctrl-sm8150.c:1425-1428). Only mux/pull/drive bits    */
+/* (cfg [8:0]) change; OE is left clear (the SE drives the pins). Each      */
+/* write is read back and logged. Nothing else is touched.                  */
+static void
+vayu_ir_pins(const char *cmdline)
+{
+	unsigned failed = 0;
+
+	if (!nvt_cmdline_word(cmdline, "vayu_ir_pins=1")) {
+		return;
+	}
+	print("vayu-ir: setting up the IR blaster pins 114-117 (vayu_ir_pins=1)\n");
+	for (unsigned pin = 114; pin <= 117; pin++) {
+		uint64_t cfg_pa = NVT_PIN_CFG(NVT_TLMM_SOUTH, pin);
+		uint32_t cfg = nvt_rd(cfg_pa), want, got;
+
+		want = (cfg & ~0x3ffu) | (1u << 2) | (2u << 6);        /* function 1, no pull, drive code 2 (6 mA), OE 0 */
+		nvt_wr(cfg_pa, want);
+		got = nvt_rd(cfg_pa);
+		print("vayu-ir: gpio%d: cfg %x -> %x%s\n", (uint64_t)pin, (uint64_t)cfg, (uint64_t)got,
+		    (got & 0x3ffu) == (want & 0x3ffu) ? "" : " DID NOT TAKE");
+		failed += (got & 0x3ffu) != (want & 0x3ffu);
+	}
+	print("vayu-ir: pins done, %d did not take\n", (uint64_t)failed);
+}
+
+/* vayu IR blaster: QUP wrapper 0 SE1's clock (GCC exception 7a, maintainers,  */
+/* 2026-10-25), loader only, only with vayu_ir_clk=1. Vendor vayu-r-oss      */
+/* gcc-sm8150.c: vote word 0x5200c bit 6 wrap0 m_ahb (halt 0x17004,         */
+/* l.2965-2977), bit 7 wrap0 s_ahb (halt 0x17008, l.2978-2990), bit 11 SE1  */
+/* (halt 0x17274, l.2623-2628); SE1's RCG cmd 0x17278, cfg 0x1727c, DFSR    */
+/* cmd + 0x14 (l.665-670; clk-rcg2.c as for SE3). Only while DFS is off,    */
+/* the RCG goes to XO (src 0, parent_map_0 l.60-65) divided by 1: 19.2 MHz  */
+/* (ftbl F(19200000, P_BI_TCXO, 1, 0, 0)); XNU's vayu_ir.c divides by 10 in  */
+/* the SE for the vendor ir-spi's 1.92 MHz. Each write read back; each      */
+/* branch halt-checked (bounded); nothing else is touched.                  */
+#define NVT_IR_GCC_VOTE   0x5200c
+#define NVT_IR_VOTE_M_AHB (1u << 6)
+#define NVT_IR_VOTE_S_AHB (1u << 7)
+#define NVT_IR_VOTE_SE1   (1u << 11)
+#define NVT_IR_HALT_M_AHB 0x17004
+#define NVT_IR_HALT_S_AHB 0x17008
+#define NVT_IR_HALT_SE1   0x17274
+#define NVT_IR_RCG_CMD    0x17278
+#define NVT_IR_RCG_CFG    0x1727c
+#define NVT_IR_RCG_DFS    0x1728c       /* cmd + 0x14 */
+#define NVT_IR_SE_BASE    0x00884000ULL
+
+static void
+vayu_ir_clk(const char *cmdline)
+{
+	uint32_t vote;
+	int i, on;
+
+	if (!nvt_cmdline_word(cmdline, "vayu_ir_clk=1")) {
+		return;
+	}
+	vote = nvt_rd(NVT_GCC + NVT_IR_GCC_VOTE);
+	print("vayu-ir: clock (vayu_ir_clk=1): before vote %x (m_ahb %d, s_ahb %d, se1 %d), halts %x %x %x, rcg cmd %x cfg %x dfs %x\n",
+	    (uint64_t)vote, (uint64_t)((vote >> 6) & 1), (uint64_t)((vote >> 7) & 1), (uint64_t)((vote >> 11) & 1),
+	    (uint64_t)nvt_rd(NVT_GCC + NVT_IR_HALT_M_AHB), (uint64_t)nvt_rd(NVT_GCC + NVT_IR_HALT_S_AHB),
+	    (uint64_t)nvt_rd(NVT_GCC + NVT_IR_HALT_SE1), (uint64_t)nvt_rd(NVT_GCC + NVT_IR_RCG_CMD),
+	    (uint64_t)nvt_rd(NVT_GCC + NVT_IR_RCG_CFG), (uint64_t)nvt_rd(NVT_GCC + NVT_IR_RCG_DFS));
+	if ((vote & (NVT_IR_VOTE_M_AHB | NVT_IR_VOTE_S_AHB)) != (NVT_IR_VOTE_M_AHB | NVT_IR_VOTE_S_AHB)) {
+		nvt_gcc_wr(NVT_IR_GCC_VOTE, nvt_rd(NVT_GCC + NVT_IR_GCC_VOTE) | NVT_IR_VOTE_M_AHB | NVT_IR_VOTE_S_AHB, "ir vote (wrap0 ahb)");
+	}
+	on = nvt_gcc_branch_on(NVT_IR_HALT_M_AHB, "wrap0 m_ahb", 0);
+	if (!nvt_gcc_branch_on(NVT_IR_HALT_S_AHB, "wrap0 s_ahb", 1)) {
+		on = 0;
+	}
+	if (!on) {
+		print("vayu-ir: clock: wrapper 0 AHB did not come on: SE1 left alone\n");
+		return;
+	}
+	nvt_gcc_wr(NVT_IR_GCC_VOTE, nvt_rd(NVT_GCC + NVT_IR_GCC_VOTE) | NVT_IR_VOTE_SE1, "ir vote (se1)");
+	on = nvt_gcc_branch_on(NVT_IR_HALT_SE1, "wrap0 se1", 0);
+	if (nvt_rd(NVT_GCC + NVT_IR_RCG_DFS) & 1) {
+		print("vayu-ir: clock: se1 rcg is in DFS: rate left to its levels (XNU uses CLK_SEL)\n");
+	} else {
+		uint32_t c = nvt_rd(NVT_GCC + NVT_IR_RCG_CFG);
+
+		nvt_gcc_wr(NVT_IR_RCG_CFG, (c & ~(0x1fu | (0x7u << 8) | (0x3u << 12))) | 1u, "ir se1 rcg cfg (xo/1)");
+		nvt_gcc_wr(NVT_IR_RCG_CMD, nvt_rd(NVT_GCC + NVT_IR_RCG_CMD) | NVT_RCG_UPDATE, "ir se1 rcg update");
+		for (i = 0; i < 100 && (nvt_rd(NVT_GCC + NVT_IR_RCG_CMD) & NVT_RCG_UPDATE); i++) {
+			BS->stall(10);
+		}
+		print("vayu-ir: clock: se1 rcg cmd %x cfg %x%s\n", (uint64_t)nvt_rd(NVT_GCC + NVT_IR_RCG_CMD),
+		    (uint64_t)nvt_rd(NVT_GCC + NVT_IR_RCG_CFG), (nvt_rd(NVT_GCC + NVT_IR_RCG_CMD) & (NVT_RCG_UPDATE | NVT_RCG_ROOT_OFF)) ?
+		    ": UPDATE DID NOT COMPLETE or root off" : ": 19.2 MHz");
+	}
+	print("vayu-ir: clock: done: se1 %s, fw revision %x (protocol %x, 1 = SPI)\n", on ? "on" : "OFF",
+	    (uint64_t)nvt_rd(NVT_IR_SE_BASE + 0x68), (uint64_t)((nvt_rd(NVT_IR_SE_BASE + 0x68) >> 8) & 0xff));
+}
+
+/* vayu Bluetooth: QUP wrapper 2 SE3's clock vote and GPIO 43-46, for XNU's */
+/* bsd/dev/vayu_bt.c.                                                       */
+/*                                                                          */
+/* The WCN3990 hangs on SE3 (registers at 0xc8c000) behind QUP wrapper 2.   */
+/* XNU writes neither TLMM nor GCC on this phone (this port's rule, as for    */
+/* touch and audio): the loader prepares the clocks and the pins here.      */
+/* GPIO 43-46 are the UART's CTS, RTS, TX and RX in the TLMM EAST tile      */
+/* (0x03500000; cfg at +0x1000 * pin, io at cfg + 4). The live DT's active  */
+/* state is qup13, function index 1, 2 mA (drive code 0), input (OE 0):     */
+/* 44 pulls down, 45 pulls up, 43 and 46 have no pull.                      */
+/*                                                                          */
+/* GCC is at 0x00100000. Vote word 0x52014 (gcc-sm8150.c:2911-2916): bit 1  */
+/* wrapper 2 s_ahb, bit 2 wrapper 2 m_ahb, bit 7 wrapper 2 SE3. The halt    */
+/* registers are 0x1e008, 0x1e004 and 0x1e4d4; bit 31 reads 1 while a clock */
+/* is off. s_ahb is hardware-gated (its CBCR keeps bit 31 set while idle),  */
+/* so nvt_gcc_branch_on() gets hwcg = 1 for it. SE3's RCG is cmd 0x1e4d8,   */
+/* cfg 0x1e4dc and dfs 0x1e4ec (cmd + 0x14); the vendor kernel leaves it in */
+/* DFS mode as XBL set it (gcc-sm8150.c:4188), so this loader never writes  */
+/* those three: it reads and prints them only.                              */
+/*                                                                          */
+/* The SE (fw revision 0xc8c068, IF_DISABLE 0xc8c064) is read only when     */
+/* wrapper 2's AHB path runs; no SE address at or above 0xc8e000 is read.   */
+/*                                                                          */
+/*   vayu_bt_loader=1  reads only: the vote, the three halt registers, the  */
+/*                     RCG and the pins, then the SE if its AHB is already  */
+/*                     running; nothing is written at all.                  */
+/*   vayu_bt_loader=2  the same, then votes and checks s_ahb and m_ahb,     */
+/*                     votes and checks SE3, and muxes GPIO 43-46. Only the */
+/*                     vote word (read-modify-write, bits 1/2/7) and the    */
+/*                     four pin cfg registers are written.                  */
+/* ------------------------------------------------------------------------ */
+
+#define NVT_TLMM_EAST     0x03500000ULL
+#define NVT_BT_PIN0       43
+#define NVT_BT_PINS       4
+#define NVT_VOTE_SE3      (1u << 7)     /* wrapper 2 SE3 (gcc-sm8150.c:2911-2916) */
+#define NVT_BT_HALT_SE3   0x1e4d4
+#define NVT_BT_RCG_CMD    0x1e4d8
+#define NVT_BT_RCG_CFG    0x1e4dc
+#define NVT_BT_RCG_DFS    0x1e4ec       /* cmd + 0x14 */
+#define NVT_BT_SE_BASE    0x00c8c000ULL
+#define NVT_BT_SE_FWREV   0x68          /* GENI_FW_REVISION_RO */
+#define NVT_BT_SE_IFDIS   0x64          /* GENI_IF_DISABLE_RO */
+
+static void
+vayu_bt_pin_show(const char *when, unsigned pin, const char *role)
+{
+	uint32_t cfg = nvt_rd(NVT_PIN_CFG(NVT_TLMM_EAST, pin));
+	uint32_t io = nvt_rd(NVT_PIN_IO(NVT_TLMM_EAST, pin));
+
+	print("vayu-bt: loader: %s gpio%d %s: cfg %x io %x (mux %x, pull %x, drive %x, oe %x, in %x)\n", when,
+	    (uint64_t)pin, role, (uint64_t)cfg, (uint64_t)io, (uint64_t)((cfg >> 2) & 0xf), (uint64_t)(cfg & 3),
+	    (uint64_t)((cfg >> 6) & 7), (uint64_t)((cfg >> 9) & 1), (uint64_t)(io & 1));
+}
+
+static void
+vayu_bt_loader(const char *cmdline)
+{
+	static const char *const role[NVT_BT_PINS] = { "CTS", "RTS", "TX", "RX" };
+	static const uint32_t pull[NVT_BT_PINS] = { 0, 1, 3, 0 };
+	uint32_t vote, halt_m, halt_s, halt_se3, rcg_cmd, rcg_cfg, rcg_dfs;
+	uint32_t want, got, io, fw, ifdis;
+	int mode, i, ahb_on = 0, se3_on, pins_ok;
+
+	if (nvt_cmdline_word(cmdline, "vayu_bt_loader=2")) {
+		mode = 2;
+	} else if (nvt_cmdline_word(cmdline, "vayu_bt_loader=1")) {
+		mode = 1;
+	} else {
+		return;
+	}
+	print("vayu-bt: loader: mode %d (1: reads only, 2: SE3 clock vote + pins)\n", (uint64_t)mode);
+
+	/* What the bootloader left, before anything is written. */
+	vote = nvt_rd(NVT_GCC + NVT_GCC_VOTE);
+	halt_m = nvt_rd(NVT_GCC + NVT_HALT_M_AHB);
+	halt_s = nvt_rd(NVT_GCC + NVT_HALT_S_AHB);
+	halt_se3 = nvt_rd(NVT_GCC + NVT_BT_HALT_SE3);
+	print("vayu-bt: loader: before vote %x (s_ahb %d, m_ahb %d, se3 %d)\n", (uint64_t)vote,
+	    (uint64_t)((vote & NVT_VOTE_S_AHB) ? 1 : 0), (uint64_t)((vote & NVT_VOTE_M_AHB) ? 1 : 0),
+	    (uint64_t)((vote & NVT_VOTE_SE3) ? 1 : 0));
+	print("vayu-bt: loader: before halts m_ahb %x (%s), s_ahb %x (%s), se3 %x (%s)\n", (uint64_t)halt_m,
+	    (halt_m & NVT_CLK_OFF) ? "OFF" : "on", (uint64_t)halt_s, (halt_s & NVT_CLK_OFF) ? "OFF" : "on",
+	    (uint64_t)halt_se3, (halt_se3 & NVT_CLK_OFF) ? "OFF" : "on");
+	rcg_cmd = nvt_rd(NVT_GCC + NVT_BT_RCG_CMD);
+	rcg_cfg = nvt_rd(NVT_GCC + NVT_BT_RCG_CFG);
+	rcg_dfs = nvt_rd(NVT_GCC + NVT_BT_RCG_DFS);
+	print("vayu-bt: loader: before se3 rcg cmd %x cfg %x dfs %x (dfs %s)\n", (uint64_t)rcg_cmd,
+	    (uint64_t)rcg_cfg, (uint64_t)rcg_dfs, (rcg_dfs & 1) ? "enabled" : "off");
+	for (i = 0; i < NVT_BT_PINS; i++) {
+		vayu_bt_pin_show("before", NVT_BT_PIN0 + i, role[i]);
+	}
+
+	se3_on = (halt_se3 & NVT_CLK_OFF) == 0;
+	if (mode == 2) {
+		if ((vote & (NVT_VOTE_M_AHB | NVT_VOTE_S_AHB)) != (NVT_VOTE_M_AHB | NVT_VOTE_S_AHB)) {
+			nvt_gcc_wr(NVT_GCC_VOTE, nvt_rd(NVT_GCC + NVT_GCC_VOTE) | NVT_VOTE_M_AHB | NVT_VOTE_S_AHB,
+			    "bt vote (ahb)");
+		}
+		ahb_on = nvt_gcc_branch_on(NVT_HALT_M_AHB, "m_ahb", 0);
+		if (!nvt_gcc_branch_on(NVT_HALT_S_AHB, "s_ahb", 1)) {
+			ahb_on = 0;
+		}
+		if (!ahb_on) {
+			print("vayu-bt: loader: wrapper 2 AHB did not come on: SE3 clock and pins left alone\n");
+		} else {
+			nvt_gcc_wr(NVT_GCC_VOTE, nvt_rd(NVT_GCC + NVT_GCC_VOTE) | NVT_VOTE_SE3, "bt vote (se3)");
+			se3_on = nvt_gcc_branch_on(NVT_BT_HALT_SE3, "se3", 0);
+			/*
+			 * The SE3 rate. Run 031412 (bt1): XBL leaves this RCG with DFS off (dfs word 0x8020,
+			 * all DFSR 0) at XO/bypass (cfg 0x100000) -- 19.2 MHz has no integer divider for
+			 * 115200 x 32. So, only while DFS is off, the loader programs the vendor's first
+			 * table entry, 7 372 800 Hz = GPLL0_EVEN (src 6) / 1 * 384 / 15625 (vendor
+			 * gcc-sm8150.c:624-641, clk_rcg2_configure() clk-rcg2.c:440-490: M = m, N = ~(n - m),
+			 * D = ~n, CFG = hid 1 | src 6 | dual-edge mode, CFG bit 20 kept), then UPDATE -- after the SE3 branch is on, so the root runs (bt1: cmd 0x80000000 = root off before the vote).
+			 * With DFS on nothing is written (the vendor kernel never writes a DFS RCG).
+			 */
+			if (nvt_rd(NVT_GCC + NVT_BT_RCG_DFS) & 1) {
+				print("vayu-bt: loader: se3 rcg is in DFS: rate left to its levels\n");
+			} else {
+				uint32_t c = nvt_rd(NVT_GCC + NVT_BT_RCG_CFG);
+
+				print("vayu-bt: loader: gpll0 mode %x user_ctl %x (bit 31 lock, user_ctl bit 1 even out)\n",
+				    (uint64_t)nvt_rd(NVT_GCC + 0x0), (uint64_t)nvt_rd(NVT_GCC + 0xc));
+				nvt_gcc_wr(NVT_BT_RCG_CMD + 0x8, 384, "bt se3 rcg m");
+				nvt_gcc_wr(NVT_BT_RCG_CMD + 0xc, ~(15625u - 384u) & 0xffffu, "bt se3 rcg n");
+				nvt_gcc_wr(NVT_BT_RCG_CMD + 0x10, ~15625u & 0xffffu, "bt se3 rcg d");
+				nvt_gcc_wr(NVT_BT_RCG_CFG, (c & ~(0x1fu | (0x7u << 8) | (0x3u << 12))) | 1u | (6u << 8) |
+				    (2u << 12), "bt se3 rcg cfg (gpll0_even, mnd)");
+				nvt_gcc_wr(NVT_BT_RCG_CMD, nvt_rd(NVT_GCC + NVT_BT_RCG_CMD) | NVT_RCG_UPDATE, "bt se3 rcg update");
+				for (i = 0; i < 100 && (nvt_rd(NVT_GCC + NVT_BT_RCG_CMD) & NVT_RCG_UPDATE); i++) {
+					BS->stall(10);
+				}
+				print("vayu-bt: loader: se3 rcg cmd %x cfg %x m %x n %x d %x%s\n",
+				    (uint64_t)nvt_rd(NVT_GCC + NVT_BT_RCG_CMD), (uint64_t)nvt_rd(NVT_GCC + NVT_BT_RCG_CFG),
+				    (uint64_t)nvt_rd(NVT_GCC + NVT_BT_RCG_CMD + 0x8), (uint64_t)nvt_rd(NVT_GCC + NVT_BT_RCG_CMD + 0xc),
+				    (uint64_t)nvt_rd(NVT_GCC + NVT_BT_RCG_CMD + 0x10),
+				    (nvt_rd(NVT_GCC + NVT_BT_RCG_CMD) & (NVT_RCG_UPDATE | NVT_RCG_ROOT_OFF)) ?
+				    ": UPDATE DID NOT COMPLETE or root off" : ": 7372800 Hz");
+			}
+			for (i = 0; i < NVT_BT_PINS; i++) {
+				unsigned pin = NVT_BT_PIN0 + i;
+				uint64_t cfg_pa = NVT_PIN_CFG(NVT_TLMM_EAST, pin);
+				uint32_t cfg = nvt_rd(cfg_pa);
+
+				want = (cfg & ~0x3ffu) | (1u << 2) | pull[i] | (0u << 6);
+				nvt_wr(cfg_pa, want);
+				got = nvt_rd(cfg_pa);
+				io = nvt_rd(NVT_PIN_IO(NVT_TLMM_EAST, pin));
+				print("vayu-bt: loader: gpio%d %s: cfg %x -> %x (mux %x, pull %x, drive %x, oe %x), io %x\n",
+				    (uint64_t)pin, role[i], (uint64_t)cfg, (uint64_t)got, (uint64_t)((got >> 2) & 0xf),
+				    (uint64_t)(got & 3), (uint64_t)((got >> 6) & 7), (uint64_t)((got >> 9) & 1),
+				    (uint64_t)io);
+				if ((got & 0x3ff) != (want & 0x3ff)) {
+					print("vayu-bt: loader: gpio%d DID NOT TAKE (wanted %x)\n", (uint64_t)pin,
+					    (uint64_t)want);
+				}
+			}
+		}
+	} else {
+		ahb_on = (nvt_rd(NVT_GCC + NVT_HALT_M_AHB) & NVT_CLK_OFF) == 0 &&
+		    (nvt_rd(NVT_GCC + NVT_GCC_VOTE) & (NVT_VOTE_M_AHB | NVT_VOTE_S_AHB)) ==
+		    (NVT_VOTE_M_AHB | NVT_VOTE_S_AHB);
+	}
+
+	if (ahb_on) {
+		fw = nvt_rd(NVT_BT_SE_BASE + NVT_BT_SE_FWREV);
+		ifdis = nvt_rd(NVT_BT_SE_BASE + NVT_BT_SE_IFDIS);
+		print("vayu-bt: loader: after se3 fw revision %x protocol %x (2 = UART), if_disable %x (FIFO %s)\n",
+		    (uint64_t)fw, (uint64_t)((fw >> 8) & 0xff), (uint64_t)ifdis, (ifdis & 1) ? "disabled" : "allowed");
+	} else {
+		print("vayu-bt: loader: the wrapper 2 AHB clocks are off; the SE is not read\n");
+	}
+
+	pins_ok = 0;
+	for (i = 0; i < NVT_BT_PINS; i++) {
+		uint32_t cfg = nvt_rd(NVT_PIN_CFG(NVT_TLMM_EAST, NVT_BT_PIN0 + i));
+
+		if (mode == 2) {
+			if ((cfg & 0x3ffu) == ((1u << 2) | pull[i])) {
+				pins_ok++;
+			}
+		} else if (((cfg >> 2) & 0xf) == 1 && (cfg & 3) == pull[i]) {
+			pins_ok++;
+		}
+	}
+	print("vayu-bt: loader: done: mode %d, se3 clock %s, %d of 4 pins as wanted\n", (uint64_t)mode,
+	    se3_on ? "on" : "off", (uint64_t)pins_ok);
+}
+
 /*
  * Load and run the kernel from the payload. Returns when the kernel comes
  * back (panic, checkpoint, early exception); the combined log is staged and
  * written to the log partition. Returns 0 if the kernel could not be started.
  */
 static int starts_with(const char *s, const char *prefix);
+
+static void usb_restart_after_run(void);
+static int usb_restart_enabled = 1;            /* payload cmdline usb_restart=0: no restart after the run */
+/*
+ * usb_handover=1 (the USB networking's USB networking): the kernel asks for the USB controller (kernel_live usb_take = 1)
+ * and this loader then leaves it alone for the rest of the run (usb_given = 1): no polling, no transfers, and
+ * no stop() first (Qualcomm's stop may gate the clocks the kernel needs; the kernel halts and resets the
+ * core itself). After the run the stack is always stopped and started again (usb_restart_after_run), on
+ * every way out of a run. Live logs end at the handover.
+ */
+static int usb_handover_enabled, usb_given_away;
+/*
+ * After a kernel's return, no command from the host for IDLE_RESET_SECONDS: the phone is restarted
+ * (UEFI ResetSystem, cold), the log having been written to logdump first. A loader the host cannot reach
+ * any more (runs 001804, 005616, 022501: after a replug) then comes back by itself instead of waiting for
+ * a person; the host side brings it back to the loader as after any reboot. Payload cmdline idle_reset=0
+ * turns it off. Every command that arrives starts the count again.
+ */
+#define IDLE_RESET_SECONDS_PLAIN 120
+#define IDLE_RESET_SECONDS_HANDOVER 600     /* usb_handover=1: the host may take minutes to find the loader again (test run, loader 1.8) */
+#define IDLE_RESET_SECONDS (usb_handover_enabled ? IDLE_RESET_SECONDS_HANDOVER : IDLE_RESET_SECONDS_PLAIN)
+static int idle_reset_enabled = 1;
+static uint64_t idle_reset_at;                  /* CNTVCT; 0: not counting */
+static unsigned usb_run_changes;                /* (tentative: defined with the USB code below) */
+static int usb_rx_queued;
 
 static int
 run_kernel(int have_checkpoint, uint64_t checkpoint)
@@ -2732,6 +4502,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("no kernel in payload\n");
 		return 0;
 	}
+	kernel_started_this_session = 1;        /* (from here on, logdump is this session's: loader 1.8) */
 	if (!have_checkpoint) {
 		checkpoint = pi.checkpoint;
 	}
@@ -2957,14 +4728,22 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		own_serial |= starts_with(c, "serial=");
 	}
 	const char *base_cmdline = (PLAT->uart != 0 && !own_serial) ? "debug=0x8 serial=3 " : "debug=0x8 ";
+	/*
+	 * The command line is composed in full here (loader 1.9): XNU's boot_args has room for 607 characters
+	 * (BOOT_LINE_LENGTH 608) and a test run's 920 were cut at "vayu_cam" (run 220922). boot_args gets the first 607;
+	 * the whole line goes into the device tree as /chosen "hakios-bootargs", which the kernel's PE_boot_args()
+	 * prefers when it is there (pexpert/arm/pe_bootargs.c).
+	 */
+	static char full_cmd[FULL_CMD_LEN];
+	memset(full_cmd, 0, sizeof(full_cmd));
 	uint32_t n = 0;
-	for (const char *c = base_cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-		ba->commandLine[n++] = *c;
+	for (const char *c = base_cmdline; *c && n < FULL_CMD_LEN - 1; c++) {
+		full_cmd[n++] = *c;
 	}
 	/* one processor unless the payload asks for more (of two "cpus=" the kernel takes the first) */
 	if (!more_cores) {
-		for (const char *c = "cpus=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = "cpus=1 "; *c && n < FULL_CMD_LEN - 1; c++) {
+			full_cmd[n++] = *c;
 		}
 	}
 	/* the root is the first RAM disk unless the payload says otherwise */
@@ -2973,13 +4752,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		own_root |= starts_with(c, "rd=") && (c == pi.cmdline || c[-1] == ' ');
 	}
 	if (rd_size != 0 && !own_root) {
-		for (const char *c = "rd=md0 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = "rd=md0 "; *c && n < FULL_CMD_LEN - 1; c++) {
+			full_cmd[n++] = *c;
 		}
 	}
 	if (wdt_armed) {
-		for (const char *c = "hv_wdt_pet=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = "hv_wdt_pet=1 "; *c && n < FULL_CMD_LEN - 1; c++) {
+			full_cmd[n++] = *c;
 		}
 	}
 	if (block_enabled) {
@@ -2987,29 +4766,86 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		static const char hex[] = "0123456789abcdef";
 		uint64_t address = (uint64_t)(uintptr_t)&block_shared;
 
-		for (const char *c = prefix; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = prefix; *c && n < FULL_CMD_LEN - 1; c++) {
+			full_cmd[n++] = *c;
 		}
-		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
-			ba->commandLine[n++] = hex[(address >> shift) & 0xf];
+		for (int shift = 60; shift >= 0 && n < FULL_CMD_LEN - 1; shift -= 4) {
+			full_cmd[n++] = hex[(address >> shift) & 0xf];
 		}
-		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
+		if (n < FULL_CMD_LEN - 1) full_cmd[n++] = ' ';
+		/* the port's partition as this loader knows it: the kernel checks the table against these */
+		if (PLAT->darwin != NULL) {
+			const char *names[3] = { "ufs_darwin_first=0x", "ufs_darwin_blocks=0x", "ufs_write_first=0x" };
+			uint64_t values[3] = { PLAT->darwin->first_lba, PLAT->darwin->last_lba - PLAT->darwin->first_lba + 1,
+			    PLAT->darwin->write_first };
+
+			for (int k = 0; k < 3; k++) {
+				for (const char *c = names[k]; *c && n < FULL_CMD_LEN - 1; c++) {
+					full_cmd[n++] = *c;
+				}
+				for (int shift = 60; shift >= 0 && n < FULL_CMD_LEN - 1; shift -= 4) {
+					full_cmd[n++] = hex[(values[k] >> shift) & 0xf];
+				}
+				if (n < FULL_CMD_LEN - 1) full_cmd[n++] = ' ';
+			}
+		}
 	}
 	if (battery_requested) {
 		static const char prefix[] = "battery_shared_pa=0x";
 		static const char hex[] = "0123456789abcdef";
 		uint64_t address = (uint64_t)(uintptr_t)&charger_shared;
 
-		for (const char *c = prefix; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-			ba->commandLine[n++] = *c;
+		for (const char *c = prefix; *c && n < FULL_CMD_LEN - 1; c++) {
+			full_cmd[n++] = *c;
 		}
-		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
-			ba->commandLine[n++] = hex[(address >> shift) & 0xf];
+		for (int shift = 60; shift >= 0 && n < FULL_CMD_LEN - 1; shift -= 4) {
+			full_cmd[n++] = hex[(address >> shift) & 0xf];
 		}
-		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
+		if (n < FULL_CMD_LEN - 1) full_cmd[n++] = ' ';
 	}
-	for (const char *c = pi.cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-		ba->commandLine[n++] = *c;
+	/*
+	 * fb_spare=N (1-3): N frames of 12 MiB each (loader 1.6; 1.2-1.5: the panel's 1080 x 2400 x 4) in one piece below 4 GB,
+	 * for the display controller to scan out (vayu_mdp.c; its address registers have 32 bits, and XNU could
+	 * find no such piece of its own: run 034941). Taken from what UEFI has left once XNU's window is claimed,
+	 * once per loader session (kept for the next runs), and handed over as fb_spare_pa= and fb_spare_frames=.
+	 */
+	for (const char *c = pi.cmdline; *c; c++) {
+
+		if ((c == pi.cmdline || c[-1] == ' ') && starts_with(c, "fb_spare=") && c[9] >= '1' && c[9] <= '3') {
+			uint64_t frames = (uint64_t)(c[9] - '0'), frame_pages = (12ULL << 20) >> 12;   /* 12 MiB: a 1125x2436 BGRA surface with its row padding (zero-copy, fb_zero) */
+			static const char hex[] = "0123456789abcdef";
+			const char *names[2] = { "fb_spare_pa=0x", "fb_spare_frames=0x" };
+			uint64_t values[2];
+
+			(void)frame_pages;
+			if (fb_spare_get(frames) == 0) {
+				break;
+			}
+			print("fb_spare: %d frames at %x (below 4 GB, outside XNU's window)\n", fb_spare_count, fb_spare_pa);
+			values[0] = fb_spare_pa;
+			values[1] = fb_spare_count;
+			for (int k = 0; k < 2; k++) {
+				for (const char *q = names[k]; *q && n < FULL_CMD_LEN - 1; q++) {
+					full_cmd[n++] = *q;
+				}
+				for (int shift = 60; shift >= 0 && n < FULL_CMD_LEN - 1; shift -= 4) {
+					full_cmd[n++] = hex[(values[k] >> shift) & 0xf];
+				}
+				if (n < FULL_CMD_LEN - 1) full_cmd[n++] = ' ';
+			}
+			break;
+		}
+	}
+	for (const char *c = pi.cmdline; *c && n < FULL_CMD_LEN - 1; c++) {
+		full_cmd[n++] = *c;
+	}
+	for (uint32_t i = 0; i < BOOT_LINE_LENGTH - 1; i++) {
+		ba->commandLine[i] = i < n ? full_cmd[i] : 0;
+	}
+	ba->commandLine[BOOT_LINE_LENGTH - 1] = 0;
+	if (n >= BOOT_LINE_LENGTH - 1) {
+		print("cmdline: %d characters: boot_args has the first %d, /chosen hakios-bootargs all of it\n", (uint64_t)n,
+		    (uint64_t)(BOOT_LINE_LENGTH - 1));
 	}
 
 	/* --- device tree ---------------------------------------------------- */
@@ -3051,6 +4887,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_u32(&w, "display-rotation", 0);
 	/* how the kernel is to ask the firmware for more cores (PSCI) */
 	dt_prop_str(&w, "psci-method", plat->psci_hvc ? "hvc" : "smc");
+	/* the whole command line (boot_args holds only its first 607 characters): pexpert/arm/pe_bootargs.c reads it */
+	dt_prop_str(&w, "hakios-bootargs", full_cmd);
 	/* the time now, by the firmware's clock (the kernel has no real-time clock driver) */
 	uint64_t epoch = firmware_epoch();
 	if (epoch != 0) {
@@ -3256,7 +5094,56 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	ba->deviceTreeP = dt_pa - slide;
 	ba->deviceTreeLength = dt_len;
 	print("device tree %x len %x, boot_args %x, top %x\n", dt_pa, (uint64_t)dt_len, ba_pa, top);
-	print("cmdline: %s\n", ba->commandLine);
+
+	/*
+	 * The touch bus: only when the payload asks for it. XNU cannot write
+	 * TLMM on this phone, so the loader owns the pins, reset, VDDIO and the
+	 * SE's GCC clocks; the kernel's QUP driver (bsd/dev/vayu_qup_spi.c)
+	 * checks the clocks and sets up GENI.
+	 */
+	charger_paused = nvt_cmdline_word(pi.cmdline, "loader_charger=0");
+	if (charger_paused) {
+		print("loader_charger=0: no charger polls during this run\n");
+	}
+	if (nvt_cmdline_word(pi.cmdline, "nvt_qup=1") || nvt_cmdline_word(pi.cmdline, "touch_driver=nvt_qup")) {
+		nvt_qup_setup(pi.cmdline);
+	}
+
+	/* The speaker amplifiers' pins: only when the payload asks (XNU does not write TLMM: see vayu_audio_pins()). */
+	if (aud_word(pi.cmdline, "vayu_audio_pins=1") || aud_word(pi.cmdline, "vayu_audio_pins=2") ||
+	    aud_word(pi.cmdline, "vayu_audio_mi2s=1") || aud_word(pi.cmdline, "vayu_audio_mi2s=2")) {
+		vayu_audio_pins(pi.cmdline);
+	}
+	/* The PN553's pins and the optional read-only probe: only when the payload asks (see vayu_nfc_pins()). */
+	if (aud_word(pi.cmdline, "vayu_nfc_pins=1") || aud_word(pi.cmdline, "vayu_nfc_pins=2")) {
+		vayu_nfc_pins(pi.cmdline);
+	}
+	usb_restart_enabled = !aud_word(pi.cmdline, "usb_restart=0");
+	usb_handover_enabled = aud_word(pi.cmdline, "usb_handover=1");
+	idle_reset_enabled = !aud_word(pi.cmdline, "idle_reset=0");
+	idle_reset_at = 0;
+	usb_run_changes = 0;
+	/* The codec's reset pin: see vayu_jack_pins(). */
+	if (aud_word(pi.cmdline, "vayu_jack_pins=1") || aud_word(pi.cmdline, "vayu_jack_pins=2")) {
+		vayu_jack_pins(pi.cmdline);
+	}
+	/* The IR blaster's SE1 clock: only with vayu_ir_clk=1 (GCC exception 7a: see vayu_ir_clk()). */
+	if (nvt_cmdline_word(pi.cmdline, "vayu_ir_clk=1")) {
+		vayu_ir_clk(pi.cmdline);
+	}
+	/* The IR blaster's pins: only with vayu_ir_pins=1 (TLMM exception 7: see vayu_ir_pins()). */
+	if (nvt_cmdline_word(pi.cmdline, "vayu_ir_pins=1")) {
+		vayu_ir_pins(pi.cmdline);
+	}
+	/* The camera's pins: only with vayu_cam_pins=1 (XNU does not write TLMM: see vayu_cam_pins()). */
+	if (nvt_cmdline_word(pi.cmdline, "vayu_cam_pins=1")) {
+		vayu_cam_pins(pi.cmdline);
+	}
+	/* The Bluetooth UART's SE3 clock vote and pins: only with vayu_bt_loader=1|2 (see vayu_bt_loader()). */
+	if (nvt_cmdline_word(pi.cmdline, "vayu_bt_loader=1") || nvt_cmdline_word(pi.cmdline, "vayu_bt_loader=2")) {
+		vayu_bt_loader(pi.cmdline);
+	}
+	print("cmdline: %s\n", full_cmd);
 	if (kernel_mpidr != this_mpidr) {
 		print("the kernel will run on core %x (this is core %x)\n", kernel_mpidr, this_mpidr);
 	}
@@ -3307,6 +5194,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				    (uint64_t)SILENCE_SECONDS);
 				set_result("hung", loader_ctx[CTX_LOG_LEN], 0);
 				write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
+				usb_restart_after_run();        /* (also after a handover: usb_handover=1) */
 				return 1;
 			} else if (status != 0) {
 				/* the kernel was told it would be on that core (return path, device tree): no second try */
@@ -3317,6 +5205,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				}
 				set_result("no-such-core", (uint64_t)(status < 0 ? -status : status), 0);
 				write_logs(NULL, 0);
+				usb_restart_after_run();
 				return 1;
 			}
 		} else {
@@ -3379,6 +5268,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		klog_len = 0;
 	} else {
 		print("kernel returned: log at %x, %d bytes\n", (uint64_t)(uintptr_t)klog, klog_len);
+		nfc_ven_off("VEN off (kernel returned)");
 		if (reason == 2) {
 			print("STOPPED AT CHECKPOINT %d\n", loader_ctx[CTX_ESR]);
 			set_result("checkpoint", loader_ctx[CTX_ESR], 0);
@@ -3393,6 +5283,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		}
 	}
 	write_logs(klog, klog_len);
+	usb_restart_after_run();
+	if (idle_reset_enabled) {
+		idle_reset_at = READ_SYSREG(CNTVCT_EL0) + IDLE_RESET_SECONDS * READ_SYSREG(CNTFRQ_EL0);
+		print("loader: no command from the host for %d s from now: the phone restarts by itself (idle_reset=0: not)\n",
+		    (uint64_t)IDLE_RESET_SECONDS);
+	}
 	return 1;
 }
 
@@ -3448,6 +5344,8 @@ usb_dummy_notify(void *event, void *ctx)
 {
 }
 
+static usb_device_descriptor_set usb_set;      /* what start_ex() was given: again after a run that saw the cable change */
+
 static int
 usb_start(void)
 {
@@ -3455,7 +5353,8 @@ usb_start(void)
 	static const efi_guid init_guid = QCOM_USB_INIT_EVENT_GUID;
 	static const void *cfg = usb_cfg_desc, *ss_cfg = usb_ss_cfg_desc;
 	static const void *strings[5] = { usb_str0, usb_str_mfr, usb_str_prod, usb_str_serial, usb_str_iface };
-	static usb_device_descriptor_set set;
+	usb_device_descriptor_set *const set_p = &usb_set;
+#define set (*set_p)
 	void *event;
 
 	/* Ask the platform to bring the controller up in peripheral mode (as the stock fastboot does). */
@@ -3488,7 +5387,64 @@ usb_start(void)
 	}
 	print("usb: started\n");
 	return 1;
+#undef set
 }
+
+static int usb_reconnected;     /* a cable change since the last command that arrived (see usb_rearm_if_stale) */
+/*
+ * Cable changes while a kernel runs. This core then watches with its interrupts masked (watching_only: XNU
+ * owns the GIC), so whatever of Qualcomm's UEFI USB stack runs on interrupts or timers cannot set a new
+ * session up after a replug: the device enumerates (handle_event is polled) but no command got through
+ * again (test runs 001804, 005616, 022501, loader 0.5-0.8; 0.7's re-arm of the receive was not enough).
+ * Each change is noted in the log; after the kernel's return -- the log written to logdump first, the
+ * interrupts back -- the stack is stopped and started again (start_ex, the same descriptors), as a
+ * soft reconnect, so that the host can fetch the result and the log. usb_restart=0 skips that.
+ */
+static unsigned usb_run_changes;
+
+static void
+usb_restart_after_run(void)
+{
+	efi_status s;
+
+	if (USB == NULL || (usb_run_changes == 0 && !usb_given_away)) {
+		return;
+	}
+	if (!usb_restart_enabled && !usb_given_away) {
+		print("usb: the cable changed %d times during the run; usb_restart=0: the stack is left as it is\n",
+		    (uint64_t)usb_run_changes);
+		return;
+	}
+	print("usb: %s: the USB stack is stopped and started again\n", usb_given_away ? "the kernel had the controller" :
+	    "the cable changed during the run");
+	usb_given_away = 0;
+	if (USB->abort_xfer != NULL) {
+		USB->abort_xfer(USB_EP_OUT);
+		USB->abort_xfer(USB_EP_IN);
+	}
+	s = USB->stop();
+	print("usb: stop %x\n", (uint64_t)s);
+	BS->stall(300000);
+	s = USB->start_ex(&usb_set);
+	print("usb: start_ex %x%s\n", (uint64_t)s, EFI_ERROR(s) ? ": THE HOST CANNOT REACH THIS LOADER NOW" : "");
+	usb_connected = 0;
+	usb_rx_queued = 0;
+	usb_reconnected = 1;
+	usb_run_changes = 0;
+	write_logs(returned_klog, returned_klog_len);   /* (these lines into logdump too) */
+}
+
+static void
+usb_note_change(uint32_t state)
+{
+	if (running_live != NULL) {
+		if (usb_run_changes++ < 20) {
+			print("usb: the cable %s while the kernel runs (change %d)\n", state == UsbDeviceStateConnected ?
+			    "came back" : "went away", (uint64_t)usb_run_changes);
+		}
+	}
+}
+static uint64_t usb_rx_since;   /* CNTVCT when the receive now queued was queued */
 
 /*
  * Pump controller events until a transfer on `endpoint` finishes.
@@ -3507,9 +5463,22 @@ usb_wait(uint8_t endpoint)
 		uint64_t size = 0;
 		usb_device_event_data data;
 
+		if (idle_reset_at != 0 && running_live == NULL && READ_SYSREG(CNTVCT_EL0) > idle_reset_at) {
+			print("loader: no command from the host for %d s after the kernel's return: restarting the phone\n",
+			    (uint64_t)IDLE_RESET_SECONDS);
+			write_logs(returned_klog, returned_klog_len);
+			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+		}
 		USB->handle_event(&msg, &size, &data);
 		if (msg == UsbDeviceEventDeviceStateChange) {
 			usb_connected = (data.device_state == UsbDeviceStateConnected);
+			usb_reconnected = 1;
+			usb_note_change(data.device_state);
+			return -1;
+		}
+		/* (after a cable change: a receive that has waited 2 s may be one the controller lost; queued again) */
+		if (endpoint == USB_EP_OUT && usb_reconnected && READ_SYSREG(CNTVCT_EL0) - began > 2 * freq) {
+			USB->abort_xfer(USB_EP_OUT);
 			return -1;
 		}
 		/* with a kernel running, a host that went away must not keep this core from watching it */
@@ -3527,6 +5496,25 @@ usb_wait(uint8_t endpoint)
 }
 
 static int usb_rx_queued;       /* usb_poll_command() has left the receive for the next command with the controller */
+/*
+ * Set by every change of the cable's state, cleared by the next command that arrives. After a cable is
+ * pulled and put back, a receive queued as soon as the controller says "connected" -- before the host has
+ * configured the device -- can be lost without a notification: usb_rx_queued then stayed 1 for ever and
+ * no command was read again, while the host still listed the device (test runs 001804 and 005616: the
+ * tester unplugged the cable; the loader answered nothing more and had to be forced off). While this is
+ * set, a receive that has waited 2 s is aborted and queued again.
+ */
+
+static void
+usb_rearm_if_stale(void)
+{
+	uint64_t now = READ_SYSREG(CNTVCT_EL0);
+
+	if (usb_reconnected && usb_rx_queued && now - usb_rx_since > 2 * READ_SYSREG(CNTFRQ_EL0)) {
+		USB->abort_xfer(USB_EP_OUT);
+		usb_rx_queued = 0;      /* (queued again by the next poll; a "cancelled" notice for it is ignored) */
+	}
+}
 
 static int64_t
 usb_rx(uint8_t *buf, uint64_t len)
@@ -3595,9 +5583,15 @@ fb_command(char *cmd)
 	int busy = running_live != NULL;
 
 	{
+		if (!busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
+		    starts_with(cmd, "oem selftest"))) {
+			returned_klog = NULL;   /* (memory a new payload or run may reuse: the last run's log is not staged again) */
+			returned_klog_len = 0;
+		}
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
-		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
+		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap") ||
+		    starts_with(cmd, "oem fbspare") || starts_with(cmd, "oem fbtouch"))) {
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
@@ -3610,7 +5604,7 @@ fb_command(char *cmd)
 			if (str_eq(var, "product")) {
 				fb_reply("OKAY", "xnuloader");
 			} else if (str_eq(var, "version")) {
-				fb_reply("OKAY", "0.5");
+				fb_reply("OKAY", "2.1");      /* 0.6: idle "oem log" stages the last kernel log; 0.7: USB receive re-armed; 0.8: vayu-ufs; 0.9: USB stack restarted after cable changes; 1.0: restart after 120 s without a host command; 1.1: usb_handover=1; 1.2: fb_spare=N frames below 4 GB; 1.3: the vayu train (cam/bt/jack/nfc pin paths, all opt-in by cmdline); 1.4: vayu_ir_pins=1 (TLMM exception 7); 1.5: vayu_ir_clk=1 (GCC exception 7a); 1.6: fb_spare frames of 12 MiB (zero-copy surfaces); 1.7: fb_spare clear of the vendor's reserved ranges, oem fbspare / oem fbtouch; 1.8: logdump kept at boot if it holds the last run's log, oem prevlog; 1.8a: idle reset 600 s with usb_handover=1; 1.9: the whole command line in /chosen hakios-bootargs; 2.0: vayu darwin (sda33) known, writes served with ufs_write=1; 2.1: vayu_cam_pins also sets GPIO 24 (rear VAF enable) */
 			} else if (str_eq(var, "max-download-size")) {
 				fb_reply("OKAY", download_to_ramdisk ? "0xffffffff" : "0x03f00000");
 			} else if (str_eq(var, "result")) {
@@ -3740,6 +5734,40 @@ fb_command(char *cmd)
 			fb_reply("OKAY", "watchdog test: not petting any more");
 			for (;;) {
 			}
+		} else if (starts_with(cmd, "oem fbspare")) {
+			/* the frames fb_spare=2 would get, allocated and said (then "oem log" and fetch); nothing touched */
+			fb_reply(fb_spare_get(2) != 0 ? "OKAY" : "FAIL", "");
+		} else if (starts_with(cmd, "oem fbtouch")) {
+			/*
+			 * The loader itself writes and reads back the first and last word of each fb_spare frame: if that
+			 * hangs the phone, the memory is the problem (H1), with no kernel involved. Each step said first.
+			 */
+			uint64_t pa = fb_spare_get(2);
+
+			logdump_force = 1;      /* (each step must reach logdump before the touch; the last run's log stays in memory: oem prevlog) */
+			for (uint64_t f = 0; pa != 0 && f < fb_spare_count; f++) {
+				volatile uint32_t *first = (volatile uint32_t *)(uintptr_t)(pa + f * (12ULL << 20));
+				volatile uint32_t *last = (volatile uint32_t *)(uintptr_t)(pa + (f + 1) * (12ULL << 20) - 4);
+
+				print("fbtouch: frame %d first word at %x: writing\n", f, (uint64_t)(uintptr_t)first);
+				flush_log();
+				*first = 0x5a5a1234u;
+				print("fbtouch: frame %d first word reads %x; last word at %x: writing\n", f, (uint64_t)*first,
+				    (uint64_t)(uintptr_t)last);
+				flush_log();
+				*last = 0xa5a54321u;
+				print("fbtouch: frame %d last word reads %x\n", f, (uint64_t)*last);
+			}
+			fb_reply(pa != 0 ? "OKAY" : "FAIL", "");
+		} else if (starts_with(cmd, "oem prevlog")) {
+			/* the run before this boot, as logdump had it (then get_staged) */
+			if (prev_log != NULL) {
+				staged_data = prev_log;
+				staged_len = prev_log_len;
+				fb_reply("OKAY", "");
+			} else {
+				fb_reply("FAIL", "logdump held no kernel's log at this boot");
+			}
 		} else if (starts_with(cmd, "oem memmap")) {
 			/* the firmware's memory map into the log (then "oem log" and fetch it) */
 			print_memory_map();
@@ -3748,7 +5776,7 @@ fb_command(char *cmd)
 			if (busy) {
 				compose_live_log(running_live, running_slide);
 			} else {
-				compose_logs(NULL, 0);
+				compose_logs(returned_klog, returned_klog_len);  /* (the last run's kernel log, if any) */
 			}
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
@@ -3777,13 +5805,33 @@ usb_poll_command(void)
 	if (USB == NULL) {
 		return;         /* this run was not started over USB */
 	}
+	if (usb_given_away) {
+		return;         /* (the kernel has the controller until the run ends) */
+	}
+	if (usb_handover_enabled && running_live != NULL && running_live->magic2 == KERNEL_LIVE_MAGIC2 &&
+	    running_live->magic3 == KERNEL_LIVE_MAGIC3 && running_live->usb_take == 1) {
+		if (USB->abort_xfer != NULL) {
+			USB->abort_xfer(USB_EP_OUT);
+			USB->abort_xfer(USB_EP_IN);
+		}
+		print("usb: handed to the kernel (usb_handover=1); live logs stop here\n");
+		usb_given_away = 1;
+		usb_rx_queued = 0;
+		((struct kernel_live *)(uintptr_t)running_live)->usb_given = 1;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		return;
+	}
 	if (!usb_rx_queued && usb_connected && !EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
 		usb_rx_queued = 1;
+		usb_rx_since = READ_SYSREG(CNTVCT_EL0);
 	}
+	usb_rearm_if_stale();
 	USB->handle_event(&msg, &size, &data);
 	if (msg == UsbDeviceEventDeviceStateChange) {
 		usb_connected = (data.device_state == UsbDeviceStateConnected);
 		usb_rx_queued = 0;
+		usb_reconnected = 1;
+		usb_note_change(data.device_state);
 		return;
 	}
 	if (msg != UsbDeviceEventTransferNotification || data.transfer.endpoint_index != USB_EP_OUT) {
@@ -3796,6 +5844,7 @@ usb_poll_command(void)
 	n = data.transfer.bytes_completed < sizeof(cmd) - 1 ? data.transfer.bytes_completed : sizeof(cmd) - 1;
 	memcpy(cmd, usb_rx_buf, (size_t)n);
 	cmd[n] = 0;
+	usb_reconnected = 0;            /* (a command came: the channel works) */
 	fb_command(cmd);
 }
 
@@ -3814,6 +5863,10 @@ usb_command_loop(void)
 		n = usb_rx(usb_rx_buf, 511);
 		if (n <= 0) {
 			continue;
+		}
+		usb_reconnected = 0;    /* (a command came: the channel works) */
+		if (idle_reset_at != 0) {
+			idle_reset_at = READ_SYSREG(CNTVCT_EL0) + IDLE_RESET_SECONDS * READ_SYSREG(CNTFRQ_EL0);
 		}
 		if (n > (int64_t)sizeof(cmd) - 1) {
 			n = sizeof(cmd) - 1;
@@ -3921,7 +5974,22 @@ efi_main(efi_handle image, efi_system_table *st)
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
+	install_exception_hook();
+
+	int have_payload = parse_payload(&pi, 0);
+
+	/*
+	 * The image says which device it was built for; that is stronger than
+	 * guessing from the framebuffer base (which can change with the panel).
+	 */
 	PLAT = &platform_qemu_virt;
+	if (have_payload && pi.platform != NULL) {
+		const struct platform *named = platform_by_name(pi.platform, pi.platform_size);
+
+		if (named != NULL) {
+			PLAT = named;
+		}
+	}
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
 		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
@@ -3930,19 +5998,22 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.width = GOP->mode->info->width;
 		SCREEN.height = GOP->mode->info->height;
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
-		if (SCREEN.base == 0xE1000000ULL) {
-			PLAT = &platform_redwood;
-		} else {
+		if (PLAT == &platform_qemu_virt) {
+			for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++) {
+				if (platforms[i]->fb_base == SCREEN.base) {
+					PLAT = platforms[i];
+				}
+			}
+		}
+		if (PLAT == &platform_qemu_virt) {
 			ramfb_phone_screen();
 		}
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
 
-	install_exception_hook();
 	wdt_arm();
 
-	int have_payload = parse_payload(&pi, 0);
 	if (have_payload && pi.usb_mode && usb_start()) {
 		flush_log();
 		usb_command_loop();
