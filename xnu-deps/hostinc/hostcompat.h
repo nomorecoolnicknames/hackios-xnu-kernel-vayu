@@ -68,4 +68,32 @@ static inline mode_t getmode(const void *set, mode_t omode) { (void)omode; retur
 #ifndef EFTYPE
 #define EFTYPE EINVAL
 #endif
+
+/*
+ * Apple's libc has strlcpy/strlcat; glibc does not. XNU's SETUP tools use
+ * them (replacecontents), so provide the small BSD implementations here.
+ */
+static inline size_t
+strlcpy(char *dst, const char *src, size_t size)
+{
+	size_t len = strlen(src);
+
+	if (size != 0) {
+		size_t n = (len < size - 1) ? len : size - 1;
+		memcpy(dst, src, n);
+		dst[n] = '\0';
+	}
+	return len;
+}
+
+static inline size_t
+strlcat(char *dst, const char *src, size_t size)
+{
+	size_t dlen = strnlen(dst, size);
+
+	if (dlen == size) {
+		return size + strlen(src);
+	}
+	return dlen + strlcpy(dst + dlen, src, size - dlen);
+}
 #endif
