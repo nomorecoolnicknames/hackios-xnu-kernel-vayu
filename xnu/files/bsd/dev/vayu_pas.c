@@ -1003,8 +1003,12 @@ struct smp2p {
 static bool
 their_words(const struct vayu_rproc *rp, struct smp2p *words)
 {
-	uint32_t size = 0, at = vayu_smem_item(rp->smem_host, rp->smp2p_theirs, &size);
+	uint32_t size = 0, at;
 
+	if (rp->smp2p_theirs == 0) {
+		return false;               /* this processor has no SMP2P item of its own (IPA) */
+	}
+	at = vayu_smem_item(rp->smem_host, rp->smp2p_theirs, &size);
 	return at != 0 && size >= sizeof(*words) && vayu_smem_peek(at, words, sizeof(*words)) && words->magic == SMP2P_MAGIC;
 }
 
@@ -1225,7 +1229,14 @@ our_item_fill(struct vayu_rproc *rp)
 {
 	struct smp2p ours;
 	uint32_t cacheline = 0, partition, name[4] = { 0 }, extra;
+	bool ipa_enabled = false;
+	uint32_t ipa_arg = 0;
 
+	if (rp->smp2p_ours == 0) {
+		/* IPA has no own SMP2P item. Its AUTH_AND_RESET is the readiness event;
+		 * the modem's item is filled separately below, with the "ipa" entry. */
+		return true;
+	}
 	partition = smem_partition(VAYU_SMEM_HOST_APPS, rp->smem_host, &cacheline);
 	if (partition == 0) {
 		say("%s: there is no partition for hosts 0 and %u\n", rp->name, rp->smem_host);
@@ -1269,7 +1280,18 @@ our_item_fill(struct vayu_rproc *rp)
 		vayu_smem_poke(rp->our_item + SMP2P_AT_VALUE(1), 0);
 		say("%s: our item also has entry 1 \"%s\" = 0 (vayu_smp2p_extra=1)\n", rp->name, rp->smp2p_extra);
 	}
-	vayu_smem_poke(rp->our_item + SMP2P_AT_COUNTS, 16 | (extra != 0 && rp->smp2p_extra != NULL ? 2u : 1u) << 16);
+	if (rp->smem_host == 1 && rp->smp2p_ours == 428 &&
+	    PE_parse_boot_argn("vayu_ipa", &ipa_arg, sizeof(ipa_arg)) && ipa_arg == 1 && vayu_ipa_firmware_up()) {
+		ipa_enabled = true;
+		memset(name, 0, sizeof(name));
+		strlcpy((char *)name, "ipa", sizeof(name));
+		for (uint32_t word = 0; word < 4; word++) {
+			vayu_smem_poke(rp->our_item + SMP2P_AT_NAME(1) + 4 * word, name[word]);
+		}
+		vayu_smem_poke(rp->our_item + SMP2P_AT_VALUE(1), 3); /* answer valid + clock on */
+		say("%s: our SMP2P entry \"ipa\" = 3 (valid + clock on)\n", rp->name);
+	}
+	vayu_smem_poke(rp->our_item + SMP2P_AT_COUNTS, 16 | ((extra != 0 && rp->smp2p_extra != NULL) || ipa_enabled ? 2u : 1u) << 16);
 	vayu_smem_poke(rp->our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8);
 	settle();
 	vayu_smem_poke(rp->our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8 | SMP2P_VERSION);
@@ -2079,7 +2101,7 @@ rproc_shutdown(struct vayu_rproc *rp, const char *why)
 	say("%s: SHUT DOWN\n", rp->name);
 	rp->started = false;
 	snprintf(text, sizeof(text), "{class: image, res: load_state, name: %s, val: off}", rp->name);
-	vayu_aop_send(text);
+	if (strcmp(rp->name, "ipa") != 0) vayu_aop_send(text);
 	rails_give_back(rp);
 	return true;
 }
@@ -2098,7 +2120,18 @@ vayu_pas_load(struct vayu_rproc *rp)
 	if (!image_check(rp)) {
 		goto out;
 	}
-	if (their_words(rp, &words) && (slave_state(&words) & VAYU_RPROC_READY)) {
+	if (rp->smp2p_theirs == 0 && rp->pas_id == 15) {
+		/* vayu DT: qcom,pil-force-shutdown on ipa_fws. There is no IPA SMP2P
+		 * channel with which to ask first; Android does the same forced PAS shutdown. */
+		result = scm(rp->name, "to force-shutdown before INIT_IMAGE (qcom,pil-force-shutdown)",
+		    SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, rp->pas_id, 0, 0, &answer);
+		if (result != 0 || answer != 0) {
+			say("%s: forced shutdown returned %d, answer %#llx; AUTH will provide the next result\n",
+			    rp->name, result, answer);
+		}
+		rp->started = false;
+	}
+	if (rp->smp2p_theirs != 0 && their_words(rp, &words) && (slave_state(&words) & VAYU_RPROC_READY)) {
 		show_words(rp, "it has left words in the shared memory and may be running", &words);
 		if (!rproc_shutdown(rp, "it may be running")) {
 			goto out;
@@ -2170,8 +2203,10 @@ vayu_pas_start(struct vayu_rproc *rp, uint32_t wait_ms)
 		}
 		rp->rails_asked = true;
 	}
+	/* The always-on processor has no load_state for IPA (Linux sends it only for the remote processors):
+	 * on hardware it did not take "name: ipa", so IPA goes straight to AUTH_AND_RESET. */
 	snprintf(text, sizeof(text), "{class: image, res: load_state, name: %s, val: on}", rp->name);
-	if (!vayu_aop_send(text)) {
+	if (strcmp(rp->name, "ipa") != 0 && !vayu_aop_send(text)) {
 		goto undo;
 	}
 	result = scm(rp->name, "to authenticate the image and let it out of reset", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE,
@@ -2181,11 +2216,16 @@ vayu_pas_start(struct vayu_rproc *rp, uint32_t wait_ms)
 	if (result != 0 || answer != 0) {
 		say("%s: TRUSTZONE DOES NOT START IT: %d, answer %#llx\n", rp->name, result, answer);
 		snprintf(text, sizeof(text), "{class: image, res: load_state, name: %s, val: off}", rp->name);
-		vayu_aop_send(text);
+		if (strcmp(rp->name, "ipa") != 0) vayu_aop_send(text);
 		goto undo;
 	}
 	rp->started = true;
 	lck_mtx_unlock(&pas_lock);
+	if (rp->smp2p_ours == 0) {
+		say("%s: TRUSTZONE authenticated the image and let it out of reset; no SMP2P readiness wait\n",
+		    rp->name);
+		return true;
+	}
 	say("%s: TRUSTZONE HAS AUTHENTICATED THE IMAGE AND LET IT OUT OF RESET; watching for %u ms\n", rp->name, wait_ms);
 	limit = started + wait_ms * 1000ull;
 	for (;;) {

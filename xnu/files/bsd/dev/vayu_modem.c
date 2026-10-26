@@ -43,7 +43,7 @@
  *   vayu_wifi=N  (bsd/dev/vayu_wifi.c) our pd-mapper + tftp (1), and the WLFW probe (2)
  *   vayu_rmtfs=N (bsd/dev/vayu_rmtfs.c) the EFS service the modem asks for: 1 publishes it and logs
  *                the requests, 2 serves modemst1/modemst2/fsc/fsg from RAM (writes never reach storage)
- *   vayu_cell=N  (bsd/dev/vayu_cell.c) the SIM and the network over QMI, read-only: 1 one round,
+ *   vayu_cell=N  (bsd/dev/vayu_cell.c) SIM/network over QMI, read-only by default: 1 one round,
  *                2 a round every vayu_cell_poll s; /dev/vayu-cell holds the record (see sys/vayu_cell.h)
  *   vayu_modem_chan=1  also open back "glink_ssr" and "SSM_RTR_MODEM_APPS" (the modem opened both in run 012936)
  *                      and log what it sends on them; nothing is sent there
@@ -79,6 +79,7 @@
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
 #include <sys/vayu_cell.h>
+#include <sys/vayu_ipa.h>
 #include <sys/vayu_modem.h>
 #include <sys/vayu_pas.h>
 #include <sys/vayu_rmtfs.h>
@@ -274,7 +275,8 @@ step_link(void)
 	}
 	vayu_qrtr_attach(&qrtr);
 	vayu_rmtfs_start(&qrtr);
-	vayu_cell_start(&qrtr);		/* vayu_cell=N: the SIM and the network, read-only (bsd/dev/vayu_cell.c) */
+	vayu_ipa_start(&qrtr);
+	vayu_cell_start(&qrtr);		/* vayu_cell=N: SIM/network; changes gated by vayu_cell_* args */
 	vayu_wifi_start(&qrtr, listen_s);
 	for (s = 1; s <= listen_s; s++) {
 		delay_for_interval(1, NSEC_PER_SEC);
@@ -305,6 +307,7 @@ step_link(void)
 	}
 	vayu_cell_stop();
 	vayu_wifi_stop();
+	vayu_ipa_stop();
 	vayu_rmtfs_stop();
 	vayu_qrtr_detach(&qrtr);
 }
@@ -320,12 +323,16 @@ modem_thread(void *arg __unused, wait_result_t wr __unused)
 	}
 	if (!step_look()) {
 		say("vayu-modem: 1: FAILED: not vayu's shared memory/command database; nothing more is done\n");
-	} else if (level >= 2 && step_up()) {
-		if (level >= 3) {
-			step_link();
-		} else {
-			delay_for_interval(secs, NSEC_PER_SEC);
-			say("vayu-modem: after %u s more its \"slave-kernel\" says %#x\n", secs, vayu_pas_state(&mpss));
+	} else if (level >= 2) {
+		/* IPA firmware and its SMP2P/filter prerequisites must exist before MPSS starts. */
+		vayu_ipa_prepare();
+		if (step_up()) {
+			if (level >= 3) {
+				step_link();
+			} else {
+				delay_for_interval(secs, NSEC_PER_SEC);
+				say("vayu-modem: after %u s more its \"slave-kernel\" says %#x\n", secs, vayu_pas_state(&mpss));
+			}
 		}
 	}
 	if (glink_prepared) {
@@ -334,6 +341,7 @@ modem_thread(void *arg __unused, wait_result_t wr __unused)
 	if (mpss.started) {
 		vayu_pas_stop(&mpss, "the probe is over");
 	}
+	vayu_ipa_prepare_stop();
 	say("vayu-modem: everything taken down\n");
 	thread_terminate(current_thread());
 }

@@ -21,6 +21,7 @@
 #include <sys/hakios.qmi.h>
 #include <sys/vayu_cell.h>
 #include <sys/vayu_cell_qmi.h>
+#include <sys/vayu_cell_data_qmi.h>
 
 static int checks, failures;
 
@@ -311,6 +312,263 @@ test_requests(void)
 	}
 }
 
+/* ---- DMS ONLINE, UIM slot/provisioning and UMTS signal --------------------------------------- */
+
+static void
+test_modem_state_messages(void)
+{
+	uint8_t out[256];
+	int length;
+
+	/* UIM Switch Slot: logical slot 1 -> physical slot 2. */
+	{
+		struct vayu_cell_uim_switch_slot_req request = { .logical_slot = 1, .physical_slot = 2 };
+		static const uint8_t want[] = {
+			0x00, 0x04, 0x00, 0x46, 0x00, 0x0b, 0x00,
+			0x01, 0x01, 0x00, 0x01,
+			0x02, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00,
+		};
+
+		length = hakios_qmi_encode(QMI_REQUEST, VAYU_CELL_UIM_SWITCH_SLOT, 4,
+		    vayu_cell_uim_switch_slot_req_ei, &request, out, sizeof(out));
+		check_bytes(out, length, want, sizeof(want), "UIM switch slot request");
+	}
+
+	/* Primary GW provisioning: activate, logical slot 1, AID a0000000871002. */
+	{
+		struct vayu_cell_uim_change_provisioning_req request = { 0 };
+		static const uint8_t aid[] = { 0xa0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02 };
+		static const uint8_t want[] = {
+			0x00, 0x05, 0x00, 0x38, 0x00, 0x11, 0x00,
+			0x01, 0x02, 0x00, 0x00, 0x01,
+			0x10, 0x09, 0x00, 0x01, 0x07,
+			0xa0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02,
+		};
+
+		request.change.session_type = VAYU_CELL_UIM_SESSION_PRIMARY_GW;
+		request.change.activate = 1;
+		request.application.slot = 1;
+		request.application.aid_len = sizeof(aid);
+		memcpy(request.application.aid, aid, sizeof(aid));
+		length = hakios_qmi_encode(QMI_REQUEST, VAYU_CELL_UIM_CHANGE_PROVISIONING, 5,
+		    vayu_cell_uim_change_provisioning_req_ei, &request, out, sizeof(out));
+		check_bytes(out, length, want, sizeof(want), "UIM change provisioning request");
+	}
+
+	/* DMS ONLINE is one byte in TLV 1; Get Operating Mode returns the same mode. */
+	{
+		struct vayu_cell_dms_set_operating_mode_req request = { .mode = VAYU_CELL_DMS_MODE_ONLINE };
+		struct vayu_cell_dms_get_operating_mode_resp response;
+		static const uint8_t want[] = {
+			0x00, 0x06, 0x00, 0x2e, 0x00, 0x04, 0x00,
+			0x01, 0x01, 0x00, 0x00,
+		};
+		static const uint8_t reply[] = {
+			0x02, 0x07, 0x00, 0x2d, 0x00, 0x0b, 0x00,
+			0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x01, 0x01, 0x00, 0x00,
+		};
+
+		length = hakios_qmi_encode(QMI_REQUEST, VAYU_CELL_DMS_SET_OPERATING_MODE, 6,
+		    vayu_cell_dms_set_operating_mode_req_ei, &request, out, sizeof(out));
+		check_bytes(out, length, want, sizeof(want), "DMS set ONLINE request");
+		memset(&response, 0, sizeof(response));
+		length = hakios_qmi_decode(reply, sizeof(reply), vayu_cell_dms_get_operating_mode_resp_ei, &response);
+		check(length == (int)sizeof(reply) && response.mode_valid == 1 &&
+		    response.mode == VAYU_CELL_DMS_MODE_ONLINE, "DMS get operating mode response");
+	}
+
+	/* NAS Get Signal Info: WCDMA RSSI -86 dBm and raw ECIO -95. */
+	{
+		struct vayu_cell_nas_get_signal_info_resp response;
+		static const uint8_t reply[] = {
+			0x02, 0x08, 0x00, 0x4f, 0x00, 0x0d, 0x00,
+			0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x13, 0x03, 0x00, 0xaa, 0xa1, 0xff,
+		};
+
+		memset(&response, 0, sizeof(response));
+		length = hakios_qmi_decode(reply, sizeof(reply), vayu_cell_nas_get_signal_info_resp_ei, &response);
+		check(length == (int)sizeof(reply) && response.wcdma_valid == 1, "UMTS signal TLV decoded");
+		check((int8_t)response.wcdma.rssi == -86 && response.wcdma.ecio == -95,
+		    "UMTS RSSI %d ECIO %d", (int)(int8_t)response.wcdma.rssi, (int)response.wcdma.ecio);
+		memset(out, 0, sizeof(out));
+		length = hakios_qmi_encode(QMI_RESPONSE, VAYU_CELL_NAS_GET_SIGNAL_INFO, 8,
+		    vayu_cell_nas_get_signal_info_resp_ei, &response, out, sizeof(out));
+		check_bytes(out, length, reply, sizeof(reply), "UMTS signal encoded back");
+	}
+}
+
+/* ---- DPM/WDA/WDS data-session control messages ----------------------------------------------- */
+
+static void
+test_data_messages(void)
+{
+	uint8_t out[256];
+	int length;
+
+	/* DPM Open Port: one hardware port, embedded interface 1, modem RX 2 / TX 11 (vayu). */
+	{
+		struct vayu_cell_dpm_open_port_req request = { 0 };
+		static const uint8_t want[] = {
+			0x00, 0x09, 0x00, 0x20, 0x00, 0x14, 0x00,
+			0x11, 0x11, 0x00, 0x01,
+			0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+			0x02, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00,
+		};
+
+		request.ports_len = 1;
+		request.ports[0].endpoint.endpoint_type = VAYU_CELL_ENDPOINT_EMBEDDED;
+		request.ports[0].endpoint.interface_number = 1;
+		request.ports[0].rx_endpoint_number = 2;
+		request.ports[0].tx_endpoint_number = 11;
+		length = hakios_qmi_encode(QMI_REQUEST, VAYU_CELL_DPM_OPEN_PORT, 9,
+		    vayu_cell_dpm_open_port_req_ei, &request, out, sizeof(out));
+		check_bytes(out, length, want, sizeof(want), "DPM open port request");
+	}
+
+	/* WDA: raw IP/QMAP, 16 datagrams and 0x3800 bytes, embedded interface 1. */
+	{
+		struct vayu_cell_wda_set_format_req request = { 0 };
+		static const uint8_t want[] = {
+			0x00, 0x0a, 0x00, 0x20, 0x00, 0x2e, 0x00,
+			0x11, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00,
+			0x12, 0x04, 0x00, 0x05, 0x00, 0x00, 0x00,
+			0x13, 0x04, 0x00, 0x05, 0x00, 0x00, 0x00,
+			0x15, 0x04, 0x00, 0x10, 0x00, 0x00, 0x00,
+			0x16, 0x04, 0x00, 0x00, 0x38, 0x00, 0x00,
+			0x17, 0x08, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+		};
+
+		request.link_layer_protocol = VAYU_CELL_RAW_IP;
+		request.uplink_aggregation = request.downlink_aggregation = VAYU_CELL_QMAP;
+		request.downlink_max_datagrams = 16;
+		request.downlink_max_size = 0x3800;
+		request.endpoint.endpoint_type = VAYU_CELL_ENDPOINT_EMBEDDED;
+		request.endpoint.interface_number = 1;
+		length = hakios_qmi_encode(QMI_REQUEST, VAYU_CELL_WDA_SET_DATA_FORMAT, 10,
+		    vayu_cell_wda_set_format_req_ei, &request, out, sizeof(out));
+		check_bytes(out, length, want, sizeof(want), "WDA set data format request");
+	}
+
+	/* WDS bind + IP family, then Start Network Interface without an APN TLV. */
+	{
+		struct vayu_cell_wds_bind_req bind = { 0 };
+		struct vayu_cell_wds_ip_family_req family = { .preference = VAYU_CELL_IPV4 };
+		struct vayu_cell_wds_start_req start = { .ip_family = VAYU_CELL_IPV4 };
+		static const uint8_t bind_want[] = {
+			0x00, 0x0b, 0x00, 0xa2, 0x00, 0x0f, 0x00,
+			0x10, 0x08, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+			0x11, 0x01, 0x00, 0x01,
+		};
+		static const uint8_t family_want[] = {
+			0x00, 0x0c, 0x00, 0x4d, 0x00, 0x04, 0x00,
+			0x01, 0x01, 0x00, 0x04,
+		};
+		static const uint8_t start_want[] = {
+			0x00, 0x0d, 0x00, 0x20, 0x00, 0x04, 0x00,
+			0x19, 0x01, 0x00, 0x04,
+		};
+
+		bind.endpoint.endpoint_type = VAYU_CELL_ENDPOINT_EMBEDDED;
+		bind.endpoint.interface_number = 1;
+		bind.mux_id = 1;
+		length = hakios_qmi_encode(QMI_REQUEST, VAYU_CELL_WDS_BIND_MUX_DATA_PORT, 11,
+		    vayu_cell_wds_bind_req_ei, &bind, out, sizeof(out));
+		check_bytes(out, length, bind_want, sizeof(bind_want), "WDS bind mux request");
+		length = hakios_qmi_encode(QMI_REQUEST, VAYU_CELL_WDS_SET_IP_FAMILY, 12,
+		    vayu_cell_wds_ip_family_req_ei, &family, out, sizeof(out));
+		check_bytes(out, length, family_want, sizeof(family_want), "WDS IP family request");
+		length = hakios_qmi_encode(QMI_REQUEST, VAYU_CELL_WDS_START_NETWORK_INTERFACE, 13,
+		    vayu_cell_wds_start_req_ei, &start, out, sizeof(out));
+		check_bytes(out, length, start_want, sizeof(start_want), "WDS start request");
+	}
+
+	/* The accepted session carries a handle; settings decode address/gateway/DNS/MTU. */
+	{
+		struct vayu_cell_wds_start_resp start;
+		struct vayu_cell_wds_settings_resp settings;
+		static const uint8_t accepted[] = {
+			0x02, 0x0d, 0x00, 0x20, 0x00, 0x0e, 0x00,
+			0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x01, 0x04, 0x00, 0x78, 0x56, 0x34, 0x12,
+		};
+		static const uint8_t current[] = {
+			0x02, 0x0e, 0x00, 0x2d, 0x00, 0x35, 0x00,
+			0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x15, 0x04, 0x00, 0x08, 0x08, 0x08, 0x08,
+			0x16, 0x04, 0x00, 0x01, 0x01, 0x01, 0x01,
+			0x1e, 0x04, 0x00, 0x93, 0x13, 0x14, 0x0a,
+			0x20, 0x04, 0x00, 0x94, 0x13, 0x14, 0x0a,
+			0x21, 0x04, 0x00, 0xf8, 0xff, 0xff, 0xff,
+			0x29, 0x04, 0x00, 0xdc, 0x05, 0x00, 0x00,
+			0x2b, 0x01, 0x00, 0x04,
+		};
+
+		memset(&start, 0, sizeof(start));
+		length = hakios_qmi_decode(accepted, sizeof(accepted), vayu_cell_wds_start_resp_ei, &start);
+		check(length == (int)sizeof(accepted) && start.handle_valid == 1 && start.handle == 0x12345678,
+		    "WDS start response handle");
+		memset(&settings, 0, sizeof(settings));
+		length = hakios_qmi_decode(current, sizeof(current), vayu_cell_wds_settings_resp_ei, &settings);
+		check(length == (int)sizeof(current), "WDS settings decode returned %d", length);
+		check(settings.dns1_valid && settings.dns1 == 0x08080808 && settings.dns2_valid && settings.dns2 == 0x01010101,
+		    "WDS DNS values");
+		check(settings.address_valid && settings.address == 0x0a141393 && settings.gateway_valid &&
+		    settings.gateway == 0x0a141394 && settings.mask_valid && settings.mask == 0xfffffff8 &&
+		    settings.mtu_valid && settings.mtu == 1500 && settings.ip_family_valid && settings.ip_family == 4,
+		    "WDS address/gateway/mask/MTU/IP family values");
+	}
+}
+
+static void
+test_data_lifecycle_messages(void)
+{
+	uint8_t out[256];
+	int length;
+
+	/* Stop uses the handle returned by Start; no second Start is implied. */
+	{
+		struct vayu_cell_wds_stop_req request = { .handle = 0x12345678 };
+		static const uint8_t want[] = {
+			0x00, 0x0f, 0x00, 0x21, 0x00, 0x07, 0x00,
+			0x01, 0x04, 0x00, 0x78, 0x56, 0x34, 0x12,
+		};
+
+		length = hakios_qmi_encode(QMI_REQUEST, VAYU_CELL_WDS_STOP_NETWORK_INTERFACE, 15,
+		    vayu_cell_wds_stop_req_ei, &request, out, sizeof(out));
+		check_bytes(out, length, want, sizeof(want), "WDS stop request");
+	}
+
+	/* APN is present only when supplied; top-level strings carry no trailing NUL. */
+	{
+		struct vayu_cell_wds_start_req request = { .ip_family = VAYU_CELL_IPV4, .apn_valid = 1 };
+		static const uint8_t want[] = {
+			0x00, 0x10, 0x00, 0x20, 0x00, 0x0f, 0x00,
+			0x14, 0x08, 0x00, 'i', 'n', 't', 'e', 'r', 'n', 'e', 't',
+			0x19, 0x01, 0x00, 0x04,
+		};
+
+		memcpy(request.apn, "internet", sizeof("internet"));
+		length = hakios_qmi_encode(QMI_REQUEST, VAYU_CELL_WDS_START_NETWORK_INTERFACE, 16,
+		    vayu_cell_wds_start_req_ei, &request, out, sizeof(out));
+		check_bytes(out, length, want, sizeof(want), "WDS start with APN request");
+	}
+
+	/* Get Current Settings asks for DNS, address, gateway, MTU and IP family. */
+	{
+		struct vayu_cell_wds_settings_req request = { .requested_settings = VAYU_CELL_SETTINGS_MASK };
+		static const uint8_t want[] = {
+			0x00, 0x11, 0x00, 0x2d, 0x00, 0x07, 0x00,
+			0x10, 0x04, 0x00, 0x10, 0xa3, 0x00, 0x00,
+		};
+
+		length = hakios_qmi_encode(QMI_REQUEST, VAYU_CELL_WDS_GET_CURRENT_SETTINGS, 17,
+		    vayu_cell_wds_settings_req_ei, &request, out, sizeof(out));
+		check_bytes(out, length, want, sizeof(want), "WDS settings request");
+	}
+}
+
 /* ---- the card's digits, and what of them may be shown ----------------------------------------- */
 
 static void
@@ -374,6 +632,9 @@ main(void)
 	test_serving_system();
 	test_signal_info();
 	test_requests();
+	test_modem_state_messages();
+	test_data_messages();
+	test_data_lifecycle_messages();
 	test_digits();
 	if (failures != 0) {
 		printf("cell-test: %d of %d checks FAILED\n", failures, checks);

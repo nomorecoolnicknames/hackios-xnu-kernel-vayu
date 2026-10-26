@@ -1,27 +1,30 @@
 /*
  * Cellular, the first real look at the SIM and the network of the POCO X3 Pro (vayu, SM8150-AC,
  * X24): a QMI client of the modem's UIM and NAS services, over QRTR on the modem's GLINK channel
- * (the transport vayu_pas.c gives the QMI helpers of hakios.qmi.c). It is read-only, and it is
- * off unless boot-arg vayu_cell=N asks for it.
+ * (the transport vayu_pas.c gives the QMI helpers of hakios.qmi.c). It is read-only by default;
+ * the optional modem-state changes below are individually gated and it is off unless vayu_cell=N.
  *
- * What it asks, and why only that:
- *   UIM 0x0b  Get Card Status (0x002f)         is there a card, is an application ready, is a PIN
- *                                              wanted (asked only, never sent)
- *   UIM 0x0b  Read Record (0x0021)             EF_ICCID (0x2fe2) and EF_IMSI (0x6f07), as the
- *   UIM 0x0b  Read Transparent (0x0020)        messages were specified; a transparent file is
- *                                              not read by Read Record, so the record read that
- *                                              the card refuses is followed by a transparent one
- *   NAS 0x03  Get Serving System (0x0024)      registration, PLMN and its name, radio, LAC/CID
- *   NAS 0x03  Get Signal Info (0x004f)         LTE RSRP/RSRQ/RSSI/SNR in dB(m), or 5G's, or GSM's
- *   NAS 0x03  Initiate Network Register (0x0022)  ONLY with vayu_cell_register=1: asking the
- *                                              modem to register may make it transmit, so it is
- *                                              never done by default
+ * What it asks, and why:
+ *   UIM 0x0b  Get Card Status (0x002f)         card slot, application readiness, PIN state, AID
+ *   UIM 0x0b  Read Record/Transparent          EF_ICCID and EF_IMSI, masked before logging
+ *   DMS 0x02  Get Operating Mode (0x002d)      online/offline only, never an identifier
+ *   NAS 0x03  Get Serving System (0x0024)      registration, PLMN/name, radio, LAC/CID
+ *   NAS 0x03  Get Signal Info (0x004f)         LTE/5G RSRP and GSM/UMTS RSSI in dBm
  *
- * What it never does: DMS (0x02) is not even looked up -- its useful messages are identifiers
- * (Get IDs, IMEI) and no identifier is needed here; no UIM write, no Verify/Unblock PIN, no
- * storage write, no WDS (there is no data call), no power or mode change. Every byte a reply
- * carries that is an identifier is dropped before anything is logged: only the number of digits
- * and a masked tail ("...1234") of the ICCID and IMSI are kept, in the log and in the record.
+ * Optional modem-side changes are all OFF by default and independently gated:
+ *   vayu_cell_online=1      DMS Set Operating Mode ONLINE (0x002e)
+ *   vayu_cell_provision=1   UIM Switch Slot (0x0046) when the usable card is not in logical slot 1,
+ *                           then Change Provisioning Session (0x0038) if primary GW is unassigned
+ *   vayu_cell_register=1    NAS Initiate Network Register automatic (0x0022), retried with backoff
+ *                           while unregistered (UIM initialization and PS attach are asynchronous)
+ *   vayu_cell_data=1        after REGISTERED, a separate DPM/WDA/WDS client starts an IPv4 session
+ *                           and reads its settings (bsd/dev/vayu_cell_data.c); no packets yet
+ *
+ * What it never does: no DMS identifier request, no SIM PIN, no APDU, no EFS/storage write, no
+ * WDS/data call and no IPA register access. The host writes no storage; rmtfs keeps any modem
+ * NV/EFS writes in the RAM overlay, including anything a session change may persist. Every identifier
+ * byte is dropped before logging: only the digit count and a masked
+ * tail ("...1234") of ICCID/IMSI are kept in the log and in the record.
  *
  * The answer, for the iOS userland shim: /dev/vayu-cell, a fixed record of 152 bytes
  * (sys/vayu_cell.h has every field and its offset). One is always readable; seq is 0 until the
@@ -31,11 +34,15 @@
  * Boot-args:
  *   vayu_cell=0        nothing at all (the default)
  *   vayu_cell=1        one round after the UIM/NAS services appear, then the QMI handle is let go
+ *                      (use vayu_cell=2 for slot/provisioning followed by registration retries)
  *   vayu_cell=2        one round, and another every vayu_cell_poll seconds
  *   vayu_cell_wait=S   how long to wait for UIM and NAS (default 20, 1..120)
- *   vayu_cell_poll=S   seconds between rounds at vayu_cell=2 (default 30, 5..3600)
- *   vayu_cell_register=1  may send NAS Initiate Network Register (automatic); 0, or anything but
- *                      exactly 1, refuses it
+ *   vayu_cell_poll=S   seconds between rounds at vayu_cell=2 (default 30, 5..3600; while a
+ *                      subscription/registration change is pending, re-read after 1 s)
+ *   vayu_cell_online=1 may send DMS Set Operating Mode ONLINE; default 0: only read the mode
+ *   vayu_cell_provision=1 may point logical slot 1 at the slot with a usable USIM and make that
+ *                      application primary GW; default 0: no UIM changes
+ *   vayu_cell_register=1 may send NAS Initiate Network Register automatic and retry it; default 0
  *
  * Facts behind the numbers: the QMI service ids (UIM 0x0b, NAS 0x03, DMS 0x02), the message ids
  * and the TLV layouts are libqmi's data/qmi-service-uim.json and qmi-service-nas.json (master,
@@ -66,6 +73,7 @@
 #include <sys/uio.h>
 #include <sys/vayu_cell.h>
 #include <sys/vayu_cell_qmi.h>
+#include <sys/vayu_cell_data.h>
 #include <sys/vayu_pas.h>
 
 extern void loader_log_putc(char c);
@@ -81,13 +89,31 @@ extern void loader_log_putc(char c);
 struct vayu_cell_state {
 	struct qmi_handle qmi;
 	bool qmi_up;
-	volatile bool uim_there, nas_there;
+	volatile bool uim_there, nas_there, dms_there;
 	uint32_t uim_node, uim_port, uim_version, uim_instance;
 	uint32_t nas_node, nas_port, nas_version, nas_instance;
+	uint32_t dms_node, dms_port, dms_version, dms_instance;
 	volatile bool stop, running;
 	bool started;
-	uint32_t level, wait_s, poll_s, register_arg;
-	bool register_sent;
+	uint32_t level, wait_s, poll_s, register_arg, online_arg, provision_arg;
+	bool online_sent, slot_switch_sent, provision_sent;
+	uint32_t online_attempts;
+	uint8_t online_stage;
+	bool online_low_power_tried;
+	uint16_t online_qmi_error;
+	uint64_t online_next_ms;
+	bool dms_mode_valid, dms_missing_logged, card_dumped;
+	uint8_t dms_mode;
+	int dms_last_mode;
+	uint64_t next_register_ms;
+	uint32_t recheck_delay_ms;
+	uint32_t register_attempts;
+	bool registration_blocked, registration_denied, slot_switch_done;
+	bool last_registered;
+	bool last_signal_valid;
+	int32_t last_signal_dbm;
+	uint8_t last_signal_radio;
+	uint64_t last_signal_ms;
 	uint32_t rounds, requests, failures;
 	uint32_t seq;
 	struct vayu_cell_record record;
@@ -96,6 +122,7 @@ struct vayu_cell_state {
 	struct vayu_cell_uim_read_resp read;
 	struct vayu_cell_nas_get_serving_system_resp serving;
 	struct vayu_cell_nas_get_signal_info_resp signal;
+	struct vayu_cell_dms_get_operating_mode_resp operating;
 };
 
 static struct vayu_cell_state cell;
@@ -150,6 +177,12 @@ cell_new_server(struct qmi_handle *qmi __unused, struct qmi_service *service)
 		cell.nas_version = service->version;
 		cell.nas_instance = service->instance;
 		cell.nas_there = true;
+	} else if (service->service == VAYU_CELL_DMS_SERVICE) {
+		cell.dms_node = service->node;
+		cell.dms_port = service->port;
+		cell.dms_version = service->version;
+		cell.dms_instance = service->instance;
+		cell.dms_there = true;
 	} else {
 		return -1;                      /* not one we asked for: the helpers forget it again */
 	}
@@ -164,6 +197,24 @@ cell_del_server(struct qmi_handle *qmi __unused, struct qmi_service *service)
 	}
 	if (service->service == VAYU_CELL_NAS_SERVICE && cell.nas_node == service->node && cell.nas_port == service->port) {
 		cell.nas_there = false;
+		cell.last_registered = false;
+		vayu_cell_data_registered(false);
+		cell.register_attempts = 0;
+		cell.registration_denied = false;
+		cell.registration_blocked = false;
+		cell.next_register_ms = 0;
+		cell.last_signal_valid = false;
+		cell.last_signal_ms = 0;
+	}
+	if (service->service == VAYU_CELL_DMS_SERVICE && cell.dms_node == service->node && cell.dms_port == service->port) {
+		cell.dms_there = false;
+		cell.dms_mode_valid = false;
+		cell.online_sent = false;              /* allow a fresh bounded sequence after a DMS restart */
+		cell.online_attempts = 0;
+		cell.online_stage = 0;
+		cell.online_low_power_tried = false;
+		cell.online_qmi_error = 0;
+		cell.online_next_ms = 0;
 	}
 }
 
@@ -222,20 +273,134 @@ cell_request(const char *what, uint32_t node, uint32_t port, uint16_t message,
 	return 0;
 }
 
-/* ---- the SIM ------------------------------------------------------------------------------------- */
 
-static const struct vayu_cell_uim_card *
-cell_card(const struct vayu_cell_uim_card_status *status)
+/* ---- DMS operating mode: no identifiers, and ONLINE only when explicitly allowed --------------- */
+
+/* libqmi/ModemManager's observed offline -> low-power -> online fallback is error 52;
+ * upstream HackiOS also treats it that way. Keep 60 visible as a possible invalid transition:
+ * try ONLINE first, and use LOW_POWER only as a bounded fallback, never RESET/SHUTDOWN.
+ */
+static void
+cell_dms_set(uint8_t mode, bool low_power_step)
 {
-	uint32_t count = status->cards_len < VAYU_CELL_CARDS ? status->cards_len : VAYU_CELL_CARDS;
+	struct vayu_cell_dms_set_operating_mode_req request = { .mode = mode };
+	struct vayu_cell_result_resp response = { 0 };
+	char what[64];
+	int ret;
 
-	for (uint32_t i = 0; i < count; i++) {
-		if (status->cards[i].card_state == VAYU_CELL_CARD_PRESENT) {
-			return &status->cards[i];
+	snprintf(what, sizeof(what), "set operating mode %s", low_power_step ? "LOW_POWER" : "ONLINE");
+	if (low_power_step) {
+		cell.online_low_power_tried = true;     /* at most one LOW_POWER write; ONLINE has its own budget */
+	} else {
+		cell.online_attempts++;
+	}
+	say("vayu-cell: vayu_cell_online=1: DMS Set Operating Mode %s (ONLINE attempts %u/3, from mode %u); "
+	    "the modem may transmit\n", low_power_step ? "LOW_POWER" : "ONLINE",
+	    (unsigned int)cell.online_attempts, (unsigned int)cell.dms_mode);
+	ret = cell_request(what, cell.dms_node, cell.dms_port, VAYU_CELL_DMS_SET_OPERATING_MODE,
+	    vayu_cell_dms_set_operating_mode_req_ei, &request, vayu_cell_result_resp_ei, &response,
+	    &response.result);
+	cell.online_qmi_error = response.result.error;
+	if (ret == 0) {
+		cell.dms_mode = mode;
+		cell.online_stage = low_power_step ? 2 : 0;
+		cell.online_next_ms = now_ms() + (low_power_step ? 2000 : 5000);
+		/* A later read-back decides whether ONLINE still needs sending. The success
+		 * latch must not suppress the final ONLINE after LOW_POWER or an accepted-but-
+		 * not-persisted ONLINE (the mode-5 case). ONLINE attempts remain capped at 3. */
+		cell.online_sent = false;
+		say("vayu-cell: DMS %s accepted; read-back on the next round%s\n",
+		    low_power_step ? "LOW_POWER" : "ONLINE", low_power_step ? " before ONLINE" : "");
+		return;
+	}
+	if (ret != -EIO && cell.online_attempts < 3) {
+		/* Transport failures may be retried; a QMI refusal advances only to the documented fallback. */
+		cell.online_sent = false;
+		say("vayu-cell: DMS %s transport failed; one bounded retry is allowed\n",
+		    low_power_step ? "LOW_POWER" : "ONLINE");
+		return;
+	}
+	if (low_power_step) {
+		cell.online_stage = 2;          /* the detour failed: try ONLINE directly, budget permitting */
+		cell.online_next_ms = now_ms() + 1000;
+		cell.online_sent = false;
+		say("vayu-cell: LOW_POWER was not accepted; ONLINE is still tried directly\n");
+		return;
+	}
+	if ((response.result.error == 52 || response.result.error == 60) && cell.online_attempts < 3) {
+		cell.online_stage = 1;
+		cell.online_next_ms = now_ms() + 1000;
+		cell.online_sent = false;
+		say("vayu-cell: ONLINE refused with QMI error %u; next: LOW_POWER, wait 2 s, then ONLINE\n",
+		    (unsigned int)response.result.error);
+		return;
+	}
+	say("vayu-cell: DMS %s refused (result %u error %u); no reset/shutdown command is sent\n",
+	    low_power_step ? "LOW_POWER" : "ONLINE", (unsigned int)response.result.result,
+	    (unsigned int)response.result.error);
+}
+
+static void
+cell_dms_round(void)
+{
+	int ret;
+
+	if (!cell.dms_there) {
+		if (cell.online_arg == 1 && !cell.dms_missing_logged) {
+			cell.dms_missing_logged = true;
+			say("vayu-cell: DMS is not there: cannot check/set ONLINE\n");
+		}
+		return;
+	}
+	memset(&cell.operating, 0, sizeof(cell.operating));
+	ret = cell_request("get operating mode", cell.dms_node, cell.dms_port, VAYU_CELL_DMS_GET_OPERATING_MODE,
+	    NULL, NULL, vayu_cell_dms_get_operating_mode_resp_ei, &cell.operating, &cell.operating.result);
+	if (ret != 0 || !cell.operating.mode_valid) {
+		return;
+	}
+	cell.dms_mode = cell.operating.mode;
+	cell.dms_mode_valid = true;
+	if (cell.dms_last_mode != cell.dms_mode) {
+		cell.dms_last_mode = cell.dms_mode;
+		say("vayu-cell: DMS operating mode %u (%s), offline reason %u, hardware restricted %u\n",
+		    (unsigned int)cell.dms_mode, cell.dms_mode == VAYU_CELL_DMS_MODE_ONLINE ? "ONLINE" : "not online",
+		    cell.operating.offline_reason_valid ? (unsigned int)cell.operating.offline_reason : 0xffffU,
+		    cell.operating.hw_restricted_valid ? (unsigned int)cell.operating.hw_restricted : 0xffU);
+	}
+	if (cell.dms_mode != VAYU_CELL_DMS_MODE_ONLINE && !cell.dms_missing_logged &&
+	    (cell.online_arg == 1 || cell.register_arg == 1)) {
+		cell.dms_missing_logged = true;
+		say("vayu-cell: DMS is not ONLINE; %s\n", cell.online_arg == 1 ?
+		    "try ONLINE once even from SHUTTING_DOWN; LOW_POWER is a bounded fallback on error 52/60, never a reset" :
+		    "NAS automatic registration waits for ONLINE (set vayu_cell_online=1 to allow the transition)");
+	}
+	if (cell.online_arg == 1 && cell.dms_mode != VAYU_CELL_DMS_MODE_ONLINE && !cell.online_sent &&
+	    now_ms() >= cell.online_next_ms) {
+		if (cell.online_stage == 1 && (cell.dms_mode == 1 || cell.online_low_power_tried)) {
+			cell.online_stage = 2;      /* low power already accepted or already tried once */
+			cell.online_next_ms = now_ms() + 2000;
+			return;
+		}
+		if (cell.dms_mode == 4 || cell.dms_mode == 2 || cell.dms_mode == 0xff) {
+			say("vayu-cell: DMS mode %u is not a safe ONLINE source; no reset/shutdown command\n",
+			    (unsigned int)cell.dms_mode);
+			return;                     /* do not latch: a later read may show a recoverable mode */
+		}
+		if (cell.online_attempts >= 3) {
+			return;                     /* at most 3 ONLINE writes, plus at most one LOW_POWER */
+		}
+		cell.online_sent = true;
+		if (cell.online_stage == 1) {
+			cell_dms_set(1, true);      /* low power, then 2 s and ONLINE on the next round */
+		} else {
+			/* 0610b: mode 5 persisted while QMI answered. ONLINE is the first probe,
+			 * not an unconditional low-power/reset cycle. The modem's response decides. */
+			cell_dms_set(VAYU_CELL_DMS_MODE_ONLINE, false);
 		}
 	}
-	return count != 0 ? &status->cards[0] : NULL;
 }
+
+/* ---- the SIM ------------------------------------------------------------------------------------- */
 
 /* The USIM's application if there is one, else the SIM's, else the first the card lists. */
 static const struct vayu_cell_uim_app *
@@ -398,13 +563,147 @@ cell_read_file(const char *name, uint16_t file_id, const uint8_t *path, uint32_t
 	return true;
 }
 
+/* The USIM/SIM application states that a provisioning session may name. */
+static bool
+cell_app_provisionable(const struct vayu_cell_uim_app *app)
+{
+	return app != NULL && (app->type == VAYU_CELL_UIM_APP_TYPE_USIM || app->type == VAYU_CELL_UIM_APP_TYPE_SIM) &&
+	    (app->state == VAYU_CELL_UIM_APP_READY || app->state == VAYU_CELL_UIM_APP_DETECTED);
+}
+
+/* Is primary GW already mapped to a present slot with a usable USIM/SIM application?
+ * The packed index is (slot_index << 8 | application_index); 0xffff means unassigned.
+ * Do not switch a working subscription merely because the best card sits in slot 2.
+ */
+static bool
+cell_primary_usable(const struct vayu_cell_uim_card_status *status)
+{
+	uint32_t index = status->index_gw_primary;
+	uint32_t slot = index >> 8;
+	const struct vayu_cell_uim_card *card;
+
+	if (index == VAYU_CELL_UIM_INDEX_NONE || slot >= status->cards_len || slot >= VAYU_CELL_CARDS) {
+		return false;
+	}
+	card = &status->cards[slot];
+	return card->card_state == VAYU_CELL_CARD_PRESENT && cell_app_provisionable(cell_app(card));
+}
+
+/* Pick the card with an application NAS can use, not merely the first slot. */
+static const struct vayu_cell_uim_card *
+cell_select_card(const struct vayu_cell_uim_card_status *status, uint32_t *slot)
+{
+	const struct vayu_cell_uim_card *best = NULL;
+	unsigned best_score = 0;
+	uint32_t count = status->cards_len < VAYU_CELL_CARDS ? status->cards_len : VAYU_CELL_CARDS;
+
+	*slot = 1;
+	for (uint32_t i = 0; i < count; i++) {
+		const struct vayu_cell_uim_card *card = &status->cards[i];
+		const struct vayu_cell_uim_app *app = cell_app(card);
+		unsigned score = 0;
+
+		if (card->card_state == VAYU_CELL_CARD_PRESENT) {
+			score = 2;
+			if (app != NULL && app->state == VAYU_CELL_UIM_APP_DETECTED) {
+				score = 3;
+			}
+			if (app != NULL && app->state == VAYU_CELL_UIM_APP_READY) {
+				score = 4;
+			}
+		} else if (best == NULL) {
+			score = 1;
+		}
+		if (score > best_score) {
+			best = card;
+			best_score = score;
+			*slot = i + 1;
+		}
+	}
+	return best;
+}
+
+static void
+cell_dump_cards(const struct vayu_cell_uim_card_status *status)
+{
+	uint32_t count = status->cards_len < VAYU_CELL_CARDS ? status->cards_len : VAYU_CELL_CARDS;
+
+	say("vayu-cell: UIM primary GW index %#x (0xffff: none), %u slot(s)\n",
+	    (unsigned int)status->index_gw_primary, (unsigned int)status->cards_len);
+	for (uint32_t i = 0; i < count; i++) {
+		const struct vayu_cell_uim_card *card = &status->cards[i];
+		uint32_t apps = card->app_len < VAYU_CELL_APPLICATIONS ? card->app_len : VAYU_CELL_APPLICATIONS;
+
+		say("vayu-cell: UIM slot %u: card state %u, error %u, %u application(s)\n", i + 1,
+		    (unsigned int)card->card_state, (unsigned int)card->error_code, (unsigned int)card->app_len);
+		for (uint32_t a = 0; a < apps; a++) {
+			const struct vayu_cell_uim_app *app = &card->app[a];
+			say("vayu-cell: UIM slot %u app %u: %s, state %u, AID %u bytes\n", i + 1, a,
+			    cell_app_name(app->type), (unsigned int)app->state, (unsigned int)app->aid_len);
+		}
+	}
+}
+
+static void
+cell_switch_slot(uint32_t physical_slot)
+{
+	struct vayu_cell_uim_switch_slot_req request = {
+		.logical_slot = VAYU_CELL_UIM_SLOT_1,
+		.physical_slot = physical_slot,
+	};
+	struct vayu_cell_result_resp response = { 0 };
+	int ret;
+
+	cell.slot_switch_sent = true;           /* one attempt: never toggle mappings in a loop */
+	say("vayu-cell: vayu_cell_provision=1: UIM Switch Slot logical 1 -> physical %u\n", physical_slot);
+	ret = cell_request("switch slot", cell.uim_node, cell.uim_port, VAYU_CELL_UIM_SWITCH_SLOT,
+	    vayu_cell_uim_switch_slot_req_ei, &request, vayu_cell_result_resp_ei, &response, &response.result);
+	cell.card_dumped = false;
+	cell.last_registered = false;
+	cell.next_register_ms = now_ms() + 2000;
+	cell.slot_switch_done = ret == 0;
+	cell.recheck_delay_ms = ret == 0 ? 1000 : 0;
+	say("vayu-cell: switch slot: %s; card status will be read again\n", ret == 0 ? "accepted" : "refused");
+}
+
+static void
+cell_change_provisioning(const struct vayu_cell_uim_app *app, uint32_t slot)
+{
+	struct vayu_cell_uim_change_provisioning_req request = { 0 };
+	struct vayu_cell_result_resp response = { 0 };
+	int ret;
+
+	if (app == NULL || app->aid_len == 0 || app->aid_len > VAYU_CELL_AID) {
+		say("vayu-cell: provisioning: the selected application has no usable AID; not sent\n");
+		cell.provision_sent = true;
+		return;
+	}
+	request.change.session_type = VAYU_CELL_UIM_SESSION_PRIMARY_GW;
+	request.change.activate = 1;
+	request.application.slot = (uint8_t)slot;
+	request.application.aid_len = app->aid_len;
+	memcpy(request.application.aid, app->aid, app->aid_len);
+	cell.provision_sent = true;             /* one attempt per boot, success or refusal */
+	say("vayu-cell: vayu_cell_provision=1: make the USIM/SIM of slot %u the primary GW application "
+	    "(AID %u bytes)\n", slot, (unsigned int)app->aid_len);
+	ret = cell_request("change provisioning session", cell.uim_node, cell.uim_port,
+	    VAYU_CELL_UIM_CHANGE_PROVISIONING, vayu_cell_uim_change_provisioning_req_ei, &request,
+	    vayu_cell_result_resp_ei, &response, &response.result);
+	cell.card_dumped = false;
+	cell.last_registered = false;
+	cell.next_register_ms = now_ms() + 2000;
+	cell.recheck_delay_ms = ret == 0 ? 1000 : 0;
+	say("vayu-cell: provisioning change: %s; NAS registration may be asked again after re-read\n",
+	    ret == 0 ? "accepted" : "refused");
+}
+
 /* The card's state, then its ICCID and IMSI (masked; only their digit counts are kept whole). */
 static void
 cell_uim_round(struct vayu_cell_record *record)
 {
 	char digits[VAYU_CELL_DIGITS];
 	uint8_t data[VAYU_CELL_FILE_DATA];
-	uint32_t length;
+	uint32_t length, slot = 1;
 	const struct vayu_cell_uim_card *card;
 	const struct vayu_cell_uim_app *app;
 	uint8_t pin;
@@ -434,7 +733,11 @@ cell_uim_round(struct vayu_cell_record *record)
 		return;
 	}
 	record->flags |= VAYU_CELL_FLAG_CARD_STATUS;
-	card = cell_card(&cell.card_status.card_status);
+	if (!cell.card_dumped) {
+		cell.card_dumped = true;
+		cell_dump_cards(&cell.card_status.card_status);
+	}
+	card = cell_select_card(&cell.card_status.card_status, &slot);
 	if (card == NULL) {
 		say("vayu-cell: card status: no card slot in the reply\n");
 		record->sim_state = VAYU_CELL_SIM_ABSENT;
@@ -449,12 +752,28 @@ cell_uim_round(struct vayu_cell_record *record)
 	record->pin_state = pin;
 	record->pin_retries = cell_pin_retries(card, app);
 	record->sim_state = cell_sim_state(card, app, pin);
-	say("vayu-cell: SIM: %s; card state %u, %u application(s)%s%s, PIN state %u with %u attempt(s) left%s\n",
-	    cell_sim_name(record->sim_state), (unsigned int)card->card_state, (unsigned int)card->app_len,
+	say("vayu-cell: SIM slot %u: %s; card state %u, %u application(s)%s%s, PIN state %u with %u attempt(s) left%s\n",
+	    slot, cell_sim_name(record->sim_state), (unsigned int)card->card_state, (unsigned int)card->app_len,
 	    app != NULL ? ", " : "", app != NULL ? cell_app_name(app->type) : "",
 	    (unsigned int)pin, (unsigned int)record->pin_retries,
 	    record->sim_state == VAYU_CELL_SIM_PIN_REQUIRED ? " (no PIN is ever sent)" : "");
+
+	/* Never switch an already usable primary GW. After one attempt, successful or not,
+	 * continue ordinary UIM/NAS reads instead of hiding the network behind a retry loop.
+	 */
+	if (cell.provision_arg == 1 && slot > 1 && !cell_primary_usable(&cell.card_status.card_status) &&
+	    !cell.slot_switch_done && !cell.slot_switch_sent) {
+		cell_switch_slot(slot);
+		return;
+	}
 	if (card->card_state != VAYU_CELL_CARD_PRESENT) {
+		return;
+	}
+	if (cell.provision_arg == 1 && !cell_primary_usable(&cell.card_status.card_status) &&
+	    cell_app_provisionable(app) && !cell.provision_sent) {
+		/* The selected slot is physical; after Switch Slot the primary may already be usable,
+		 * otherwise bind that card's application directly (also works after a switch refusal). */
+		cell_change_provisioning(app, slot);
 		return;
 	}
 
@@ -534,6 +853,45 @@ cell_in_range(int value, int lowest, int highest)
 	return value >= lowest && value <= highest;
 }
 
+#define VAYU_CELL_REGISTER_MAX_ATTEMPTS 12
+
+/* Stop modem signalling on a terminal condition, and back off while UIM/PS attach settles.
+ * SIM_ABSENT/PIN/ERROR follows the latest card state and can clear when the card changes;
+ * DENIED and the attempt budget stop retries until registration/searching or a new session.
+ */
+static void
+cell_update_registration_blocked(const struct vayu_cell_record *record)
+{
+	bool sim_blocked = record->sim_state == VAYU_CELL_SIM_ABSENT ||
+	    record->sim_state == VAYU_CELL_SIM_ERROR || record->sim_state == VAYU_CELL_SIM_PIN_REQUIRED;
+	bool radio_blocked = cell.dms_mode_valid && cell.dms_mode != VAYU_CELL_DMS_MODE_ONLINE;
+	bool blocked = sim_blocked || radio_blocked || cell.registration_denied ||
+	    cell.register_attempts >= VAYU_CELL_REGISTER_MAX_ATTEMPTS;
+
+	if (blocked != cell.registration_blocked) {
+		say("vayu-cell: NAS automatic registration %s%s%s%s\n", blocked ? "paused" : "resumed",
+		    sim_blocked ? " (SIM absent/error/PIN)" : "",
+		    radio_blocked ? " (DMS not ONLINE)" : "",
+		    cell.registration_denied ? " (network denied)" : "",
+		    cell.register_attempts >= VAYU_CELL_REGISTER_MAX_ATTEMPTS ? " (retry budget exhausted)" : "");
+	}
+	cell.registration_blocked = blocked;
+}
+
+static void
+cell_schedule_registration_retry(const struct vayu_cell_record *record)
+{
+	uint32_t delay_ms = cell.register_attempts < 4 ? 6000 : cell.register_attempts < 8 ? 15000 : 60000;
+
+	cell.register_attempts++;
+	cell.next_register_ms = now_ms() + delay_ms;
+	if (cell.register_attempts == VAYU_CELL_REGISTER_MAX_ATTEMPTS) {
+		say("vayu-cell: NAS registration retry budget (%u attempts) exhausted; stopping automatic attempts\n",
+		    VAYU_CELL_REGISTER_MAX_ATTEMPTS);
+		cell_update_registration_blocked(record);
+	}
+}
+
 /*
  * Registration and the operator: Get Serving System's TLVs. Then the signal, Get Signal Info's:
  * RSRP is dBm as it comes (QMI NAS's LTE RSRP is -140..-44 dBm), RSRQ is dB, SNR is 0.1 dB.
@@ -547,19 +905,27 @@ cell_nas_round(struct vayu_cell_record *record)
 
 	if (!cell.nas_there) {
 		say("vayu-cell: NAS is not there: no network state\n");
+		vayu_cell_data_registered(false);
+		if (vayu_cell_data_pending()) {
+			cell.recheck_delay_ms = 1000;
+		}
 		return;
 	}
-	if (cell.register_arg == 1 && !cell.register_sent) {
+	cell_update_registration_blocked(record);
+	if (cell.register_arg == 1 && !cell.registration_blocked && !cell.last_registered &&
+	    now_ms() >= cell.next_register_ms && (!cell.dms_mode_valid || cell.dms_mode == VAYU_CELL_DMS_MODE_ONLINE)) {
 		struct vayu_cell_nas_initiate_register_req request = { .action = VAYU_CELL_NAS_REGISTER_AUTOMATIC };
 		struct vayu_cell_nas_register_resp response = { 0 };
 
-		cell.register_sent = true;
+		/* Retry while unregistered: UIM initialization and packet-domain attach are asynchronous. */
+		cell_schedule_registration_retry(record);
 		say("vayu-cell: vayu_cell_register=1: NAS Initiate Network Register (automatic) is sent; "
 		    "the modem may transmit because of it\n");
 		ret = cell_request("initiate register", cell.nas_node, cell.nas_port, VAYU_CELL_NAS_INITIATE_NETWORK_REGISTER,
 		    vayu_cell_nas_initiate_register_req_ei, &request, vayu_cell_nas_register_resp_ei, &response,
 		    &response.result);
-		say("vayu-cell: initiate register: %s\n", ret == 0 ? "the modem agreed" : "refused (see above)");
+		say("vayu-cell: initiate register: %s%s\n", ret == 0 ? "the modem agreed" : "refused (see above)",
+		    ret == 0 ? "" : "; will retry after the next UIM/NAS poll");
 	}
 	if (cell.stop) {
 		return;
@@ -607,8 +973,38 @@ cell_nas_round(struct vayu_cell_record *record)
 		if (cell.serving.detailed_valid && cell.serving.detailed.forbidden != 0) {
 			say("vayu-cell: network: the modem says this network is forbidden\n");
 		}
-	} else if (ret == 0) {
-		say("vayu-cell: serving system: the reply has no serving system TLV\n");
+		cell.last_registered = record->reg_state == VAYU_CELL_REG_REGISTERED;
+		vayu_cell_data_registered(cell.last_registered);
+		if (record->reg_state == VAYU_CELL_REG_DENIED) {
+			cell.registration_denied = true;
+		} else if (record->reg_state == VAYU_CELL_REG_SEARCHING || cell.last_registered) {
+			cell.registration_denied = false;
+			if (record->reg_state == VAYU_CELL_REG_SEARCHING &&
+			    cell.record.reg_state != VAYU_CELL_REG_SEARCHING) {
+				/* One reset on entry; a persistent SEARCHING state must not postpone retries forever. */
+				cell.register_attempts = 0;
+				cell.next_register_ms = now_ms() + 6000;
+			}
+		}
+		if (cell.last_registered) {
+			cell.register_attempts = 0;
+			cell.next_register_ms = 0;
+		}
+		cell_update_registration_blocked(record);
+		if (!cell.last_registered &&
+		    (vayu_cell_data_pending() || (cell.register_arg == 1 && !cell.registration_blocked))) {
+			cell.recheck_delay_ms = cell.register_attempts < 4 ? 1000 : 5000;
+		}
+	} else {
+		if (ret == 0) {
+			say("vayu-cell: serving system: the reply has no serving system TLV\n");
+		}
+		/* A failed/missing serving response is not proof of continued registration. */
+		cell.last_registered = false;
+		vayu_cell_data_registered(false);
+		if (vayu_cell_data_pending()) {
+			cell.recheck_delay_ms = 1000;
+		}
 	}
 	if (cell.stop) {
 		return;
@@ -616,10 +1012,7 @@ cell_nas_round(struct vayu_cell_record *record)
 	memset(&cell.signal, 0, sizeof(cell.signal));
 	ret = cell_request("signal info", cell.nas_node, cell.nas_port, VAYU_CELL_NAS_GET_SIGNAL_INFO, NULL, NULL,
 	    vayu_cell_nas_get_signal_info_resp_ei, &cell.signal, &cell.signal.result);
-	if (ret != 0) {
-		return;
-	}
-	if (cell.signal.lte_valid && cell.signal.lte.rsrp != (int16_t)0x8000) {
+	if (ret == 0 && cell.signal.lte_valid && cell.signal.lte.rsrp != (int16_t)0x8000) {
 		if (!cell_in_range(cell.signal.lte.rsrp, -140, -44)) {
 			say("vayu-cell: signal: LTE RSRP %d dBm is not in -140..-44 dBm: not used\n",
 			    (int)cell.signal.lte.rsrp);
@@ -642,7 +1035,7 @@ cell_nas_round(struct vayu_cell_record *record)
 			}
 		}
 	}
-	if ((record->flags & VAYU_CELL_FLAG_SIGNAL) == 0 && cell.signal.nr5g_valid &&
+	if ((record->flags & VAYU_CELL_FLAG_SIGNAL) == 0 && ret == 0 && cell.signal.nr5g_valid &&
 	    cell.signal.nr5g.rsrp != (int16_t)0x8000) {
 		if (!cell_in_range(cell.signal.nr5g.rsrp, -156, -44)) {
 			say("vayu-cell: signal: 5G NR RSRP %d dBm is not in -156..-44 dBm: not used\n",
@@ -661,14 +1054,36 @@ cell_nas_round(struct vayu_cell_record *record)
 			}
 		}
 	}
-	if ((record->flags & VAYU_CELL_FLAG_SIGNAL) == 0 && cell.signal.gsm_valid &&
+	if ((record->flags & VAYU_CELL_FLAG_SIGNAL) == 0 && ret == 0 && cell.signal.wcdma_valid &&
+	    cell_in_range((int8_t)cell.signal.wcdma.rssi, -120, -20)) {
+		record->signal_dbm = (int8_t)cell.signal.wcdma.rssi;
+		record->flags |= VAYU_CELL_FLAG_SIGNAL;
+		say("vayu-cell: signal: UMTS RSSI %d dBm, ECIO raw %d\n", (int)record->signal_dbm,
+		    (int)cell.signal.wcdma.ecio);
+	}
+	if ((record->flags & VAYU_CELL_FLAG_SIGNAL) == 0 && ret == 0 && cell.signal.gsm_valid &&
 	    cell_in_range((int8_t)cell.signal.gsm_rssi, -120, -20)) {
 		record->signal_dbm = (int8_t)cell.signal.gsm_rssi;
 		record->flags |= VAYU_CELL_FLAG_SIGNAL;
 		say("vayu-cell: signal: GSM RSSI %d dBm\n", (int)record->signal_dbm);
 	}
-	if ((record->flags & VAYU_CELL_FLAG_SIGNAL) == 0) {
-		say("vayu-cell: signal: no LTE, 5G or GSM strength to use in the reply\n");
+	if ((record->flags & VAYU_CELL_FLAG_SIGNAL) != 0) {
+		cell.last_signal_valid = true;
+		cell.last_signal_dbm = record->signal_dbm;
+		cell.last_signal_radio = record->radio;
+		cell.last_signal_ms = now_ms();
+	} else if (cell.last_signal_valid && now_ms() - cell.last_signal_ms <= 60000) {
+		/* NAS can alternate registration and signal answers. Keep only a fresh measurement,
+		 * and mark it as cached; never invent a level when there was none. */
+		record->signal_dbm = cell.last_signal_dbm;
+		record->flags |= VAYU_CELL_FLAG_SIGNAL | VAYU_CELL_FLAG_SIGNAL_CACHED;
+		if (record->radio == 0xff) {           /* only when serving gave no radio, never replace NONE */
+			record->radio = cell.last_signal_radio;
+		}
+		say("vayu-cell: signal: cached %d dBm (%llu ms old)\n", (int)record->signal_dbm,
+		    (unsigned long long)(now_ms() - cell.last_signal_ms));
+	} else {
+		say("vayu-cell: signal: no fresh or recent LTE, 5G, UMTS or GSM strength in the reply\n");
 	}
 }
 
@@ -705,11 +1120,20 @@ cell_round(void)
 	struct vayu_cell_record record;
 
 	cell_record_reset(&record);
+	cell.recheck_delay_ms = 0;
 	cell_uim_round(&record);
 	if (cell.stop) {
 		return;
 	}
-	cell_nas_round(&record);
+	/* Subscription first, radio mode second: never attach with the wrong slot. */
+	if (cell.recheck_delay_ms == 0) {
+		cell_dms_round();
+	}
+	if (cell.recheck_delay_ms == 0) {
+		cell_nas_round(&record);
+	} else {
+		say("vayu-cell: subscription changed: NAS is polled after the UIM re-read\n");
+	}
 	if (cell.stop) {
 		return;
 	}
@@ -796,12 +1220,19 @@ cell_thread(void *argument __unused, wait_result_t wait __unused)
 		say("vayu-cell: qmi_add_lookup(NAS): %d\n", ret);
 		goto out;
 	}
-	while ((!cell.uim_there || !cell.nas_there) && !cell.stop && waited_ms < (uint64_t)cell.wait_s * 1000) {
+	ret = qmi_add_lookup(&cell.qmi, VAYU_CELL_DMS_SERVICE, 1, 0);
+	if (ret < 0) {
+		say("vayu-cell: qmi_add_lookup(DMS): %d\n", ret);
+		goto out;
+	}
+	while ((!cell.uim_there || !cell.nas_there || (cell.online_arg == 1 && !cell.dms_there)) && !cell.stop &&
+	    waited_ms < (uint64_t)cell.wait_s * 1000) {
 		delay_for_interval(100, NSEC_PER_MSEC);
 		waited_ms += 100;
 	}
-	say("vayu-cell: after %llu ms: UIM is %s, NAS is %s\n", (unsigned long long)waited_ms,
-	    cell.uim_there ? "there" : "MISSING", cell.nas_there ? "there" : "MISSING");
+	say("vayu-cell: after %llu ms: UIM is %s, NAS is %s, DMS is %s\n", (unsigned long long)waited_ms,
+	    cell.uim_there ? "there" : "MISSING", cell.nas_there ? "there" : "MISSING",
+	    cell.dms_there ? "there" : "MISSING");
 	if (cell.uim_there) {
 		say("vayu-cell: UIM: node %u port %u, version %u instance %u\n", cell.uim_node, cell.uim_port,
 		    cell.uim_version, cell.uim_instance);
@@ -810,6 +1241,10 @@ cell_thread(void *argument __unused, wait_result_t wait __unused)
 		say("vayu-cell: NAS: node %u port %u, version %u instance %u\n", cell.nas_node, cell.nas_port,
 		    cell.nas_version, cell.nas_instance);
 	}
+	if (cell.dms_there) {
+		say("vayu-cell: DMS: node %u port %u, version %u instance %u (operating mode only)\n",
+		    cell.dms_node, cell.dms_port, cell.dms_version, cell.dms_instance);
+	}
 	if (!cell.uim_there && !cell.nas_there) {
 		say("vayu-cell: neither service appeared\n");
 		if (cell.level < 2) {
@@ -817,7 +1252,7 @@ cell_thread(void *argument __unused, wait_result_t wait __unused)
 			goto out;
 		}
 	} else {
-		say("vayu-cell: DMS (0x02) is not asked: no identifier is needed here, and none is kept\n");
+		say("vayu-cell: DMS is used for operating mode only: no device identifiers are asked or kept\n");
 	}
 
 	for (;;) {
@@ -825,7 +1260,8 @@ cell_thread(void *argument __unused, wait_result_t wait __unused)
 		if (cell.stop || cell.level < 2 || cell.poll_s == 0) {
 			break;
 		}
-		for (uint32_t slept = 0; slept < cell.poll_s * 1000 && !cell.stop; slept += 100) {
+		uint32_t delay_ms = cell.recheck_delay_ms != 0 ? cell.recheck_delay_ms : cell.poll_s * 1000;
+		for (uint32_t slept = 0; slept < delay_ms && !cell.stop; slept += 100) {
 			delay_for_interval(100, NSEC_PER_MSEC);
 		}
 		if (cell.stop) {
@@ -848,7 +1284,7 @@ void
 vayu_cell_start(struct vayu_qrtr *q)
 {
 	thread_t thread;
-	uint32_t level = 0, wait_s = 20, poll_s = 30, register_arg = 0;
+	uint32_t level = 0, wait_s = 20, poll_s = 30, register_arg = 0, online_arg = 0, provision_arg = 0;
 
 	if (cell.started) {
 		say("vayu-cell: already started\n");
@@ -878,30 +1314,70 @@ vayu_cell_start(struct vayu_qrtr *q)
 	if (poll_s > 3600) {
 		poll_s = 3600;
 	}
+	PE_parse_boot_argn("vayu_cell_online", &online_arg, sizeof(online_arg));
+	PE_parse_boot_argn("vayu_cell_provision", &provision_arg, sizeof(provision_arg));
 	PE_parse_boot_argn("vayu_cell_register", &register_arg, sizeof(register_arg));
+	if (online_arg != 0 && online_arg != 1) {
+		say("vayu-cell: vayu_cell_online=%u is refused: only 1 allows DMS ONLINE\n", online_arg);
+		online_arg = 0;
+	}
+	if (provision_arg != 0 && provision_arg != 1) {
+		say("vayu-cell: vayu_cell_provision=%u is refused: only 1 allows UIM slot/provisioning changes\n",
+		    provision_arg);
+		provision_arg = 0;
+	}
 	if (register_arg != 0 && register_arg != 1) {
 		say("vayu-cell: vayu_cell_register=%u is refused: only 1 allows NAS Initiate Network Register\n",
 		    register_arg);
 		register_arg = 0;
 	}
+	cell.uim_there = cell.nas_there = cell.dms_there = false;
 	cell.level = level;
 	cell.wait_s = wait_s;
 	cell.poll_s = poll_s;
 	cell.register_arg = register_arg;
+	cell.online_arg = online_arg;
+	cell.provision_arg = provision_arg;
 	cell.stop = false;
 	cell.running = true;
-	cell.register_sent = false;
+	cell.online_sent = false;
+	cell.online_attempts = 0;
+	cell.online_stage = 0;
+	cell.online_low_power_tried = false;
+	cell.online_qmi_error = 0;
+	cell.online_next_ms = 0;
+	cell.slot_switch_sent = false;
+	cell.provision_sent = false;
+	cell.dms_mode_valid = false;
+	cell.dms_missing_logged = false;
+	cell.card_dumped = false;
+	cell.dms_last_mode = -1;
+	cell.next_register_ms = 0;
+	cell.recheck_delay_ms = 0;
+	cell.register_attempts = 0;
+	cell.registration_blocked = false;
+	cell.registration_denied = false;
+	cell.slot_switch_done = false;
+	cell.last_registered = false;
+	cell.last_signal_valid = false;
+	cell.last_signal_dbm = INT32_MIN;
+	cell.last_signal_radio = 0xff;
+	cell.last_signal_ms = 0;
 	cell.rounds = cell.requests = cell.failures = 0;
 	cell.seq = 0;
 	cell_record_reset(&cell.record);
-	say("vayu-cell: vayu_cell=%u vayu_cell_wait=%u vayu_cell_poll=%u vayu_cell_register=%u\n", level, wait_s,
-	    poll_s, register_arg);
-	say("vayu-cell: read-only: UIM 0x%x (card status, EF_ICCID, EF_IMSI), NAS 0x%x (serving system, signal); "
-	    "no DMS, no PIN, no write, no data call\n", VAYU_CELL_UIM_SERVICE, VAYU_CELL_NAS_SERVICE);
+	say("vayu-cell: vayu_cell=%u vayu_cell_wait=%u vayu_cell_poll=%u vayu_cell_online=%u "
+	    "vayu_cell_provision=%u vayu_cell_register=%u\n", level, wait_s, poll_s, online_arg, provision_arg,
+	    register_arg);
+	say("vayu-cell: UIM 0x%x (card status, EF_ICCID, EF_IMSI), NAS 0x%x (serving system, signal), "
+	    "DMS 0x%x (operating mode); no PIN, no host storage write; data only under vayu_cell_data=1\n",
+	    VAYU_CELL_UIM_SERVICE, VAYU_CELL_NAS_SERVICE, VAYU_CELL_DMS_SERVICE);
 	(void)cell_make_node();
 	cell.started = true;
+	vayu_cell_data_start(q);
 	if (kernel_thread_start(cell_thread, NULL, &thread) != KERN_SUCCESS) {
 		say("vayu-cell: no thread\n");
+		vayu_cell_data_stop();
 		cell.running = false;
 		cell.started = false;
 		return;
@@ -917,6 +1393,7 @@ vayu_cell_stop(void)
 	if (!cell.started) {
 		return;
 	}
+	vayu_cell_data_stop();
 	cell.stop = true;
 	for (uint32_t waited = 0; waited < VAYU_CELL_STOP_MS && cell.running; waited += 20) {
 		delay_for_interval(20, NSEC_PER_MSEC);

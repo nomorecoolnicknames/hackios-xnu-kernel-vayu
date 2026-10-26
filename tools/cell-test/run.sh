@@ -12,7 +12,7 @@ B=$ROOT/xnu-deps/build/cell-test
 rm -rf "$B"
 mkdir -p "$B/inc/sys"
 ln -s "$K/bsd/sys/hakios.qmi.h" "$K/bsd/sys/hakios.qrtr.h" "$K/bsd/sys/vayu_cell.h" \
-	"$K/bsd/sys/vayu_cell_qmi.h" "$B/inc/sys/"
+	"$K/bsd/sys/vayu_cell_qmi.h" "$K/bsd/sys/vayu_cell_data_qmi.h" "$B/inc/sys/"
 FLAGS="-std=gnu11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all"
 ${CC:-cc} $FLAGS -I"$B/inc" -o "$B/test" "$HERE/test_cell.c" "$K/bsd/dev/hakios.qmi.c"
 echo "cell-test: with $K/bsd/dev/hakios.qmi.c"

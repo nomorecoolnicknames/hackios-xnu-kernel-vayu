@@ -1,10 +1,10 @@
 /*
- * Cellular, the first read-only look at the SIM and the network for the POCO X3 Pro (vayu,
+ * Cellular, the SIM and network state for the POCO X3 Pro (vayu,
  * SM8150-AC, X24): what bsd/dev/vayu_cell.c finds out and the fixed record it leaves for a
  * userland shim to read through /dev/vayu-cell.
  *
  * The client itself is a QMI client on QRTR over the modem's GLINK channel; it asks the modem's
- * UIM and NAS services only (no DMS identifier, no UIM write, no SIM PIN, no data call). The
+ * UIM, NAS and DMS (no DMS identifier, no SIM PIN, no data call). Optional UIM/DMS changes are gated by boot-args. The
  * record below is the whole of what leaves the kernel: no IMSI, ICCID or IMEI is in it, only the
  * last digits of an identifier, masked (vayu_cell_mask_tail()).
  *
@@ -13,10 +13,11 @@
  *   vayu_cell=1        one round: card status, EF_ICCID and EF_IMSI (masked), serving system,
  *                      signal; then the QMI handle is let go and the record stays
  *   vayu_cell=2        one round, and another every vayu_cell_poll seconds
- *   vayu_cell_wait=S   how long to wait for the UIM and NAS services (default 20, at most 120)
- *   vayu_cell_poll=S   seconds between rounds at vayu_cell=2 (default 30, at least 5)
- *   vayu_cell_register=0  1: NAS Initiate Network Register (automatic) may be sent; anything
- *                      else, and it never is (0 is the default: this client asks, it does not act)
+ *   vayu_cell_wait=S   how long to wait for UIM/NAS (and DMS when online=1), default 20, at most 120
+ *   vayu_cell_poll=S   seconds between rounds at vayu_cell=2 (default 30, at least 5; 1 s while registering)
+ *   vayu_cell_online=1   permit DMS ONLINE; default 0: only read the operating mode
+ *   vayu_cell_provision=1 permit UIM slot/provisioning changes; default 0: read only
+ *   vayu_cell_register=1 permit NAS automatic registration and retries; default 0: read only
  *
  * Record layout: the field offsets are written at their declarations, and `size` is filled with
  * sizeof(struct vayu_cell_record) (152 bytes in the kernel's ABI). Numbers are the machine's
@@ -53,7 +54,7 @@ enum {
 	VAYU_CELL_REG_UNKNOWN = 0xff,   /* no serving system TLV */
 };
 
-/* What of the record was filled: the modem answered that part. */
+/* What of the record was filled: the modem answered that part; SIGNAL_CACHED marks a recent old reading. */
 #define VAYU_CELL_FLAG_CARD_STATUS      0x00000001u
 #define VAYU_CELL_FLAG_SERVING          0x00000002u
 #define VAYU_CELL_FLAG_SIGNAL           0x00000004u
@@ -61,6 +62,7 @@ enum {
 #define VAYU_CELL_FLAG_IMSI             0x00000010u
 #define VAYU_CELL_FLAG_OPERATOR         0x00000020u
 #define VAYU_CELL_FLAG_LAC_CID          0x00000040u
+#define VAYU_CELL_FLAG_SIGNAL_CACHED    0x00000080u     /* last valid reading, at most 60 s old */
 #define VAYU_CELL_FLAG_DATA_CALL        0x00000200u     /* never set: this client has no data call */
 
 struct vayu_cell_record {
@@ -71,7 +73,7 @@ struct vayu_cell_record {
 	uint64_t updated_ms;            /*  16: uptime of that round, milliseconds */
 	uint32_t iccid_length;          /*  24: digits the card has, 0: not read */
 	uint32_t imsi_length;           /*  28: digits the card has, 0: not read */
-	int32_t  signal_dbm;            /*  32: RSRP (LTE/5G) or RSSI (GSM), dBm; INT32_MIN: none */
+	int32_t  signal_dbm;            /*  32: RSRP (LTE/5G) or RSSI (GSM/UMTS), dBm; INT32_MIN: none */
 	int32_t  rsrq_db;               /*  36: LTE RSRQ, dB; INT32_MIN: none */
 	int32_t  snr_tenth_db;          /*  40: LTE/5G SNR in 0.1 dB; INT32_MIN: none */
 	uint32_t lac;                   /*  44: 3GPP LAC/TAC; 0xffffffff: none */

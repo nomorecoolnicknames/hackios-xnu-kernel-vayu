@@ -17,9 +17,9 @@
  *   DMS  0x02  -- nothing is asked: its useful messages are identifiers (Get IDs / Get IMEI),
  *              and this client has no business with an identifier it does not need.
  *
- * What is deliberately absent: UIM Verify PIN / Unblock PIN / any write, NAS Set Operating Mode,
- * NAS Initiate Network Register (present but sent only with vayu_cell_register=1), WDS (no data
- * call). The client is read-only.
+ * What is deliberately absent: UIM Verify PIN / Unblock PIN / APDU, NAS Set Operating Mode and
+ * WDS (no data call). DMS/UIM/NAS requests that change modem state are present but sent only
+ * under their explicit vayu_cell_online/provision/register boot-args; all default to read-only.
  *
  * Two notes on the element types, because the JSON's types are finer than the coding has:
  *   - a gint8 (RSSI, RSRQ, a radio interface) is a QMI_UNSIGNED_1_BYTE here, and the client reads
@@ -41,11 +41,15 @@
 
 #define VAYU_CELL_UIM_SERVICE   0x0b
 #define VAYU_CELL_NAS_SERVICE   0x03
-#define VAYU_CELL_DMS_SERVICE   0x02            /* named for the log; never looked up */
+#define VAYU_CELL_DMS_SERVICE   0x02            /* operating mode only, no identifiers */
 
 #define VAYU_CELL_UIM_GET_CARD_STATUS           0x002f
 #define VAYU_CELL_UIM_READ_RECORD               0x0021
 #define VAYU_CELL_UIM_READ_TRANSPARENT          0x0020
+#define VAYU_CELL_UIM_CHANGE_PROVISIONING       0x0038
+#define VAYU_CELL_UIM_SWITCH_SLOT               0x0046
+#define VAYU_CELL_DMS_GET_OPERATING_MODE        0x002d
+#define VAYU_CELL_DMS_SET_OPERATING_MODE        0x002e
 #define VAYU_CELL_NAS_GET_SERVING_SYSTEM        0x0024
 #define VAYU_CELL_NAS_GET_SIGNAL_INFO           0x004f
 #define VAYU_CELL_NAS_INITIATE_NETWORK_REGISTER 0x0022
@@ -72,6 +76,7 @@
 #define VAYU_CELL_CARD_ERROR    2
 
 /* UIM card application states (QmiUimCardApplicationState). */
+#define VAYU_CELL_UIM_APP_DETECTED                  1
 #define VAYU_CELL_UIM_APP_READY                     7
 #define VAYU_CELL_UIM_APP_PIN1_REQUIRED             2
 #define VAYU_CELL_UIM_APP_PUK1_REQUIRED             3
@@ -112,6 +117,11 @@
 /* NAS Initiate Network Register's action (QmiNasNetworkRegisterType). */
 #define VAYU_CELL_NAS_REGISTER_AUTOMATIC    1
 
+/* DMS operating modes and UIM slot/provisioning constants. */
+#define VAYU_CELL_DMS_MODE_ONLINE         0
+#define VAYU_CELL_UIM_INDEX_NONE          0xffff
+#define VAYU_CELL_UIM_SLOT_1              1
+
 /* NAS roaming indicator (QmiNasRoamingIndicatorStatus): ON is 0, OFF is 1. */
 #define VAYU_CELL_NAS_ROAM_ON       0
 #define VAYU_CELL_NAS_ROAM_OFF      1
@@ -129,6 +139,18 @@ static const struct qmi_elem_info vayu_cell_result_ei[] = {
 	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_cell_result, result) },
 	{ .data_type = QMI_UNSIGNED_2_BYTE, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
 	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_cell_result, error) },
+	{ .data_type = QMI_EOTI },
+};
+
+/* The reply shared by DMS Set Operating Mode, UIM Switch Slot and Change Provisioning Session. */
+struct vayu_cell_result_resp {
+	struct vayu_cell_result result;
+};
+
+static const struct qmi_elem_info vayu_cell_result_resp_ei[] = {
+	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_cell_result), .array_type = NO_ARRAY,
+	  .tlv_type = 0x02, .offset = offsetof(struct vayu_cell_result_resp, result),
+	  .ei_array = vayu_cell_result_ei },
 	{ .data_type = QMI_EOTI },
 };
 
@@ -297,6 +319,110 @@ static const struct qmi_elem_info vayu_cell_uim_get_card_status_resp_ei[] = {
 	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_cell_uim_card_status), .array_type = NO_ARRAY,
 	  .tlv_type = 0x10, .offset = offsetof(struct vayu_cell_uim_get_card_status_resp, card_status),
 	  .ei_array = vayu_cell_uim_card_status_ei },
+	{ .data_type = QMI_EOTI },
+};
+
+
+/* ---- UIM: Switch Slot (0x0046) and Change Provisioning Session (0x0038) ----------------------- */
+
+struct vayu_cell_uim_switch_slot_req {
+	uint8_t logical_slot;               /* TLV 0x01 */
+	uint32_t physical_slot;             /* TLV 0x02, one-based */
+};
+
+static const struct qmi_elem_info vayu_cell_uim_switch_slot_req_ei[] = {
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x01, .offset = offsetof(struct vayu_cell_uim_switch_slot_req, logical_slot) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x02, .offset = offsetof(struct vayu_cell_uim_switch_slot_req, physical_slot) },
+	{ .data_type = QMI_EOTI },
+};
+
+struct vayu_cell_uim_session_change {
+	uint8_t session_type;               /* primary GW (0) */
+	uint8_t activate;                   /* 1: activate */
+};
+
+struct vayu_cell_uim_application_info {
+	uint8_t slot;                       /* logical slot, one-based */
+	uint32_t aid_len;                   /* one byte on the wire */
+	uint8_t aid[VAYU_CELL_AID];
+};
+
+struct vayu_cell_uim_change_provisioning_req {
+	struct vayu_cell_uim_session_change change;         /* TLV 0x01 */
+	struct vayu_cell_uim_application_info application;  /* TLV 0x10 */
+};
+
+static const struct qmi_elem_info vayu_cell_uim_session_change_ei[] = {
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_cell_uim_session_change, session_type) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_cell_uim_session_change, activate) },
+	{ .data_type = QMI_EOTI },
+};
+
+static const struct qmi_elem_info vayu_cell_uim_application_info_ei[] = {
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_cell_uim_application_info, slot) },
+	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_cell_uim_application_info, aid_len) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = VAYU_CELL_AID, .elem_size = sizeof(uint8_t),
+	  .array_type = VAR_LEN_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE,
+	  .offset = offsetof(struct vayu_cell_uim_application_info, aid) },
+	{ .data_type = QMI_EOTI },
+};
+
+static const struct qmi_elem_info vayu_cell_uim_change_provisioning_req_ei[] = {
+	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_cell_uim_session_change),
+	  .array_type = NO_ARRAY, .tlv_type = 0x01,
+	  .offset = offsetof(struct vayu_cell_uim_change_provisioning_req, change),
+	  .ei_array = vayu_cell_uim_session_change_ei },
+	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_cell_uim_application_info),
+	  .array_type = NO_ARRAY, .tlv_type = 0x10,
+	  .offset = offsetof(struct vayu_cell_uim_change_provisioning_req, application),
+	  .ei_array = vayu_cell_uim_application_info_ei },
+	{ .data_type = QMI_EOTI },
+};
+
+/* ---- DMS: Get/Set Operating Mode (0x002d/0x002e), no identifiers ----------------------------- */
+
+struct vayu_cell_dms_get_operating_mode_resp {
+	struct vayu_cell_result result;
+	uint8_t mode_valid;                 /* TLV 0x01 */
+	uint8_t mode;                       /* 0: online */
+	uint8_t offline_reason_valid;       /* TLV 0x10 */
+	uint16_t offline_reason;
+	uint8_t hw_restricted_valid;        /* TLV 0x11 */
+	uint8_t hw_restricted;
+};
+
+struct vayu_cell_dms_set_operating_mode_req {
+	uint8_t mode;                       /* TLV 0x01 */
+};
+
+static const struct qmi_elem_info vayu_cell_dms_get_operating_mode_resp_ei[] = {
+	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_cell_result), .array_type = NO_ARRAY,
+	  .tlv_type = 0x02, .offset = offsetof(struct vayu_cell_dms_get_operating_mode_resp, result),
+	  .ei_array = vayu_cell_result_ei },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x01, .offset = offsetof(struct vayu_cell_dms_get_operating_mode_resp, mode_valid) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x01, .offset = offsetof(struct vayu_cell_dms_get_operating_mode_resp, mode) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x10, .offset = offsetof(struct vayu_cell_dms_get_operating_mode_resp, offline_reason_valid) },
+	{ .data_type = QMI_UNSIGNED_2_BYTE, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x10, .offset = offsetof(struct vayu_cell_dms_get_operating_mode_resp, offline_reason) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x11, .offset = offsetof(struct vayu_cell_dms_get_operating_mode_resp, hw_restricted_valid) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x11, .offset = offsetof(struct vayu_cell_dms_get_operating_mode_resp, hw_restricted) },
+	{ .data_type = QMI_EOTI },
+};
+
+static const struct qmi_elem_info vayu_cell_dms_set_operating_mode_req_ei[] = {
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x01, .offset = offsetof(struct vayu_cell_dms_set_operating_mode_req, mode) },
 	{ .data_type = QMI_EOTI },
 };
 
@@ -564,6 +690,12 @@ static const struct qmi_elem_info vayu_cell_nas_get_serving_system_resp_ei[] = {
 
 /* ---- NAS: Get Signal Info (0x004f) ----------------------------------------------------------- */
 
+/* TLV 0x13 "WCDMA Signal Strength": RSSI and ECIO (the raw ECIO value is logged, not converted). */
+struct vayu_cell_nas_wcdma_signal {
+	uint8_t rssi;                       /* gint8, dBm */
+	int16_t ecio;
+};
+
 /* TLV 0x14 "LTE Signal Strength": RSSI and RSRQ in dB(m), RSRP in dBm, SNR in 0.1 dB. */
 struct vayu_cell_nas_lte_signal {
 	uint8_t rssi;                   /* gint8 */
@@ -582,10 +714,20 @@ struct vayu_cell_nas_get_signal_info_resp {
 	struct vayu_cell_result result;         /* TLV 0x02 */
 	uint8_t gsm_valid;                      /* TLV 0x12: RSSI, gint8 */
 	uint8_t gsm_rssi;
+	uint8_t wcdma_valid;                    /* TLV 0x13 */
+	struct vayu_cell_nas_wcdma_signal wcdma;
 	uint8_t lte_valid;                      /* TLV 0x14 */
 	struct vayu_cell_nas_lte_signal lte;
 	uint8_t nr5g_valid;                     /* TLV 0x17 */
 	struct vayu_cell_nas_nr5g_signal nr5g;
+};
+
+static const struct qmi_elem_info vayu_cell_nas_wcdma_signal_ei[] = {
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_cell_nas_wcdma_signal, rssi) },
+	{ .data_type = QMI_SIGNED_2_BYTE_ENUM, .elem_len = 1, .elem_size = sizeof(int16_t), .array_type = NO_ARRAY,
+	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_cell_nas_wcdma_signal, ecio) },
+	{ .data_type = QMI_EOTI },
 };
 
 static const struct qmi_elem_info vayu_cell_nas_lte_signal_ei[] = {
@@ -616,6 +758,12 @@ static const struct qmi_elem_info vayu_cell_nas_get_signal_info_resp_ei[] = {
 	  .tlv_type = 0x12, .offset = offsetof(struct vayu_cell_nas_get_signal_info_resp, gsm_valid) },
 	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
 	  .tlv_type = 0x12, .offset = offsetof(struct vayu_cell_nas_get_signal_info_resp, gsm_rssi) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x13, .offset = offsetof(struct vayu_cell_nas_get_signal_info_resp, wcdma_valid) },
+	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_cell_nas_wcdma_signal),
+	  .array_type = NO_ARRAY, .tlv_type = 0x13,
+	  .offset = offsetof(struct vayu_cell_nas_get_signal_info_resp, wcdma),
+	  .ei_array = vayu_cell_nas_wcdma_signal_ei },
 	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
 	  .tlv_type = 0x14, .offset = offsetof(struct vayu_cell_nas_get_signal_info_resp, lte_valid) },
 	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_cell_nas_lte_signal), .array_type = NO_ARRAY,

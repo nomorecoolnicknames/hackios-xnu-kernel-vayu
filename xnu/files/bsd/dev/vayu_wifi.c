@@ -36,11 +36,14 @@
  *                        host_cap at all.
  *   vayu_wifi_cap=0      do not send the cap request (default 1: send it).
  *
- * What it never does: no BDF_DOWNLOAD, no CAL_* request, no WLAN_CFG, no WLAN_MODE, no
- * INI, no ATHDIAG_*, no MAC_ADDR, no RESPOND_MEM, no SCM call and no SMEM write. It never writes to
- * any storage (the tftp server is read-only and a WRQ is refused). The only bytes that go to the
- * modem are answers to what it asked and the four read-only WLFW requests above. (Linux's
- * ath10k_qmi_add_wlan_ver_smem writes the firmware build id to SMEM; that is not done here.)
+ * After cap and with vayu_wifi_bdf=1 (default) it downloads the board data file from the boot
+ * image's fw/ (bdwlan.b<board>, fallback bdwlan.bin) over BDF_DOWNLOAD, sends CAL_REPORT, waits
+ * for FW_READY, then with vayu_wifi_wlan=1 (default) sends WLAN_CFG (the ath10k_snoc WCN3990 CE
+ * target/service/shadow tables) and WLAN_MODE MISSION.  The host WCN3990/SNOC/CE/ath10k data path
+ * is still absent, so this does not create a network interface and there is no internet.
+ * What it never does: no INI, no ATHDIAG_*, no MAC_ADDR, no RESPOND_MEM, no SCM call and no SMEM
+ * write. It never writes to any storage (the tftp server is read-only and a WRQ is refused).
+ * (Linux's ath10k_qmi_add_wlan_ver_smem writes the firmware build id to SMEM; not done here.)
  *
  * What may be seen:
  *   H1: the modem reads wlanmdsp.mbn over tftp and then WLFW (0x45) appears -- then the firmware
@@ -110,6 +113,7 @@ static LCK_MTX_DECLARE(vayu_wifi_lock, &vayu_wifi_lck_grp);
 #define VAYU_TFTP_XFERS         8
 
 static uint32_t wifi_level, wifi_hostcap = 1, wifi_cap = 1;
+static uint32_t wifi_bdf = 1, wifi_wlan = 1;   /* 1: BDF download / WLAN cfg+mode after cap */
 static uint32_t wifi_msa_fixed_perm;      /* 1: TZ fixes the MSA permissions; skip the assign */
 static uint32_t wifi_listen_s;
 static bool wifi_started;
@@ -1425,6 +1429,22 @@ tftp_receive(void *context __unused, uint32_t node, uint32_t from_port, const vo
 #define VAYU_WLFW_MSA_INFO_REQ_MAX      18
 #define VAYU_WLFW_CAP_REQ_MAX           0
 #define VAYU_WLFW_MSA_READY_REQ_MAX     0
+#define VAYU_WLFW_BDF_DOWNLOAD_REQ_V01  0x0025
+#define VAYU_WLFW_CAL_REPORT_REQ_V01    0x0026
+#define VAYU_WLFW_WLAN_MODE_REQ_V01     0x0022
+#define VAYU_WLFW_WLAN_CFG_REQ_V01      0x0023
+#define VAYU_WLFW_BDF_DOWNLOAD_REQ_MAX  6182
+#define VAYU_WLFW_CAL_REPORT_REQ_MAX    28
+#define VAYU_WLFW_WLAN_MODE_REQ_MAX     11
+#define VAYU_WLFW_WLAN_CFG_REQ_MAX      803
+#define VAYU_WLFW_MAX_DATA_SIZE_V01     6144
+#define VAYU_WLFW_MAX_NUM_CE_V01        12
+#define VAYU_WLFW_MAX_NUM_SVC_V01       24
+#define VAYU_WLFW_MAX_NUM_SHADOW_REG_V01 24
+#define VAYU_WLFW_MAX_NUM_CAL_V01       5
+#define VAYU_WLFW_MAX_STR_LEN_V01       32
+#define VAYU_WLFW_DRIVER_MODE_MISSION_V01 0
+#define VAYU_QMI_ERR_MALFORMED_MSG_V01  3
 #define VAYU_WLFW_MAX_MEM_REG_V01       2
 #define VAYU_WLFW_MAX_TIMESTAMP_LEN_V01 32
 #define VAYU_WLFW_MAX_BUILD_ID_LEN_V01  128
@@ -1577,6 +1597,85 @@ struct vayu_wlfw_msa_ready_req_msg_v01 {
 };
 
 struct vayu_wlfw_msa_ready_resp_msg_v01 {
+	struct qmi_response_type_v01 resp;
+};
+
+struct vayu_wlfw_bdf_download_req_msg_v01 {
+	uint8_t valid;
+	uint8_t file_id_valid;
+	uint32_t file_id;
+	uint8_t total_size_valid;
+	uint32_t total_size;
+	uint8_t seg_id_valid;
+	uint32_t seg_id;
+	uint8_t data_valid;
+	uint32_t data_len;
+	uint8_t data[VAYU_WLFW_MAX_DATA_SIZE_V01];
+	uint8_t end_valid;
+	uint8_t end;
+	uint8_t bdf_type_valid;
+	uint8_t bdf_type;
+};
+
+struct vayu_wlfw_bdf_download_resp_msg_v01 {
+	struct qmi_response_type_v01 resp;
+};
+
+struct vayu_wlfw_cal_report_req_msg_v01 {
+	uint32_t meta_data_len;
+	uint32_t meta_data[VAYU_WLFW_MAX_NUM_CAL_V01];
+	uint8_t xo_cal_data_valid;
+	uint8_t xo_cal_data;
+};
+
+struct vayu_wlfw_cal_report_resp_msg_v01 {
+	struct qmi_response_type_v01 resp;
+};
+
+struct vayu_wlfw_wlan_mode_req_msg_v01 {
+	uint32_t mode;
+	uint8_t hw_debug_valid;
+	uint8_t hw_debug;
+};
+
+struct vayu_wlfw_wlan_mode_resp_msg_v01 {
+	struct qmi_response_type_v01 resp;
+};
+
+struct vayu_wlfw_ce_tgt_pipe_cfg_s_v01 {
+	uint32_t pipe_num;
+	uint32_t pipe_dir;
+	uint32_t nentries;
+	uint32_t nbytes_max;
+	uint32_t flags;
+};
+
+struct vayu_wlfw_ce_svc_pipe_cfg_s_v01 {
+	uint32_t service_id;
+	uint32_t pipe_dir;
+	uint32_t pipe_num;
+};
+
+struct vayu_wlfw_shadow_reg_cfg_s_v01 {
+	uint16_t id;
+	uint16_t offset;
+};
+
+struct vayu_wlfw_wlan_cfg_req_msg_v01 {
+	uint8_t host_version_valid;
+	char host_version[VAYU_WLFW_MAX_STR_LEN_V01 + 1];
+	uint8_t tgt_cfg_valid;
+	uint32_t tgt_cfg_len;
+	struct vayu_wlfw_ce_tgt_pipe_cfg_s_v01 tgt_cfg[VAYU_WLFW_MAX_NUM_CE_V01];
+	uint8_t svc_cfg_valid;
+	uint32_t svc_cfg_len;
+	struct vayu_wlfw_ce_svc_pipe_cfg_s_v01 svc_cfg[VAYU_WLFW_MAX_NUM_SVC_V01];
+	uint8_t shadow_reg_valid;
+	uint32_t shadow_reg_len;
+	struct vayu_wlfw_shadow_reg_cfg_s_v01 shadow_reg[VAYU_WLFW_MAX_NUM_SHADOW_REG_V01];
+};
+
+struct vayu_wlfw_wlan_cfg_resp_msg_v01 {
 	struct qmi_response_type_v01 resp;
 };
 
@@ -1987,6 +2086,189 @@ static const struct qmi_elem_info vayu_wlfw_msa_ready_resp_msg_v01_ei[] = {
 	{}
 };
 
+static const struct qmi_elem_info vayu_wlfw_bdf_download_req_msg_v01_ei[] = {
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x01,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_req_msg_v01, valid) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x10,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_req_msg_v01, file_id_valid) },
+	{ .data_type = QMI_SIGNED_4_BYTE_ENUM, .elem_len = 1, .elem_size = sizeof(uint32_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x10,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_req_msg_v01, file_id) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x11,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_req_msg_v01, total_size_valid) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x11,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_req_msg_v01, total_size) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x12,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_req_msg_v01, seg_id_valid) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x12,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_req_msg_v01, seg_id) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x13,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_req_msg_v01, data_valid) },
+	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint16_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x13,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_req_msg_v01, data_len) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = VAYU_WLFW_MAX_DATA_SIZE_V01, .elem_size = sizeof(uint8_t),
+	  .array_type = VAR_LEN_ARRAY, .tlv_type = 0x13,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_req_msg_v01, data) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x14,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_req_msg_v01, end_valid) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x14,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_req_msg_v01, end) },
+	{}
+};
+
+static const struct qmi_elem_info vayu_wlfw_bdf_download_resp_msg_v01_ei[] = {
+	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct qmi_response_type_v01),
+	  .array_type = NO_ARRAY, .tlv_type = 0x02,
+	  .offset = offsetof(struct vayu_wlfw_bdf_download_resp_msg_v01, resp),
+	  .ei_array = qmi_response_type_v01_ei },
+	{}
+};
+
+static const struct qmi_elem_info vayu_wlfw_cal_report_req_msg_v01_ei[] = {
+	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x01,
+	  .offset = offsetof(struct vayu_wlfw_cal_report_req_msg_v01, meta_data_len) },
+	{ .data_type = QMI_SIGNED_4_BYTE_ENUM, .elem_len = VAYU_WLFW_MAX_NUM_CAL_V01, .elem_size = sizeof(uint32_t),
+	  .array_type = VAR_LEN_ARRAY, .tlv_type = 0x01,
+	  .offset = offsetof(struct vayu_wlfw_cal_report_req_msg_v01, meta_data) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x10,
+	  .offset = offsetof(struct vayu_wlfw_cal_report_req_msg_v01, xo_cal_data_valid) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x10,
+	  .offset = offsetof(struct vayu_wlfw_cal_report_req_msg_v01, xo_cal_data) },
+	{}
+};
+
+static const struct qmi_elem_info vayu_wlfw_cal_report_resp_msg_v01_ei[] = {
+	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct qmi_response_type_v01),
+	  .array_type = NO_ARRAY, .tlv_type = 0x02,
+	  .offset = offsetof(struct vayu_wlfw_cal_report_resp_msg_v01, resp),
+	  .ei_array = qmi_response_type_v01_ei },
+	{}
+};
+
+static const struct qmi_elem_info vayu_wlfw_wlan_mode_req_msg_v01_ei[] = {
+	{ .data_type = QMI_SIGNED_4_BYTE_ENUM, .elem_len = 1, .elem_size = sizeof(uint32_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x01,
+	  .offset = offsetof(struct vayu_wlfw_wlan_mode_req_msg_v01, mode) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x10,
+	  .offset = offsetof(struct vayu_wlfw_wlan_mode_req_msg_v01, hw_debug_valid) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x10,
+	  .offset = offsetof(struct vayu_wlfw_wlan_mode_req_msg_v01, hw_debug) },
+	{}
+};
+
+static const struct qmi_elem_info vayu_wlfw_wlan_mode_resp_msg_v01_ei[] = {
+	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct qmi_response_type_v01),
+	  .array_type = NO_ARRAY, .tlv_type = 0x02,
+	  .offset = offsetof(struct vayu_wlfw_wlan_mode_resp_msg_v01, resp),
+	  .ei_array = qmi_response_type_v01_ei },
+	{}
+};
+
+static const struct qmi_elem_info vayu_wlfw_ce_tgt_pipe_cfg_s_v01_ei[] = {
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0,
+	  .offset = offsetof(struct vayu_wlfw_ce_tgt_pipe_cfg_s_v01, pipe_num) },
+	{ .data_type = QMI_SIGNED_4_BYTE_ENUM, .elem_len = 1, .elem_size = sizeof(uint32_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0,
+	  .offset = offsetof(struct vayu_wlfw_ce_tgt_pipe_cfg_s_v01, pipe_dir) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0,
+	  .offset = offsetof(struct vayu_wlfw_ce_tgt_pipe_cfg_s_v01, nentries) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0,
+	  .offset = offsetof(struct vayu_wlfw_ce_tgt_pipe_cfg_s_v01, nbytes_max) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0,
+	  .offset = offsetof(struct vayu_wlfw_ce_tgt_pipe_cfg_s_v01, flags) },
+	{}
+};
+
+static const struct qmi_elem_info vayu_wlfw_ce_svc_pipe_cfg_s_v01_ei[] = {
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0,
+	  .offset = offsetof(struct vayu_wlfw_ce_svc_pipe_cfg_s_v01, service_id) },
+	{ .data_type = QMI_SIGNED_4_BYTE_ENUM, .elem_len = 1, .elem_size = sizeof(uint32_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0,
+	  .offset = offsetof(struct vayu_wlfw_ce_svc_pipe_cfg_s_v01, pipe_dir) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0,
+	  .offset = offsetof(struct vayu_wlfw_ce_svc_pipe_cfg_s_v01, pipe_num) },
+	{}
+};
+
+static const struct qmi_elem_info vayu_wlfw_shadow_reg_cfg_s_v01_ei[] = {
+	{ .data_type = QMI_UNSIGNED_2_BYTE, .elem_len = 1, .elem_size = sizeof(uint16_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0,
+	  .offset = offsetof(struct vayu_wlfw_shadow_reg_cfg_s_v01, id) },
+	{ .data_type = QMI_UNSIGNED_2_BYTE, .elem_len = 1, .elem_size = sizeof(uint16_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0,
+	  .offset = offsetof(struct vayu_wlfw_shadow_reg_cfg_s_v01, offset) },
+	{}
+};
+
+static const struct qmi_elem_info vayu_wlfw_wlan_cfg_req_msg_v01_ei[] = {
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x10,
+	  .offset = offsetof(struct vayu_wlfw_wlan_cfg_req_msg_v01, host_version_valid) },
+	{ .data_type = QMI_STRING, .elem_len = VAYU_WLFW_MAX_STR_LEN_V01 + 1, .elem_size = sizeof(char),
+	  .array_type = NO_ARRAY, .tlv_type = 0x10,
+	  .offset = offsetof(struct vayu_wlfw_wlan_cfg_req_msg_v01, host_version) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x11,
+	  .offset = offsetof(struct vayu_wlfw_wlan_cfg_req_msg_v01, tgt_cfg_valid) },
+	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x11,
+	  .offset = offsetof(struct vayu_wlfw_wlan_cfg_req_msg_v01, tgt_cfg_len) },
+	{ .data_type = QMI_STRUCT, .elem_len = VAYU_WLFW_MAX_NUM_CE_V01, .elem_size = sizeof(struct vayu_wlfw_ce_tgt_pipe_cfg_s_v01),
+	  .array_type = VAR_LEN_ARRAY, .tlv_type = 0x11,
+	  .offset = offsetof(struct vayu_wlfw_wlan_cfg_req_msg_v01, tgt_cfg),
+	  .ei_array = vayu_wlfw_ce_tgt_pipe_cfg_s_v01_ei },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x12,
+	  .offset = offsetof(struct vayu_wlfw_wlan_cfg_req_msg_v01, svc_cfg_valid) },
+	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x12,
+	  .offset = offsetof(struct vayu_wlfw_wlan_cfg_req_msg_v01, svc_cfg_len) },
+	{ .data_type = QMI_STRUCT, .elem_len = VAYU_WLFW_MAX_NUM_SVC_V01, .elem_size = sizeof(struct vayu_wlfw_ce_svc_pipe_cfg_s_v01),
+	  .array_type = VAR_LEN_ARRAY, .tlv_type = 0x12,
+	  .offset = offsetof(struct vayu_wlfw_wlan_cfg_req_msg_v01, svc_cfg),
+	  .ei_array = vayu_wlfw_ce_svc_pipe_cfg_s_v01_ei },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x13,
+	  .offset = offsetof(struct vayu_wlfw_wlan_cfg_req_msg_v01, shadow_reg_valid) },
+	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint8_t),
+	  .array_type = NO_ARRAY, .tlv_type = 0x13,
+	  .offset = offsetof(struct vayu_wlfw_wlan_cfg_req_msg_v01, shadow_reg_len) },
+	{ .data_type = QMI_STRUCT, .elem_len = VAYU_WLFW_MAX_NUM_SHADOW_REG_V01, .elem_size = sizeof(struct vayu_wlfw_shadow_reg_cfg_s_v01),
+	  .array_type = VAR_LEN_ARRAY, .tlv_type = 0x13,
+	  .offset = offsetof(struct vayu_wlfw_wlan_cfg_req_msg_v01, shadow_reg),
+	  .ei_array = vayu_wlfw_shadow_reg_cfg_s_v01_ei },
+	{}
+};
+
+static const struct qmi_elem_info vayu_wlfw_wlan_cfg_resp_msg_v01_ei[] = {
+	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct qmi_response_type_v01),
+	  .array_type = NO_ARRAY, .tlv_type = 0x02,
+	  .offset = offsetof(struct vayu_wlfw_wlan_cfg_resp_msg_v01, resp),
+	  .ei_array = qmi_response_type_v01_ei },
+	{}
+};
+
 static const struct qmi_elem_info vayu_wlfw_fw_init_done_ind_msg_v01_ei[] = {
 	{ .data_type = QMI_EOTI }
 };
@@ -1998,6 +2280,7 @@ static struct {
 	uint32_t node, port;
 	volatile bool stop;
 	volatile bool fw_ready;         /* the FW_READY indication arrived */
+	volatile bool msa_ready;        /* the firmware MSA_READY indication arrived */
 	uint32_t chip_id, board_id, soc_id;
 	char summary[96];
 } wlfw;
@@ -2044,6 +2327,7 @@ wlfw_ind_msa_ready(struct qmi_handle *qmi __unused, struct sockaddr_qrtr *sq __u
     const void *decoded __unused)
 {
 	say("vayu-wifi: wlfw: indication MSA_READY\n");
+	wlfw.msa_ready = true;
 }
 
 static void
@@ -2148,6 +2432,205 @@ wlfw_request(const char *what, uint16_t message, size_t largest, const struct qm
 		return ret;
 	}
 	return 0;
+}
+
+
+/*
+ * WCN3990 CE target/service/shadow configuration, from ath10k_snoc.c
+ * (target_ce_config_wlan, target_service_to_ce_map_wlan, target_shadow_reg_cfg_map).
+ * These are the tables the Linux host sends in WLAN_CFG before WLAN_MODE MISSION.
+ */
+static const struct vayu_wlfw_ce_tgt_pipe_cfg_s_v01 vayu_wlan_tgt_cfg[] = {
+	{ 0, 2, 32, 2048, 0 },          /* CE0: host->target HTC control/raw */
+	{ 1, 1, 32, 2048, 0 },          /* CE1: target->host HTT + HTC control */
+	{ 2, 1, 64, 2048, 0 },          /* CE2: target->host WMI */
+	{ 3, 2, 32, 2048, 0 },          /* CE3: host->target WMI */
+	{ 4, 2, 256, 256, 8 },          /* CE4: host->target HTT, no intr */
+	{ 5, 2, 1024, 64, 8 },          /* CE5: HIF->HTT, no intr */
+	{ 6, 3, 32, 16384, 0 },         /* CE6: target autonomous hif_memcpy */
+	{ 7, 4, 0, 0, 8 },              /* CE7: host-only diagnostic window */
+	{ 8, 1, 32, 2048, 0 },          /* CE8: target to uMC */
+	{ 9, 1, 32, 2048, 0 },          /* CE9: target->host HTT */
+	{ 10, 1, 32, 2048, 0 },         /* CE10: target->host HTT */
+	{ 11, 1, 32, 2048, 0 },         /* CE11: target autonomous qcache memcpy */
+};
+
+static const struct vayu_wlfw_ce_svc_pipe_cfg_s_v01 vayu_wlan_svc_cfg[] = {
+	{ 0x0104, 2, 3 },  { 0x0104, 1, 2 },   /* WMI_DATA_VO  out/in  */
+	{ 0x0102, 2, 3 },  { 0x0102, 1, 2 },   /* WMI_DATA_BK  out/in  */
+	{ 0x0101, 2, 3 },  { 0x0101, 1, 2 },   /* WMI_DATA_BE  out/in  */
+	{ 0x0103, 2, 3 },  { 0x0103, 1, 2 },   /* WMI_DATA_VI  out/in  */
+	{ 0x0100, 2, 3 },  { 0x0100, 1, 2 },   /* WMI_CONTROL  out/in  */
+	{ 0x0001, 2, 0 },  { 0x0001, 1, 2 },   /* RSVD_CTRL    out/in  */
+	{ 0x0500, 2, 0 },  { 0x0500, 1, 2 },   /* TEST_RAW     out/in  */
+	{ 0x0300, 2, 4 },  { 0x0300, 1, 1 },   /* HTT_DATA     out/in  */
+	{ 0x0500, 2, 5 },                       /* TEST_RAW out 5      */
+	{ 0x0301, 1, 9 },                       /* HTT_DATA2 in 9      */
+	{ 0x0302, 1, 10 },                      /* HTT_DATA3 in 10     */
+	{ 0x0400, 1, 11 },                      /* HTT_LOG in 11       */
+	{ 0x0000, 0, 0 },                       /* ath10k_snoc's sentinel */
+};
+
+static const struct vayu_wlfw_shadow_reg_cfg_s_v01 vayu_wlan_shadow_reg[] = {
+	{ 0, 0x3c }, { 3, 0x3c }, { 4, 0x3c }, { 5, 0x3c }, { 7, 0x3c },
+	{ 1, 0x40 }, { 2, 0x40 }, { 7, 0x40 }, { 8, 0x40 }, { 9, 0x40 },
+	{ 10, 0x40 }, { 11, 0x40 },
+};
+
+static const uint8_t *
+vayu_wifi_bdf_file(uint32_t board_id, uint64_t *size)
+{
+	char name[64];
+	const uint8_t *bdf;
+
+	*size = 0;
+	if (board_id != 0 && board_id != 0xff && board_id != 0xffffffffU) {
+		snprintf(name, sizeof(name), "bdwlan.b%u", (unsigned int)board_id);
+		bdf = hakios_image_file("fw", name, size, NULL);
+		if (bdf != NULL) {
+			say("vayu-wifi: wlfw: bdf: fw/%s %llu bytes (board %#x)\n", name,
+			    (unsigned long long)*size, board_id);
+			return bdf;
+		}
+	}
+	bdf = hakios_image_file("fw", "bdwlan.bin", size, NULL);
+	if (bdf != NULL) {
+		say("vayu-wifi: wlfw: bdf: fw/bdwlan.bin %llu bytes (board %#x, fallback)\n",
+		    (unsigned long long)*size, board_id);
+	}
+	return bdf;
+}
+
+static int
+vayu_wifi_bdf_download(const uint8_t *bdf, uint64_t size)
+{
+	struct vayu_wlfw_bdf_download_req_msg_v01 req;
+	struct vayu_wlfw_bdf_download_resp_msg_v01 resp;
+	uint64_t off = 0;
+	uint32_t seg = 0;
+	int ret;
+
+	if (size == 0 || size > 0xffffffffULL) {
+		say("vayu-wifi: wlfw: bdf: bad size %llu\n", (unsigned long long)size);
+		return -1;
+	}
+	while (off < size) {
+		size_t chunk = (size - off) > VAYU_WLFW_MAX_DATA_SIZE_V01 ?
+		    VAYU_WLFW_MAX_DATA_SIZE_V01 : (size_t)(size - off);
+		uint8_t end = (off + chunk == size) ? 1 : 0;
+
+		memset(&req, 0, sizeof(req));
+		memset(&resp, 0, sizeof(resp));
+		req.valid = 1;
+		req.file_id_valid = 1;
+		req.file_id = 0;
+		req.total_size_valid = 1;
+		req.total_size = (uint32_t)size;
+		req.seg_id_valid = 1;
+		req.seg_id = seg;
+		req.data_valid = 1;
+		req.data_len = (uint32_t)chunk;
+		memcpy(req.data, bdf + off, chunk);
+		req.end_valid = 1;
+		req.end = end;
+		/* Linux ath10k_qmi_bdf_dnld_send_sync() does not set bdf_type_valid/bdf_type
+		 * for the normal BDF download.  The extra TLV 0x15 was a wrong addition:
+		 * the firmware crashed right after cal_report in 010232.  Leave it out. */
+
+		ret = wlfw_request("bdf_download", VAYU_WLFW_BDF_DOWNLOAD_REQ_V01,
+		    VAYU_WLFW_BDF_DOWNLOAD_REQ_MAX, vayu_wlfw_bdf_download_req_msg_v01_ei, &req,
+		    vayu_wlfw_bdf_download_resp_msg_v01_ei, &resp);
+		if (ret < 0) {
+			return ret;
+		}
+		if (resp.resp.result != QMI_RESULT_SUCCESS_V01 &&
+		    !(end && (resp.resp.error == VAYU_QMI_ERR_MALFORMED_MSG_V01 ||
+		    resp.resp.result == VAYU_QMI_ERR_MALFORMED_MSG_V01))) {
+			say("vayu-wifi: wlfw: bdf: segment %u rejected: result %u error %u\n",
+			    seg, (unsigned int)resp.resp.result, (unsigned int)resp.resp.error);
+			return -1;
+		}
+		off += chunk;
+		seg++;
+	}
+	say("vayu-wifi: wlfw: bdf: %llu bytes sent in %u segments\n",
+	    (unsigned long long)size, seg);
+	return 0;
+}
+
+static int
+vayu_wifi_cal_report(void)
+{
+	struct vayu_wlfw_cal_report_req_msg_v01 req;
+	struct vayu_wlfw_cal_report_resp_msg_v01 resp;
+	int ret;
+
+	memset(&req, 0, sizeof(req));
+	memset(&resp, 0, sizeof(resp));
+	req.meta_data_len = 0;                  /* no host calibration data here */
+	req.xo_cal_data_valid = 0;
+	ret = wlfw_request("cal_report", VAYU_WLFW_CAL_REPORT_REQ_V01,
+	    VAYU_WLFW_CAL_REPORT_REQ_MAX, vayu_wlfw_cal_report_req_msg_v01_ei, &req,
+	    vayu_wlfw_cal_report_resp_msg_v01_ei, &resp);
+	if (ret < 0) {
+		return ret;
+	}
+	say("vayu-wifi: wlfw: cal_report: result %u error %u\n",
+	    (unsigned int)resp.resp.result, (unsigned int)resp.resp.error);
+	return resp.resp.result == QMI_RESULT_SUCCESS_V01 ? 0 : -1;
+}
+
+static int
+vayu_wifi_wlan_cfg(void)
+{
+	struct vayu_wlfw_wlan_cfg_req_msg_v01 req;
+	struct vayu_wlfw_wlan_cfg_resp_msg_v01 resp;
+	int ret;
+
+	memset(&req, 0, sizeof(req));
+	memset(&resp, 0, sizeof(resp));
+	req.host_version_valid = 0;
+	req.tgt_cfg_valid = 1;
+	req.tgt_cfg_len = (uint32_t)(sizeof(vayu_wlan_tgt_cfg) / sizeof(vayu_wlan_tgt_cfg[0]));
+	memcpy(req.tgt_cfg, vayu_wlan_tgt_cfg, sizeof(vayu_wlan_tgt_cfg));
+	req.svc_cfg_valid = 1;
+	req.svc_cfg_len = (uint32_t)(sizeof(vayu_wlan_svc_cfg) / sizeof(vayu_wlan_svc_cfg[0]));
+	memcpy(req.svc_cfg, vayu_wlan_svc_cfg, sizeof(vayu_wlan_svc_cfg));
+	req.shadow_reg_valid = 1;
+	req.shadow_reg_len = (uint32_t)(sizeof(vayu_wlan_shadow_reg) / sizeof(vayu_wlan_shadow_reg[0]));
+	memcpy(req.shadow_reg, vayu_wlan_shadow_reg, sizeof(vayu_wlan_shadow_reg));
+
+	ret = wlfw_request("wlan_cfg", VAYU_WLFW_WLAN_CFG_REQ_V01, VAYU_WLFW_WLAN_CFG_REQ_MAX,
+	    vayu_wlfw_wlan_cfg_req_msg_v01_ei, &req, vayu_wlfw_wlan_cfg_resp_msg_v01_ei, &resp);
+	if (ret < 0) {
+		return ret;
+	}
+	say("vayu-wifi: wlfw: wlan_cfg: result %u error %u (tgt %u svc %u shadow %u)\n",
+	    (unsigned int)resp.resp.result, (unsigned int)resp.resp.error, req.tgt_cfg_len,
+	    req.svc_cfg_len, req.shadow_reg_len);
+	return resp.resp.result == QMI_RESULT_SUCCESS_V01 ? 0 : -1;
+}
+
+static int
+vayu_wifi_wlan_mode(void)
+{
+	struct vayu_wlfw_wlan_mode_req_msg_v01 req;
+	struct vayu_wlfw_wlan_mode_resp_msg_v01 resp;
+	int ret;
+
+	memset(&req, 0, sizeof(req));
+	memset(&resp, 0, sizeof(resp));
+	req.mode = VAYU_WLFW_DRIVER_MODE_MISSION_V01;   /* normal mode, as ath10k_snoc.c */
+	req.hw_debug_valid = 1;
+	req.hw_debug = 0;
+	ret = wlfw_request("wlan_mode", VAYU_WLFW_WLAN_MODE_REQ_V01, VAYU_WLFW_WLAN_MODE_REQ_MAX,
+	    vayu_wlfw_wlan_mode_req_msg_v01_ei, &req, vayu_wlfw_wlan_mode_resp_msg_v01_ei, &resp);
+	if (ret < 0) {
+		return ret;
+	}
+	say("vayu-wifi: wlfw: wlan_mode MISSION: result %u error %u\n",
+	    (unsigned int)resp.resp.result, (unsigned int)resp.resp.error);
+	return resp.resp.result == QMI_RESULT_SUCCESS_V01 ? 0 : -1;
 }
 
 static void
@@ -2392,10 +2875,60 @@ wlfw_thread(void *arg __unused, wait_result_t wr __unused)
 		say("vayu-wifi: wlfw: cap: not sent (vayu_wifi_cap=0)\n");
 	}
 
-	snprintf(wlfw.summary, sizeof(wlfw.summary), "answered: chip %#x board %#x soc %#x", wlfw.chip_id,
-	    wlfw.board_id, wlfw.soc_id);
-	say("vayu-wifi: wlfw: stopped after cap: MSA permissions and MSA_READY request done; "
-	    "no BDF, no wlan mode\n");
+	if (wifi_bdf != 0) {
+		uint64_t waited_ms;
+		const uint8_t *bdf;
+		uint64_t bdf_size = 0;
+
+		for (waited_ms = 0; !wlfw.msa_ready && !wlfw.stop && waited_ms < 5000; waited_ms += 100) {
+			delay_for_interval(100, NSEC_PER_MSEC);
+		}
+		say("vayu-wifi: wlfw: MSA_READY indication %s (waited up to 5000 ms)\n",
+		    wlfw.msa_ready ? "seen" : "not seen");
+		if (!wlfw.msa_ready) {
+			wlfw_fail("msa_ready_ind");
+			goto out_release;
+		}
+		bdf = vayu_wifi_bdf_file(wlfw.board_id, &bdf_size);
+		if (bdf == NULL) {
+			say("vayu-wifi: wlfw: bdf: no fw/bdwlan.b<board> or fw/bdwlan.bin in the boot image\n");
+			wlfw_fail("bdf_file");
+			goto out_release;
+		}
+		ret = vayu_wifi_bdf_download(bdf, bdf_size);
+		if (ret < 0) {
+			wlfw_fail("bdf_download");
+			goto out_release;
+		}
+		if (vayu_wifi_cal_report() < 0) {
+			say("vayu-wifi: wlfw: cal_report failed; waiting for FW_READY anyway\n");
+		}
+		for (waited_ms = 0; !wlfw.fw_ready && !wlfw.stop && waited_ms < 10000; waited_ms += 100) {
+			delay_for_interval(100, NSEC_PER_MSEC);
+		}
+		say("vayu-wifi: wlfw: FW_READY indication %s (waited up to 10000 ms)\n",
+		    wlfw.fw_ready ? "seen" : "not seen");
+		if (!wlfw.fw_ready) {
+			wlfw_fail("fw_ready");
+			goto out_release;
+		}
+		if (wifi_wlan != 0) {
+			if (vayu_wifi_wlan_cfg() < 0) {
+				say("vayu-wifi: wlfw: wlan_cfg rejected (host CE config)\n");
+			}
+			if (vayu_wifi_wlan_mode() < 0) {
+				say("vayu-wifi: wlfw: wlan_mode rejected\n");
+			}
+		}
+		snprintf(wlfw.summary, sizeof(wlfw.summary),
+		    "BDF+wlan: chip %#x board %#x soc %#x", wlfw.chip_id, wlfw.board_id, wlfw.soc_id);
+		say("vayu-wifi: wlfw: firmware side done: BDF, cal_report, WLAN_CFG, WLAN_MODE MISSION; "
+		    "host WCN3990/SNOC/CE/ath10k data path is not implemented: no internet\n");
+	} else {
+		snprintf(wlfw.summary, sizeof(wlfw.summary), "answered: chip %#x board %#x soc %#x",
+		    wlfw.chip_id, wlfw.board_id, wlfw.soc_id);
+		say("vayu-wifi: wlfw: stopped after cap (vayu_wifi_bdf=0); no BDF, no wlan mode\n");
+	}
 
 out_release:
 	qmi_handle_release(&wlfw_handle);
@@ -2422,13 +2955,18 @@ vayu_wifi_start(struct vayu_qrtr *q, uint32_t listen_s)
 	wifi_level = 0;
 	wifi_hostcap = 1;
 	wifi_cap = 1;
+	wifi_bdf = 1;
+	wifi_wlan = 1;
 	PE_parse_boot_argn("vayu_wifi", &wifi_level, sizeof(wifi_level));
 	PE_parse_boot_argn("vayu_wifi_hostcap", &wifi_hostcap, sizeof(wifi_hostcap));
 	PE_parse_boot_argn("vayu_wifi_cap", &wifi_cap, sizeof(wifi_cap));
+	PE_parse_boot_argn("vayu_wifi_bdf", &wifi_bdf, sizeof(wifi_bdf));
+	PE_parse_boot_argn("vayu_wifi_wlan", &wifi_wlan, sizeof(wifi_wlan));
 	PE_parse_boot_argn("vayu_msa_fixed_perm", &wifi_msa_fixed_perm, sizeof(wifi_msa_fixed_perm));
 	wifi_listen_s = listen_s;
-	say("vayu-wifi: vayu_wifi=%u vayu_wifi_hostcap=%u vayu_wifi_cap=%u vayu_msa_fixed_perm=%u listen=%u s\n",
-	    wifi_level, wifi_hostcap, wifi_cap, wifi_msa_fixed_perm, listen_s);
+	say("vayu-wifi: vayu_wifi=%u vayu_wifi_hostcap=%u vayu_wifi_cap=%u vayu_wifi_bdf=%u "
+	    "vayu_wifi_wlan=%u vayu_msa_fixed_perm=%u listen=%u s\n",
+	    wifi_level, wifi_hostcap, wifi_cap, wifi_bdf, wifi_wlan, wifi_msa_fixed_perm, listen_s);
 	if (wifi_level == 0) {
 		return;
 	}
