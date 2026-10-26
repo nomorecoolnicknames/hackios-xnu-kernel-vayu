@@ -4,9 +4,10 @@
  * (AWB), and a picture: each 2x2 Bayer cell one pixel of colour, scaled to the size asked for, or
  * every pixel (bilinear demosaic) at the sensor's own size; lens shading (a grid of gains per
  * colour), the white balance's and AE's gains, a colour matrix, a gamma; as 8-bit YCbCr 4:2:0 (NV12,
- * full range: CoreVideo's 420f, or video range: 420v) or BGRA. The photographs then get the stills'
- * look (struct isp_look: noise reduction, sharpening, local contrast, vibrance, a highlight roll-off),
- * off by default; the preview gets only the look's sharpening across its lines.
+ * full range: CoreVideo's 420f, or video range: 420v) or BGRA. The preview is demosaiced at half
+ * resolution -- one pixel per cell, scaled up -- and its inner loops are NEON where the processor has
+ * it (isp_render_nv12_half(), struct isp_fast); the photographs get the stills' look (struct isp_look:
+ * noise reduction, sharpening, local contrast, vibrance, a highlight roll-off), off by default.
  */
 #ifndef CAMERA_ISP_H
 #define CAMERA_ISP_H
@@ -96,6 +97,18 @@ struct isp_look {
 	float           preview_sharp;
 };
 
+/*
+ * The fast paths (camera_device.c sets them from the boot arguments; isp_init() has them on): the
+ * preview's debayer at half resolution (one pixel per 2x2 cell, then scaled), and the NEON code of the
+ * inner loops where the processor has it. The NEON loops are the scalar ones' arithmetic exactly; the
+ * half-resolution preview is the same cells interpolated again, a code or two from the old picture.
+ * cam_preview_half=0 and cam_neon=0 put the old paths back.
+ */
+struct isp_fast {
+	bool            preview_half;
+	bool            neon;
+};
+
 struct isp {
 	float           wb[3];          /* the white balance's gains, green 1 */
 	float           digital;        /* more gain, for what AE cannot reach with the sensor's */
@@ -113,9 +126,12 @@ struct isp {
 	struct isp_tuning *tuning;              /* isp_load_tuning()'s, or none */
 	float           saturation;     /* applied to every colour matrix set (1: none) */
 	float           contrast;       /* the S-curve folded into the gamma table (0: none) */
+	struct isp_fast fast;           /* the preview's half-resolution debayer, the NEON loops */
 };
 
 void isp_init(struct isp *isp);
+/* the fast paths (look NULL: the defaults -- both on) */
+void isp_set_fast(struct isp *isp, const struct isp_fast *fast);
 /* the tone of the picture: an S-curve of contrast c (0 none, ~0.3 gentle) into the gamma table, and saturation s
  * (1 none) applied to the colour matrix from now on */
 void isp_set_tone(struct isp *isp, float contrast, float saturation);
@@ -148,6 +164,15 @@ void isp_awb(struct isp *isp, const struct isp_stats *s);
  */
 void isp_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
     uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range);
+/*
+ * The moving pictures' preview, by the fast path when isp->fast.preview_half is on: the frame demosaiced
+ * once per 2x2 cell (half the picture's width and height), and that cell picture scaled up to width x
+ * height. A quarter of the demosaic, the colour matrix and the curve work; the same NV12 conversion
+ * (isp_render_nv12, whose path it falls back to when the picture is smaller than the cell one).
+ */
+void isp_render_nv12_half(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y,
+    size_t y_stride, uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row,
+    bool video_range);
 void isp_render_bgra(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *out, size_t stride,
     uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row);
 /*

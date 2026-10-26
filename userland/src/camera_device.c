@@ -456,6 +456,9 @@ struct stream {
 	struct output   out[OUTPUTS];
 	pthread_mutex_t lock;
 	pthread_t       worker;
+	dispatch_queue_t still_queue;   /* the photographs, made off the frame's thread (cam_still_async=0: on it) */
+	bool            still_async;
+	uint32_t        pieces;         /* the rows of a picture made at once (cam_pieces=, 8) */
 	volatile bool   running;
 	volatile bool   graph_running;  /* the capture graph has started this stream: frames may be given out */
 	bool            worker_started;
@@ -835,9 +838,10 @@ render_piece(void *context, size_t i)
 		    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0), CVPixelBufferGetBaseAddressOfPlane(j->pb, 1),
 		    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end, j->format == PF_420V);
 	} else {
-		isp_render_nv12(j->isp, j->f, j->raw, CVPixelBufferGetBaseAddressOfPlane(j->pb, 0), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0),
-		    CVPixelBufferGetBaseAddressOfPlane(j->pb, 1), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end,
-		    j->format == PF_420V);
+		/* (the moving picture: the preview's half-resolution debayer, when the isp's fast path is on) */
+		isp_render_nv12_half(j->isp, j->f, j->raw, CVPixelBufferGetBaseAddressOfPlane(j->pb, 0),
+		    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0), CVPixelBufferGetBaseAddressOfPlane(j->pb, 1),
+		    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end, j->format == PF_420V);
 	}
 }
 
@@ -906,6 +910,98 @@ let_go(struct output *out)
 	}
 }
 
+/* ---- the photograph, off the frame's thread ---------------------------------------------------------- */
+
+/* what a photograph needs of the frame it was taken from: the frame's own bytes, and the processor's state at it */
+struct still_job {
+	struct isp      isp;
+	struct hakios_camera_frame f;
+	uint8_t         *raw;
+	CVPixelBufferRef pb;            /* ours from the pool: the block hands it over and releases it */
+	CFDictionaryRef metadata;
+	uint32_t        pf, width, height, pieces;
+	void            *handler;
+};
+
+/* the picture's attachments, and the graph's block: the same here and on the capture queue */
+static void
+hand_over(CVPixelBufferRef pb, CFDictionaryRef metadata, uint64_t time, void *handler)
+{
+	CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
+	CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+	CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
+	    kCVAttachmentMode_ShouldPropagate);
+	if (metadata != NULL) {
+		CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, metadata);
+
+		CVBufferSetAttachment(pb, md_attachment, m, kCVAttachmentMode_ShouldPropagate);
+		CFRelease(m);
+	}
+	((pixel_buffer_handler)handler)(pb, CMClockMakeHostTimeFromSystemUnits(time));
+}
+
+/* the photograph: the whole of the frame it was taken from, once, through the stills' look */
+static void
+still_job_render(struct still_job *j)
+{
+	static mach_timebase_info_data_t tb;
+	struct render_job job = { &j->isp, &j->f, j->raw, j->pb, j->pf, j->width, j->height, j->pieces, true };
+	uint64_t began = mach_absolute_time(), done;
+	double ms;
+
+	CVPixelBufferLockBaseAddress(j->pb, 0);
+	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &job, render_piece);
+	CVPixelBufferUnlockBaseAddress(j->pb, 0);
+	done = mach_absolute_time();
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	ms = (double)(done - began) * tb.numer / tb.denom / 1e6;
+	{
+		struct isp_still_timing timing;
+
+		isp_take_still_timing(&timing);
+		say("StillImage: %ux%u made of every pixel in %.0f ms off the frame's thread (still: NR %.1f ms, sharpen %.1f ms, "
+		    "local contrast %.1f ms)", j->width, j->height, ms, timing.nr_ms, timing.sharpen_ms, timing.lcon_ms);
+	}
+	hand_over(j->pb, j->metadata, j->f.time, j->handler);
+	if (j->metadata != NULL) {
+		CFRelease(j->metadata);
+	}
+	CVPixelBufferRelease(j->pb);
+	free(j->raw);
+	free(j);
+}
+
+/* the frame copied out of the kernel's buffer (the worker reads the next one into it) and queued */
+static bool
+still_capture(struct stream *s, struct output *out, const struct isp *isp, const struct hakios_camera_frame *f,
+    const uint8_t *raw, CFDictionaryRef metadata, CVPixelBufferRef pb, uint32_t pf, uint32_t width, uint32_t height)
+{
+	size_t bytes = (size_t)f->stride * f->height;
+	struct still_job *j = calloc(1, sizeof(*j));
+
+	if (j == NULL || (j->raw = malloc(bytes)) == NULL) {
+		free(j);
+		return false;
+	}
+	j->isp = *isp;
+	j->isp.tuning = NULL;           /* (the renderer does not read it, and the stream may change it under the block) */
+	j->f = *f;
+	memcpy(j->raw, raw, bytes);
+	j->pb = pb;
+	j->metadata = metadata != NULL ? CFRetain(metadata) : NULL;
+	j->pf = pf;
+	j->width = width;
+	j->height = height;
+	j->pieces = s->pieces;
+	j->handler = out->handler;
+	dispatch_async(s->still_queue, ^{
+		still_job_render(j);
+	});
+	return true;
+}
+
 static void
 md_put(CFMutableDictionaryRef m, int key, CFTypeRef value)
 {
@@ -963,8 +1059,8 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 {
 	CVPixelBufferRef pb = output_buffer(out);
 	uint32_t pf, width, height;
+	bool still;
 
-	(void)s;
 	if (pb == NULL) {
 		return;
 	}
@@ -980,9 +1076,19 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		CVPixelBufferRelease(pb);
 		return;
 	}
+	still = strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA;
+	/*
+	 * The photograph is heavy (every pixel of the sensor, then spec L's noise reduction, local contrast
+	 * and sharpening) and it used to be made here, on the thread that reads the frames: the preview stood
+	 * still for it. It is copied out (the kernel's buffer is read into again at once) and made on the
+	 * capture queue, this thread already reading the next frame. cam_still_async=0 makes it here again.
+	 */
+	if (still && s->still_async && still_capture(s, out, isp, f, raw, metadata, pb, pf, width, height)) {
+		return;
+	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA };
+	struct render_job job = { isp, f, raw, pb, pf, width, height, s->pieces, still };
 	uint64_t began = mach_absolute_time();
 
 	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
@@ -1008,21 +1114,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		}
 	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
-	CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
-	CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
-	CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
-	    kCVAttachmentMode_ShouldPropagate);
-
-	if (metadata != NULL) {
-		CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, metadata);
-
-		CVBufferSetAttachment(pb, md_attachment, m, kCVAttachmentMode_ShouldPropagate);
-		CFRelease(m);
-	}
-
-	CMTime pts = CMClockMakeHostTimeFromSystemUnits(f->time);
-
-	((pixel_buffer_handler)out->handler)(pb, pts);
+	hand_over(pb, metadata, f->time, out->handler);
 	/*
 	 * The moving picture's buffers are kept for HELD frames after they are given. The preview's pool
 	 * would otherwise hand a buffer straight back -- the graph lets go of it as soon as it has passed
@@ -1309,6 +1401,39 @@ boot_number(const char *arguments, const char *name, float fallback)
 	return end == at + strlen(name) ? fallback : v;
 }
 
+/*
+ * The fast paths' boot arguments: cam_preview_half=0 (the preview's full-resolution debayer, the way it
+ * was), cam_neon=0 (the scalar inner loops), cam_still_async=0 (the photograph on the frame's thread, as
+ * it was), cam_pieces=N (8). All of them on but the last's default, which is the 8 pieces this made
+ * pictures in before.
+ */
+static void
+load_fast(struct isp *isp, struct stream *s)
+{
+	static int said;
+	char arguments[4096] = "";
+	size_t size = sizeof(arguments) - 1;
+	struct isp_fast fast = { true, true };
+	int pieces = 8, async = 1;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+		fast.preview_half = boot_number(arguments, "cam_preview_half=", 1) != 0;
+		fast.neon = boot_number(arguments, "cam_neon=", 1) != 0;
+		async = boot_number(arguments, "cam_still_async=", 1) != 0;
+		pieces = (int)boot_number(arguments, "cam_pieces=", 8);
+	}
+	pieces = pieces < 1 ? 1 : pieces > 32 ? 32 : pieces;
+	isp_set_fast(isp, &fast);
+	s->pieces = (uint32_t)pieces;
+	s->still_async = async != 0 && s->still_queue != NULL;
+	if (!said) {
+		said = 1;
+		say("the fast paths: the preview at half resolution (%s), the NEON loops (%s), %d pieces, the photograph on %s",
+		    fast.preview_half ? "on" : "off", fast.neon ? "on" : "off", pieces,
+		    s->still_async ? "the capture queue" : "the frame's thread (cam_still_async=0)");
+	}
+}
+
 /* the sensor's colour tuning, when the image has one (fw/camera-<sensor>.isp, tools/camtuning.py) */
 static void
 load_tuning(struct isp *isp, uint32_t sensor)
@@ -1388,6 +1513,7 @@ worker(void *context)
 		return NULL;
 	}
 	isp_init(&isp);
+	load_fast(&isp, s);
 	while (s->running && failures < 5) {
 		ssize_t n;
 
@@ -1581,6 +1707,16 @@ stream_stop(CMBaseObjectRef o)
 		pthread_join(s->worker, NULL);
 		s->worker_started = false;
 	}
+	/*
+	 * The photograph the worker handed to the capture queue may still be being made, and its block
+	 * calls the graph's handler: after this returns the graph may be gone, and a handler called then
+	 * walks the source node's innards and takes mediaserverd down with it (see the frames' comment in
+	 * worker()). Drained here, before the stream is let go.
+	 */
+	if (s->still_queue != NULL) {
+		dispatch_sync(s->still_queue, ^{
+		});
+	}
 	return 0;
 }
 
@@ -1707,6 +1843,9 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	memset(s, 0, sizeof(*s));
 	pthread_mutex_init(&s->lock, NULL);
 	pthread_mutex_init(&s->metadata_lock, NULL);
+	/* (the photographs' queue: one at a time, in the order they were asked for) */
+	s->still_queue = dispatch_queue_create("hakios-camera-still", DISPATCH_QUEUE_SERIAL);
+	s->pieces = 8;
 	s->torch = -1;
 	s->min_fps = 2;
 	s->zoom = 1;
