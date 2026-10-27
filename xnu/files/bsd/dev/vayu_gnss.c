@@ -18,9 +18,12 @@
  * which sys/vayu_gnss_qmi.h does and tools/gnss-test tests.
  *
  * Facts behind the numbers:
- *   - the service: the modem announces QMI LOC 0x10 instance 0x2 over QRTR -- FACT,
- *     artifacts/vayu/test1-20261026/base-run.log:59790 ("service 16 (0x10) instance 0x2 at node 0
- *     port 77"), t1-run.log:61567 (port 78), a test run-20261026/025023-run.log:56079 (port 79).
+ *   - the service: the modem announces QMI LOC 0x10 version 2, instance 0 over QRTR -- FACT:
+ *     artifacts/vayu/test5-20261027/run/test5q-110918.log:448427 ("service 16 (0x10), version 2,
+ *     instance 0, at node 0 port 78"). The "instance 0x2" of the older run logs is that same word
+ *     read without its packing (version in the low byte, instance above it): vayu_pas.c:3329-3340
+ *     prints version = word & 0xff and instance = word >> 8, vayu_modem.c:290-292 prints the raw
+ *     word as the instance. The instance is 0; a request goes to the port.
  *   - the message ids, the event bits, and which parts of the answer are a guess:
  *     sys/vayu_gnss_qmi.h, at its top, line by line.
  *   - NMEA 0183 is the path that cannot be misread: GGA and RMC carry the position, GGA the
@@ -692,17 +695,36 @@ gnss_message(const void *data, size_t length)
 
 /* ---- the session ------------------------------------------------------------------------------- */
 
+/*
+ * LOC_REG_EVENTS in the two lengths the IDL has had. The mask is eight bytes in the LOC v02
+ * revision this modem runs; four is the LOC v01 layout (sys/vayu_gnss_qmi.h has the evidence).
+ * The four-byte form is tried only when the modem says the eight-byte message itself is wrong
+ * (error 1 malformed, 58 encoding), the same rule LOC_START's forms follow: a refusal for any
+ * other reason is the modem's answer about the session, and a shorter request would not change it.
+ */
 static int
 gnss_register_events(void)
 {
 	struct vayu_gnss_reg_events_req request = {
 		.mask = VAYU_GNSS_EVENT_POSITION | VAYU_GNSS_EVENT_SV_INFO | VAYU_GNSS_EVENT_NMEA,
 	};
+	struct vayu_gnss_reg_events_req32 narrow = { .mask = (uint32_t)request.mask };
+	int ret;
 
-	say("vayu-gnss: Register Events: position (bit 0), SV info (bit 1), NMEA (bit 2), mask %#x\n",
-	    (unsigned int)request.mask);
-	return gnss_transaction("register events", gnss.loc_node, gnss.loc_port, VAYU_GNSS_LOC_REG_EVENTS,
-	    vayu_gnss_reg_events_req_ei, &request, VAYU_GNSS_REPLY_MS);
+	say("vayu-gnss: Register Events: position (bit 0), SV info (bit 1), NMEA (bit 2), mask %#llx "
+	    "in an 8-byte TLV 0x01\n", (unsigned long long)request.mask);
+	ret = gnss_transaction("register events (8-byte mask)", gnss.loc_node, gnss.loc_port,
+	    VAYU_GNSS_LOC_REG_EVENTS, vayu_gnss_reg_events_req_ei, &request, VAYU_GNSS_REPLY_MS);
+	if (ret == 0) {
+		return 0;
+	}
+	if (ret != -EIO || (gnss.last_error != QMI_ERR_MALFORMED_MSG_V01 && gnss.last_error != QMI_ERR_ENCODING_V01)) {
+		return ret;
+	}
+	say("vayu-gnss: the 8-byte mask was refused as malformed (error %u): Register Events again with "
+	    "a 4-byte mask\n", (unsigned int)gnss.last_error);
+	return gnss_transaction("register events (4-byte mask)", gnss.loc_node, gnss.loc_port,
+	    VAYU_GNSS_LOC_REG_EVENTS, vayu_gnss_reg_events_req32_ei, &narrow, VAYU_GNSS_REPLY_MS);
 }
 
 /*

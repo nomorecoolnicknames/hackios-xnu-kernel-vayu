@@ -4,10 +4,13 @@
  * machine that builds the kernel can code, decode and test the same messages (tools/gnss-test),
  * as sys/vayu_cell_qmi.h is for the cellular client.
  *
- * The service: QMI LOC, service id 0x10 (16). It is on the modem, which announces it over QRTR:
- * the vayu-cell run logs have "service 16 (0x10) instance 0x2 at node 0 port 77" (78 and 79 in the
- * runs of the same day) -- FACT: artifacts/vayu/test1-20261026/base-run.log:59790,
- * artifacts/vayu/test1-20261026/t1-run.log:61567, artifacts/vayu/a test run-20261026/025023-run.log:56079.
+ * The service: QMI LOC, service id 0x10 (16), version 2, instance 0, on the modem, over QRTR -- FACT:
+ * artifacts/vayu/test5-20261027/run/test5q-110918.log:448427 ("service 16 (0x10), version 2,
+ * instance 0, at node 0 port 78"). The "instance 0x2" of the older run logs is that same 32-bit
+ * word read without its packing: the router puts the version in its low byte and the instance
+ * above it, so vayu_pas.c's handler prints version 2 / instance 0 (vayu_pas.c:3335, 3339-3340) while
+ * vayu_modem.c:290-292 prints the whole word as the instance. The service is LOC v02, not v01;
+ * the instance is 0 and a request is routed by the port (78), never by that field.
  *
  * The message ids are the QMI LOC v02 IDL's, the header Android's location HAL is generated from
  * (qmi_loc_v02.h): Register Events 0x0021, Start 0x0022, Stop 0x0023, and the indications this
@@ -22,6 +25,25 @@
  *          and consistent with the order of the enum those names come from.
  *   FACT   Register Events' TLV 0x01 is the event bitmask, and its bits are in the same order as
  *          the indications: position 0x0024 is bit 0, SV info 0x0025 bit 1, NMEA 0x0026 bit 2.
+ *   FACT   that mask is EIGHT bytes wide in the LOC v02 IDL this modem runs, not four. The
+ *          downstream library the phone's own Android uses for exactly this message,
+ *          libloc_api_v02.so of the vayu vendor image
+ *          (artifacts/vayu/shm-rescue-20261026/vayu-sens-tasks/vendor/ex/lib64/libloc_api_v02.so,
+ *          build.prop: ro.product.vendor.device=vayu):
+ *            - locClientRegisterEventMask (0x4d578) sends message 0x21 with the mask stored into
+ *              the request's offset 0 by one 8-byte store ("str x1, [sp, #24]") and the message
+ *              id in "mov w1, #0x21";
+ *            - LocApiV02::convertMask(uint64_t) (0x218a4), whose result goes to that call, keeps
+ *              event bits above 31 in the QMI mask ("and x4, x10, #0x10000000000" bit 40,
+ *              "and x20, x10, #0x8000000000" bit 39, "and x2, x2, #0x800000000000" bit 47), which
+ *              a 4-byte field cannot hold;
+ *            - the service object it registers with is LOC v02, IDL revision 134
+ *              (loc_get_service_object_internal_v02: major 2, minor 134, idl_version 6).
+ *          A four-byte TLV 0x01 is therefore a different length from the one that IDL declares,
+ *          and the modem refuses it with result 1, error 1 (malformed): TEST5Q,
+ *          test5q-110918.log:449265. An older IDL (LOC v01, and v02 revisions before the mask
+ *          grew) takes four bytes; the client falls back to that form, and says so, when the
+ *          eight-byte one is refused as malformed.
  *   HYPOTHESIS  Start's TLV 0x01 session id, 0x03 "intermediate report", 0x04 minimum interval in
  *          milliseconds, 0x06 fix mode (bitmask, 0 = the engine's default). The client sends
  *          these in a fixed order of attempts -- all of them, then session+interval, then the
@@ -879,14 +901,27 @@ vayu_gnss_reply_mode(const uint8_t *message, size_t length, uint8_t *mode)
 
 /* ---- the requests, as tables of struct qmi_elem_info (sys/hakios.qmi.h) ---------------------- */
 
-/* Register Events (0x0021): TLV 0x01, the mask of the indications that are wanted. */
+/* Register Events (0x0021): TLV 0x01, the mask of the indications that are wanted. Eight bytes:
+ * the LOC v02 IDL of this modem's generation widened the mask to 64 bits (see the FACT above). */
 struct vayu_gnss_reg_events_req {
-	uint32_t mask;
+	uint64_t mask;
 };
 
 static const struct qmi_elem_info vayu_gnss_reg_events_req_ei[] = {
-	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	{ .data_type = QMI_UNSIGNED_8_BYTE, .elem_len = 1, .elem_size = sizeof(uint64_t), .array_type = NO_ARRAY,
 	  .tlv_type = 0x01, .offset = offsetof(struct vayu_gnss_reg_events_req, mask) },
+	{ .data_type = QMI_EOTI },
+};
+
+/* The same request with a four-byte mask: the LOC v01 layout, and what the first LOC v02 revisions
+ * had. Sent only when the modem calls the eight-byte one malformed. */
+struct vayu_gnss_reg_events_req32 {
+	uint32_t mask;
+};
+
+static const struct qmi_elem_info vayu_gnss_reg_events_req32_ei[] = {
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x01, .offset = offsetof(struct vayu_gnss_reg_events_req32, mask) },
 	{ .data_type = QMI_EOTI },
 };
 

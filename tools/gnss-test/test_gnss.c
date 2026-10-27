@@ -138,9 +138,16 @@ test_reg_events(void)
 	struct vayu_gnss_reg_events_req request = {
 		.mask = VAYU_GNSS_EVENT_POSITION | VAYU_GNSS_EVENT_SV_INFO | VAYU_GNSS_EVENT_NMEA,
 	};
+	struct vayu_gnss_reg_events_req32 narrow = { .mask = VAYU_GNSS_EVENT_POSITION | VAYU_GNSS_EVENT_SV_INFO |
+	    VAYU_GNSS_EVENT_NMEA };
 	static const uint8_t want[] = {
-		0x00, 0x00, 0x00, 0x21, 0x00, 0x07, 0x00,       /* request, transaction 0, id 0x0021, 7 bytes */
-		0x01, 0x04, 0x00, 0x07, 0x00, 0x00, 0x00,       /* TLV 0x01, 4 bytes: bits 0, 1 and 2 */
+		0x00, 0x00, 0x00, 0x21, 0x00, 0x0b, 0x00,       /* request, transaction 0, id 0x0021, 11 bytes */
+		0x01, 0x08, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, /* TLV 0x01, 8 bytes: bits 0, 1 and 2 */
+		0x00, 0x00, 0x00,
+	};
+	static const uint8_t want_narrow[] = {
+		0x00, 0x05, 0x00, 0x21, 0x00, 0x07, 0x00,       /* the four-byte form: LOC v01's layout */
+		0x01, 0x04, 0x00, 0x07, 0x00, 0x00, 0x00,
 	};
 	uint8_t out[64];
 	int length;
@@ -148,6 +155,9 @@ test_reg_events(void)
 	length = hakios_qmi_encode(QMI_REQUEST, VAYU_GNSS_LOC_REG_EVENTS, 0, vayu_gnss_reg_events_req_ei, &request,
 	    out, sizeof(out));
 	check_bytes(out, length, want, sizeof(want), "Register Events");
+	length = hakios_qmi_encode(QMI_REQUEST, VAYU_GNSS_LOC_REG_EVENTS, 5, vayu_gnss_reg_events_req32_ei, &narrow,
+	    out, sizeof(out));
+	check_bytes(out, length, want_narrow, sizeof(want_narrow), "Register Events, four-byte fallback");
 }
 
 static void
