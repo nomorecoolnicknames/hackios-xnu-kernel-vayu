@@ -19,6 +19,7 @@
 #import <objc/message.h>
 #include <signal.h>
 #include <sqlite3.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -67,6 +68,8 @@ extern NSString *const ML3TrackPropertyFilePath;
 extern NSString *const ML3TrackPropertyIsPlayable;
 extern NSString *const ML3TrackPropertyIsLocal;
 extern NSString *const ML3TrackPropertyIsCurrentlyRestricted;
+extern NSString *const ML3TrackPropertyIsExplicit;
+extern NSString *const ML3TrackPropertyContentRating;
 #define UTF8(s) ((s) ? [(s) UTF8String] : "(none)")
 
 static int usage(void) {
@@ -78,13 +81,23 @@ static int usage(void) {
 static int error(const char *path) {
 	fprintf(stderr, "music_import: %s: %s\n", path, strerror(errno)); return -1;
 }
-/* One directory, made 0755 and given to mobile when it is not there yet. */
+/* One directory, made 0755 and given to mobile when it is not there yet. R2/TEST5Q: a directory
+ * that is already there is fixed too -- a boot that made it as root, or a copy of the image with
+ * another owner, left mediaserverd (mobile) with a path it could not traverse, and the import then
+ * "worked" with an asset nothing could open. */
 static int make_dir(const char *path) {
 	struct stat status;
 
 	if (stat(path, &status) == 0) {
-		if (S_ISDIR(status.st_mode)) return 0;
-		fprintf(stderr, "music_import: %s is not a directory\n", path); return -1;
+		if (!S_ISDIR(status.st_mode)) {
+			fprintf(stderr, "music_import: %s is not a directory\n", path); return -1;
+		}
+		if ((status.st_mode & 07777) != 0755 || status.st_uid != MOBILE_ID || status.st_gid != MOBILE_ID) {
+			if (chmod(path, 0755) != 0 || chown(path, MOBILE_ID, MOBILE_ID) != 0) return error(path);
+			fprintf(stderr, "music_import: fixed %s (0755, 501:501, was %04o %u:%u)\n", path,
+			    status.st_mode & 07777, status.st_uid, status.st_gid);
+		}
+		return 0;
 	}
 	if (errno != ENOENT || mkdir(path, 0755) != 0) return error(path);
 	if (chmod(path, 0755) != 0 || chown(path, MOBILE_ID, MOBILE_ID) != 0) return error(path);
@@ -238,6 +251,10 @@ dump_row(int64_t pid, const char *when)
 		"SELECT 'row', item_pid, media_type, in_my_library, base_location_id, remote_location_id, title_order, "
 		    "album_pid, item_artist_pid, date_added, keep_local FROM item WHERE item_pid = ?1",
 		"SELECT 'extra', title, location, file_size, total_time_ms, location_kind_id FROM item_extra WHERE item_pid = ?1",
+		/* R2: content_rating 1 is what ML3 calls explicit and what Music refuses when the library's
+		 * MPExplicitContentAllowedBoolean is 0 (see fix_explicitness); read it back every time */
+		"SELECT 'explicit', content_rating, content_rating_level, extended_content_rating "
+		    "FROM item_extra WHERE item_pid = ?1",
 		"SELECT 'base', base_location_id, path FROM base_location",
 	};
 	sqlite3 *h = NULL;
@@ -281,13 +298,16 @@ dump_row(int64_t pid, const char *when)
  * Done here in SQL on the library's own database, as mobile, as small and idempotent as possible.
  */
 static void
-fix_rows(int64_t pid, long long file_size)
+fix_rows(int64_t pid, const char *location, long long file_size)
 {
 	static const char *db = "/var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb";
 	const char *statements[] = {
 		"INSERT OR IGNORE INTO base_location (base_location_id, path) VALUES (3840, 'iTunes_Control/Music/F00')",
+		/* R2: a base whose path is not the one the library resolves (ML3BaseLocationIDFromMediaRelativePath
+		 * InLibrary gave 3840) makes the item's file path point somewhere else */
+		"UPDATE base_location SET path = 'iTunes_Control/Music/F00' WHERE base_location_id = 3840 "
+		    "AND path <> 'iTunes_Control/Music/F00'",
 		"UPDATE item SET in_my_library = 1, date_added = CASE date_added WHEN 0 THEN ?2 ELSE date_added END WHERE item_pid = ?1",
-		"UPDATE item_extra SET file_size = ?3 WHERE item_pid = ?1 AND file_size = 0",
 	};
 	sqlite3 *h = NULL;
 
@@ -309,6 +329,36 @@ fix_rows(int64_t pid, long long file_size)
 		}
 		fprintf(stderr, "music_import: fix %u: %s (%d changed)\n", i, rc == SQLITE_DONE ? "done" : sqlite3_errmsg(h),
 		    sqlite3_changes(h));
+		sqlite3_finalize(st);
+	}
+	/* R2: the row has to describe the file that is there. A stale size (0 from an older import, or
+	 * the size of a different copy) is what ML3's integrity/asset checks and the player's byte-range
+	 * setup read; the file is the source of truth and is stat'ed by both callers. */
+	if (file_size > 0) {
+		sqlite3_stmt *st = NULL;
+
+		if (sqlite3_prepare_v2(h, "UPDATE item_extra SET file_size = ?2 WHERE item_pid = ?1 "
+		    "AND file_size <> ?2", -1, &st, NULL) == SQLITE_OK) {
+			sqlite3_bind_int64(st, 1, pid);
+			sqlite3_bind_int64(st, 2, file_size);
+			fprintf(stderr, "music_import: fix file size: %s (%d changed)\n",
+			    sqlite3_step(st) == SQLITE_DONE ? "done" : sqlite3_errmsg(h), sqlite3_changes(h));
+		}
+		sqlite3_finalize(st);
+	}
+	/* R2: item_extra.location is the file name relative to base_location.path ("RDWD.mp3", base
+	 * "iTunes_Control/Music/F00"); an empty value or an absolute path is not what ML3's file-path
+	 * composition (and the ipod-library asset URL built from it) expects */
+	if (location != NULL && location[0] != '\0') {
+		sqlite3_stmt *st = NULL;
+
+		if (sqlite3_prepare_v2(h, "UPDATE item_extra SET location = ?2 WHERE item_pid = ?1 "
+		    "AND (location IS NULL OR location = '' OR instr(location, '/') > 0)", -1, &st, NULL) == SQLITE_OK) {
+			sqlite3_bind_int64(st, 1, pid);
+			sqlite3_bind_text(st, 2, location, -1, SQLITE_STATIC);
+			fprintf(stderr, "music_import: fix location: %s (%d changed)\n",
+			    sqlite3_step(st) == SQLITE_DONE ? "done" : sqlite3_errmsg(h), sqlite3_changes(h));
+		}
 		sqlite3_finalize(st);
 	}
 	sqlite3_close(h);
@@ -512,6 +562,202 @@ run(sqlite3 *h, const char *what, const char *sql, int n, int64_t v1, int64_t v2
 	return rc;
 }
 
+/*
+ * R2/TEST5Q: Music's "Content restriction" screen. The library's own gate is
+ *   ML3IsCurrentlyRestrictedMedia(item.media_type, item_extra.content_rating,
+ *       item_extra.content_rating_level, (SELECT value FROM _MLDatabaseProperties
+ *       WHERE key='MPExplicitContentAllowedBoolean'))
+ * (MusicLibrary 18.0.0, the expression is a cstring in the binary, and the function at
+ * 0x1a914fae0 returns 1 for content_rating == 1 when that property is 0 or absent; 2 means
+ * "clean", 0 "unrated" and neither is restricted). item_extra has no is_explicit column at
+ * all: content_rating and content_rating_level are the flags. The import leaves them at the
+ * schema defaults (0) but a row repaired by an older run, or written by another importer,
+ * can carry 1, so every repair path pins them to 0 here. Idempotent; a column that this
+ * library does not have is skipped, not guessed. */
+static void
+fix_explicitness_db(sqlite3 *h, int64_t pid)
+{
+	if (pid == 0) {
+		return;
+	}
+	if (table_exists(h, "item_extra") && column_exists(h, "item_extra", "content_rating")) {
+		run(h, "content rating", "UPDATE item_extra SET content_rating = 0 WHERE item_pid = ?1 "
+		    "AND content_rating <> 0", 1, pid, 0, 0);
+	}
+	if (table_exists(h, "item_extra") && column_exists(h, "item_extra", "content_rating_level")) {
+		run(h, "content rating level", "UPDATE item_extra SET content_rating_level = 0 "
+		    "WHERE item_pid = ?1 AND content_rating_level <> 0", 1, pid, 0, 0);
+	}
+	if (table_exists(h, "item_extra") && column_exists(h, "item_extra", "extended_content_rating")) {
+		run(h, "extended content rating", "UPDATE item_extra SET extended_content_rating = '' "
+		    "WHERE item_pid = ?1 AND extended_content_rating <> ''", 1, pid, 0, 0);
+	}
+	if (table_exists(h, "item_video") && column_exists(h, "item_video", "extended_content_rating")) {
+		run(h, "video extended content rating", "UPDATE item_video SET extended_content_rating = '' "
+		    "WHERE item_pid = ?1 AND extended_content_rating <> ''", 1, pid, 0, 0);
+	}
+	if (table_exists(h, "item_extra") && column_exists(h, "item_extra", "content_rating")) {
+		sqlite3_stmt *st = NULL;
+
+		if (sqlite3_prepare_v2(h, "SELECT content_rating, content_rating_level FROM item_extra "
+		    "WHERE item_pid = ?1", -1, &st, NULL) == SQLITE_OK) {
+			sqlite3_bind_int64(st, 1, pid);
+			if (sqlite3_step(st) == SQLITE_ROW) {
+				fprintf(stderr, "music_import: local: explicit flags of %lld: content_rating %d, "
+				    "content_rating_level %d\n", (long long)pid, sqlite3_column_int(st, 0),
+				    sqlite3_column_int(st, 1));
+			}
+		}
+		sqlite3_finalize(st);
+	}
+}
+
+/* One _MLDatabaseProperties value; -1 when the key has no row (the fresh library's state). */
+static int
+database_property(sqlite3 *h, const char *key)
+{
+	sqlite3_stmt *st = NULL;
+	int value = -1;
+
+	if (sqlite3_prepare_v2(h, "SELECT value FROM _MLDatabaseProperties WHERE key = ?1", -1, &st, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
+		if (sqlite3_step(st) == SQLITE_ROW) {
+			value = sqlite3_column_int(st, 0);
+		}
+	}
+	sqlite3_finalize(st);
+	return value;
+}
+
+/*
+ * R2/TEST5Q: the rest of Music's "Content restriction" screen.
+ *
+ * The library's predicate (see fix_explicitness_db) reads
+ * _MLDatabaseProperties.MPExplicitContentAllowedBoolean, and MusicLibrary never writes that key
+ * itself: its own strings have one SELECT for it and only the generic
+ * INSERT OR REPLACE INTO _MLDatabaseProperties (key, value) VALUES (?, ?) as a writer, with no
+ * literal insert anywhere. A fresh library therefore has no row, the subquery is NULL, and an item
+ * with content_rating 1 is then "restricted". Write it as mobile, in the same file the daemon reads.
+ *
+ * The Music app's own screen also asks ManagedConfiguration, through MediaPlayer's
+ * MPRestrictionsMonitor (-[MCProfileConnection isExplicitContentAllowedOutAsk:], which is the
+ * "age restriction" part). MediaPlayer and MusicLibrary both link ManagedConfiguration, and
+ * ML3HasExplicitContentRestriction() (0x1a8faa420) returns (MCFeatureExplicitContentAllowed
+ * effective value == 2), so 0 (unset) and 1 (allowed) are not restricted and only 2 is. The value
+ * is asked here for the log; if the device says no, the user-level Screen Time store
+ * (com.apple.applicationaccess allowExplicitContent) is set and the MC notification posted, then
+ * the answer is asked again. Nothing is invented: everything that could not be read is logged as
+ * unknown.
+ */
+static void
+allow_explicit_content(void)
+{
+	static const char *db = "/var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb";
+	static const char *key = "MPExplicitContentAllowedBoolean";
+	sqlite3 *h = NULL;
+	void *mc = NULL;
+
+	if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK) {
+		sqlite3_stmt *st = NULL;
+		int before, after;
+
+		sqlite3_busy_timeout(h, 5000);
+		before = database_property(h, key);
+		if (sqlite3_prepare_v2(h, "INSERT OR REPLACE INTO _MLDatabaseProperties (key, value) "
+		    "VALUES (?1, 1)", -1, &st, NULL) == SQLITE_OK) {
+			sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
+			fprintf(stderr, "music_import: restrictions: %s: %s\n", key,
+			    sqlite3_step(st) == SQLITE_DONE ? "written" : sqlite3_errmsg(h));
+		} else {
+			fprintf(stderr, "music_import: restrictions: %s: %s\n", key, sqlite3_errmsg(h));
+		}
+		sqlite3_finalize(st);
+		after = database_property(h, key);
+		fprintf(stderr, "music_import: restrictions: %s was %s, is %s (1 = explicit content allowed)\n", key,
+		    before < 0 ? "absent" : before ? "1" : "0", after < 0 ? "absent" : after ? "1" : "0");
+		sqlite3_close(h);
+	} else {
+		fprintf(stderr, "music_import: restrictions: cannot open %s: %s\n", db, h ? sqlite3_errmsg(h) : "?");
+		sqlite3_close(h);
+	}
+	{
+		NSString *feature = nil;
+		id connection = nil;
+		NSInteger effective = -1;
+		BOOL ask = NO, allowed = YES;
+
+		mc = dlopen("/System/Library/PrivateFrameworks/ManagedConfiguration.framework/ManagedConfiguration",
+		    RTLD_LAZY);
+		if (mc != NULL) {
+			NSString *const *slot = (NSString *const *)dlsym(mc, "MCFeatureExplicitContentAllowed");
+
+			feature = slot != NULL ? *slot : nil;
+		} else {
+			fprintf(stderr, "music_import: restrictions: no ManagedConfiguration: %s\n", dlerror());
+		}
+		Class connection_class = NSClassFromString(@"MCProfileConnection");
+
+		if (connection_class != Nil) {
+			connection = ((id (*)(id, SEL))objc_msgSend)(connection_class, @selector(sharedConnection));
+		}
+		if (feature != nil && connection != nil &&
+		    [connection respondsToSelector:@selector(effectiveValueForSetting:)]) {
+			effective = ((NSInteger (*)(id, SEL, id))objc_msgSend)(connection,
+			    @selector(effectiveValueForSetting:), feature);
+		}
+		if (connection != nil && [connection respondsToSelector:@selector(isExplicitContentAllowedOutAsk:)]) {
+			allowed = ((BOOL (*)(id, SEL, BOOL *))objc_msgSend)(connection,
+			    @selector(isExplicitContentAllowedOutAsk:), &ask);
+		} else {
+			fprintf(stderr, "music_import: restrictions: MCProfileConnection %s\n",
+			    connection == nil ? "is not there" : "has no isExplicitContentAllowedOutAsk:");
+			allowed = YES;
+		}
+		fprintf(stderr, "music_import: restrictions: MCFeatureExplicitContentAllowed effective %ld "
+		    "(0 unset, 1 allowed, 2 not allowed), explicit content allowed %d, age asked %d\n",
+		    (long)effective, allowed ? 1 : 0, ask ? 1 : 0);
+		if (!allowed || effective == 2) {
+			Boolean synced;
+
+			CFPreferencesSetAppValue(CFSTR("allowExplicitContent"), kCFBooleanTrue,
+			    CFSTR("com.apple.applicationaccess"));
+			synced = CFPreferencesAppSynchronize(CFSTR("com.apple.applicationaccess"));
+			fprintf(stderr, "music_import: restrictions: com.apple.applicationaccess "
+			    "allowExplicitContent = true (synchronised %d)\n", synced ? 1 : 0);
+			{
+				NSString *const *slot = mc != NULL ?
+				    (NSString *const *)dlsym(mc, "MCEffectiveSettingsChangedNotification") : NULL;
+
+				if (slot != NULL && *slot != nil) {
+					CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+					    (__bridge CFStringRef)*slot, NULL, NULL, true);
+					fprintf(stderr, "music_import: restrictions: posted %s\n", [*slot UTF8String]);
+				}
+			}
+			if (feature != nil && [connection respondsToSelector:@selector(setValue:forSetting:)]) {
+				@try {
+					((void (*)(id, SEL, id, id))objc_msgSend)(connection,
+					    @selector(setValue:forSetting:), @YES, feature);
+					fprintf(stderr, "music_import: restrictions: setValue:forSetting: sent\n");
+				} @catch (NSException *exception) {
+					fprintf(stderr, "music_import: restrictions: setValue:forSetting: %s\n",
+					    UTF8([exception reason]));
+				}
+			}
+			allowed = YES;
+			ask = NO;
+			if (connection != nil &&
+			    [connection respondsToSelector:@selector(isExplicitContentAllowedOutAsk:)]) {
+				allowed = ((BOOL (*)(id, SEL, BOOL *))objc_msgSend)(connection,
+				    @selector(isExplicitContentAllowedOutAsk:), &ask);
+			}
+			fprintf(stderr, "music_import: restrictions: after the write: allowed %d, age asked %d\n",
+			    allowed ? 1 : 0, ask ? 1 : 0);
+		}
+	}
+	/* ManagedConfiguration stays loaded: MCProfileConnection holds state this process may still ask for */
+}
+
 /* A letter's place among the sections ("#" is 0), the way a name's first character sorts. */
 static int
 section_of(NSString *name)
@@ -603,9 +849,16 @@ repair_local(int64_t pid, NSString *title, NSString *artist, NSString *album, lo
 	    "WHERE item_pid = ?1", 2, pid, now, 0);
 	/* keep_local_status stays 0: keep_local = 1 is what "on this device" means, and a status made up
 	 * here could be read as a download request for a cloud asset we do not have */
-	run(h, "item_extra", "UPDATE item_extra SET file_size = CASE file_size WHEN 0 THEN ?2 ELSE file_size END, "
-	    "date_created = CASE date_created WHEN 0 THEN ?3 ELSE date_created END WHERE item_pid = ?1",
-	    3, pid, file_size, now);
+	/* R2: this library's item_extra has no date_created (TEST5Q line 449641: "no such column:
+	 * date_created"), and one failing statement took file_size down with it; one column at a time */
+	run(h, "item_extra file size", "UPDATE item_extra SET file_size = CASE file_size WHEN 0 THEN ?2 "
+	    "ELSE file_size END WHERE item_pid = ?1", 2, pid, file_size, 0);
+	if (column_exists(h, "item_extra", "date_created")) {
+		run(h, "item_extra date created", "UPDATE item_extra SET date_created = CASE date_created WHEN 0 "
+		    "THEN ?2 ELSE date_created END WHERE item_pid = ?1", 2, pid, now, 0);
+	}
+	/* R2: never leave an explicit bit on the item (see fix_explicitness_db) */
+	fix_explicitness_db(h, pid);
 	/* significantAmountHasBeenPlayed is (total_time_ms - bookmark_time_ms < 30 s AND total_time_ms > 60 s) OR
 	 * (bookmark_time_ms >= .95 * total_time_ms) (MusicLibrary, _ML3TrackPropertySignificantAmountHasBeenPlayed);
 	 * with total_time_ms = 0 its second half is 0 >= 0 -- true -- and the provider's "not played" filter would
@@ -785,6 +1038,91 @@ dump_songs(int64_t pid)
 		sqlite3_finalize(st);
 	}
 	sqlite3_close(h);
+}
+
+/*
+ * R2/TEST5Q: the asset Music hands to AVPlayer is the file behind the row, and the row is only a
+ * path: base_location.path + item_extra.location, both relative to /var/mobile/Media. Music names it
+ * ipod-library://item/item.mp3?id=<pid>, mediaserverd opens the file as mobile (501). This prints
+ * every component with its mode and owner, opens and reads the first bytes of the file in this
+ * process (mobile at this point) and compares the row's path with the file that was imported, so a
+ * "not readable" answer in the next run is evidence and not a guess.
+ */
+static void
+report_asset(int64_t pid, const char *destination)
+{
+	static const char *db = "/var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb";
+	static const char *dirs[] = { MEDIA, MEDIA "/iTunes_Control", MEDIA "/iTunes_Control/Music", MUSIC_DIR };
+	char path[4096], base[1024] = "", location[1024] = "", composed[4096] = "";
+	struct stat status;
+	unsigned i;
+	int64_t base_id = 0;
+	sqlite3 *h = NULL;
+
+	for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		if (stat(dirs[i], &status) != 0) {
+			fprintf(stderr, "music_import: asset: %s: %s\n", dirs[i], strerror(errno));
+			continue;
+		}
+		fprintf(stderr, "music_import: asset: %s mode %04o owner %u:%u, readable and searchable %s\n", dirs[i],
+		    (unsigned)(status.st_mode & 07777), status.st_uid, status.st_gid,
+		    access(dirs[i], R_OK | X_OK) == 0 ? "yes" : "NO");
+	}
+	snprintf(path, sizeof(path), "%s/%s", MUSIC_DIR, destination);
+	if (stat(path, &status) != 0) {
+		fprintf(stderr, "music_import: asset: %s: %s\n", path, strerror(errno));
+	} else {
+		unsigned char head[16];
+		ssize_t got = -1, b;
+		int fd = open(path, O_RDONLY);
+
+		if (fd >= 0) {
+			got = read(fd, head, sizeof(head));
+			close(fd);
+		}
+		fprintf(stderr, "music_import: asset: %s mode %04o owner %u:%u size %lld, opened %s, read %zd bytes%s",
+		    path, (unsigned)(status.st_mode & 07777), status.st_uid, status.st_gid,
+		    (long long)status.st_size, fd >= 0 ? "yes" : "NO", got, got > 0 ? ":" : "");
+		for (b = 0; b < got && b < (ssize_t)sizeof(head); b++) {
+			fprintf(stderr, "%s%02x", b ? " " : " ", head[b]);
+		}
+		fprintf(stderr, "\n");
+	}
+	if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+		sqlite3_stmt *st = NULL;
+
+		if (sqlite3_prepare_v2(h, "SELECT item.base_location_id, item_extra.location FROM item "
+		    "LEFT JOIN item_extra ON item_extra.item_pid = item.item_pid WHERE item.item_pid = ?1",
+		    -1, &st, NULL) == SQLITE_OK) {
+			sqlite3_bind_int64(st, 1, pid);
+			if (sqlite3_step(st) == SQLITE_ROW) {
+				const unsigned char *v;
+
+				base_id = sqlite3_column_int64(st, 0);
+				v = sqlite3_column_text(st, 1);
+				if (v != NULL) snprintf(location, sizeof(location), "%s", (const char *)v);
+			}
+		}
+		sqlite3_finalize(st);
+		if (sqlite3_prepare_v2(h, "SELECT path FROM base_location WHERE base_location_id = ?1",
+		    -1, &st, NULL) == SQLITE_OK) {
+			sqlite3_bind_int64(st, 1, base_id);
+			if (sqlite3_step(st) == SQLITE_ROW) {
+				const unsigned char *v = sqlite3_column_text(st, 0);
+
+				if (v != NULL) snprintf(base, sizeof(base), "%s", (const char *)v);
+			}
+		}
+		sqlite3_finalize(st);
+		sqlite3_close(h);
+		snprintf(composed, sizeof(composed), "%s/%s/%s", MEDIA, base, location);
+		fprintf(stderr, "music_import: asset: the row is base %lld \"%s\" + location \"%s\" = %s; the file "
+		    "imported is %s: %s\n", (long long)base_id, base, location, composed, path,
+		    strcmp(composed, path) == 0 ? "the same" : "NOT the same");
+	} else {
+		fprintf(stderr, "music_import: asset: cannot open %s: %s\n", db, h ? sqlite3_errmsg(h) : "?");
+		sqlite3_close(h);
+	}
 }
 
 /*
@@ -1069,6 +1407,100 @@ drop_stale_rows(const char *location, int64_t keep)
 	sqlite3_close(h);
 }
 
+/* The item a file name belongs to: item_extra.location is the file name relative to its base. */
+static int64_t
+find_pid(const char *location)
+{
+	static const char *db = "/var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb";
+	sqlite3 *h = NULL;
+	sqlite3_stmt *st = NULL;
+	int64_t pid = 0;
+
+	if (location == NULL || location[0] == '\0') {
+		return 0;
+	}
+	if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+		fprintf(stderr, "music_import: find: cannot open %s: %s\n", db, h ? sqlite3_errmsg(h) : "?");
+		sqlite3_close(h);
+		return 0;
+	}
+	if (sqlite3_prepare_v2(h, "SELECT item_pid FROM item_extra WHERE location = ?1", -1, &st, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(st, 1, location, -1, SQLITE_STATIC);
+		if (sqlite3_step(st) == SQLITE_ROW) {
+			pid = sqlite3_column_int64(st, 0);
+		}
+	}
+	sqlite3_finalize(st);
+	sqlite3_close(h);
+	return pid;
+}
+
+/* One place for "tell the library", used by the import and by the repair of an earlier import. */
+static void
+tell_library_changed(void)
+{
+	ML3MusicLibrary *library = [ML3MusicLibrary autoupdatingSharedLibrary];
+
+	if (library != nil && [library respondsToSelector:@selector(notifyContentsDidChange)]) {
+		[library notifyContentsDidChange];
+		fprintf(stderr, "music_import: told the library its contents changed\n");
+	} else {
+		fprintf(stderr, "music_import: the library has no notifyContentsDidChange\n");
+	}
+}
+
+/*
+ * R2/TEST5Q: what a marker-only boot has to do. The marker is written once, at the end of a
+ * successful import, and the first thing import() did on every later boot was return because of it
+ * (TEST5Q log line 2779992). So the row that Music refused (explicit, or an asset nobody could open)
+ * was never touched again by any boot. Everything the import repairs is idempotent and keyed by the
+ * item's pid, so run the same repair on the row the marker stands for; -1 only when the marker has
+ * no row at all (then the caller imports for real).
+ */
+static int
+repair_imported(const char *destination)
+{
+	char path[4096];
+	struct stat status;
+	NSString *t = nil, *a = nil, *al = nil, *g = nil;
+	double secs = 0;
+	long long size = 0;
+	int64_t pid = find_pid(destination);
+
+	if (pid == 0) {
+		fprintf(stderr, "music_import: no row names %s\n", destination);
+		return -1;
+	}
+	fprintf(stderr, "music_import: the marker is there; repairing item %lld instead of returning\n",
+	    (long long)pid);
+	if (getuid() == 0) {
+		(void)setgroups(0, NULL);
+		if (setgid(MOBILE_ID) != 0 || setuid(MOBILE_ID) != 0) {
+			fprintf(stderr, "music_import: setgid/setuid: %s\n", strerror(errno)); return 1;
+		}
+		setenv("HOME", "/var/mobile", 1);
+		setenv("CFFIXED_USER_HOME", "/var/mobile", 1);
+	}
+	snprintf(path, sizeof(path), "%s/%s", MUSIC_DIR, destination);
+	if (stat(path, &status) == 0) {
+		size = (long long)status.st_size;
+	}
+	read_metadata(path, [[NSString stringWithUTF8String:destination] stringByDeletingPathExtension], &t, &a, &al,
+	    &g, &secs);
+	fprintf(stderr, "music_import: repair: artist \"%s\", album \"%s\", %lld bytes\n", UTF8(a), UTF8(al), size);
+	repair_entities(pid, a, al);
+	fix_rows(pid, destination, size);
+	repair_local(pid, t, a, al, size, secs);
+	allow_explicit_content();
+	report_asset(pid, destination);
+	dump_row(pid, "after the repair (marker present)");
+	dump_songs(pid);
+	media_query("after the repair (marker present)", pid);
+	tell_library_changed();
+	fprintf(stderr, "music_import: done\n");
+	return 0;
+}
+
 static int import(int argc, char **argv) {
 	const char *source, *dest = "RDWD.mp3";
 	double wait = 0;
@@ -1130,7 +1562,10 @@ static int import(int argc, char **argv) {
 				    &g, &secs);
 				fprintf(stderr, "music_import: repair: artist \"%s\", album \"%s\", %lld bytes\n", UTF8(a), UTF8(al), size);
 				repair_entities(pid, a, al);
+				fix_rows(pid, name, size);
 				repair_local(pid, t, a, al, size, secs);
+				allow_explicit_content();
+				report_asset(pid, name);
 			}
 			dump_row(pid, "after the repair");
 			dump_songs(pid);
@@ -1186,7 +1621,16 @@ static int import(int argc, char **argv) {
 	    make_dir(MEDIA "/iTunes_Control/Music") != 0 || make_dir(MUSIC_DIR) != 0 ||
 	    make_dir(ITUNES_DIR) != 0) return 1;
 	if (access(marker_path, F_OK) == 0) {
-		fprintf(stderr, "music_import: already imported: %s\n", marker_path); return 0;
+		int repaired;
+
+		fprintf(stderr, "music_import: already imported: %s\n", marker_path);
+		say_step("repairing the row an earlier boot imported");
+		repaired = repair_imported(dest);
+		if (repaired == 0) {
+			return 0;
+		}
+		/* a marker without a row (a library that was dropped, a row deleted here): import it again */
+		fprintf(stderr, "music_import: the marker %s has no row; importing it again\n", marker_path);
 	}
 	signal(SIGALRM, died);
 	signal(SIGSEGV, died);
@@ -1244,24 +1688,26 @@ static int import(int argc, char **argv) {
 	@catch (NSException *exception) {
 		fprintf(stderr, "music_import: setValue in-my-library: %s\n", UTF8([exception reason]));
 	}
-	fix_rows([track persistentID], copied);
+	fix_rows([track persistentID], dest, copied);
 	repair_entities([track persistentID], artist, album);
 	repair_local([track persistentID], title, artist, album, copied, seconds);
+	allow_explicit_content();
+	report_asset([track persistentID], dest);
 	drop_stale_rows(dest, [track persistentID]);
 	dump_songs([track persistentID]);
-	fprintf(stderr, "music_import: the track says now: file path %s, playable %s, local %s, restricted %s\n",
+	fprintf(stderr, "music_import: the track says now: file path %s, playable %s, local %s, restricted %s, "
+	    "explicit %s, content rating %s\n",
 	    UTF8([[track valueForProperty:ML3TrackPropertyFilePath] description]),
 	    UTF8([[track valueForProperty:ML3TrackPropertyIsPlayable] description]),
 	    UTF8([[track valueForProperty:ML3TrackPropertyIsLocal] description]),
-	    UTF8([[track valueForProperty:ML3TrackPropertyIsCurrentlyRestricted] description]));
+	    UTF8([[track valueForProperty:ML3TrackPropertyIsCurrentlyRestricted] description]),
+	    UTF8([[track valueForProperty:ML3TrackPropertyIsExplicit] description]),
+	    UTF8([[track valueForProperty:ML3TrackPropertyContentRating] description]));
 	dump_row([track persistentID], "after completing");
 	say_step("asking MediaPlayer what Music would list");
 	media_query("after completing", [track persistentID]);
 	say_step("telling the library");
-	if ([library respondsToSelector:@selector(notifyContentsDidChange)]) {
-		[library notifyContentsDidChange];
-		fprintf(stderr, "music_import: told the library its contents changed\n");
-	} else fprintf(stderr, "music_import: the library has no notifyContentsDidChange\n");
+	tell_library_changed();
 	marker = open(marker_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (marker < 0) { error(marker_path); return 1; }
 	if (write(marker, dest, strlen(dest)) != (ssize_t)strlen(dest) || write(marker, "\n", 1) != 1) {

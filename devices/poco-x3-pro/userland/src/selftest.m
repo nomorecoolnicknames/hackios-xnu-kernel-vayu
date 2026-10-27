@@ -1066,6 +1066,7 @@ stage_music(double at, const char *source, const char *track_name)
 	MPMediaItem *item = nil;
 	unsigned long songs = 0, wide = 0;
 	int import_ok = 0, alive, played = 0, exit_code;
+	int explicit = -1;   /* R2: -1 = the item was not found, 0/1 = MPMediaItemPropertyIsExplicit */
 	const char *played_with = "none";
 
 	g_stage = "music";
@@ -1127,6 +1128,12 @@ stage_music(double at, const char *source, const char *track_name)
 		stage_say("the track in the library: title \"%s\", artist \"%s\", %.1f s, assetURL %s (found by %s)",
 		    utf8([item title]), utf8([item artist]), (double)[item playbackDuration],
 		    utf8([item assetURL]), [how UTF8String]);
+		/* R2/TEST5Q: ML3's isExplicit is (item_extra.content_rating == 1); Music's
+		 * "Content restriction" screen follows this flag and the device's explicit-content
+		 * setting, so the next log has to say which of the two the item carries */
+		explicit = [[item valueForProperty:MPMediaItemPropertyIsExplicit] boolValue] ? 1 : 0;
+		stage_say("the track's explicit flag: %d (ML3 item_extra.content_rating == 1), media type %lu", explicit,
+		    (unsigned long)[[item valueForProperty:MPMediaItemPropertyMediaType] integerValue]);
 	} else {
 		stage_say("the track is NOT in the songs query (no assetURL for %s)", track_name);
 	}
@@ -1169,9 +1176,10 @@ stage_music(double at, const char *source, const char *track_name)
 		played_with = "none";
 	}
 	stage_result(alive && import_ok && songs > 0 && played,
-	    "medialibraryd=%d imported=%s songs=%lu play=%s timeControlStatus=%s status=%s",
+	    "medialibraryd=%d imported=%s songs=%lu play=%s timeControlStatus=%s status=%s explicit=%s",
 	    alive ? 1 : 0, import_ok ? "yes" : "no", songs, played_with,
-	    played ? "playing" : "not-playing", played ? "ok" : "failed");
+	    played ? "playing" : "not-playing", played ? "ok" : "failed",
+	    explicit < 0 ? "unknown" : explicit ? "yes" : "no");
 	return alive && import_ok && songs > 0 && played;
 }
 
