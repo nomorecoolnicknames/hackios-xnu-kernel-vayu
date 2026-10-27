@@ -105,6 +105,31 @@ static char             gSurfaceTraceOf[32];
 
 extern "C" void loader_log_line(const char *line);
 
+/*
+ * Every line of this file goes to the loader's log too, which is the one a run's log keeps: IOLog
+ * alone does not reach it (MiniIOMobileFramebuffer.cpp says why at its top). What is here is the
+ * surfaces' own account -- made, freed, and what that cost (MiniIOSurfaceCost()) -- and the scanout
+ * pool's setup, none of which a run could see before: T120b.
+ */
+extern "C" void loader_log_putc(char c);
+
+static void surfaceLog(const char * format, ...) __printflike(1, 2);
+static void
+surfaceLog(const char * format, ...)
+{
+	char line[512];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char * c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	(IOLog)("%s", line);                    /* (in parentheses: IOLog is this, below) */
+}
+#define IOLog(...)      surfaceLog(__VA_ARGS__)
+
 /* A line about a traced surface: to the loader's log too, where it outlives the kernel's own, short log. */
 static void
 traceLine(const char * format, ...)
@@ -118,7 +143,7 @@ traceLine(const char * format, ...)
 	if (gSurfaceTraceOf[0] != 0) {
 		loader_log_line(line);
 	}
-	IOLog("%s", line);
+	(IOLog)("%s", line);                    /* (not the tee: a traced line is in the loader's log already) */
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */

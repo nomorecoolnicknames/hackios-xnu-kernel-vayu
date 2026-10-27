@@ -45,6 +45,34 @@
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 
+/*
+ * Every line of this file also goes to the loader's log, which is the one a run's log keeps: IOLog
+ * alone does not reach it (MiniIOMobileFramebuffer.cpp says the same at its top, and the TEST5Q run
+ * with 2.8 million lines has not one "HakiosGPU:" line in it while it has every printf of bsd/dev/).
+ * The five-second summary below is the only place the GPU's own work per submission is written down
+ * ("the GPU worked %llu us on each of %u", with the 0.1/0.25/0.5/1/2/4 ms buckets, the cache pushes
+ * and the waits), and a display whose frames come late cannot be told from a window server that asks
+ * for them late without it: T120b.
+ */
+extern "C" void loader_log_putc(char c);
+
+static void gpuLog(const char * format, ...) __printflike(1, 2);
+static void
+gpuLog(const char * format, ...)
+{
+	char line[512];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char * c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	(IOLog)("%s", line);                    /* (in parentheses: IOLog is this, below) */
+}
+#define IOLog(...)      gpuLog(__VA_ARGS__)
+
 extern "C" {
 /* bsd/dev/hakios.adreno.c ("the GPU kept on"; declared in bsd/sys/hakios.input.h, which is not seen from here) */
 bool hakios_gpu_ready(void);
