@@ -2137,15 +2137,16 @@ struct hfi_bw_table {
 static struct hfi_perf_table perf;
 static struct hfi_bw_table bw;
 static uint32_t hfi_number, core_speed, speed_levels;
-static bool hfi_quiet;                  /* a message that is not to be said on the way out (hfi_send; a speed vote of vayu_gpu_idle) */
-static bool hfi_taken;                  /* the GMU looked at the last message sent, answered or not (hfi_send) */
 /*
  * How long a message waits for the GMU's answer, in 100 us (hfi_send). A second for the bring-up, where a
  * stuck message is the thing to see; two milliseconds for a vote in the middle of a submission: the GMU
  * does not answer message 30 until it has carried it out, and step 18 of every boot of the TEST5Q run saw
  * that answer come late ("the GMU answers message 30 ... late: verdict 0", 73 of 73 boots) -- a submission
- * that waited for it would hold the frame for a second (8.33 ms is a frame at 120 Hz).
+ * that waited for it would hold the frame for a second (8.33 ms is a frame at 120 Hz). A vote that is
+ * asked for quietly takes HFI_QUIET_PATIENCE instead; both are handed to hfi_send, not left in a global
+ * that the idle thread and a client's submission would write over each other.
  */
+#define HFI_QUIET_PATIENCE      20              /* (2 ms) */
 static uint32_t hfi_patience = 10000;
 static bool staged;                     /* vayu_adreno=N: the step-by-step bring-up, not the default path */
 static uint32_t hfi_late, hfi_late_verdict = ~0u;   /* a message whose answer may still come */
@@ -2154,7 +2155,7 @@ static uint32_t gpu_bus_index;          /* step 18's speed-vote bus index, for t
 
 /* Everything waiting in a queue of the GMU's; true if the answer to the message numbered `number` was among it. */
 static bool
-hfi_receive(unsigned which, uint32_t number, uint32_t *verdict)
+hfi_receive(unsigned which, uint32_t number, uint32_t *verdict, bool quiet)
 {
 	volatile struct hfi_queue *queue = &hfi->queue[which];
 	volatile uint32_t *data = (volatile uint32_t *)((vm_offset_t)hfi + HFI_QUEUE_AT(which));
@@ -2175,8 +2176,10 @@ hfi_receive(unsigned which, uint32_t number, uint32_t *verdict)
 			answered = true;
 		} else if ((message[0] >> 16 & 0xf) == HFI_ANSWER && hfi_late != 0 && message[1] >> 20 == hfi_late) {
 			/* the GMU answers the speed vote only once it has carried it out (171211: after GX was up) */
-			printf("vayu: %u: the GMU answers message %u (number %u) late: verdict %#x\n", step, message[1] & 0xff,
-			    hfi_late, message[2]);
+			if (!quiet) {
+				printf("vayu: %u: the GMU answers message %u (number %u) late: verdict %#x\n", step,
+				    message[1] & 0xff, hfi_late, message[2]);
+			}
 			hfi_late_verdict = message[2];
 			hfi_late = 0;
 		} else {
@@ -2184,7 +2187,7 @@ hfi_receive(unsigned which, uint32_t number, uint32_t *verdict)
 			if ((message[0] & 0xff) == HFI_ERROR) {         /* vendor's adreno_a6xx_receive_err_req */
 				printf("vayu: %u: THE GMU REPORTS AN ERROR: %u, %u, \"%s\"\n", step, message[1] >> 16,
 				    message[1] & 0xffff, (const char *)&message[2]);
-			} else if (!hfi_quiet) {
+			} else if (!quiet) {
 				/* (not from the middle of a submission: a vote's late answer is drained here, some 9 ms of line) */
 				printf("vayu: %u: the GMU says (queue %u, %u words): %#x %#x %#x %#x %#x %#x\n", step, which, words,
 				    message[0], message[1], message[2], message[3], message[4], message[5]);
@@ -2220,20 +2223,27 @@ hfi_give(void)
 	__atomic_store_n(&hfi_busy, 0, __ATOMIC_RELEASE);
 }
 
-/* Send a message whose first word is yet to be made and wait for the GMU's verdict on it. */
+/*
+ * Send a message whose first word is yet to be made and wait for the GMU's verdict on it.
+ * `quiet`: nothing on the way out, and a short patience -- a vote sent from the middle of a
+ * submission. `taken` (may be NULL): the GMU looked at the message before its patience ran out,
+ * answered or not; it is read here, under the one-message-at-a-time lock, so a vote of the idle
+ * thread and a vote of a submission cannot read each other's.
+ */
 static bool
-hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
+hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words, bool quiet, bool *taken)
 {
 	volatile struct hfi_queue *queue = &hfi->queue[0];
 	volatile uint32_t *data = (volatile uint32_t *)((vm_offset_t)hfi + HFI_QUEUE_AT(0));
-	uint32_t at, number, verdict = 0, waiting = 0;
+	uint32_t at, number, verdict = 0, waiting = 0, patience;
 	bool answered = false;
 
 	hfi_take();                             /* (one message at a time: the idle vote and a submission's vote come from two threads) */
+	patience = quiet ? HFI_QUIET_PATIENCE : hfi_patience;
 	at = queue->write % HFI_QUEUE_WORDS;
 	number = ++hfi_number & 0xfff;
 	message[0] = id | words << 8 | number << 20;
-	if (!hfi_quiet) {
+	if (!quiet) {
 		printf("vayu: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
 	}
 	snprintf(last_write, sizeof(last_write), "step %u sent the GMU message %u (%s)", step, id, what);
@@ -2245,30 +2255,34 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 	queue->write = at;
 	settle();
 	wr(gmu.base + GMU_HOST2GMU_INTR_SET, 1);
-	for (uint32_t i = 0; i < hfi_patience && !answered; i++) {
+	for (uint32_t i = 0; i < patience && !answered; i++) {
 		sleep_us(100);
 		waiting = rd(gmu.base + GMU_GMU2HOST_INTR_INFO);
 		if (waiting & 1) {
 			wr(gmu.base + GMU_GMU2HOST_INTR_CLR, 1);
 		}
 		/* the answer queue is looked at whether or not the interrupt bit came: it shows which of the two failed */
-		answered = hfi_receive(1, number, &verdict);
-		if (answered && !(waiting & 1)) {
+		answered = hfi_receive(1, number, &verdict, quiet);
+		if (answered && !(waiting & 1) && !quiet) {
 			printf("vayu: %u: the GMU answered in its queue without raising gmu2host_intr_info\n", step);
 		}
 		if (rd(gmu.base + GMU_CM3_FW_INIT_RESULT) & GMU_FAILED) {
 			break;
 		}
 	}
-	hfi_receive(2, ~0u, &waiting);
+	hfi_receive(2, ~0u, &waiting, quiet);
+	/*
+	 * Was it taken? read == write on queue 0: the GMU looked at the message (its answer may come later,
+	 * as message 30's did at step 18 of every boot of the TEST5Q run); read behind: it never did. Read
+	 * here, before the lock is given back, so that a vote of the idle thread and a vote of a submission
+	 * each see their own message and not the one that came after it.
+	 */
+	if (taken != NULL) {
+		*taken = answered || hfi->queue[0].read == hfi->queue[0].write;
+	}
 	hfi_give();
 	if (!answered || verdict != 0) {
-		/*
-		 * Was it taken? read == write on queue 0: the GMU looked at the message (its answer may come later,
-		 * as message 30's did at step 18 of every boot of the TEST5Q run); read behind: it never did.
-		 */
-		hfi_taken = !answered && hfi->queue[0].read == hfi->queue[0].write;
-		if (hfi_quiet) {
+		if (quiet) {
 			return false;                   /* (a vote in the middle of a submission: no lines, the caller tells) */
 		}
 		printf("vayu: %u: the GMU %s (%#x) to %s; fw_init_result %#x, gmu2host_intr_info %#x\n", step,
@@ -2733,8 +2747,8 @@ step_core_power(void)
 	announce(what);
 	printf("vayu: options: fence %s, ECP control %s, bus index %u\n", fence ? "on" : "off", ecp_control ? "on" : "off",
 	    bus_index);
-	if (!hfi_send("the table of speeds", HFI_PERF_TABLE, &perf.header, sizeof(perf) / 4) ||
-	    !hfi_send("the table of bus votes", HFI_BW_TABLE, &bw.header, sizeof(bw) / 4)) {
+	if (!hfi_send("the table of speeds", HFI_PERF_TABLE, &perf.header, sizeof(perf) / 4, false, NULL) ||
+	    !hfi_send("the table of bus votes", HFI_BW_TABLE, &bw.header, sizeof(bw) / 4, false, NULL)) {
 		return false;
 	}
 	if (ecp_control) {
@@ -2746,12 +2760,12 @@ step_core_power(void)
 		 * header is { feature, enable, data } (vendor kgsl_hfi.h:80, 304-309). An unanswered
 		 * feature control does not fail the step: one line is printed and the step goes on.
 		 */
-		if (!hfi_send("feature control: ECP off (as the vendor driver sends it)", HFI_FEATURE_CTRL, ecp, 3)) {
+		if (!hfi_send("feature control: ECP off (as the vendor driver sends it)", HFI_FEATURE_CTRL, ecp, 3, false, NULL)) {
 			printf("vayu: %u: the GMU did not answer the ECP feature control; going on\n", step);
 		}
 	}
-	if (!hfi_send("\"core firmware start\"", HFI_CORE_FW_START, core_start, 2) ||
-	    !hfi_send("\"start\"", HFI_START, start, 1)) {
+	if (!hfi_send("\"core firmware start\"", HFI_CORE_FW_START, core_start, 2, false, NULL) ||
+	    !hfi_send("\"start\"", HFI_START, start, 1, false, NULL)) {
 		return false;
 	}
 	/*
@@ -2767,7 +2781,7 @@ step_core_power(void)
 	 * vote will not grant that either, and the step then fails there, with the RPMh channel shown.
 	 */
 	vote[3] = bus_index;                    /* vayu_gpu_bw=N; the vendor's INVALID_DCVS_IDX is 0xff (kgsl_gmu_core.h:36) */
-	if (!hfi_send("the speed wanted", HFI_GX_BW_PERF_VOTE, vote, 4)) {
+	if (!hfi_send("the speed wanted", HFI_GX_BW_PERF_VOTE, vote, 4, false, NULL)) {
 		uint32_t strict = 0;
 
 		hfi_late = hfi_number & 0xfff;          /* its answer is looked for until the end of the step */
@@ -2812,7 +2826,7 @@ step_core_power(void)
 		uint32_t ignored = 0;
 
 		for (int i = 0; i < 1000 && hfi_late != 0; i++) {
-			hfi_receive(1, ~0u, &ignored);
+			hfi_receive(1, ~0u, &ignored, false);
 			if (hfi_late != 0) {
 				sleep_us(1000);
 			}
@@ -3283,14 +3297,15 @@ vayu_gpu_kept(void)
  * given, whether or not its answer came, and `core_speed` follows it. That is what the idle half needs:
  * a vote recorded as refused would leave the driver thinking the core is still at 499 MHz while the GMU
  * has taken it down to 257, and no submission would ever vote it back up. `quiet`: nothing on the way
- * out, and hfi_patience short -- the vote is sent from the middle of a submission then.
+ * out, and HFI_QUIET_PATIENCE instead of hfi_patience -- the vote is sent from the middle of a
+ * submission then.
  */
 static bool
 gpu_vote_speed(uint32_t speed, const char *what, bool quiet)
 {
 	uint32_t message[4] = { 1, 0, 0, 0 };
 	uint32_t saved = step;
-	bool ok;
+	bool ok, taken = false;
 
 	if (!gpu_kept || !gmu_talks || !core_runs || speed >= perf.gpu_levels) {
 		return false;
@@ -3298,16 +3313,9 @@ gpu_vote_speed(uint32_t speed, const char *what, bool quiet)
 	message[2] = speed;
 	message[3] = gpu_bus_index;
 	step = 0;                               /* (a vote after the bring-up is not a step) */
-	hfi_quiet = quiet;
-	hfi_taken = false;
-	if (quiet) {
-		hfi_patience = 20;              /* (2 ms: a frame at 120 Hz is 8.33) */
-	}
-	ok = hfi_send(what, HFI_GX_BW_PERF_VOTE, message, 4);
-	hfi_patience = 10000;
-	hfi_quiet = false;
+	ok = hfi_send(what, HFI_GX_BW_PERF_VOTE, message, 4, quiet, &taken);
 	step = saved;
-	if (!ok && !hfi_taken) {
+	if (!ok && !taken) {
 		return false;                   /* (the GMU never looked at the queue: the vote was not given) */
 	}
 	core_speed = speed;
@@ -3824,7 +3832,7 @@ vayu_block_stop(void)
 		core_is_on = false;
 	}
 	if (gmu_talks && hfi_number != 0) {   /* only a GMU that was given step 18's tables is told to slumber */
-		hfi_send("\"slumber\"", HFI_PREPARE_SLUMBER, slumber, 3);
+		hfi_send("\"slumber\"", HFI_PREPARE_SLUMBER, slumber, 3, false, NULL);
 	}
 	gmu_talks = false;
 	if (gmu_runs) {

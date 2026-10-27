@@ -57,7 +57,7 @@ static void fbLog(const char * format, ...) __printflike(1, 2);
 static void
 fbLog(const char * format, ...)
 {
-	char line[400];
+	char line[1024];
 	va_list list;
 
 	va_start(list, format);
