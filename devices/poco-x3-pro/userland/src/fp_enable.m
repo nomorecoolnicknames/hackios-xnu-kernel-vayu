@@ -24,6 +24,32 @@
  * The provider's document storage is the app group container + "File Provider Storage"
  * (media_import makes it; here it is made too, because the daemon starts the extension on the domain start).
  *
+ * TEST7 (2026-10-27, receipt: TEST7 section of 2026-10-23-vayu-backup-fw-hwruns.md): "no answer from
+ * fileproviderd in 20 s / no connection to fileproviderd", and the daemon was NOT at fault --
+ * launchd's own lines say "(user/501/com.apple.FileProvider [120]) <Notice>: Successfully spawned
+ * fileproviderd[120] because ipc (mach)" and "job state = running", fileproviderctl answered
+ * "domain list" (exit 0, " - Local Storage (disabled)") and "dump" (exit 0, "8 providers") in the
+ * same run, and /var/mobile/Library/Application Support/FileProvider/com.apple.FileProvider.LocalStorage
+ * was made at 13:30. What failed was this program's first line of contact: wait_for_daemon() printed
+ * only its "waiting ... (N s of 20)" lines, never "fileproviderd is not up yet" (which needs a
+ * non-nil proxy), and ended in "no connection to fileproviderd" -- so proxy() was nil, i.e.
+ * NSClassFromString(@"FPDaemonConnection") found nothing. That class is exported by
+ * FileProvider.framework (/System/Library/Frameworks/FileProvider.framework/FileProvider:
+ * _OBJC_CLASS_$_FPDaemonConnection, and the framework has synchronousSharedConnectionProxy,
+ * getDomainsForProviderIdentifier:completionHandler:, removeAllDomainsForProviderIdentifier:
+ * completionHandler:, setEnabled:forDomainIdentifier:providerIdentifier:completionHandler: and
+ * providerDomainForIdentifier:completionHandler:), and build.sh linked Foundation only: the class is
+ * not in the process unless the framework is. build.sh now links it; load_fileprovider() below is the
+ * same thing at run time for a build that does not, and proxy() says which of the two it was.
+ *
+ * The other half of TEST7: the domain is listed and "(disabled)", and the daemon does not re-enable an
+ * existing domain by itself -- _recreateDefaultDomainIfNeeded (FileProviderDaemon 0x1c3c71e64) sets
+ * userEnabled = [descriptor enabledByDefault] only where it creates the default domain, and the FPDProvider
+ * methods that call it are removeAllDomainsForProviderIdentifier: and addDomain:. An enable call on a
+ * domain that is there but disabled answers NSFileNoSuchFileError when the daemon's domainsByID does not
+ * have the identifier (0x1c3cb28f8, the error the 15:18 run saw), so --reset / a reset driven by the
+ * domain's own state comes first, then setEnabled:YES, then the state is read back and is the verdict.
+ *
  * usage: fp_enable [--wait[=SECONDS]] [--trace] [--check] [--reset] [PROVIDER_ID]
  *        --wait    wait up to SECONDS (default 30) for fileproviderd to answer before doing anything: the
  *                  unattended self-test calls this at +45 s and launchd may be starting the daemon on this
@@ -34,12 +60,14 @@
  *                  in the app group; the daemon re-creates the default domain)
  *        as mobile, from root too; signed with fileproviderctl's entitlements
  *
- * exit: 0 the provider has at least one domain and every enable call answered without an error;
- *       1 no daemon, no domain after the reset, or an error; 2 bad usage
+ * exit: 0 the provider has a domain whose userEnabled is YES and every enable call answered without an
+ *          error (--check: a domain is enabled);
+ *       1 no daemon, no domain after the reset, a domain that stayed disabled, or an error; 2 bad usage
  */
 #import <Foundation/Foundation.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <grp.h>
 #include <stdlib.h>
@@ -128,20 +156,60 @@ trace_errors(void)
 	fprintf(stderr, "fp_enable: trace: NSError creation watched for Cocoa 4\n");
 }
 
+/*
+ * FPDaemonConnection is in FileProvider.framework, and a program that links only Foundation does not have
+ * it: NSClassFromString() answers nil, proxy() makes nothing, and every call says "no connection to
+ * fileproviderd" while the daemon is up and answering fileproviderctl (TEST7). build.sh links the
+ * framework (-framework FileProvider); this is the belt for a build that does not, and it says so.
+ */
+static void
+load_fileprovider(void)
+{
+	static const char *const paths[] = {
+		"/System/Library/Frameworks/FileProvider.framework/FileProvider",
+		"/System/Library/PrivateFrameworks/FileProviderDaemon.framework/FileProviderDaemon",
+	};
+	unsigned i;
+
+	if (NSClassFromString(@"FPDaemonConnection") != Nil) {
+		return;
+	}
+	for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		if (dlopen(paths[i], RTLD_NOW | RTLD_GLOBAL) == NULL) {
+			fprintf(stderr, "fp_enable: dlopen %s: %s\n", paths[i], dlerror());
+		} else {
+			fprintf(stderr, "fp_enable: loaded %s\n", paths[i]);
+		}
+	}
+}
+
 static id
 proxy(void)
 {
 	Class connection = NSClassFromString(@"FPDaemonConnection");
 	id shared;
 
+	if (connection == Nil) {
+		fprintf(stderr, "fp_enable: FPDaemonConnection is not in this process: FileProvider.framework is not "
+		    "loaded (build with -framework FileProvider)\n");
+		return nil;
+	}
 	if ([connection respondsToSelector:@selector(synchronousSharedConnectionProxy)]) {
 		return [connection performSelector:@selector(synchronousSharedConnectionProxy)];
 	}
-	shared = [connection respondsToSelector:@selector(sharedConnection)] ? [connection performSelector:@selector(sharedConnection)] : nil;
-	return [shared respondsToSelector:@selector(remoteObjectProxyWithErrorHandler:)] ?
-	    ((id (*)(id, SEL, id))objc_msgSend)(shared, @selector(remoteObjectProxyWithErrorHandler:), ^(NSError *error) {
-		    fprintf(stderr, "fp_enable: connection: %s\n", [[error description] UTF8String]);
-	    }) : nil;
+	if (![connection respondsToSelector:@selector(sharedConnection)]) {
+		fprintf(stderr, "fp_enable: FPDaemonConnection has neither synchronousSharedConnectionProxy nor "
+		    "sharedConnection\n");
+		return nil;
+	}
+	shared = [connection performSelector:@selector(sharedConnection)];
+	if (![shared respondsToSelector:@selector(remoteObjectProxyWithErrorHandler:)]) {
+		fprintf(stderr, "fp_enable: the shared FPDaemonConnection has no remoteObjectProxyWithErrorHandler:\n");
+		return nil;
+	}
+	return ((id (*)(id, SEL, id))objc_msgSend)(shared, @selector(remoteObjectProxyWithErrorHandler:), ^(NSError *error) {
+		fprintf(stderr, "fp_enable: connection: %s\n", [[error description] UTF8String]);
+	});
 }
 
 /* A domain's identifier: the public NSFileProviderDomain answers "identifier"; a daemon-side object may use another. */
@@ -174,6 +242,36 @@ show_domain(id domain, const char *when, NSUInteger index)
 			fprintf(stderr, "fp_enable: %s:   %s = %s\n", when, [key UTF8String], [[value description] UTF8String]);
 		}
 	}
+}
+
+/* The state that decides "(disabled)" in `fileproviderctl domain list`: the domain's userEnabled
+ * (NSFileProviderDomain, iOS 16.5), or the daemon-side object's isEnabled. -1: neither answers. */
+static int
+domain_enabled(id domain)
+{
+	for (NSString *key in @[ @"userEnabled", @"isEnabled" ]) {
+		if (![domain respondsToSelector:NSSelectorFromString(key)]) {
+			continue;
+		}
+		id value = [domain valueForKey:key];
+		if ([value respondsToSelector:@selector(boolValue)]) {
+			return [value boolValue] ? 1 : 0;
+		}
+	}
+	return -1;
+}
+
+static int
+enabled_count(NSArray *domains)
+{
+	int enabled = 0;
+
+	for (NSUInteger i = 0; i < [domains count]; i++) {
+		if (domain_enabled(domains[i]) == 1) {
+			enabled++;
+		}
+	}
+	return enabled;
 }
 
 /* The provider as fileproviderd describes it (the call fileproviderctl dump uses). */
@@ -354,6 +452,33 @@ set_enabled(id daemon, NSString *provider, NSString *domain)
 	return failed;
 }
 
+/*
+ * The app group's container without the app-group entitlement: the container manager writes each shared
+ * container's group into .com.apple.mobile_container_manager.metadata.plist, which is what
+ * -containerURLForSecurityApplicationGroupIdentifier: reads after the entitlement check. fp_enable is
+ * signed with fileproviderctl's entitlements, and they name no app group, so the API answers nil while
+ * the container is right there (TEST7: "group group.com.apple.FileProvider.LocalStorage: (none)").
+ */
+static NSString *
+group_container_path(NSString *group)
+{
+	NSFileManager *manager = [NSFileManager defaultManager];
+	NSString *root = @"/private/var/mobile/Containers/Shared/AppGroup";
+	NSString *metadata = @".com.apple.mobile_container_manager.metadata.plist";
+	NSArray *entries = [manager contentsOfDirectoryAtPath:root error:NULL];
+
+	for (NSString *entry in entries) {
+		NSString *path = [root stringByAppendingPathComponent:entry];
+		NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+		    [path stringByAppendingPathComponent:metadata]];
+
+		if ([group isEqual:[info objectForKey:@"MCMMetadataIdentifier"]]) {
+			return path;
+		}
+	}
+	return nil;
+}
+
 /* The LocalStorage extension's document storage: app group + "File Provider Storage" (media_import does the same). */
 static void
 ensure_storage(void)
@@ -367,6 +492,14 @@ ensure_storage(void)
 	fprintf(stderr, "fp_enable: group group.com.apple.FileProvider.LocalStorage: %s\n",
 	    container ? [[container path] UTF8String] : "(none)");
 	if (container == nil) {
+		/* fileproviderctl's entitlements, which this program is signed with, do not name the group:
+		 * the container manager's own metadata does, so read the directory's identity instead. */
+		container = [NSURL fileURLWithPath:group_container_path(@"group.com.apple.FileProvider.LocalStorage")];
+		fprintf(stderr, "fp_enable: group group.com.apple.FileProvider.LocalStorage (by metadata): %s\n",
+		    container ? [[container path] UTF8String] : "(not found)");
+	}
+	if (container == nil || [[container path] length] == 0) {
+		fprintf(stderr, "fp_enable: group group.com.apple.FileProvider.LocalStorage: (none)\n");
 		return;
 	}
 	directory = [[container path] stringByAppendingPathComponent:@"File Provider Storage"];
@@ -432,27 +565,40 @@ main(int argc, char **argv)
 		fprintf(stderr, "fp_enable: running as uid %d gid %d (%s)\n", (int)getuid(), (int)getgid(),
 		    getuid() == MOBILE_ID ? "mobile" : "NOT mobile");
 		ensure_storage();
+		load_fileprovider();
 		daemon = wait ? wait_for_daemon(provider, wait_seconds) : proxy();
 		if (daemon == nil) { fprintf(stderr, "fp_enable: no connection to fileproviderd\n"); return 1; }
 		show_provider(daemon, provider, "provider");
 		{
 			NSError *error = nil;
 			NSArray *domains = get_domains(daemon, provider, &error);
-			int failures = 0;
+			int failures = 0, enabled;
 
 			fprintf(stderr, "fp_enable: domains before: %lu%s%s\n", (unsigned long)[domains count],
 			    error ? ", error " : "", error ? [[error description] UTF8String] : "");
 			for (NSUInteger i = 0; i < [domains count]; i++) {
 				show_domain(domains[i], "before", i);
 			}
+			enabled = enabled_count(domains);
 			if (check) {
 				show_provider(daemon, provider, "after (no change)");
-				return 0;
+				fprintf(stderr, "fp_enable: --check: %d of %lu domain(s) enabled\n", enabled,
+				    (unsigned long)[domains count]);
+				return enabled > 0 ? 0 : 1;
 			}
-			/* no domain at all (the state every run so far): make the daemon create the default one.
-			 * --reset does the same on purpose when a domain exists but is disabled. */
-			if ([domains count] == 0 || reset) {
-				NSError *failure = remove_all_domains(daemon, provider);
+			/* no domain at all (the state every run so far): make the daemon create the default one;
+			 * a domain that is there but disabled (TEST7): the daemon never re-enables it by itself,
+			 * _recreateDefaultDomainIfNeeded sets userEnabled only where it creates the domain, so the
+			 * reset is the only call that gives setEnabled:YES an identifier to work on. --reset does the
+			 * same on purpose. LocalStorage's files stay in the app group; the daemon re-creates the
+			 * default domain. */
+			if ([domains count] == 0 || reset || enabled == 0) {
+				NSError *failure;
+
+				fprintf(stderr, "fp_enable: reset (%s): %lu domain(s), %d enabled\n",
+				    [domains count] == 0 ? "no domain" : reset ? "--reset" : "none enabled",
+				    (unsigned long)[domains count], enabled);
+				failure = remove_all_domains(daemon, provider);
 
 				fprintf(stderr, "fp_enable: removeAllDomains: %s\n",
 				    failure ? [[failure description] UTF8String] : "done");
@@ -476,29 +622,46 @@ main(int argc, char **argv)
 			for (NSUInteger i = 0; i < [domains count]; i++) {
 				NSString *identifier = domain_identifier(domains[i]);
 
+				/* the re-created default domain already has userEnabled = [descriptor enabledByDefault];
+				 * an enable call on top is what the Files toggle does, and it is not an error either way */
+				if (domain_enabled(domains[i]) == 1) {
+					fprintf(stderr, "fp_enable: domain \"%s\" is enabled already\n",
+					    identifier ? [identifier UTF8String] : "(no identifier)");
+					continue;
+				}
 				if (identifier != nil && set_enabled(daemon, provider, identifier) != 0) {
 					failures++;
 				}
 			}
-			/* The guessed identifiers of fp_enable 15:18 are kept only as a last resort: the default domain ID
-			 * if the daemon still has not listed one. */
+			/* The guessed identifiers of fp_enable 15:18 are kept only as a last resort: the default
+			 * domain ID if the daemon still has not listed one. Not after a successful enable -- the
+			 * domain list here is the one the reset returned, and an identifier the daemon does not have
+			 * answers NSFileNoSuchFileError (4), which would turn a working enable into a failure. */
 			if ([domains count] == 0) {
 				failures += set_enabled(daemon, provider, @"NSFileProviderDomainDefaultIdentifier") != 0;
 			}
 			error = nil;
 			domains = get_domains(daemon, provider, &error);
-			fprintf(stderr, "fp_enable: domains at the end: %lu%s%s\n", (unsigned long)[domains count],
-			    error ? ", error " : "", error ? [[error description] UTF8String] : "");
+			enabled = enabled_count(domains);
+			fprintf(stderr, "fp_enable: domains at the end: %lu, %d enabled%s%s\n", (unsigned long)[domains count],
+			    enabled, error ? ", error " : "", error ? [[error description] UTF8String] : "");
 			for (NSUInteger i = 0; i < [domains count]; i++) {
 				show_domain(domains[i], "at the end", i);
 			}
 			show_provider(daemon, provider, "after");
+			fprintf(stderr, "fp_enable: verdict: %s %s\n", [provider UTF8String],
+			    enabled > 0 ? "has an enabled domain" : "has NO enabled domain");
 			if ([domains count] == 0) {
 				fprintf(stderr, "fp_enable: the provider still has no domain\n");
 				return 1;
 			}
 			if (failures != 0) {
 				fprintf(stderr, "fp_enable: %d enable call(s) answered with an error\n", failures);
+				return 1;
+			}
+			if (enabled == 0) {
+				fprintf(stderr, "fp_enable: the domain is listed but still disabled: the daemon "
+				    "answered, the enable did not take (fileproviderctl domain list is the same state)\n");
 				return 1;
 			}
 		}
