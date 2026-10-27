@@ -1322,6 +1322,15 @@ static const unsigned char t120_quartzcore_uuid[16] = {
 #define T120_QC_FLOOR           0x54cc4e28UL   /* 0x1dcf3fe28: the cached answer of
                                                      CADisableMinimumFrameDurationOnPhone */
 
+/* Same extra switches as src/inject.c: 16 CA_ALWAYS_RENDER (0x1e1f6b7a0), 53
+ * CA_DISABLE_DISPLAY_IDLE (0x1e1f6b7c5), 114/115 the arbitration and its log (0x1e1f6b802/3),
+ * 124 CA_VELOCITY_FRAME_RATE_UNCONSTRAINED (0x1e1f6b80c). */
+#define T120_QC_ALWAYS_RENDER   16
+#define T120_QC_DISABLE_IDLE    53
+#define T120_QC_FR_ARBITRATION  114
+#define T120_QC_FR_PRINT        115
+#define T120_QC_VELOCITY_FREE   124
+
 static int
 t120_wanted(void)
 {
@@ -1335,6 +1344,22 @@ t120_wanted(void)
 		    strstr(arguments, "t120=1") != NULL;
 	}
 	return wanted;
+}
+
+static int
+t120_switch(const char *name)
+{
+	char arguments[4096] = "";
+	char wanted[32];
+	size_t size = sizeof(arguments) - 1;
+
+	if (!t120_wanted() || snprintf(wanted, sizeof(wanted), "%s=1", name) >= (int)sizeof(wanted)) {
+		return 0;
+	}
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return 0;
+	}
+	return strstr(arguments, wanted) != NULL;
 }
 
 static const struct mach_header_64 *
@@ -1396,6 +1421,27 @@ t120_poke(const char *who)
 		say("hakios: %s: t120=1: CADisableMinimumFrameDurationOnPhone's cached answer is 1 (byte %p)\n", who,
 		    floor);
 	}
+	if (t120_switch("t120_idle") && settings[T120_QC_DISABLE_IDLE] != 1) {
+		settings[T120_QC_DISABLE_IDLE] = 1;
+		say("hakios: %s: t120_idle=1: CA_DISABLE_DISPLAY_IDLE=1 (the display no longer drops to its "
+		    "idle rate)\n", who);
+	}
+	if (t120_switch("t120_vel") && settings[T120_QC_VELOCITY_FREE] != 1) {
+		settings[T120_QC_VELOCITY_FREE] = 1;
+		say("hakios: %s: t120_vel=1: CA_VELOCITY_FRAME_RATE_UNCONSTRAINED=1 (velocity no longer "
+		    "lowers the frame rate)\n", who);
+	}
+	if (t120_switch("t120_always") && settings[T120_QC_ALWAYS_RENDER] != 1) {
+		settings[T120_QC_ALWAYS_RENDER] = 1;
+		say("hakios: %s: t120_always=1: CA_ALWAYS_RENDER=1 (a frame every refresh)\n", who);
+	}
+	if (t120_switch("t120_frlog") &&
+	    (settings[T120_QC_FR_ARBITRATION] != 1 || settings[T120_QC_FR_PRINT] != 1)) {
+		settings[T120_QC_FR_ARBITRATION] = 1;
+		settings[T120_QC_FR_PRINT] = 1;
+		say("hakios: %s: t120_frlog=1: CA_ENABLE_FRAME_RATE_ARBITRATION=1, "
+		    "CA_PRINT_FRAME_RATE_ARBITRATION=1\n", who);
+	}
 }
 
 static long
@@ -1437,6 +1483,19 @@ t120_setup(void)
 	setenv("CA_FORCE_120HZ", "1", 1);
 	setenv("CA_ENABLE_ALL_FRAME_RATES", "1", 1);
 	setenv("CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION", "0", 1);
+	if (t120_switch("t120_idle")) {
+		setenv("CA_DISABLE_DISPLAY_IDLE", "1", 1);
+	}
+	if (t120_switch("t120_vel")) {
+		setenv("CA_VELOCITY_FRAME_RATE_UNCONSTRAINED", "1", 1);
+	}
+	if (t120_switch("t120_always")) {
+		setenv("CA_ALWAYS_RENDER", "1", 1);
+	}
+	if (t120_switch("t120_frlog")) {
+		setenv("CA_ENABLE_FRAME_RATE_ARBITRATION", "1", 1);
+		setenv("CA_PRINT_FRAME_RATE_ARBITRATION", "1", 1);
+	}
 	t120_again();
 	/* UIKit is loaded before us in an application, but not necessarily in every program this
 	 * library ends up in; so the answer is put in again after the process has settled. */

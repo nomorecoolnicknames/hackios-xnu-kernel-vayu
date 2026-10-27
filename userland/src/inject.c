@@ -1274,6 +1274,42 @@ static const unsigned char t120_quartzcore_uuid[16] = {
 #define T120_QC_FLOOR           0x54cc4e28UL   /* 0x1dcf3fe28: the cached answer of
                                                      CADisableMinimumFrameDurationOnPhone */
 
+/*
+ * The rest of the switches, same table (see the note above t120_poke):
+ *
+ *   16  CA_ALWAYS_RENDER                     (0x1e1f6b7a0, read at 0x1884ed7e8)
+ *   53  CA_DISABLE_DISPLAY_IDLE              (0x1e1f6b7c5, read at 0x1882f619c: with it set the
+ *                                            display's frame-rate update skips the idle path)
+ *  114  CA_ENABLE_FRAME_RATE_ARBITRATION     (0x1e1f6b802, read at 0x188393484)
+ *  115  CA_PRINT_FRAME_RATE_ARBITRATION      (0x1e1f6b803, read in the arbitration's logging; the
+ *                                            line is "Frame Rate Reasons %ld")
+ *  124  CA_VELOCITY_FRAME_RATE_UNCONSTRAINED (0x1e1f6b80c, read at 0x18842a8c0: with it set the
+ *                                            velocity-derived rate no longer takes the minimum)
+ */
+#define T120_QC_ALWAYS_RENDER   16
+#define T120_QC_DISABLE_IDLE    53
+#define T120_QC_FR_ARBITRATION  114
+#define T120_QC_FR_PRINT        115
+#define T120_QC_VELOCITY_FREE   124
+
+/* t120_<name>=1 in the boot arguments. Deliberately not strstr(name) on "t120=1": the flags are
+ * separate variables of one experiment each. */
+static int
+t120_switch(const char *name)
+{
+	char arguments[4096] = "";
+	char wanted[32];
+	size_t size = sizeof(arguments) - 1;
+
+	if (!t120_wanted() || snprintf(wanted, sizeof(wanted), "%s=1", name) >= (int)sizeof(wanted)) {
+		return 0;
+	}
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return 0;
+	}
+	return strstr(arguments, wanted) != NULL;
+}
+
 static int
 t120_wanted(void)
 {
@@ -1349,6 +1385,40 @@ t120_poke(const char *who)
 		say("hakios: %s: t120=1: CADisableMinimumFrameDurationOnPhone's cached answer is 1 (byte %p)\n", who,
 		    floor);
 	}
+	/*
+	 * t120_idle=1: CA_DISABLE_DISPLAY_IDLE. TEST11 kept the display at 30 a second in two of the
+	 * five runs where a finger was down for longer than 200 ms (tl: s intervals: 33 ms median for
+	 * 0.81 s and 0.25 s), while three other runs were at 7.8-8.2 ms (120). The idle path is what
+	 * those two are: with this byte set the display's frame-rate update at 0x1882f619c does not
+	 * take it. It is a separate flag because it costs power in every idle second.
+	 */
+	if (t120_switch("t120_idle") && settings[T120_QC_DISABLE_IDLE] != 1) {
+		settings[T120_QC_DISABLE_IDLE] = 1;
+		say("hakios: %s: t120_idle=1: CA_DISABLE_DISPLAY_IDLE=1 (the display no longer drops to its "
+		    "idle rate)\n", who);
+	}
+	/* t120_vel=1: CA_VELOCITY_FRAME_RATE_UNCONSTRAINED -- a scroll's rate is not lowered because
+	 * its velocity is below CA_VELOCITY_THRESHOLD_120HZ. */
+	if (t120_switch("t120_vel") && settings[T120_QC_VELOCITY_FREE] != 1) {
+		settings[T120_QC_VELOCITY_FREE] = 1;
+		say("hakios: %s: t120_vel=1: CA_VELOCITY_FRAME_RATE_UNCONSTRAINED=1 (velocity no longer "
+		    "lowers the frame rate)\n", who);
+	}
+	/* t120_always=1: CA_ALWAYS_RENDER -- the render server draws every refresh, changed or not. */
+	if (t120_switch("t120_always") && settings[T120_QC_ALWAYS_RENDER] != 1) {
+		settings[T120_QC_ALWAYS_RENDER] = 1;
+		say("hakios: %s: t120_always=1: CA_ALWAYS_RENDER=1 (a frame every refresh)\n", who);
+	}
+	/* t120_frlog=1: the arbitration's own log. The next run's log should then carry "Frame Rate
+	 * Reasons %ld" next to the frame-rate line, i.e. who asked for what. */
+	if (t120_switch("t120_frlog")) {
+		if (settings[T120_QC_FR_ARBITRATION] != 1 || settings[T120_QC_FR_PRINT] != 1) {
+			settings[T120_QC_FR_ARBITRATION] = 1;
+			settings[T120_QC_FR_PRINT] = 1;
+			say("hakios: %s: t120_frlog=1: CA_ENABLE_FRAME_RATE_ARBITRATION=1, "
+			    "CA_PRINT_FRAME_RATE_ARBITRATION=1\n", who);
+		}
+	}
 }
 
 static void
@@ -1360,6 +1430,19 @@ t120_setup(void)
 	setenv("CA_FORCE_120HZ", "1", 1);
 	setenv("CA_ENABLE_ALL_FRAME_RATES", "1", 1);
 	setenv("CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION", "0", 1);
+	if (t120_switch("t120_idle")) {
+		setenv("CA_DISABLE_DISPLAY_IDLE", "1", 1);
+	}
+	if (t120_switch("t120_vel")) {
+		setenv("CA_VELOCITY_FRAME_RATE_UNCONSTRAINED", "1", 1);
+	}
+	if (t120_switch("t120_always")) {
+		setenv("CA_ALWAYS_RENDER", "1", 1);
+	}
+	if (t120_switch("t120_frlog")) {
+		setenv("CA_ENABLE_FRAME_RATE_ARBITRATION", "1", 1);
+		setenv("CA_PRINT_FRAME_RATE_ARBITRATION", "1", 1);
+	}
 	t120_poke(getprogname());
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
 		t120_poke(getprogname());

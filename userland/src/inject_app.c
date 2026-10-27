@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <CoreFoundation/CoreFoundation.h>
 
@@ -416,6 +417,15 @@ static const unsigned char t120_quartzcore_uuid[16] = {
 #define T120_QC_FLOOR           0x54cc4e28UL   /* 0x1dcf3fe28: the cached answer of
                                                      CADisableMinimumFrameDurationOnPhone */
 
+/* Same extra switches as src/inject.c: 16 CA_ALWAYS_RENDER (0x1e1f6b7a0), 53
+ * CA_DISABLE_DISPLAY_IDLE (0x1e1f6b7c5), 114/115 the arbitration and its log (0x1e1f6b802/3),
+ * 124 CA_VELOCITY_FRAME_RATE_UNCONSTRAINED (0x1e1f6b80c). */
+#define T120_QC_ALWAYS_RENDER   16
+#define T120_QC_DISABLE_IDLE    53
+#define T120_QC_FR_ARBITRATION  114
+#define T120_QC_FR_PRINT        115
+#define T120_QC_VELOCITY_FREE   124
+
 static void
 sayf(const char *format, ...)
 {
@@ -444,6 +454,22 @@ t120_wanted(void)
 		    strstr(arguments, "t120=1") != NULL;
 	}
 	return wanted;
+}
+
+static int
+t120_switch(const char *name)
+{
+	char arguments[4096] = "";
+	char wanted[32];
+	size_t size = sizeof(arguments) - 1;
+
+	if (!t120_wanted() || snprintf(wanted, sizeof(wanted), "%s=1", name) >= (int)sizeof(wanted)) {
+		return 0;
+	}
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return 0;
+	}
+	return strstr(arguments, wanted) != NULL;
 }
 
 static const struct mach_header_64 *
@@ -505,6 +531,27 @@ t120_poke(void)
 		sayf("hakios: %s: t120=1: CADisableMinimumFrameDurationOnPhone's cached answer is 1 (byte %p)\n", who,
 		    floor);
 	}
+	if (t120_switch("t120_idle") && settings[T120_QC_DISABLE_IDLE] != 1) {
+		settings[T120_QC_DISABLE_IDLE] = 1;
+		sayf("hakios: %s: t120_idle=1: CA_DISABLE_DISPLAY_IDLE=1 (the display no longer drops to its "
+		    "idle rate)\n", who);
+	}
+	if (t120_switch("t120_vel") && settings[T120_QC_VELOCITY_FREE] != 1) {
+		settings[T120_QC_VELOCITY_FREE] = 1;
+		sayf("hakios: %s: t120_vel=1: CA_VELOCITY_FRAME_RATE_UNCONSTRAINED=1 (velocity no longer "
+		    "lowers the frame rate)\n", who);
+	}
+	if (t120_switch("t120_always") && settings[T120_QC_ALWAYS_RENDER] != 1) {
+		settings[T120_QC_ALWAYS_RENDER] = 1;
+		sayf("hakios: %s: t120_always=1: CA_ALWAYS_RENDER=1 (a frame every refresh)\n", who);
+	}
+	if (t120_switch("t120_frlog") &&
+	    (settings[T120_QC_FR_ARBITRATION] != 1 || settings[T120_QC_FR_PRINT] != 1)) {
+		settings[T120_QC_FR_ARBITRATION] = 1;
+		settings[T120_QC_FR_PRINT] = 1;
+		sayf("hakios: %s: t120_frlog=1: CA_ENABLE_FRAME_RATE_ARBITRATION=1, "
+		    "CA_PRINT_FRAME_RATE_ARBITRATION=1\n", who);
+	}
 }
 
 /* +[UIScreen maximumFramesPerSecond] (UIKitCore) and its private spelling, both answered 120. */
@@ -555,12 +602,13 @@ typedef struct { float minimum, maximum, preferred; } t120_range;
 
 static void (*link_rate_original)(id, SEL, long);
 static void (*link_range_original)(id, SEL, t120_range);
+static void (*link_run_original)(id, SEL, id, id);
 static id    (*link_factory_original)(id, SEL, id, SEL);
 static int   t120_link_said;
 static unsigned t120_link_changed;      /* links whose rate this raised, for the next 5 s line's sake */
 
 #define T120_LINKS      64
-static struct { id link; unsigned char scroll; } t120_link_table[T120_LINKS];
+static struct { id link; unsigned char scroll; char name[48]; } t120_link_table[T120_LINKS];
 static unsigned t120_link_next;
 
 static int
@@ -576,7 +624,7 @@ t120_link_level(void)
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 			const char *at = strstr(arguments, "t120_link=");
 
-			if (at != NULL && at[10] >= '1' && at[10] <= '3') {
+			if (at != NULL && at[10] >= '1' && at[10] <= '5') {
 				level = at[10] - '0';
 			}
 		}
@@ -584,38 +632,62 @@ t120_link_level(void)
 			sayf("hakios: %s: t120_link=%d: display links %s\n", who, level,
 			    level == 1 ? "are to be said, not changed" :
 			    level == 2 ? "of scroll views are answered 120 where they asked for 60 or more" :
-			    "are answered 120 where they asked for 60 or more");
+			    level == 3 ? "are answered 120 where they asked for 60 or more" :
+			    level == 4 ? "are answered 120, whatever they asked" :
+			    "are answered 120, whatever they asked, at the run loop too");
 		}
 	}
 	return level;
 }
 
-/* Does the link's target have "ScrollView" in its class name (UIScrollView and everything under it)? */
+/*
+ * Is the link's target a scroll? TEST11 had 205 range requests of 48..120 preferred 0 from Files
+ * and NOT ONE target whose class had "ScrollView" in it: the object that owns the link is the
+ * animation, not the view (UIKitCore has UIScrollAnimation and UIScrollViewScrollAnimation).
+ */
 static int
 t120_scroll_class(id target)
 {
 	for (Class cls = target != nil ? object_getClass(target) : Nil; cls != Nil; cls = class_getSuperclass(cls)) {
 		const char *name = class_getName(cls);
 
-		if (name != NULL && strstr(name, "ScrollView") != NULL) {
+		if (name == NULL) {
+			continue;
+		}
+		if (strstr(name, "ScrollView") != NULL || strcmp(name, "UIScrollAnimation") == 0 ||
+		    strstr(name, "ScrollAnimation") != NULL || strstr(name, "DisplayLinkScroll") != NULL ||
+		    strstr(name, "Deceleration") != NULL) {
 			return 1;
 		}
 	}
 	return 0;
 }
 
-static void
-t120_link_remember(id link, int scroll)
+static const char *
+t120_class_name(id target)
 {
+	Class cls = target != nil ? object_getClass(target) : Nil;
+	const char *name = cls != Nil ? class_getName(cls) : NULL;
+
+	return name != NULL ? name : "?";
+}
+
+static void
+t120_link_remember(id link, id target)
+{
+	const char *name;
+
 	if (link == nil) {
 		return;
 	}
+	name = t120_class_name(target);
 	t120_link_next = (t120_link_next + 1) % T120_LINKS;
 	t120_link_table[t120_link_next].link = link;
-	t120_link_table[t120_link_next].scroll = (unsigned char) (scroll != 0);
+	t120_link_table[t120_link_next].scroll = (unsigned char) t120_scroll_class(target);
+	snprintf(t120_link_table[t120_link_next].name, sizeof(t120_link_table[t120_link_next].name), "%s", name);
 }
 
-/* 1 = a scroll view's, 0 = somebody else's, -1 = not seen being made (fb: no factory call) */
+/* 1 = a scroll view's, 0 = somebody else's, -1 = not seen being made (no factory call) */
 static int
 t120_link_scroll(id link)
 {
@@ -627,13 +699,24 @@ t120_link_scroll(id link)
 	return -1;
 }
 
+static const char *
+t120_link_name(id link)
+{
+	for (unsigned i = 0; i < T120_LINKS; i++) {
+		if (t120_link_table[i].link == link) {
+			return t120_link_table[i].name;
+		}
+	}
+	return "not seen being made";
+}
+
 /* +[CADisplayLink displayLinkWithTarget:selector:]: remember what the link was made for. */
 static id
 t120_link_factory(id self, SEL cmd, id target, SEL selector)
 {
 	id link = link_factory_original != NULL ? link_factory_original(self, cmd, target, selector) : nil;
 
-	t120_link_remember(link, t120_scroll_class(target));
+	t120_link_remember(link, target);
 	return link;
 }
 
@@ -646,18 +729,45 @@ t120_link_say(id link, const char *what, const char *asked, const char *answered
 		return;
 	}
 	t120_link_said++;
-	sayf("hakios: %s: t120_link: %s%s: %s -> %s\n", who, what,
-	    scroll == 1 ? " on a scroll view's link" : scroll == 0 ? " on another link" : "", asked, answered);
+	sayf("hakios: %s: t120_link: %s%s [%s]: %s -> %s\n", who, what,
+	    scroll == 1 ? " on a scroll view's link" : scroll == 0 ? " on another link" : "",
+	    t120_link_name(link), asked, answered);
+}
+
+/*
+ * Should this request be answered 120? Levels:
+ *   2  a scroll view's link            3  every link that asked for 60 or more
+ *   4  every link, whatever it asked   5  the same, at addToRunLoop:forMode: as well
+ * A preferred of 0 means "the system chooses". TEST11's Files links were 48..120 preferred 0 and
+ * the old test (preferred >= 60) skipped exactly those, which is why the level 3 knob did nothing.
+ */
+static int
+t120_link_raise(int level, int scroll, float preferred)
+{
+	if (preferred >= 120.0f) {
+		return 0;
+	}
+	if (level >= 4) {
+		return 1;
+	}
+	if (level == 2) {
+		return scroll == 1 && (preferred >= 60.0f || preferred == 0.0f);
+	}
+	if (level >= 3) {
+		return preferred >= 60.0f || preferred == 0.0f;
+	}
+	return 0;
 }
 
 static void
 t120_link_rate(id self, SEL cmd, long rate)
 {
 	int level = t120_link_level();
+	int scroll = t120_link_scroll(self);
 	long wanted = rate;
 	char asked[48], answered[48];
 
-	if (level != 0 && ((level == 2 && t120_link_scroll(self) == 1) || level >= 3) && rate >= 60 && rate < 120) {
+	if (level != 0 && rate > 0 && rate < 120 && t120_link_raise(level, scroll, (float)rate)) {
 		wanted = 120;
 		t120_link_changed++;
 	}
@@ -675,14 +785,15 @@ static void
 t120_link_range(id self, SEL cmd, t120_range range)
 {
 	int level = t120_link_level();
+	int scroll = t120_link_scroll(self);
 	t120_range wanted = range;
 	char asked[64], answered[64];
 
-	if (level != 0 && ((level == 2 && t120_link_scroll(self) == 1) || level >= 3) && range.preferred >= 60 &&
-	    range.preferred < 120) {
-		wanted.minimum = range.minimum < 120 ? range.minimum : 120;
-		wanted.maximum = 120;
-		wanted.preferred = 120;
+	if (level != 0 && t120_link_raise(level, scroll, range.preferred) &&
+	    (range.maximum >= 60.0f || range.maximum == 0.0f)) {
+		wanted.minimum = range.minimum < 120.0f ? range.minimum : 120.0f;
+		wanted.maximum = 120.0f;
+		wanted.preferred = 120.0f;
 		t120_link_changed++;
 	}
 	if (level != 0) {
@@ -692,6 +803,34 @@ t120_link_range(id self, SEL cmd, t120_range range)
 	}
 	if (link_range_original != NULL) {
 		link_range_original(self, cmd, wanted);
+	}
+}
+
+/*
+ * -[CADisplayLink addToRunLoop:forMode:], level 5: the rate is forced here as well, so a link made
+ * before this library was loaded (TEST11 had 114 rate requests whose factory had not been seen,
+ * "the rate:" without "on another link") is caught too.
+ */
+static void
+t120_link_run(id self, SEL cmd, id runloop, id mode)
+{
+	int level = t120_link_level();
+
+	if (level >= 5) {
+		t120_range range = { 0.0f, 120.0f, 120.0f };
+		char answered[48];
+
+		snprintf(answered, sizeof(answered), "the range %g..%g, preferred %g", range.minimum, range.maximum, range.preferred);
+		t120_link_say(self, "at the run loop", "as it was", answered);
+		if (link_range_original != NULL) {
+			link_range_original(self, sel_registerName("setPreferredFrameRateRange:"), range);
+		}
+		if (link_rate_original != NULL) {
+			link_rate_original(self, sel_registerName("setPreferredFramesPerSecond:"), 120);
+		}
+	}
+	if (link_run_original != NULL) {
+		link_run_original(self, cmd, runloop, mode);
 	}
 }
 
@@ -719,9 +858,60 @@ t120_links(void)
 	t120_watch_class("CADisplayLink", "displayLinkWithTarget:selector:", (IMP)t120_link_factory, &link_factory_original);
 	watch("CADisplayLink", "setPreferredFramesPerSecond:", (IMP)t120_link_rate, &link_rate_original);
 	watch("CADisplayLink", "setPreferredFrameRateRange:", (IMP)t120_link_range, &link_range_original);
+	watch("CADisplayLink", "addToRunLoop:forMode:", (IMP)t120_link_run, &link_run_original);
 	if (!missing && link_factory_original == NULL && link_rate_original == NULL && link_range_original == NULL) {
 		missing = 1;
 		sayf("hakios: %s: t120_link: CADisplayLink has none of the three where this was written for; left alone\n", who);
+	}
+}
+
+/*
+ * Boot-arg t120_touch=1 (with t120=1): how many events reach the application, and how often.
+ * The kernel's "tl: p" lines say the digitizer delivered 220-230 a second during TEST11's drags;
+ * this is the other end of the same path, so a coalescing to 60 or 30 a second would show here as
+ * a number well below the kernel's. A line every five seconds with events in it.
+ */
+static void (*app_send_event_original)(id, SEL, id);
+static unsigned long long t120_touch_start, t120_touch_count, t120_touch_last;
+
+static unsigned long long
+t120_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+static void
+t120_send_event(id self, SEL cmd, id event)
+{
+	unsigned long long now = t120_now_ns();
+
+	if (t120_touch_start == 0) {
+		t120_touch_start = now;
+	}
+	t120_touch_count++;
+	t120_touch_last = now;
+	if (now - t120_touch_start >= 5000000000ull) {
+		unsigned long long ms = (now - t120_touch_start) / 1000000ull;
+
+		sayf("hakios: %s: t120_touch: %llu events in %llu ms (%llu a second), the last one %llu ms ago\n",
+		    who, t120_touch_count, ms, t120_touch_count * 1000ull / ms,
+		    (now - t120_touch_last) / 1000000ull);
+		t120_touch_count = 0;
+		t120_touch_start = now;
+	}
+	if (app_send_event_original != NULL) {
+		app_send_event_original(self, cmd, event);
+	}
+}
+
+static void
+t120_touch_setup(void)
+{
+	if (t120_switch("t120_touch")) {
+		watch("UIApplication", "sendEvent:", (IMP)t120_send_event, &app_send_event_original);
 	}
 }
 
@@ -733,6 +923,7 @@ t120_again(void)
 	t120_answer_screen_rate("UIScreen", "_maximumFramesPerSecond");
 	t120_answer_screen_rate("CADisplay", "maximumFramesPerSecond");
 	t120_links();
+	t120_touch_setup();
 }
 
 static void
@@ -744,6 +935,19 @@ t120_setup(void)
 	setenv("CA_FORCE_120HZ", "1", 1);
 	setenv("CA_ENABLE_ALL_FRAME_RATES", "1", 1);
 	setenv("CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION", "0", 1);
+	if (t120_switch("t120_idle")) {
+		setenv("CA_DISABLE_DISPLAY_IDLE", "1", 1);
+	}
+	if (t120_switch("t120_vel")) {
+		setenv("CA_VELOCITY_FRAME_RATE_UNCONSTRAINED", "1", 1);
+	}
+	if (t120_switch("t120_always")) {
+		setenv("CA_ALWAYS_RENDER", "1", 1);
+	}
+	if (t120_switch("t120_frlog")) {
+		setenv("CA_ENABLE_FRAME_RATE_ARBITRATION", "1", 1);
+		setenv("CA_PRINT_FRAME_RATE_ARBITRATION", "1", 1);
+	}
 	t120_again();
 	/* UIKit is loaded before us in an application, but not necessarily in every program this
 	 * library ends up in; so the answer is put in again after the process has settled. */
