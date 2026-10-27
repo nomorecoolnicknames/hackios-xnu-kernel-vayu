@@ -81,6 +81,43 @@
  *    addDomain:completionHandler:], whose daemon-side addDomain:... is the other caller of
  *    _recreateDefaultDomainIfNeeded -- used only when the private calls have left no enabled domain.
  *
+ * R16 (TEST10: the provider is "enabled,userHidden", `fileproviderctl domain list` shows "Local Storage
+ * (hidden)", getDomainsForProviderIdentifier: still answers 0 and the Files app shows nothing):
+ *
+ *  - the default domain has no name of its own: its identifier is the value of FileProvider.framework's
+ *    NSFileProviderDomainDefaultIdentifier (the empty string). Both places that used to pass the
+ *    *spelling* of that constant instead -- add_domain_public()'s -initWithIdentifier: and the last-resort
+ *    setEnabled -- addressed a domain no daemon has, so the enable could never land on anything. This
+ *    version reads the constant at run time (dlsym; the theos 16.5 SDK does not declare it) and prints it.
+ *  - addDomain is the wrong door twice over: NSFileProviderDomain.h says the default domain "can not be
+ *    added" (it exists for the whole life of the provider), and -2001 is
+ *    NSFileProviderErrorProviderNotFound, "returned by NSFileProviderManager if no provider could be found
+ *    in the application" (NSFileProviderError.h) -- the daemon resolves the provider from the *calling*
+ *    application, and fp_enable is nobody's file provider. The public call is gone; the daemon's own
+ *    per-provider calls below are the ones that name the provider explicitly.
+ *  - "userHidden" is a state of its own, not a spelling of "enabled": FileProviderDaemon has
+ *    -[FPDXPCServicer setHiddenByUser:forDomainIdentifier:providerIdentifier:completionHandler:] next to
+ *    setEnabled:..., and it logs "[INFO] reloading domain because hiddenByUser state changed for %@"
+ *    (strings in FileProviderDaemon 16.5). The client-side provider description prints
+ *    "state:enabled,userHidden" (the flags string is ",backgroundPaused.,userHidden.,providerHidden.,...").
+ *    Nothing cleared it before this version, so whoever set it -- an earlier addDomain that updated the
+ *    domain's hidden state, or a boot where the descriptor's default-domain visibility was not what the
+ *    daemon wanted -- left the provider enabled and invisible. That is the state Files.app shows as no
+ *    location: a hidden default domain is *ignored* by the daemon at startup ("[DEBUG] %@: is a hidden
+ *    default domain, ignoring", FileProviderDaemon), so no root, no working set, no items.
+ *  - getDomainsForProviderIdentifier: is not the verdict for this provider. The LocalStorage default
+ *    domain is hidden (its appex has NSFileProviderDefaultDomainEnabled=true and no
+ *    NSFileProviderDefaultDomainVisible), the daemon keeps it out of that list, and `fileproviderctl domain
+ *    list` (the FPProviderDomain list) is where it appears -- TEST10 has the daemon starting the extension
+ *    right after removeAllDomains (launchd: "Successfully spawned LocalStorageFileProvider[280]") while the
+ *    same client read 0 domains before and after. So the pass now asks the provider object itself
+ *    (providerDomainForIdentifier:) for isEnabled/isHidden and uses that as the verdict; 0 domains is a
+ *    line in the log, not a failure -- and it no longer triggers the remove/add loop.
+ *  - removeAllDomains stays, for --reset and as the one-time fallback when the provider is unknown: it is
+ *    the daemon path that (re)creates the default domain (_recreateDefaultDomainIfNeeded) and it lifts
+ *    userEnabled, but the daemon cannot remove the default domain ("Default domain cannot be removed."),
+ *    so it must not be the first move.
+ *
  * usage: fp_enable [--wait[=SECONDS]] [--retry[=SECONDS]] [--trace] [--check] [--reset] [PROVIDER_ID]
  *        --wait    wait up to SECONDS (default 30) for fileproviderd to answer before doing anything: the
  *                  unattended self-test calls this at +45 s and launchd may be starting the daemon on this
@@ -90,17 +127,22 @@
  *                  SECONDS (default 120) have gone by; the domain, its extension and the daemon's own state
  *                  are all allowed to settle late
  *        --check   look only (domains, provider); change nothing
- *        --reset   remove this provider's domains first even if there are some (LocalStorage only: its files stay
- *                  in the app group; the daemon re-creates the default domain)
- *        --restart[=SECONDS]  when a pass ends with no domain at all and no error, stop fileproviderd (SIGTERM,
- *                  SIGKILL after SECONDS, default 20) and make launchd spawn a new one, then repeat the pass:
- *                  a daemon that started before LaunchServices/pkd held the appex keeps a provider list that
- *                  answers -2001 for it (R14, TEST9) and only a new process reads the completed registry
+ *        --reset   ask the daemon to remove this provider's domains before the pass even when one is
+ *                  listed (LocalStorage only: its files stay in the app group, and the daemon re-creates
+ *                  the default domain; it cannot remove the default domain itself, but the call also
+ *                  lifts userEnabled -- see R16 above)
+ *        --restart[=SECONDS]  when a pass ends with no enabled, visible provider and no error, stop
+ *                  fileproviderd (SIGTERM, SIGKILL after SECONDS, default 20) and make launchd spawn a new
+ *                  one, then repeat the pass: a daemon that started before LaunchServices/pkd held the
+ *                  appex keeps a provider list that answers -2001 for it (R14, TEST9) and only a new
+ *                  process reads the completed registry
  *        as mobile, from root too; signed with fileproviderctl's entitlements
  *
- * exit: 0 the provider has a domain whose userEnabled is YES and every enable call answered without an
- *          error (--check: a domain is enabled);
- *       1 no daemon, no domain after the reset, a domain that stayed disabled, or an error; 2 bad usage
+ * exit: 0 the provider object answers isEnabled=YES and isHidden=NO (the readback is the verdict; calls
+ *          that answered with an error are printed and counted, and fail the pass only through the state
+ *          they left behind) (--check: the same, without changing anything);
+ *       1 no daemon, a provider the daemon does not know after the fallback, a provider that stayed
+ *          disabled or hidden, or an error; 2 bad usage
  */
 #import <Foundation/Foundation.h>
 #include <objc/message.h>
@@ -436,6 +478,23 @@ say_registration_state(const char *appex)
 		    [extension[@"NSExtensionPointIdentifier"] UTF8String] ?: "(none)");
 		fprintf(stderr, "fp_enable: registry:   NSExtensionFileProviderEnabledByDefault = %s\n",
 		    [extension[@"NSExtensionFileProviderEnabledByDefault"] boolValue] ? "true" : "false/absent");
+		/* R16: the two keys the daemon's FPProviderDescriptor reads for the *default* domain
+		 * (strings NSFileProviderDefaultDomainEnabled / NSFileProviderDefaultDomainVisible are in
+		 * FileProviderDaemon 16.5 next to the NSExtensionFileProvider* keys). The first is why a
+		 * domain exists at all without an addDomain; the second is the hidden state the default
+		 * domain is created with, and a hidden default domain is what the daemon ignores at startup. */
+		fprintf(stderr, "fp_enable: registry:   NSFileProviderDefaultDomainEnabled = %s (absent: the daemon "
+		    "creates no default domain)\n", extension[@"NSFileProviderDefaultDomainEnabled"] != nil
+		    ? ([extension[@"NSFileProviderDefaultDomainEnabled"] boolValue] ? "true" : "false") : "absent");
+		fprintf(stderr, "fp_enable: registry:   NSFileProviderDefaultDomainVisible = %s (absent: no explicit "
+		    "visibility; R16 reads the domain back)\n",
+		    extension[@"NSFileProviderDefaultDomainVisible"] != nil
+		    ? ([extension[@"NSFileProviderDefaultDomainVisible"] boolValue] ? "true" : "false") : "absent");
+		fprintf(stderr, "fp_enable: registry:   NSFileProviderCanToggleDomainVisibility = %s (absent: the "
+		    "daemon may answer the user's visibility change with 'ignoring ... its visibility cannot be "
+		    "changed')\n", extension[@"NSFileProviderCanToggleDomainVisibility"] != nil
+		    ? ([extension[@"NSFileProviderCanToggleDomainVisibility"] boolValue] ? "true" : "false")
+		    : "absent");
 		fprintf(stderr, "fp_enable: registry:   executable %s: %s\n", executable ? [executable UTF8String] : "(none)",
 		    path == nil ? "no CFBundleExecutable" :
 		    [files fileExistsAtPath:path] ? "is there" : "IS MISSING (the extension cannot be exec'd)");
@@ -650,6 +709,66 @@ domain_identifier(id domain)
 	return nil;
 }
 
+/*
+ * What the provider object in providerDomainForIdentifier: says about itself -- the same object
+ * `fileproviderctl domain list` prints as "(disabled)" / "(hidden)". Its isEnabled is the domain's
+ * userEnabled; its isHidden is the hiddenByUser state the description prints as "userHidden" (R16). The
+ * daemon may not list a hidden default domain at all (see the R16 note in the header), so this is the
+ * verdict the pass uses. Returns NO when the daemon has no provider object for the identifier.
+ */
+static BOOL
+provider_flags(id daemon, NSString *provider, int *out_enabled, int *out_hidden, const char *when)
+{
+	__block BOOL known = NO;
+	__block int enabled = -1, hidden = -1;
+	dispatch_semaphore_t done = dispatch_semaphore_create(0);
+
+	if (out_enabled != NULL) {
+		*out_enabled = -1;
+	}
+	if (out_hidden != NULL) {
+		*out_hidden = -1;
+	}
+	proxy_claims(daemon, @selector(providerDomainForIdentifier:completionHandler:),
+	    "providerDomainForIdentifier:completionHandler:");
+	@try {
+		((void (*)(id, SEL, id, id))objc_msgSend)(daemon, @selector(providerDomainForIdentifier:completionHandler:),
+		    provider, ^(id object, NSError *error) {
+			if (object != nil) {
+				known = YES;
+				for (NSString *key in @[ @"isEnabled", @"userEnabled" ]) {
+					if ([object respondsToSelector:NSSelectorFromString(key)]) {
+						enabled = [[object valueForKey:key] boolValue] ? 1 : 0;
+						break;
+					}
+				}
+				if ([object respondsToSelector:NSSelectorFromString(@"isHidden")]) {
+					hidden = [[object valueForKey:@"isHidden"] boolValue] ? 1 : 0;
+				}
+			}
+			if (error != nil) {
+				fprintf(stderr, "fp_enable: %s: providerDomainForIdentifier: %s\n", when,
+				    [[error description] UTF8String]);
+			}
+			dispatch_semaphore_signal(done);
+		});
+	} @catch (NSException *exception) {
+		fprintf(stderr, "fp_enable: %s: providerDomainForIdentifier: raised %s: %s\n", when,
+		    [[exception name] UTF8String], [[exception reason] UTF8String]);
+		return NO;
+	}
+	if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) != 0) {
+		fprintf(stderr, "fp_enable: %s: providerDomainForIdentifier: no answer in 10 s\n", when);
+	}
+	if (out_enabled != NULL) {
+		*out_enabled = enabled;
+	}
+	if (out_hidden != NULL) {
+		*out_hidden = hidden;
+	}
+	return known;
+}
+
 static void
 show_domain(id domain, const char *when, NSUInteger index)
 {
@@ -694,6 +813,51 @@ enabled_count(NSArray *domains)
 		}
 	}
 	return enabled;
+}
+
+/*
+ * The identifier of the default domain (R16). It is FileProvider.framework's
+ * NSFileProviderDomainDefaultIdentifier -- the empty string -- but the theos 16.5 SDK does not declare the
+ * symbol, and the two places this program used to write the *name* of the constant instead sent a domain
+ * identifier the daemon has never heard of. Read the real value: the symbol is an exported
+ * `NSString *const`, so dlsym() gives its address and the pointer is its value. The line this prints is
+ * evidence for the next run: a non-empty answer here means the daemon's default id is not what this
+ * program assumes and every setEnabled below is addressed to the wrong domain again.
+ */
+static NSString *
+default_domain_identifier(void)
+{
+	static NSString *identifier = nil;
+	static BOOL looked = NO;
+
+	if (looked) {
+		return identifier;
+	}
+	looked = YES;
+	@try {
+		void *symbol = dlsym(RTLD_DEFAULT, "NSFileProviderDomainDefaultIdentifier");
+
+		if (symbol != NULL) {
+			NSString *__unsafe_unretained value = *(NSString *__unsafe_unretained *)symbol;
+
+			if ([value isKindOfClass:[NSString class]]) {
+				identifier = value;
+			}
+			fprintf(stderr, "fp_enable: NSFileProviderDomainDefaultIdentifier: symbol found, value \"%s\" "
+			    "(%lu character(s))\n", identifier ? [identifier UTF8String] : "(not a string)",
+			    (unsigned long)[identifier length]);
+		} else {
+			fprintf(stderr, "fp_enable: NSFileProviderDomainDefaultIdentifier: not exported by this "
+			    "FileProvider.framework; using the empty string (R16)\n");
+		}
+	} @catch (NSException *exception) {
+		fprintf(stderr, "fp_enable: NSFileProviderDomainDefaultIdentifier: reading the symbol raised %s: %s\n",
+		    [[exception name] UTF8String], [[exception reason] UTF8String]);
+	}
+	if (identifier == nil) {
+		identifier = @"";
+	}
+	return identifier;
 }
 
 /* The provider as fileproviderd describes it (the call fileproviderctl dump uses). */
@@ -773,12 +937,6 @@ get_domains_timeout(id daemon, NSString *provider, NSError **out_error, double s
 		result = nil;
 	}
 	return result;
-}
-
-static NSArray *
-get_domains(id daemon, NSString *provider, NSError **out_error)
-{
-	return get_domains_timeout(daemon, provider, out_error, 10.0);
 }
 
 /* A dead connection (fileproviderd not started yet, or restarted under us), not the daemon's answer. */
@@ -885,84 +1043,64 @@ remove_all_domains(id daemon, NSString *provider, BOOL *out_sent)
 	return failure;
 }
 
+/*
+ * The two per-provider switches the daemon has for a domain, both with the same shape
+ * (BOOL, domain identifier, provider identifier, reply(NSError *)):
+ *
+ *   -[FPDXPCServicer setEnabled:forDomainIdentifier:providerIdentifier:completionHandler:]
+ *   -[FPDXPCServicer setHiddenByUser:forDomainIdentifier:providerIdentifier:completionHandler:]
+ *
+ * The method list and the reply's type encoding (v44@0:8B16@"NSString"20@"NSString"28@?<v@?@"NSError">36)
+ * are in FileProviderDaemon 16.5. The identifier is the *domain's*, and for the default domain that is
+ * default_domain_identifier(), not the name of the constant (R16). An answer with no error is not proof
+ * that anything changed: the caller reads the provider back and that is the verdict.
+ */
 static int
-set_enabled(id daemon, NSString *provider, NSString *domain)
+set_flag_for_provider(id daemon, NSString *provider, NSString *domain, BOOL value, BOOL hidden_kind)
 {
+	const char *what = hidden_kind ? "setHiddenByUser" : "setEnabled";
+	SEL selector = hidden_kind
+	    ? @selector(setHiddenByUser:forDomainIdentifier:providerIdentifier:completionHandler:)
+	    : @selector(setEnabled:forDomainIdentifier:providerIdentifier:completionHandler:);
 	dispatch_semaphore_t done = dispatch_semaphore_create(0);
 	__block int failed = 0;
 
-	proxy_claims(daemon, @selector(setEnabled:forDomainIdentifier:providerIdentifier:completionHandler:),
-	    "setEnabled:forDomainIdentifier:providerIdentifier:completionHandler:");
+	proxy_claims(daemon, selector, hidden_kind
+	    ? "setHiddenByUser:forDomainIdentifier:providerIdentifier:completionHandler:"
+	    : "setEnabled:forDomainIdentifier:providerIdentifier:completionHandler:");
 	@try {
-		((void (*)(id, SEL, BOOL, id, id, id))objc_msgSend)(daemon,
-		    @selector(setEnabled:forDomainIdentifier:providerIdentifier:completionHandler:), YES, domain, provider,
+		((void (*)(id, SEL, BOOL, id, id, id))objc_msgSend)(daemon, selector, value, domain, provider,
 		    ^(NSError *error) {
-			fprintf(stderr, "fp_enable: setEnabled YES, domain \"%s\": %s\n", [domain UTF8String],
+			fprintf(stderr, "fp_enable: %s %s, domain \"%s\"%s: %s\n", what, value ? "YES" : "NO",
+			    [domain UTF8String], [domain length] == 0 ? " (the default domain)" : "",
 			    error ? [[error description] UTF8String] : "done");
-			say_error("setEnabled error", error, 0);
+			say_error(hidden_kind ? "setHiddenByUser error" : "setEnabled error", error, 0);
 			failed = error != nil;
 			dispatch_semaphore_signal(done);
 		});
 	} @catch (NSException *exception) {
-		fprintf(stderr, "fp_enable: setEnabled, domain \"%s\": %s\n", [domain UTF8String], [[exception reason] UTF8String]);
+		fprintf(stderr, "fp_enable: %s %s, domain \"%s\": the call raised %s: %s (it did not reach the "
+		    "daemon)\n", what, value ? "YES" : "NO", [domain UTF8String], [[exception name] UTF8String],
+		    [[exception reason] UTF8String]);
 		return 1;
 	}
 	if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) != 0) {
-		fprintf(stderr, "fp_enable: setEnabled, domain \"%s\": no answer in 10 s\n", [domain UTF8String]);
+		fprintf(stderr, "fp_enable: %s, domain \"%s\": no answer in 10 s\n", what, [domain UTF8String]);
 		return 1;
 	}
 	return failed;
 }
 
-/*
- * The public door to the same daemon: +[NSFileProviderManager addDomain:completionHandler:] goes through
- * FPDaemonConnection with the interface Apple built for it, and the daemon's addDomain:forProviderIdentifier:
- * path is the other caller of _recreateDefaultDomainIfNeeded (0x1c3c71e64) -- the same place the reset lands.
- * Used only when the private calls have left no enabled domain: an "already exists" answer is not a failure,
- * and a public API needs no protocol of ours to be guessed right.
- */
-static void
-add_domain_public(NSString *provider, NSString *display_name)
+static int
+set_enabled(id daemon, NSString *provider, NSString *domain)
 {
-	Class manager = NSClassFromString(@"NSFileProviderManager");
-	Class domain_class = NSClassFromString(@"NSFileProviderDomain");
-	dispatch_semaphore_t done;
-	id domain;
+	return set_flag_for_provider(daemon, provider, domain, YES, NO);
+}
 
-	if (manager == Nil || domain_class == Nil) {
-		fprintf(stderr, "fp_enable: NSFileProviderManager/NSFileProviderDomain are not in this process "
-		    "(FileProvider.framework not loaded)\n");
-		return;
-	}
-	if (![manager respondsToSelector:@selector(addDomain:completionHandler:)]) {
-		fprintf(stderr, "fp_enable: NSFileProviderManager has no +addDomain:completionHandler:\n");
-		return;
-	}
-	domain = ((id (*)(id, SEL, id, id))objc_msgSend)([domain_class alloc],
-	    @selector(initWithIdentifier:displayName:), @"NSFileProviderDomainDefaultIdentifier", display_name);
-	if (domain == nil) {
-		fprintf(stderr, "fp_enable: NSFileProviderDomain -initWithIdentifier:displayName: answered nil\n");
-		return;
-	}
-	done = dispatch_semaphore_create(0);
-	fprintf(stderr, "fp_enable: public: +[NSFileProviderManager addDomain:%s] for %s\n",
-	    [display_name UTF8String], [provider UTF8String]);
-	@try {
-		((void (*)(id, SEL, id, id))objc_msgSend)(manager, @selector(addDomain:completionHandler:), domain,
-		    ^(NSError *error) {
-			fprintf(stderr, "fp_enable: public: addDomain: %s\n",
-			    error ? [[error description] UTF8String] : "done");
-			say_error("public addDomain error", error, 0);
-			dispatch_semaphore_signal(done);
-		});
-	} @catch (NSException *exception) {
-		fprintf(stderr, "fp_enable: public: addDomain: raised %s: %s\n", [[exception name] UTF8String],
-		    [[exception reason] UTF8String]);
-		return;
-	}
-	if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC)) != 0) {
-		fprintf(stderr, "fp_enable: public: addDomain: no answer in 20 s\n");
-	}
+static int
+set_hidden_by_user(id daemon, NSString *provider, NSString *domain, BOOL hidden)
+{
+	return set_flag_for_provider(daemon, provider, domain, hidden, YES);
 }
 
 /*
@@ -1027,136 +1165,190 @@ ensure_storage(void)
 	}
 }
 
-/* What one pass leaves behind: the domain count, how many of them are enabled, and how many enable calls
+/* What one pass leaves behind: what getDomainsForProviderIdentifier: lists (which for LocalStorage's
+ * hidden default domain is nothing), what the provider object says about itself, and how many calls
  * answered with an error. The caller decides whether another pass is worth it (--retry). */
 struct pass_result {
 	NSUInteger	domains;
-	int		enabled;
+	int		enabled;		/* domains the list calls userEnabled */
+	int		provider_enabled;	/* the provider object's isEnabled */
+	int		provider_hidden;	/* the provider object's isHidden (the "userHidden" of its description) */
+	BOOL		provider_known;
 	int		failures;
 };
 
 /*
- * One whole look-reset-enable-verify pass. With --check it changes nothing and returns what it found; otherwise
- * it resets the provider's domains when there is none or none is enabled (the only call that makes the daemon
- * create the default domain), enables every domain that is not, falls back to the public NSFileProviderManager
- * when the private calls left nothing enabled, and reads the state back -- the readback, not the calls, is the
- * verdict.
+ * The identifier the setEnabled/setHiddenByUser calls are addressed to: the first domain the daemon lists
+ * for this provider, and for LocalStorage -- whose only domain is the default one and which the daemon
+ * keeps out of that list while it is hidden -- the default domain's own identifier (R16).
+ */
+static NSString *
+target_domain_identifier(NSArray *domains)
+{
+	for (NSUInteger i = 0; i < [domains count]; i++) {
+		NSString *identifier = domain_identifier(domains[i]);
+
+		if (identifier != nil) {
+			return identifier;
+		}
+	}
+	return default_domain_identifier();
+}
+
+/*
+ * Read both halves of the state: the domain list (what the public API would show) and the provider object
+ * (what `fileproviderctl domain list` prints). A hidden default domain is absent from the list and present
+ * as a provider, so both are read and printed every time.
+ */
+static void
+read_state(id daemon, NSString *provider, struct pass_result *result, const char *when, NSArray **out_domains)
+{
+	NSError *error = nil;
+	NSArray *domains = get_domains_timeout(daemon, provider, &error, 5.0);
+
+	fprintf(stderr, "fp_enable: %s: getDomainsForProviderIdentifier: %lu domain(s)%s%s\n", when,
+	    (unsigned long)[domains count], error ? ", error " : "",
+	    error ? [[error description] UTF8String] : "");
+	for (NSUInteger i = 0; i < [domains count]; i++) {
+		show_domain(domains[i], when, i);
+	}
+	result->domains = [domains count];
+	result->enabled = enabled_count(domains);
+	result->provider_known = provider_flags(daemon, provider, &result->provider_enabled,
+	    &result->provider_hidden, when);
+	fprintf(stderr, "fp_enable: %s: provider object: known=%s enabled=%d hidden=%d\n", when,
+	    result->provider_known ? "yes" : "NO", result->provider_enabled, result->provider_hidden);
+	if (out_domains != NULL) {
+		*out_domains = domains;
+	}
+}
+
+/*
+ * One whole look-enable-unhide-verify pass. With --check it changes nothing and returns what it found.
+ *
+ * R16: the order and the verdict changed.
+ *  - The verdict is the provider object (isEnabled, isHidden), not getDomainsForProviderIdentifier:. For
+ *    LocalStorage that call answers 0 both before and after a working enable (TEST10: the daemon started
+ *    the extension while the client read 0), because the default domain is hidden.
+ *  - The enable is setEnabled:YES addressed to the *real* domain identifier -- the default one (the empty
+ *    string) when the daemon lists none. The old last-resort call with the literal
+ *    "NSFileProviderDomainDefaultIdentifier" named no domain at all; it is gone.
+ *  - "userHidden" gets its own call (setHiddenByUser:NO). It is not a side effect of enabling, and while it
+ *    is set the daemon ignores the default domain at startup ("is a hidden default domain, ignoring"), which
+ *    is the state that leaves Files.app with no location and fileproviderctl ls with no items.
+ *  - addDomain is not called at all: the default domain can not be added (NSFileProviderDomain.h) and a
+ *    process that is not the provider's application gets -2001 "no provider could be found in the
+ *    application" (NSFileProviderError.h). Both were only noise in the log.
+ *  - removeAllDomains runs for --reset, and once as the fallback when the daemon does not know the provider
+ *    at all: it is the daemon path that (re)creates the default domain (_recreateDefaultDomainIfNeeded) and
+ *    it lifts userEnabled -- but the daemon cannot remove the default domain, so it is not the first move.
  */
 static struct pass_result
 enable_pass(id daemon, NSString *provider, BOOL reset, BOOL check)
 {
-	struct pass_result result = { 0, 0, 0 };
-	NSError *error = nil;
-	NSArray *domains;
-	BOOL reset_sent = NO;
+	struct pass_result result = { 0, 0, -1, -1, NO, 0 };
+	NSArray *domains = nil;
+	BOOL recreated = NO;
+	NSString *identifier;
 
 	show_provider(daemon, provider, "provider");
-	domains = get_domains(daemon, provider, &error);
-	fprintf(stderr, "fp_enable: domains before: %lu%s%s\n", (unsigned long)[domains count],
-	    error ? ", error " : "", error ? [[error description] UTF8String] : "");
-	for (NSUInteger i = 0; i < [domains count]; i++) {
-		show_domain(domains[i], "before", i);
-	}
-	result.domains = [domains count];
-	result.enabled = enabled_count(domains);
+	read_state(daemon, provider, &result, "before", &domains);
 	if (check) {
 		show_provider(daemon, provider, "after (no change)");
-		fprintf(stderr, "fp_enable: --check: %d of %lu domain(s) enabled\n", result.enabled,
-		    (unsigned long)[domains count]);
+		fprintf(stderr, "fp_enable: --check: provider enabled=%d hidden=%d, %d of %lu listed domain(s) enabled\n",
+		    result.provider_enabled, result.provider_hidden, result.enabled, (unsigned long)result.domains);
 		return result;
 	}
-	/* no domain at all (the state every run before TEST7): make the daemon create the default one;
-	 * a domain that is there but disabled (TEST7, TEST8): the daemon never re-enables it by itself,
-	 * _recreateDefaultDomainIfNeeded sets userEnabled only where it creates the domain, so the
-	 * reset is the only call that gives setEnabled:YES an identifier to work on. --reset does the
-	 * same on purpose. LocalStorage's files stay in the app group; the daemon re-creates the
-	 * default domain. */
-	if (result.domains == 0 || reset || result.enabled == 0) {
+	if (reset) {
 		NSError *failure;
+		BOOL sent = NO;
 
-		fprintf(stderr, "fp_enable: reset (%s): %lu domain(s), %d enabled\n",
-		    result.domains == 0 ? "no domain" : reset ? "--reset" : "none enabled",
-		    (unsigned long)result.domains, result.enabled);
-		failure = remove_all_domains(daemon, provider, &reset_sent);
-
+		fprintf(stderr, "fp_enable: --reset: asking the daemon to remove %s's domains (the default "
+		    "domain cannot be removed; the call lifts userEnabled, R16)\n", [provider UTF8String]);
+		failure = remove_all_domains(daemon, provider, &sent);
 		fprintf(stderr, "fp_enable: removeAllDomains: %s%s\n",
-		    failure ? [[failure description] UTF8String] : "done", reset_sent ? "" : " (not sent)");
+		    failure ? [[failure description] UTF8String] : "done", sent ? "" : " (not sent)");
 		say_error("removeAllDomains error", failure, 0);
-		error = nil;
-		domains = get_domains_timeout(daemon, provider, &error, 5.0);
-		/* the domain is started before removeAllDomains answers, but the list is another
-		 * round trip; an empty first answer is worth half a second and a second look */
-		for (int attempt = 0; attempt < 6 && [domains count] == 0; attempt++) {
-			fprintf(stderr, "fp_enable: no domain listed yet (attempt %d), waiting\n", attempt + 1);
-			usleep(500000);
-			error = nil;
-			domains = get_domains_timeout(daemon, provider, &error, 2.0);
-		}
-		fprintf(stderr, "fp_enable: domains after the reset: %lu%s%s\n", (unsigned long)[domains count],
-		    error ? ", error " : "", error ? [[error description] UTF8String] : "");
-		for (NSUInteger i = 0; i < [domains count]; i++) {
-			show_domain(domains[i], "after the reset", i);
-		}
-		result.domains = [domains count];
-		result.enabled = enabled_count(domains);
-		/* The private reset is the call that creates the default domain, and the proxy may have refused
-		 * it (TEST8: it never even went out). The public addDomain: lands in the same daemon code; worth
-		 * one try before the pass is called a failure. */
-		if ([domains count] == 0) {
-			add_domain_public(provider, @"Local Storage");
-			error = nil;
-			domains = get_domains_timeout(daemon, provider, &error, 5.0);
-			fprintf(stderr, "fp_enable: domains after the public addDomain: %lu%s%s\n",
-			    (unsigned long)[domains count], error ? ", error " : "",
-			    error ? [[error description] UTF8String] : "");
-			for (NSUInteger i = 0; i < [domains count]; i++) {
-				show_domain(domains[i], "after the public addDomain", i);
-			}
-			result.domains = [domains count];
-			result.enabled = enabled_count(domains);
-		}
+		recreated = YES;
+		sleep(1);
+		read_state(daemon, provider, &result, "after the reset", &domains);
 	}
-	for (NSUInteger i = 0; i < [domains count]; i++) {
-		NSString *identifier = domain_identifier(domains[i]);
+	identifier = target_domain_identifier(domains);
+	fprintf(stderr, "fp_enable: the domain identifier the enable/unhide calls will use: \"%s\"%s\n",
+	    [identifier UTF8String], [identifier length] == 0 ? " (the default domain, R16)" : "");
+	/* the toggle itself: one call for the domain, whatever the daemon says the state is; an "already
+	 * enabled" no-op costs one message and keeps the path the same for every state */
+	if (result.provider_enabled != 1 || result.domains == 0) {
+		result.failures += set_enabled(daemon, provider, identifier) != 0;
+	}
+	if (result.provider_known && result.provider_hidden == 1) {
+		result.failures += set_hidden_by_user(daemon, provider, identifier, NO) != 0;
+	}
+	read_state(daemon, provider, &result, "after the enable and the unhide", &domains);
+	if (result.provider_enabled != 1 && ![identifier isEqualToString:provider]) {
+		/* one more attempt with the provider's own identifier: it costs nothing and covers a daemon
+		 * that keys a legacy provider-wide toggle by provider instead of by domain (the three guesses
+		 * fp_enable 15:18 sent were this, the provider id and the empty string) */
+		fprintf(stderr, "fp_enable: still not enabled with \"%s\"; one more attempt with the provider "
+		    "identifier as the domain identifier\n", [identifier UTF8String]);
+		result.failures += set_enabled(daemon, provider, provider) != 0;
+		read_state(daemon, provider, &result, "after the second enable", &domains);
+	}
+	if (result.provider_known && result.provider_hidden == 1 && ![identifier isEqualToString:provider]) {
+		result.failures += set_hidden_by_user(daemon, provider, provider, NO) != 0;
+		read_state(daemon, provider, &result, "after the second unhide", &domains);
+	}
+	/* The daemon does not know the provider (no object at all): the default domain has never been
+	 * created for this provider. removeAllDomains is the daemon's own way to make it create one. Done
+	 * once, and only in that state -- not as a first move (R16). */
+	if ((!result.provider_known || (result.provider_enabled != 1 && result.domains == 0)) && !recreated) {
+		NSError *failure;
+		BOOL sent = NO;
 
-		/* the re-created default domain already has userEnabled = [descriptor enabledByDefault];
-		 * an enable call on top is what the Files toggle does, and it is not an error either way */
-		if (domain_enabled(domains[i]) == 1) {
-			fprintf(stderr, "fp_enable: domain \"%s\" is enabled already\n",
-			    identifier ? [identifier UTF8String] : "(no identifier)");
-			continue;
+		fprintf(stderr, "fp_enable: the daemon has %s; asking it to (re)create the default domain "
+		    "(removeAllDomains, the daemon's own _recreateDefaultDomainIfNeeded path)\n",
+		    result.provider_known ? "no enabled domain" : "no provider object");
+		failure = remove_all_domains(daemon, provider, &sent);
+		fprintf(stderr, "fp_enable: removeAllDomains (fallback): %s%s\n",
+		    failure ? [[failure description] UTF8String] : "done", sent ? "" : " (not sent)");
+		say_error("removeAllDomains (fallback) error", failure, 0);
+		sleep(1);
+		read_state(daemon, provider, &result, "after the fallback", &domains);
+		identifier = target_domain_identifier(domains);
+		if (result.provider_enabled != 1) {
+			result.failures += set_enabled(daemon, provider, identifier) != 0;
 		}
-		if (identifier != nil && set_enabled(daemon, provider, identifier) != 0) {
-			result.failures++;
+		if (result.provider_known && result.provider_hidden == 1) {
+			result.failures += set_hidden_by_user(daemon, provider, identifier, NO) != 0;
 		}
+		read_state(daemon, provider, &result, "at the end", &domains);
 	}
-	/* The guessed identifiers of fp_enable 15:18 are kept only as a last resort: the default
-	 * domain ID if the daemon still has not listed one. Not after a successful enable -- the
-	 * domain list here is the one the reset returned, and an identifier the daemon does not have
-	 * answers NSFileNoSuchFileError (4), which would turn a working enable into a failure. */
-	if ([domains count] == 0) {
-		result.failures += set_enabled(daemon, provider, @"NSFileProviderDomainDefaultIdentifier") != 0;
+	fprintf(stderr, "fp_enable: verdict: %s: known=%s enabled=%d hidden=%d domains=%lu errors=%d -> %s\n",
+	    [provider UTF8String], result.provider_known ? "yes" : "NO", result.provider_enabled,
+	    result.provider_hidden, (unsigned long)result.domains, result.failures,
+	    (result.provider_known && result.provider_enabled == 1 && result.provider_hidden == 0) ?
+	    "PASS" : "FAIL");
+	if (result.provider_known && result.provider_enabled == 1 && result.provider_hidden != 0) {
+		fprintf(stderr, "fp_enable: the provider is enabled but hidden (userHidden): the daemon ignores "
+		    "a hidden default domain, so Files.app gets no location and its contents are never "
+		    "enumerated. setHiddenByUser:NO did not clear it -- FileProviderDaemon answers \"ignoring "
+		    "user-disabling the domain, because its visibility cannot be changed for %%@\" for providers "
+		    "whose descriptor does not allow it; the remaining lever is the daemon's on-disk domain "
+		    "state (~/Library/Application Support/FileProvider/%s) and a new fileproviderd (R16)\n",
+		    [provider UTF8String]);
 	}
-	error = nil;
-	domains = get_domains(daemon, provider, &error);
-	result.domains = [domains count];
-	result.enabled = enabled_count(domains);
-	fprintf(stderr, "fp_enable: domains at the end: %lu, %d enabled%s%s\n", (unsigned long)[domains count],
-	    result.enabled, error ? ", error " : "", error ? [[error description] UTF8String] : "");
-	for (NSUInteger i = 0; i < [domains count]; i++) {
-		show_domain(domains[i], "at the end", i);
+	if (result.domains == 0 && result.provider_known && result.provider_enabled == 1 &&
+	    result.provider_hidden == 0) {
+		fprintf(stderr, "fp_enable: getDomainsForProviderIdentifier: lists nothing while the provider is "
+		    "enabled and visible: that is the hidden default domain case of R16 (TEST10), not a "
+		    "failure -- the provider object above is the state, `fileproviderctl domain list` is the "
+		    "same object\n");
 	}
-	show_provider(daemon, provider, "after");
-	fprintf(stderr, "fp_enable: verdict: %s %s\n", [provider UTF8String],
-	    result.enabled > 0 ? "has an enabled domain" : "has NO enabled domain");
-	if ([domains count] == 0) {
-		fprintf(stderr, "fp_enable: the provider still has no domain\n");
-	} else if (result.failures != 0) {
-		fprintf(stderr, "fp_enable: %d enable call(s) answered with an error\n", result.failures);
-	} else if (result.enabled == 0) {
-		fprintf(stderr, "fp_enable: the domain is listed but still disabled: the daemon "
-		    "answered, the enable did not take (fileproviderctl domain list is the same state)\n");
-	}
+	fprintf(stderr, "fp_enable: summary: provider=%s known=%d enabled=%d hidden=%d domains=%lu errors=%d "
+	    "result=%s\n", [provider UTF8String], result.provider_known ? 1 : 0, result.provider_enabled,
+	    result.provider_hidden, (unsigned long)result.domains, result.failures,
+	    (result.provider_known && result.provider_enabled == 1 && result.provider_hidden == 0) ?
+	    "PASS" : "FAIL");
 	return result;
 }
 
@@ -1260,25 +1452,32 @@ main(int argc, char **argv)
 			snprintf(when, sizeof(when), "pass %u", attempt);
 			say_daemon_state(when);
 			result = enable_pass(daemon, provider, reset, check);
-			pass = result.domains > 0 && result.failures == 0 && result.enabled > 0;
+			/* R16: the provider object read back is the verdict -- enabled and not hidden. The
+			 * domain list may legitimately be empty (the hidden default domain of LocalStorage is
+			 * not in it), so a count of 0 is not a failure any more, and a call that answered with
+			 * an error while the state it asked for is there is a line in the log, not a failure. */
+			pass = result.provider_known && result.provider_enabled == 1 &&
+			    result.provider_hidden == 0;
 
 			if (check) {
-				return result.enabled > 0 ? 0 : 1;
+				return pass ? 0 : 1;
 			}
 			if (pass) {
-				fprintf(stderr, "fp_enable: pass %u: %lu domain(s), %d enabled\n", attempt,
-				    (unsigned long)result.domains, result.enabled);
+				fprintf(stderr, "fp_enable: pass %u: provider enabled, not hidden, %lu domain(s) "
+				    "listed, %d error(s)\n", attempt, (unsigned long)result.domains,
+				    result.failures);
 				return 0;
 			}
-			/* R14: the provider is there and the reset was answered, but the daemon's list is
-			 * still empty -- the case TEST9 showed, where fileproviderd had started 1.4 s before
-			 * the LS/pkd rebuild finished. One restart, then the pass is repeated; a daemon born
-			 * against the complete registry is the only state difference a client can make. */
-			if (restart && !restarted && result.domains == 0 && result.failures == 0) {
+			/* R14: the provider is unknown or not enabled -- the case TEST9 showed, where
+			 * fileproviderd had started 1.4 s before the LS/pkd rebuild finished. One restart, then
+			 * the pass is repeated; a daemon born against the complete registry is the only state
+			 * difference a client can make. R16: the trigger is the provider object now, not an
+			 * empty domain list (which a working LocalStorage always has). */
+			if (restart && !restarted && !result.provider_known && result.failures == 0) {
 				restarted = YES;
-				fprintf(stderr, "fp_enable: pass %u: %lu domain(s) and no error, but no domain: "
-				    "the daemon may have started before the registry was complete; restarting it\n",
-				    attempt, (unsigned long)result.domains);
+				fprintf(stderr, "fp_enable: pass %u: the daemon does not know the provider and no "
+				    "call failed: it may have started before the registry was complete; restarting "
+				    "it\n", attempt);
 				if (restart_daemon(service, restart_seconds)) {
 					daemon = wait ? wait_for_daemon(provider,
 					    MIN(10.0, MAX(1.0, restart_seconds)), service) : proxy();
@@ -1292,14 +1491,17 @@ main(int argc, char **argv)
 				fprintf(stderr, "fp_enable: the restart did not happen; the pass goes on as before\n");
 			}
 			if (deadline == 0 || now_seconds() >= deadline) {
-				fprintf(stderr, "fp_enable: pass %u: %lu domain(s), %d enabled, %d error(s); "
-				    "%s\n", attempt, (unsigned long)result.domains, result.enabled, result.failures,
+				fprintf(stderr, "fp_enable: pass %u: known=%d enabled=%d hidden=%d %lu domain(s), "
+				    "%d error(s); %s\n", attempt, result.provider_known ? 1 : 0,
+				    result.provider_enabled, result.provider_hidden, (unsigned long)result.domains,
+				    result.failures,
 				    deadline == 0 ? "no --retry, giving up" : "the retry deadline has passed, giving up");
 				return 1;
 			}
-			fprintf(stderr, "fp_enable: pass %u: %lu domain(s), %d enabled, %d error(s); %.0f s left, "
-			    "waiting 5 s and trying again\n", attempt, (unsigned long)result.domains, result.enabled,
-			    result.failures, deadline - now_seconds());
+			fprintf(stderr, "fp_enable: pass %u: known=%d enabled=%d hidden=%d %lu domain(s), %d "
+			    "error(s); %.0f s left, waiting 5 s and trying again\n", attempt,
+			    result.provider_known ? 1 : 0, result.provider_enabled, result.provider_hidden,
+			    (unsigned long)result.domains, result.failures, deadline - now_seconds());
 			sleep(5);
 			daemon = wait ? wait_for_daemon(provider, MIN(10.0, MAX(1.0, deadline - now_seconds())), service)
 			    : proxy();
