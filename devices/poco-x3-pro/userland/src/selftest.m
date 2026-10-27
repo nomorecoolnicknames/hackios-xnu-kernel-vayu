@@ -757,6 +757,29 @@ stage_files(double at)
 	stage_say("the domain list and dump are %s's own words; the file is written as mobile and then "
 	    "looked for in the provider's listing", "fileproviderd");
 
+	/*
+	 * Before the daemon is asked anything: LaunchServices' and pkd's records of the system's app extensions.
+	 * fileproviderd's FPDProviderDescriptor takes the LocalStorage domain's initial userEnabled from the
+	 * extension's NSExtensionFileProviderEnabledByDefault attribute (FileProviderDaemon 0x1c3c65dd0:
+	 * setEnabledByDefault: = attributes[...] boolValue, NO when the key is absent), so a record built
+	 * without that key is a domain created disabled -- TEST7's "Local Storage (disabled)" while the appex's
+	 * own Info.plist says true. ls_rebuild is that rebuild; it printed "LSApplicationWorkspace MISSING" in
+	 * TEST7's camera stage because it was linked against Foundation only (fixed in build.sh), and it ran
+	 * after this stage, never before it.
+	 */
+	if (access("/redwood/bin/ls_rebuild", X_OK) == 0) {
+		char rebuild[16384];
+
+		rebuild[0] = '\0';
+		exit_code = run_capture((char *const[]){ (char *)"/redwood/bin/ls_rebuild", NULL },
+		    rebuild, sizeof(rebuild), 60);
+		stage_say("/redwood/bin/ls_rebuild (system app and plug-in database), before the daemon is asked: exit %d",
+		    exit_code);
+		detail_text(rebuild);
+	} else {
+		stage_say("ls_rebuild: /redwood/bin/ls_rebuild is not in this image");
+	}
+
 	list[0] = '\0';
 	exit_code = run_capture((char *const[]){ (char *)FILEPROVIDERCTL, (char *)"domain", (char *)"list", NULL },
 	    list, sizeof(list), 30);
@@ -768,14 +791,13 @@ stage_files(double at)
 
 	/*
 	 * The enable. On a fresh /var the domain is listed but not enabled (TEST5Q at +45 s:
-	 * "Local Storage (disabled)", and fileproviderctl ls -> -2001), because fileproviderd never ran
-	 * the path that makes the default domain. /redwood/bin/fp_enable (device build, signed with
-	 * fileproviderctl's entitlements) asks the daemon for the provider's domains, lets
-	 * removeAllDomainsForProviderIdentifier: create the default one, enables it, and drops to mobile
-	 * (501) itself -- the daemon serves user/501 and Files.app is mobile. It waits for the daemon
-	 * first: at +45 s launchd may be starting fileproviderd on this very connection (TEST5Q shows
-	 * the spawn at 11:09:29 and a Cocoa 4099 right behind it). The verdict below is read from the
-	 * second domain list, not from the first.
+	 * "Local Storage (disabled)", and fileproviderctl ls -> -2001). /redwood/bin/fp_enable (device build,
+	 * signed with fileproviderctl's entitlements) asks the daemon for the provider's domains, has
+	 * removeAllDomainsForProviderIdentifier: create the default one when there is none or the one there is
+	 * disabled, enables it, and drops to mobile (501) itself -- the daemon serves user/501 and Files.app is
+	 * mobile. It waits for the daemon first: at +45 s launchd may be starting fileproviderd on this very
+	 * connection (TEST5Q shows the spawn at 11:09:29 and a Cocoa 4099 right behind it). The verdict below
+	 * is read from the second domain list, not from the first.
 	 */
 	if (access("/redwood/bin/fp_enable", X_OK) == 0) {
 		enable[0] = '\0';
@@ -869,9 +891,11 @@ stage_files(double at)
 	extension_running = process_count("LocalStorageFileProvider") > 0;
 	stage_say("LocalStorageFileProvider: %s", extension_running ? "running" : "not seen (the ``ls`` above is the proof that matters)");
 	if (!listed || !enabled) {
-		stage_say("the domain is still not enabled after fp_enable: read its output above (removeAllDomains "
-		    "answering -2001 means fileproviderd's provider is invalidated), then fileproviderd's own log "
-		    "and whether LocalStorageFileProvider.appex is in the system image");
+		stage_say("the domain is still not enabled after fp_enable: read its output above -- \"no connection "
+		    "to fileproviderd\" and \"no answer\" are different faults (this program's FileProvider link, "
+		    "then the daemon), an error 4 is a domain the daemon does not have (the reset creates it), and a "
+		    "domain that is listed and disabled is the daemon's own descriptor (see ls_rebuild above) -- "
+		    "then fileproviderd's log and whether LocalStorageFileProvider.appex is in the system image");
 	}
 
 	{
