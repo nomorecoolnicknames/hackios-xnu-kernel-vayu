@@ -224,6 +224,12 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         # waits for; it now runs through a session.)
         'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced')
 
+# 'restore' also covers com.apple.nfrestore, and that one is deliberately not shipped even though nfcd
+# asks for it: the helper reads usr/standalone/firmware/nfrestore/firmware (left out of the system image
+# by select-system.py) and the PN553 bridge refuses download mode, so it can only fail -- and nfcd then
+# retries with a 0 s delay.  The retry is stopped on the nfcd side instead
+# (userland/src/inject_nfcrestore.m); adding this plist is not the fix.
+
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
 
