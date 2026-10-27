@@ -1,0 +1,14 @@
+# This phone's GPU, and why the image has to carry the renderer behind it.
+#
+# The kernel brings the Adreno 640 up in bsd/dev/vayu_adreno.c (steps 1..22: clocks, RPMh rails,
+# GMU firmware from fw/a640_gmu.bin, the SMMU, the zap shader through TrustZone) and, at the end,
+# keeps it powered and taking commands: "THE GPU STAYS ON for the system to draw with: the service
+# HakiosGPU". Boot-arg gpu=1 vayu_gpu=1 is what asks for it, and the firmware is in fw/, so an
+# image of this phone without them draws nothing and with them the GPU is there before the first
+# program runs -- but nothing in iOS uses it by itself: CoreAnimation has no Metal driver here, and
+# its OpenGL ES renderer exists only if the image has lib/libOSMesa.8.dylib and
+# lib/libhakios.gl.dylib (userland/src/eagl.c, GL=1).
+#
+# The file's presence is what makes userland/build.sh default GL to 1 (see "The OpenGL ES path of
+# the window server" there). Remove it and every build of this phone's root is a software-rendered
+# one again -- buildable, bootable, and visibly wrong only in use.
