@@ -32,6 +32,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <mach/mach_time.h>
 #include <notify.h>
 #include <objc/runtime.h>
@@ -1217,6 +1219,141 @@ fb120_info_value(CFBundleRef bundle, CFStringRef key)
 
 HAKIOS_INTERPOSE(fb120_info_value, CFBundleGetValueForInfoDictionaryKey);
 
+/*
+ * Boot-arg t120=1: the rest of "120 Hz while a finger is down".
+ *
+ * What TEST3 proved: the panel's clock is 120 (vayu-vsync: 3600 frames in 30 s), and with fb_120=1
+ * CoreAnimation's 16.7 ms minimum frame duration is off for backboardd and SpringBoard, so menu
+ * transitions run at 120. A scroll that a finger drives still runs at 60. The floor is not the only
+ * switch: QuartzCore keeps a *frame-rate restriction* for displays it does not take for a ProMotion
+ * one, and an iPhone X's identity is not; whatever UIKit asks for, the display link (UIScrollView's,
+ * and backboardd's own digitizer scheduler, BKDigitizerEventSchedulerWithDisplayLink) is clamped to
+ * the display's "maximum" frames per second, which for this identity is 60.
+ *
+ * The restriction is a byte in QuartzCore. In 20F66 the switch names are 207 C strings at
+ * 0x1d5b57720 and the answers are bytes at 0x1e1f6b790 (both in the shared cache's QuartzCore,
+ * uuid dc2dd4c1-7866-3443-8050-fc915a0204c1):
+ *
+ *   index 113  "CA_ENABLE_ALL_FRAME_RATES"                (0x1882cea0c)
+ *   index 118  "CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION"    (0x1883ac018)
+ *   index 119  "CA_FORCE_120HZ"                           (0x1e1f6b807; read at 0x18828b294 and
+ *                                                          0x188306184, both in the display's
+ *                                                          frame-rate arbitration, and both skip
+ *                                                          the clamp when it is set)
+ *
+ * QuartzCore fills that table from the environment once, at a moment this constructor cannot see, so
+ * the bytes are written directly as well -- after checking the image's uuid and the CA_FORCE_120HZ
+ * string, so a different cache is left alone -- and written again on a timer in case the fill
+ * happens after us.
+ */
+static const unsigned char t120_quartzcore_uuid[16] = {
+	0xdc, 0x2d, 0xd4, 0xc1, 0x78, 0x66, 0x34, 0x43, 0x80, 0x50, 0xfc, 0x91, 0x5a, 0x02, 0x04, 0xc1,
+};
+
+/* offsets from QuartzCore's mach header, 20F66 (see above): 0x1e1f6b790 - 0x18827b000, etc. */
+#define T120_QC_SETTINGS        0x59cf0790UL
+#define T120_QC_MARKER          0x31a55bUL      /* 0x18859555b: "CA_FORCE_120HZ" */
+#define T120_QC_FORCE_120HZ     119
+#define T120_QC_ALL_FRAME_RATES 113
+#define T120_QC_RESTRICTION     118
+#define T120_QC_FLOOR           0x54cc4e28UL   /* 0x1dcf3fe28: the cached answer of
+                                                     CADisableMinimumFrameDurationOnPhone */
+
+static int
+t120_wanted(void)
+{
+	static int wanted = -1;
+
+	if (wanted < 0) {
+		char arguments[4096] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+		    strstr(arguments, "t120=1") != NULL;
+	}
+	return wanted;
+}
+
+/* the loaded image whose LC_UUID is `uuid`, or NULL */
+static const struct mach_header_64 *
+t120_image(const unsigned char uuid[16])
+{
+	for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+		const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+		const unsigned char *command;
+
+		if (header == NULL || header->magic != MH_MAGIC_64) {
+			continue;
+		}
+		command = (const unsigned char *)(header + 1);
+		for (uint32_t c = 0; c < header->ncmds; c++) {
+			const struct load_command *lc = (const struct load_command *)command;
+
+			if (lc->cmdsize < sizeof(*lc)) {
+				break;
+			}
+			if (lc->cmd == LC_UUID && memcmp(((const struct uuid_command *)lc)->uuid, uuid, 16) == 0) {
+				return header;
+			}
+			command += lc->cmdsize;
+		}
+	}
+	return NULL;
+}
+
+static void
+t120_poke(const char *who)
+{
+	const struct mach_header_64 *quartzcore;
+	volatile unsigned char *settings, *floor;
+
+	if (!t120_wanted()) {
+		return;
+	}
+	quartzcore = t120_image(t120_quartzcore_uuid);
+	if (quartzcore == NULL) {
+		return;                          /* this process has no CoreAnimation */
+	}
+	if (memcmp((const char *)quartzcore + T120_QC_MARKER, "CA_FORCE_120HZ", 14) != 0) {
+		say("hakios: %s: t120=1: QuartzCore at %p has no CA_FORCE_120HZ where 20F66 has it; left alone\n", who,
+		    quartzcore);
+		return;
+	}
+	settings = (volatile unsigned char *)quartzcore + T120_QC_SETTINGS;
+	if (settings[T120_QC_FORCE_120HZ] != 1 || settings[T120_QC_RESTRICTION] != 0 ||
+	    settings[T120_QC_ALL_FRAME_RATES] != 1) {
+		settings[T120_QC_FORCE_120HZ] = 1;
+		settings[T120_QC_ALL_FRAME_RATES] = 1;
+		settings[T120_QC_RESTRICTION] = 0;
+		say("hakios: %s: t120=1: QuartzCore's frame-rate restriction is off (CA_FORCE_120HZ=1, "
+		    "CA_ENABLE_ALL_FRAME_RATES=1, CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION=0)\n", who);
+	}
+	floor = (volatile unsigned char *)quartzcore + T120_QC_FLOOR;
+	if (*floor == 0) {
+		*floor = 1;
+		say("hakios: %s: t120=1: CADisableMinimumFrameDurationOnPhone's cached answer is 1 (byte %p)\n", who,
+		    floor);
+	}
+}
+
+static void
+t120_setup(void)
+{
+	if (!t120_wanted()) {
+		return;
+	}
+	setenv("CA_FORCE_120HZ", "1", 1);
+	setenv("CA_ENABLE_ALL_FRAME_RATES", "1", 1);
+	setenv("CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION", "0", 1);
+	t120_poke(getprogname());
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
+		t120_poke(getprogname());
+	});
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
+		t120_poke(getprogname());
+	});
+}
+
 __attribute__((constructor))
 static void
 hakios_init(void)
@@ -1229,6 +1366,7 @@ hakios_init(void)
 		return;
 	}
 	slide = (uintptr_t)cache - CACHE_BASE;
+	t120_setup();
 	if (strcmp(name, "backboardd") == 0) {
 		char arguments[4096] = "";
 		size_t size = sizeof(arguments) - 1;

@@ -38,6 +38,8 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <notify.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -1291,6 +1293,162 @@ fb120_info_value(CFBundleRef bundle, CFStringRef key)
 
 HAKIOS_INTERPOSE(fb120_info_value, CFBundleGetValueForInfoDictionaryKey);
 
+/*
+ * Boot-arg t120=1: 120 Hz while a finger is down, in SpringBoard.
+ *
+ * fb_120=1 answers CADisableMinimumFrameDurationOnPhone for this process (the interposer above), so
+ * menu transitions run at 120. A scroll that a finger drives still runs at 60: QuartzCore keeps a
+ * frame-rate restriction for a display it does not take for a ProMotion one, and an iPhone X's
+ * identity is not -- the display link UIKit builds for UIScrollView is clamped to the display's
+ * "maximum" frames per second, which is 60 for this identity, while CoreAnimation's own animation
+ * clock is not.
+ *
+ * QuartzCore 20F66 keeps its switches as C strings at 0x1d5b57720 and their answers as bytes at
+ * 0x1e1f6b790: 113 CA_ENABLE_ALL_FRAME_RATES, 118 CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION,
+ * 119 CA_FORCE_120HZ (0x1e1f6b807, read at 0x18828b294 and 0x188306184). src/inject.c has the long
+ * comment. The bytes are written after a uuid and string check, and again on a timer, because
+ * QuartzCore fills the table from the environment at a moment this constructor cannot see. UIScreen's
+ * maximumFramesPerSecond answers 120 as well, so UIKit's own CAFrameRateRange is built around 120.
+ */
+static const unsigned char t120_quartzcore_uuid[16] = {
+	0xdc, 0x2d, 0xd4, 0xc1, 0x78, 0x66, 0x34, 0x43, 0x80, 0x50, 0xfc, 0x91, 0x5a, 0x02, 0x04, 0xc1,
+};
+
+#define T120_QC_SETTINGS        0x59cf0790UL
+#define T120_QC_MARKER          0x31a55bUL      /* 0x18859555b: "CA_FORCE_120HZ" */
+#define T120_QC_FORCE_120HZ     119
+#define T120_QC_ALL_FRAME_RATES 113
+#define T120_QC_RESTRICTION     118
+#define T120_QC_FLOOR           0x54cc4e28UL   /* 0x1dcf3fe28: the cached answer of
+                                                     CADisableMinimumFrameDurationOnPhone */
+
+static int
+t120_wanted(void)
+{
+	static int wanted = -1;
+
+	if (wanted < 0) {
+		char arguments[4096] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+		    strstr(arguments, "t120=1") != NULL;
+	}
+	return wanted;
+}
+
+static const struct mach_header_64 *
+t120_image(const unsigned char uuid[16])
+{
+	for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+		const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+		const unsigned char *command;
+
+		if (header == NULL || header->magic != MH_MAGIC_64) {
+			continue;
+		}
+		command = (const unsigned char *)(header + 1);
+		for (uint32_t c = 0; c < header->ncmds; c++) {
+			const struct load_command *lc = (const struct load_command *)command;
+
+			if (lc->cmdsize < sizeof(*lc)) {
+				break;
+			}
+			if (lc->cmd == LC_UUID && memcmp(((const struct uuid_command *)lc)->uuid, uuid, 16) == 0) {
+				return header;
+			}
+			command += lc->cmdsize;
+		}
+	}
+	return NULL;
+}
+
+static void
+t120_poke(const char *who)
+{
+	const struct mach_header_64 *quartzcore;
+	volatile unsigned char *settings, *floor;
+
+	if (!t120_wanted()) {
+		return;
+	}
+	quartzcore = t120_image(t120_quartzcore_uuid);
+	if (quartzcore == NULL) {
+		return;
+	}
+	if (memcmp((const char *)quartzcore + T120_QC_MARKER, "CA_FORCE_120HZ", 14) != 0) {
+		say("hakios: %s: t120=1: QuartzCore at %p has no CA_FORCE_120HZ where 20F66 has it; left alone\n", who,
+		    quartzcore);
+		return;
+	}
+	settings = (volatile unsigned char *)quartzcore + T120_QC_SETTINGS;
+	if (settings[T120_QC_FORCE_120HZ] != 1 || settings[T120_QC_RESTRICTION] != 0 ||
+	    settings[T120_QC_ALL_FRAME_RATES] != 1) {
+		settings[T120_QC_FORCE_120HZ] = 1;
+		settings[T120_QC_ALL_FRAME_RATES] = 1;
+		settings[T120_QC_RESTRICTION] = 0;
+		say("hakios: %s: t120=1: QuartzCore's frame-rate restriction is off (CA_FORCE_120HZ=1, "
+		    "CA_ENABLE_ALL_FRAME_RATES=1, CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION=0)\n", who);
+	}
+	floor = (volatile unsigned char *)quartzcore + T120_QC_FLOOR;
+	if (*floor == 0) {
+		*floor = 1;
+		say("hakios: %s: t120=1: CADisableMinimumFrameDurationOnPhone's cached answer is 1 (byte %p)\n", who,
+		    floor);
+	}
+}
+
+static long
+t120_maximum_frames(id self, SEL selector)
+{
+	(void)self;
+	(void)selector;
+	return 120;
+}
+
+static void
+t120_answer_screen_rate(const char *class_name, const char *selector)
+{
+	Class cls = objc_getClass(class_name);
+	Method method = cls != NULL ? class_getInstanceMethod(cls, sel_registerName(selector)) : NULL;
+
+	if (method == NULL || method_getImplementation(method) == (IMP)t120_maximum_frames) {
+		return;
+	}
+	method_setImplementation(method, (IMP)t120_maximum_frames);
+	say("hakios: t120=1: -[%s %s] answers 120\n", class_name, selector);
+}
+
+static void
+t120_again(void)
+{
+	t120_poke(getprogname());
+	t120_answer_screen_rate("UIScreen", "maximumFramesPerSecond");
+	t120_answer_screen_rate("UIScreen", "_maximumFramesPerSecond");
+	t120_answer_screen_rate("CADisplay", "maximumFramesPerSecond");
+}
+
+static void
+t120_setup(void)
+{
+	if (!t120_wanted()) {
+		return;
+	}
+	setenv("CA_FORCE_120HZ", "1", 1);
+	setenv("CA_ENABLE_ALL_FRAME_RATES", "1", 1);
+	setenv("CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION", "0", 1);
+	t120_again();
+	/* UIKit is loaded before us in an application, but not necessarily in every program this
+	 * library ends up in; so the answer is put in again after the process has settled. */
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
+		t120_again();
+	});
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
+		t120_again();
+	});
+}
+
+
 __attribute__((constructor))
 static void
 hakios_springboard_init(void)
@@ -1303,6 +1461,7 @@ hakios_springboard_init(void)
 	if (name == NULL) {
 		return;
 	}
+	t120_setup();
 	if (strcmp(name, "SpringBoard") != 0) {
 		static char who[64];
 

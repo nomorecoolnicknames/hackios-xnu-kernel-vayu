@@ -18,6 +18,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -383,6 +384,180 @@ fb120_info_value(CFBundleRef bundle, CFStringRef key)
 
 HAKIOS_INTERPOSE(fb120_info_value, CFBundleGetValueForInfoDictionaryKey);
 
+/*
+ * Boot-arg t120=1: 120 Hz while a finger is down, in an application.
+ *
+ * The key above (CADisableMinimumFrameDurationOnPhone) lifts CoreAnimation's 16.7 ms floor, and that
+ * is all an application needs on a ProMotion phone. It is not all this port needs: QuartzCore also
+ * keeps a frame-rate restriction for a display it does not take for a ProMotion one, and an iPhone
+ * X's identity is not. Whatever UIKit asks for -- UIScrollView's update request, a CADisplayLink --
+ * it is clamped to the display's "maximum" frames per second, which is 60 for this identity; menu
+ * transitions still run at 120 because CoreAnimation's own animation clock is not a display link.
+ * (QuartzCore 20F66: the switch names are at 0x1d5b57720, the answer bytes at 0x1e1f6b790, index 119
+ * is CA_FORCE_120HZ = 0x1e1f6b807, read at 0x18828b294 and 0x188306184. src/inject.c has the long
+ * version.)
+ *
+ * Two things are done, both under t120=1:
+ *   1. the restriction bytes are written in QuartzCore (uuid-checked, string-checked), as in
+ *      src/inject.c; and
+ *   2. UIScreen's maximumFramesPerSecond answers 120, so UIKit's own range
+ *      (CAFrameRateRange/preferredFrameRateRangeMaximum built from it) is not built around 60 in
+ *      the first place.
+ */
+static const unsigned char t120_quartzcore_uuid[16] = {
+	0xdc, 0x2d, 0xd4, 0xc1, 0x78, 0x66, 0x34, 0x43, 0x80, 0x50, 0xfc, 0x91, 0x5a, 0x02, 0x04, 0xc1,
+};
+
+#define T120_QC_SETTINGS        0x59cf0790UL
+#define T120_QC_MARKER          0x31a55bUL      /* 0x18859555b: "CA_FORCE_120HZ" */
+#define T120_QC_FORCE_120HZ     119
+#define T120_QC_ALL_FRAME_RATES 113
+#define T120_QC_RESTRICTION     118
+#define T120_QC_FLOOR           0x54cc4e28UL   /* 0x1dcf3fe28: the cached answer of
+                                                     CADisableMinimumFrameDurationOnPhone */
+
+static void
+sayf(const char *format, ...)
+{
+	char line[400];
+	va_list arguments;
+	int n;
+
+	va_start(arguments, format);
+	n = vsnprintf(line, sizeof(line), format, arguments);
+	va_end(arguments);
+	if (n > 0) {
+		say(line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
+	}
+}
+
+static int
+t120_wanted(void)
+{
+	static int wanted = -1;
+
+	if (wanted < 0) {
+		char arguments[4096] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+		    strstr(arguments, "t120=1") != NULL;
+	}
+	return wanted;
+}
+
+static const struct mach_header_64 *
+t120_image(const unsigned char uuid[16])
+{
+	for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+		const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+		const unsigned char *command;
+
+		if (header == NULL || header->magic != MH_MAGIC_64) {
+			continue;
+		}
+		command = (const unsigned char *)(header + 1);
+		for (uint32_t c = 0; c < header->ncmds; c++) {
+			const struct load_command *lc = (const struct load_command *)command;
+
+			if (lc->cmdsize < sizeof(*lc)) {
+				break;
+			}
+			if (lc->cmd == LC_UUID && memcmp(((const struct uuid_command *)lc)->uuid, uuid, 16) == 0) {
+				return header;
+			}
+			command += lc->cmdsize;
+		}
+	}
+	return NULL;
+}
+
+static void
+t120_poke(void)
+{
+	const struct mach_header_64 *quartzcore;
+	volatile unsigned char *settings, *floor;
+
+	if (!t120_wanted()) {
+		return;
+	}
+	quartzcore = t120_image(t120_quartzcore_uuid);
+	if (quartzcore == NULL) {
+		return;
+	}
+	if (memcmp((const char *)quartzcore + T120_QC_MARKER, "CA_FORCE_120HZ", 14) != 0) {
+		sayf("hakios: %s: t120=1: QuartzCore at %p has no CA_FORCE_120HZ where 20F66 has it; left alone\n", who,
+		    quartzcore);
+		return;
+	}
+	settings = (volatile unsigned char *)quartzcore + T120_QC_SETTINGS;
+	if (settings[T120_QC_FORCE_120HZ] != 1 || settings[T120_QC_RESTRICTION] != 0 ||
+	    settings[T120_QC_ALL_FRAME_RATES] != 1) {
+		settings[T120_QC_FORCE_120HZ] = 1;
+		settings[T120_QC_ALL_FRAME_RATES] = 1;
+		settings[T120_QC_RESTRICTION] = 0;
+		sayf("hakios: %s: t120=1: QuartzCore's frame-rate restriction is off (CA_FORCE_120HZ=1, "
+		    "CA_ENABLE_ALL_FRAME_RATES=1, CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION=0)\n", who);
+	}
+	floor = (volatile unsigned char *)quartzcore + T120_QC_FLOOR;
+	if (*floor == 0) {
+		*floor = 1;
+		sayf("hakios: %s: t120=1: CADisableMinimumFrameDurationOnPhone's cached answer is 1 (byte %p)\n", who,
+		    floor);
+	}
+}
+
+/* +[UIScreen maximumFramesPerSecond] (UIKitCore) and its private spelling, both answered 120. */
+static long
+t120_maximum_frames(id self, SEL selector)
+{
+	(void)self;
+	(void)selector;
+	return 120;
+}
+
+static void
+t120_answer_screen_rate(const char *class_name, const char *selector)
+{
+	Class cls = objc_getClass(class_name);
+	Method method = cls != NULL ? class_getInstanceMethod(cls, sel_registerName(selector)) : NULL;
+
+	if (method == NULL || method_getImplementation(method) == (IMP)t120_maximum_frames) {
+		return;
+	}
+	method_setImplementation(method, (IMP)t120_maximum_frames);
+	sayf("hakios: %s: t120=1: -[%s %s] answers 120\n", who, class_name, selector);
+}
+
+static void
+t120_again(void)
+{
+	t120_poke();
+	t120_answer_screen_rate("UIScreen", "maximumFramesPerSecond");
+	t120_answer_screen_rate("UIScreen", "_maximumFramesPerSecond");
+	t120_answer_screen_rate("CADisplay", "maximumFramesPerSecond");
+}
+
+static void
+t120_setup(void)
+{
+	if (!t120_wanted()) {
+		return;
+	}
+	setenv("CA_FORCE_120HZ", "1", 1);
+	setenv("CA_ENABLE_ALL_FRAME_RATES", "1", 1);
+	setenv("CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION", "0", 1);
+	t120_again();
+	/* UIKit is loaded before us in an application, but not necessarily in every program this
+	 * library ends up in; so the answer is put in again after the process has settled. */
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
+		t120_again();
+	});
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
+		t120_again();
+	});
+}
+
 __attribute__((constructor))
 static void
 hakios_app_init(void)
@@ -399,6 +574,7 @@ hakios_app_init(void)
 	}
 	who = name;
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+	t120_setup();
 	/*
 	 * An application's standard error goes nowhere here, and that is where the Swift runtime says
 	 * what it is about to die of ("Fatal error: ..."), so it is pointed at the console.
