@@ -315,13 +315,28 @@ static uint32_t gFBDivisor = 1;
  * to 10 (the phone, 15 October; fb_threads=1 is how it was).
  */
 static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
-#define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
+/*
+ * Boot-arg fb_queue=N (1 to SWAP_QUEUE, default 2): how many swaps may wait for the panel besides
+ * the one being put there. A swap that comes when the queue is full is held in SwapEnd, and a window
+ * server held past its next refresh makes that refresh late (the five-second "waited for the frame
+ * before" says how often: 62 times in the 5 s of the 69 fps window, 0 in the 119 fps one).
+ */
+#define SWAP_QUEUE              4                       /* frames that may wait for the panel at most (fb_queue) */
 static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
 static inline unsigned
 swapQueue(void)
 {
 	return gQueue >= 1 && gQueue <= SWAP_QUEUE ? gQueue : 1;
 }
+/*
+ * Boot-arg fb_early=1: the swap at the head of the queue is let go of in show() *before* the waits
+ * for the GPU's fence and for the beat, not after them: whoever draws gets its next swap in without
+ * waiting for the one before to be drawn (one more frame in flight than there are queue places).
+ * The surface of the swap stays held here until it is on the panel, whatever the queue says -- so
+ * the window server must have that many display surfaces: the five-second line now says how many
+ * it came in ("the frames came in N different surfaces"), and N must be above fb_queue + 1 for this.
+ */
+static TUNABLE(uint32_t, gEarly, "fb_early", 0);
 /*
  * Boot-arg touch_lat=1: a line for every swap handed over ("tl: s ID at US") and for every frame
  * put on the panel ("tl: v ID ready US shown US done US": the GPU done with it, its beat come, the
@@ -424,6 +439,8 @@ public:
 	 * By default two frames may wait (boot-arg fb_queue=1: one, as before): CoreAnimation draws on a
 	 * clock of its own, and a SwapEnd held past its next tick makes that tick late, the clock going
 	 * on from there (rc.jobs.fps: 28% of the frames over 16.7 ms with two, 33% with one).
+	 * fb_queue=3 or 4 leaves more room for a GPU that answers late; fb_early=1 lets the swap go
+	 * before the waits, which is one more frame in flight without another queue place.
 	 */
 	IOLock *        fSwapLock;              /* around the next five */
 	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
@@ -496,6 +513,7 @@ public:
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces, uint32_t swapFence);
+	void swapTaken(void);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
@@ -1257,6 +1275,17 @@ IOMobileFramebuffer::presenter(void)
 	}
 }
 
+/* The swap at the head of the queue is the presenter's own now: the one after it may be handed over. */
+void
+IOMobileFramebuffer::swapTaken(void)
+{
+	IOLockLock(fSwapLock);
+	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
+	fSwapsWaiting--;
+	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+	IOLockUnlock(fSwapLock);
+}
+
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint32_t swapFence)
@@ -1266,7 +1295,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 	uint32_t layers = 0;
 	MiniIOSurface * recorded = NULL;
 	uint32_t fenceUs = 0, copyUs = 0, intervalUs = 0;
+	bool early = gEarly != 0;
 	bool report;
+
+	if (early) {
+		/* (fb_early=1: SwapEnd is not held behind the waits below) */
+		swapTaken();
+	}
 
 	/*
 	 * The swap's own fence first: the GPU's last submission when the swap came in. A frame is not to be
@@ -1355,12 +1390,10 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 		}
 	}
 	shown = began;
-	/* its turn has come: the swap after it may be handed over */
-	IOLockLock(fSwapLock);
-	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
-	fSwapsWaiting--;
-	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
-	IOLockUnlock(fSwapLock);
+	/* its turn has come: the swap after it may be handed over (fb_early=1: it was, before the waits) */
+	if (!early) {
+		swapTaken();
+	}
 	IOLockLock(fLock);
 	if (fLastFrame != 0) {
 		uint64_t gap;
