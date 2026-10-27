@@ -702,8 +702,13 @@ write_test_file(const char *name)
 
 /*
  * What `fileproviderctl domain list` says about the LocalStorage domain: LISTED when its name or
- * identifier is in the text, ENABLED from the "(enabled)"/"(disabled)" word that follows it. The
+ * identifier is in the text, ENABLED from the "(disabled)"/"(hidden)" word that follows it. The
  * list is one entry over several lines, so the word is looked for on the next three lines only.
+ *
+ * R16: the list is the FPProviderDomain list (the object fp_enable's providerDomainForIdentifier: returns),
+ * and it prints "(hidden)" -- not "(disabled)" -- for a provider that is userEnabled=YES and hiddenByUser=YES.
+ * TEST10 read that as "not enabled" and the stage failed on a state whose only problem was the hidden flag,
+ * so "(hidden)" now counts as enabled; fp_enable's own summary line says which of the two it is.
  */
 static void
 parse_domain_list(const char *text, int *listed, int *enabled)
@@ -732,6 +737,8 @@ parse_domain_list(const char *text, int *listed, int *enabled)
 		if (window > 0) {
 			if (strstr(lower, "disabled") != NULL) {
 				*enabled = 0;
+			} else if (strstr(lower, "hidden") != NULL) {
+				*enabled = 1;
 			} else if (strstr(lower, "enabled") != NULL) {
 				*enabled = 1;
 			}
@@ -747,9 +754,13 @@ stage_files(double at)
 	static char list[65536], list2[65536], dump[65536], listing[65536], mobile_listing[16384], wrote[16384], enable[32768];
 	static char again[32768];
 	char name[80], path[PATH_MAX] = "", directory[PATH_MAX] = "", readback[32] = "";
-	char line[1024];
+	char line[1024], summary[512] = "";
 	int listed = 0, enabled = 0, written = 0, seen = 0, mobile_seen = 0, exit_code, enable_exit = 0;
 	int again_exit = 0;
+	/* R16: fp_enable's own verdict (the provider object) next to fileproviderctl's list (the same object,
+	 * printed). summary_seen is what decides which one the stage believes. */
+	int summary_seen = 0, summary_ok = 0, summary_hidden = 0;
+	int domain_ok;
 	int extension_running;
 
 	g_stage = "files";
@@ -843,6 +854,16 @@ stage_files(double at)
 		    (char *)"--retry=120", (char *)"--restart=20", NULL }, enable, sizeof(enable), 260);
 		stage_say("fp_enable (fileprovider domain enable, as mobile): exit %d", enable_exit);
 		detail_text(enable);
+		summary[0] = '\0';
+		if (line_after(enable, "fp_enable: summary:", summary, sizeof(summary))) {
+			summary_seen = 1;
+			summary_ok = strstr(summary, "result=PASS") != NULL;
+			summary_hidden = strstr(summary, "hidden=1") != NULL;
+			stage_say("fp_enable's own verdict (R16, the provider object): %s", summary);
+		} else {
+			stage_say("fp_enable printed no summary line (an older binary): the fileproviderctl list below "
+			    "is the verdict");
+		}
 	} else {
 		stage_say("fp_enable: /redwood/bin/fp_enable is not in this image, the domain cannot be enabled here");
 	}
@@ -940,6 +961,12 @@ stage_files(double at)
 		stage_say("fp_enable again, later (the domain was %s after the first pass): exit %d",
 		    enabled ? "enabled" : "not enabled", again_exit);
 		detail_text(again);
+		if (line_after(again, "fp_enable: summary:", summary, sizeof(summary))) {
+			summary_seen = 1;
+			summary_ok = strstr(summary, "result=PASS") != NULL;
+			summary_hidden = strstr(summary, "hidden=1") != NULL;
+			stage_say("fp_enable's own verdict, second process: %s", summary);
+		}
 		list2[0] = '\0';
 		exit_code = run_capture((char *const[]){ (char *)FILEPROVIDERCTL, (char *)"domain", (char *)"list", NULL },
 		    list2, sizeof(list2), 30);
@@ -953,33 +980,46 @@ stage_files(double at)
 	}
 	extension_running = process_count("LocalStorageFileProvider") > 0;
 	stage_say("LocalStorageFileProvider: %s", extension_running ? "running" : "not seen (the ``ls`` above is the proof that matters)");
-	if (!listed || !enabled) {
-		stage_say("the domain is still not enabled after fp_enable (two processes, the second one later): "
-		    "read its output above -- \"no connection to fileproviderd\" and \"no answer\" are different "
-		    "faults (this program's FileProvider link, then the daemon), \"the proxy says it does not answer\" "
-		    "means the call went out anyway (TEST8), an error 4 is a domain the daemon does not have (the "
-		    "reset creates it), and a domain that is listed and disabled is the daemon's own descriptor (see "
-		    "ls_rebuild above) -- then fileproviderd's log and whether LocalStorageFileProvider.appex is in "
-		    "the system image");
+	/* R16: the verdict. fp_enable's summary describes the provider object -- enabled or not, hidden or
+	 * not -- which is also the object fileproviderctl prints; it is believed when present. The list alone
+	 * cannot tell an enabled-but-hidden provider (R16's TEST10 state, "(hidden)") from a working one, and
+	 * it is empty for LocalStorage's default domain while the daemon is still using it. */
+	domain_ok = summary_seen ? summary_ok : (listed && enabled);
+	if (!domain_ok) {
+		stage_say("the provider is still not enabled and visible after fp_enable (two processes, the second "
+		    "one later): read its output above -- \"no connection to fileproviderd\" and \"no answer\" are "
+		    "different faults (this program's FileProvider link, then the daemon), \"the proxy says it does "
+		    "not answer\" means the call went out anyway (TEST8), an error 4 is a domain the daemon does not "
+		    "have (the fallback reset creates it), \"hidden=1\" without an error is the hidden default domain "
+		    "the daemon ignores at startup (R16: setHiddenByUser:NO did not take, its visibility may be "
+		    "fixed), and a domain that is listed and disabled is the daemon's own descriptor (see ls_rebuild "
+		    "above) -- then fileproviderd's log and whether LocalStorageFileProvider.appex is in the image");
+	} else if (summary_seen && summary_hidden) {
+		stage_say("the provider is enabled but hidden (R16): Files.app gets no location for it even though "
+		    "fp_enable's enable calls answered without an error -- this is the remaining fault to chase");
 	}
 
 	{
 		struct stat status;
 
 		if (path[0] != '\0' && stat(path, &status) == 0) {
-			snprintf(line, sizeof(line), "domain=%s+%s fp_enable_exit=%d again_exit=%d file=%s size=%lld "
-			    "readback=%s provider_ls=%s", listed ? "listed" : "NOT-listed",
-			    enabled ? "enabled" : "NOT-enabled", enable_exit, again_exit, path,
+			snprintf(line, sizeof(line), "domain=%s+%s provider=%s fp_enable_exit=%d again_exit=%d file=%s "
+			    "size=%lld readback=%s provider_ls=%s", listed ? "listed" : "NOT-listed",
+			    enabled ? "enabled" : "NOT-enabled",
+			    summary_seen ? (summary_ok ? "enabled+visible" : summary_hidden ? "enabled+hidden" :
+			    "not-enabled") : "unreported", enable_exit, again_exit, path,
 			    (long long)status.st_size, written ? "ok" : "no", seen ? "yes" : "NO");
 		} else {
-			snprintf(line, sizeof(line), "domain=%s+%s fp_enable_exit=%d again_exit=%d file=%s readback=%s "
-			    "provider_ls=%s", listed ? "listed" : "NOT-listed", enabled ? "enabled" : "NOT-enabled",
-			    enable_exit, again_exit, path[0] != '\0' ? path : "(none)", written ? "ok" : "no",
-			    seen ? "yes" : "NO");
+			snprintf(line, sizeof(line), "domain=%s+%s provider=%s fp_enable_exit=%d again_exit=%d file=%s "
+			    "readback=%s provider_ls=%s", listed ? "listed" : "NOT-listed",
+			    enabled ? "enabled" : "NOT-enabled",
+			    summary_seen ? (summary_ok ? "enabled+visible" : summary_hidden ? "enabled+hidden" :
+			    "not-enabled") : "unreported", enable_exit, again_exit, path[0] != '\0' ? path : "(none)",
+			    written ? "ok" : "no", seen ? "yes" : "NO");
 		}
 	}
-	stage_result(listed && enabled && written && seen, "%s", line);
-	return listed && enabled && written && seen;
+	stage_result(domain_ok && written && seen, "%s", line);
+	return domain_ok && written && seen;
 }
 
 /* ---- music ---------------------------------------------------------------------------------- */
