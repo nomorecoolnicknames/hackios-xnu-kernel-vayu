@@ -34,6 +34,15 @@
  *                        WLFW probe.
  *   vayu_wifi_hostcap=N  1 (default): host_cap with the normal table; 2: the 8-bit table; 0: no
  *                        host_cap at all.
+ *   vayu_wifi_hostcap_bits=0x0000  host_cap's TLVs beyond daemon_support, one bit each (ath10k sends
+ *                        daemon_support and nothing else, ref/qmi.c:653-703). The stock host of this
+ *                        firmware is icnss, not ath10k, so a bit is a hypothesis about what that host
+ *                        declares, not a fact: 0x0001 nm_modem=0, 0x0002 bdf_support=1,
+ *                        0x0004 bdf_cache_support=0, 0x0008 m3_support=0, 0x0010 m3_cache_support=0,
+ *                        0x0020 cal_filesys_support=1, 0x0040 cal_cache_support=0, 0x0080 cal_done=0,
+ *                        0x0100 mem_bucket=0, 0x0200 mem_cfg_mode=0. 0x0020 tells the firmware there
+ *                        is a cal file system; fw/ has no cal file, so that bit alone is a lie the
+ *                        firmware may act on. The TLVs sent are printed as bytes before the send.
  *   vayu_wifi_cap=0      do not send the cap request (default 1: send it).
  *   vayu_wifi_bdf_name=NAME  take exactly fw/NAME as the board data file, and no other: a name
  *                        that is not in the boot image is an error, not a fallback, so a run
@@ -120,6 +129,7 @@ static LCK_MTX_DECLARE(vayu_wifi_lock, &vayu_wifi_lck_grp);
 #define VAYU_TFTP_XFERS         8
 
 static uint32_t wifi_level, wifi_hostcap = 1, wifi_cap = 1;
+static uint32_t wifi_hostcap_bits;         /* vayu_wifi_hostcap_bits: host_cap TLVs beyond 0x10 */
 static uint32_t wifi_bdf = 1, wifi_wlan = 1;   /* 1: BDF download / WLAN cfg+mode after cap */
 static uint32_t wifi_bdf_pick;            /* 1: try bdwlan.b<hex> and bd_j20s.bin before the rest */
 static char wifi_bdf_name[64];            /* vayu_wifi_bdf_name=NAME: that file, and no fallback */
@@ -2708,6 +2718,118 @@ vayu_wifi_wlan_mode(void)
 	return resp.resp.result == QMI_RESULT_SUCCESS_V01 ? 0 : -1;
 }
 
+/*
+ * vayu_wifi_hostcap_bits: the host_cap TLVs ath10k never sends (ref/qmi.c:653-703 sends
+ * daemon_support only). Each bit adds one TLV with the value the stock host would be expected to
+ * give; a bit is a hypothesis, not a fact. Returns how many TLVs were added and fills `text` with
+ * them for the log (the encoded bytes are printed by the caller).
+ */
+static unsigned
+wlfw_host_cap_extra(struct vayu_wlfw_host_cap_req_msg_v01 *req, uint32_t bits, char *text, size_t size)
+{
+	unsigned added = 0;
+	size_t at = 0;
+
+	text[0] = 0;
+#define VAYU_HOST_CAP_SAY(literal) do {                                          \
+		if (at < size) {                                                 \
+			at += (size_t)snprintf(text + at, size - at, "%s", literal); \
+			if (at >= size) {                                        \
+				at = size - 1;                                   \
+			}                                                        \
+		}                                                                \
+	} while (0)
+
+	if ((bits & 0x0001) != 0) {                     /* 0x13 nm_modem */
+		req->nm_modem_valid = 1;
+		req->nm_modem = 0;
+		added++;
+		VAYU_HOST_CAP_SAY(" 0x13=0");
+	}
+	if ((bits & 0x0002) != 0) {                     /* 0x14 bdf_support */
+		req->bdf_support_valid = 1;
+		req->bdf_support = 1;
+		added++;
+		VAYU_HOST_CAP_SAY(" 0x14=1");
+	}
+	if ((bits & 0x0004) != 0) {                     /* 0x15 bdf_cache_support */
+		req->bdf_cache_support_valid = 1;
+		req->bdf_cache_support = 0;
+		added++;
+		VAYU_HOST_CAP_SAY(" 0x15=0");
+	}
+	if ((bits & 0x0008) != 0) {                     /* 0x16 m3_support */
+		req->m3_support_valid = 1;
+		req->m3_support = 0;
+		added++;
+		VAYU_HOST_CAP_SAY(" 0x16=0");
+	}
+	if ((bits & 0x0010) != 0) {                     /* 0x17 m3_cache_support */
+		req->m3_cache_support_valid = 1;
+		req->m3_cache_support = 0;
+		added++;
+		VAYU_HOST_CAP_SAY(" 0x17=0");
+	}
+	if ((bits & 0x0020) != 0) {                     /* 0x18 cal_filesys_support */
+		req->cal_filesys_support_valid = 1;
+		req->cal_filesys_support = 1;
+		added++;
+		VAYU_HOST_CAP_SAY(" 0x18=1");
+	}
+	if ((bits & 0x0040) != 0) {                     /* 0x19 cal_cache_support */
+		req->cal_cache_support_valid = 1;
+		req->cal_cache_support = 0;
+		added++;
+		VAYU_HOST_CAP_SAY(" 0x19=0");
+	}
+	if ((bits & 0x0080) != 0) {                     /* 0x1A cal_done */
+		req->cal_done_valid = 1;
+		req->cal_done = 0;
+		added++;
+		VAYU_HOST_CAP_SAY(" 0x1A=0");
+	}
+	if ((bits & 0x0100) != 0) {                     /* 0x1B mem_bucket */
+		req->mem_bucket_valid = 1;
+		req->mem_bucket = 0;
+		added++;
+		VAYU_HOST_CAP_SAY(" 0x1B=0");
+	}
+	if ((bits & 0x0200) != 0) {                     /* 0x1C mem_cfg_mode */
+		req->mem_cfg_mode_valid = 1;
+		req->mem_cfg_mode = 0;
+		added++;
+		VAYU_HOST_CAP_SAY(" 0x1C=0");
+	}
+#undef VAYU_HOST_CAP_SAY
+	return added;
+}
+
+/* The TLVs of a host_cap request as bytes (the QMI header left out), for the log. */
+static void
+wlfw_log_host_cap(const char *what, const struct qmi_elem_info *ei,
+    const struct vayu_wlfw_host_cap_req_msg_v01 *req)
+{
+	uint8_t raw[QMI_HEADER_SIZE + VAYU_WLFW_HOST_CAP_REQ_MAX];
+	char hex[3 * 64 + 1];
+	int length, n;
+
+	length = hakios_qmi_encode(QMI_REQUEST, VAYU_WLFW_HOST_CAP_REQ_V01, 0, ei, req, raw, sizeof(raw));
+	if (length <= QMI_HEADER_SIZE) {
+		say("vayu-wifi: wlfw: %s: the request cannot be encoded for the log: %d\n", what, length);
+		return;
+	}
+	n = length - QMI_HEADER_SIZE;
+	if (n > 64) {
+		n = 64;
+	}
+	for (int i = 0; i < n; i++) {
+		snprintf(hex + 3 * i, 4, " %02x", raw[QMI_HEADER_SIZE + i]);
+	}
+	hex[3 * n] = 0;
+	say("vayu-wifi: wlfw: %s: %d bytes of TLV%s%s\n", what, length - QMI_HEADER_SIZE, hex,
+	    length - QMI_HEADER_SIZE > 64 ? " ..." : "");
+}
+
 static void
 wlfw_thread(void *arg __unused, wait_result_t wr __unused)
 {
@@ -2790,11 +2912,27 @@ wlfw_thread(void *arg __unused, wait_result_t wr __unused)
 
 	/* 2. HOST_CAP, as ath10k_qmi_host_cap_send_sync() (ref/qmi.c:653-703). */
 	if (wifi_hostcap != 0) {
+		const struct qmi_elem_info *cap_ei = wifi_hostcap == 2 ? vayu_wlfw_host_cap_8bit_req_msg_v01_ei
+		    : vayu_wlfw_host_cap_req_msg_v01_ei;
+
 		cap_req.daemon_support_valid = 1;
 		cap_req.daemon_support = 0;
+		if (wifi_hostcap_bits != 0) {
+			char extra[192];
+			unsigned added;
+
+			if (wifi_hostcap == 2) {
+				say("vayu-wifi: wlfw: host_cap: vayu_wifi_hostcap=2 sends the 8-bit table only; "
+				    "vayu_wifi_hostcap_bits=0x%x not used\n", wifi_hostcap_bits);
+			} else {
+				added = wlfw_host_cap_extra(&cap_req, wifi_hostcap_bits, extra, sizeof(extra));
+				say("vayu-wifi: wlfw: host_cap: %u extra TLV(s) for bits 0x%x:%s\n", added,
+				    wifi_hostcap_bits, extra);
+			}
+		}
+		wlfw_log_host_cap("host_cap", cap_ei, &cap_req);
 		ret = wlfw_request("host_cap", VAYU_WLFW_HOST_CAP_REQ_V01, VAYU_WLFW_HOST_CAP_REQ_MAX,
-		    wifi_hostcap == 2 ? vayu_wlfw_host_cap_8bit_req_msg_v01_ei : vayu_wlfw_host_cap_req_msg_v01_ei,
-		    &cap_req, vayu_wlfw_host_cap_resp_msg_v01_ei, &cap_resp);
+		    cap_ei, &cap_req, vayu_wlfw_host_cap_resp_msg_v01_ei, &cap_resp);
 		if (ret < 0) {
 			goto out_release;
 		}
@@ -3096,6 +3234,7 @@ vayu_wifi_start(struct vayu_qrtr *q, uint32_t listen_s)
 	wifi_wlan = 1;
 	PE_parse_boot_argn("vayu_wifi", &wifi_level, sizeof(wifi_level));
 	PE_parse_boot_argn("vayu_wifi_hostcap", &wifi_hostcap, sizeof(wifi_hostcap));
+	PE_parse_boot_argn("vayu_wifi_hostcap_bits", &wifi_hostcap_bits, sizeof(wifi_hostcap_bits));
 	PE_parse_boot_argn("vayu_wifi_cap", &wifi_cap, sizeof(wifi_cap));
 	PE_parse_boot_argn("vayu_wifi_bdf", &wifi_bdf, sizeof(wifi_bdf));
 	PE_parse_boot_argn("vayu_wifi_wlan", &wifi_wlan, sizeof(wifi_wlan));
@@ -3103,9 +3242,9 @@ vayu_wifi_start(struct vayu_qrtr *q, uint32_t listen_s)
 	PE_parse_boot_argn("vayu_wifi_bdf_pick", &wifi_bdf_pick, sizeof(wifi_bdf_pick));
 	PE_parse_boot_argn("vayu_wifi_bdf_name", wifi_bdf_name, sizeof(wifi_bdf_name));
 	wifi_listen_s = listen_s;
-	say("vayu-wifi: vayu_wifi=%u vayu_wifi_hostcap=%u vayu_wifi_cap=%u vayu_wifi_bdf=%u "
+	say("vayu-wifi: vayu_wifi=%u vayu_wifi_hostcap=%u vayu_wifi_hostcap_bits=0x%x vayu_wifi_cap=%u vayu_wifi_bdf=%u "
 	    "vayu_wifi_wlan=%u vayu_msa_fixed_perm=%u listen=%u s bdf_pick=%u bdf_name=%s\n",
-	    wifi_level, wifi_hostcap, wifi_cap, wifi_bdf, wifi_wlan, wifi_msa_fixed_perm, listen_s,
+	    wifi_level, wifi_hostcap, wifi_hostcap_bits, wifi_cap, wifi_bdf, wifi_wlan, wifi_msa_fixed_perm, listen_s,
 	    wifi_bdf_pick, wifi_bdf_name[0] != 0 ? wifi_bdf_name : "(default)");
 	if (wifi_level == 0) {
 		return;

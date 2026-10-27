@@ -118,8 +118,11 @@ void vayu_pas_quiesce(struct vayu_rproc *rp);   /* the same on a panic's way bac
  * it, 480 (its queue) by it; its doorbell one APCS bit. The channels we answer when it opens them,
  * each with the intents we give it and a function for what arrives (called on the edge's thread,
  * never with a lock held). Several edges may be up at once.
+ *
+ * 12, not 4: the modem opens DS and DATA1..DATA11 too (its IPA's GSI pipes, vayu_modem_gsi=1 in
+ * vayu_modem.c); the other edges use their first few places only, and a channel is ~1.7 KB.
  */
-#define VAYU_GLINK_CHANNELS     4
+#define VAYU_GLINK_CHANNELS     12
 
 struct vayu_glink_packet {
 	struct vayu_glink_packet *next;

@@ -47,6 +47,11 @@
  *                2 a round every vayu_cell_poll s; /dev/vayu-cell holds the record (see sys/vayu_cell.h)
  *   vayu_modem_chan=1  also open back "glink_ssr" and "SSM_RTR_MODEM_APPS" (the modem opened both in run 012936)
  *                      and log what it sends on them; nothing is sent there
+ *   vayu_modem_gsi=1   also open back "DS", "DATA1".."DATA4" and "DATA11" -- the GSI pipes the modem's
+ *                      IPA opens right after it has read wlanmdsp.mbn (run 2026-10-27 110918, log
+ *                      448420-448425, where they were left unanswered). The first 16 messages in
+ *                      total, 24 bytes each, are logged; no GSI protocol is spoken, nothing is sent
+ *                      beyond the GLINK open/ack and the intents
  * After a FATAL, vayu_smem_census() lists the shared memory's items (its crash text was not in item 421).
  *
  * What it does NOT do: it runs no rmtfs server and no EFS of its own, it sends no QMI request
@@ -137,9 +142,14 @@ static struct vayu_rproc mpss = {
  * dt: qcom,glink / modem (recovery-live.dts:7872-7903): remote-pid 1, mboxes = <&apcs 12>, SPI
  * 449; the channel "IPCRTR" with qcom,intents = <0x800 5 0x2000 3 0x4400 2>. The same edge may
  * open "DS", "glink_ssr" and "fastrpcglink-apps-dsp"; nothing here answers them (vayu_pas.c logs
- * them in `others`).
+ * them in `others`) -- except with vayu_modem_gsi=1, which answers DS and the DATA* pipes too.
  */
-enum { CHANNEL_QRTR, CHANNEL_SSR, CHANNEL_SSM };
+enum {
+	CHANNEL_QRTR, CHANNEL_SSR, CHANNEL_SSM,
+	/* vayu_modem_gsi=1 only: the modem's IPA/GSI pipes, in the order the log shows them */
+	CHANNEL_DS, CHANNEL_DATA1, CHANNEL_DATA2, CHANNEL_DATA3, CHANNEL_DATA4, CHANNEL_DATA11,
+};
+#define VAYU_MODEM_GSI_CHANNELS  (CHANNEL_DATA11 + 1)
 static struct vayu_qrtr qrtr;
 static void other_input(void *context, const uint8_t *data, uint32_t length);
 static struct vayu_glink glink = {
@@ -154,6 +164,19 @@ static struct vayu_glink glink = {
 		[CHANNEL_SSR] = { .name = "glink_ssr", .intents = { { 0x400, 2 } }, .input = other_input, .context = (void *)(uintptr_t)"glink_ssr" },
 		[CHANNEL_SSM] = { .name = "SSM_RTR_MODEM_APPS", .intents = { { 0x800, 2 } }, .input = other_input,
 		                  .context = (void *)(uintptr_t)"SSM_RTR_MODEM_APPS" },
+		/* vayu_modem_gsi=1 only (.channels raised to 9): run 110918, log 448420-448425 */
+		[CHANNEL_DS] = { .name = "DS", .intents = { { 0x400, 4 } }, .input = other_input,
+		                 .context = (void *)(uintptr_t)"DS" },
+		[CHANNEL_DATA1] = { .name = "DATA1", .intents = { { 0x400, 4 } }, .input = other_input,
+		                    .context = (void *)(uintptr_t)"DATA1" },
+		[CHANNEL_DATA2] = { .name = "DATA2", .intents = { { 0x400, 4 } }, .input = other_input,
+		                    .context = (void *)(uintptr_t)"DATA2" },
+		[CHANNEL_DATA3] = { .name = "DATA3", .intents = { { 0x400, 4 } }, .input = other_input,
+		                    .context = (void *)(uintptr_t)"DATA3" },
+		[CHANNEL_DATA4] = { .name = "DATA4", .intents = { { 0x400, 4 } }, .input = other_input,
+		                    .context = (void *)(uintptr_t)"DATA4" },
+		[CHANNEL_DATA11] = { .name = "DATA11", .intents = { { 0x400, 4 } }, .input = other_input,
+		                     .context = (void *)(uintptr_t)"DATA11" },
 	},
 };
 static struct vayu_qrtr qrtr = { .glink = &glink, .channel = &glink.channel[CHANNEL_QRTR] };
@@ -365,7 +388,7 @@ vayu_modem_quiesce(void)
 void
 vayu_modem_init(void)
 {
-	uint32_t cx = 0, rails = 1, pause = 2200, chan = 0;
+	uint32_t cx = 0, rails = 1, pause = 2200, chan = 0, gsi = 0;
 	thread_t thread;
 
 	if (!PE_parse_boot_argn("vayu_modem", &level, sizeof(level)) || level == 0) {
@@ -385,13 +408,17 @@ vayu_modem_init(void)
 	rails_choose(cx, rails);
 	PE_parse_boot_argn("vayu_pause", &pause, sizeof(pause));
 	PE_parse_boot_argn("vayu_modem_chan", &chan, sizeof(chan));
-	if (chan != 0) {
+	PE_parse_boot_argn("vayu_modem_gsi", &gsi, sizeof(gsi));
+	if (chan != 0 || gsi != 0) {
 		glink.channels = 3;                     /* glink_ssr and SSM_RTR_MODEM_APPS opened back, their data logged */
+	}
+	if (gsi != 0) {
+		glink.channels = VAYU_MODEM_GSI_CHANNELS;       /* and DS, DATA1..DATA4, DATA11: the IPA's GSI pipes */
 	}
 	vayu_pas_set_pause(pause);
 	vayu_rmtfs_prepare();           /* the 3 MB rmtfs buffer from low memory, before the userland */
 	say("vayu-modem: vayu_modem=%u vayu_modem_wait=%u vayu_modem_listen=%u vayu_modem_secs=%u vayu_modem_cx=%u vayu_modem_rails=%u "
-	    "vayu_pause=%u vayu_modem_chan=%u\n", level, wait_s, listen_s, secs, cx, rails, pause, chan);
+	    "vayu_pause=%u vayu_modem_chan=%u vayu_modem_gsi=%u\n", level, wait_s, listen_s, secs, cx, rails, pause, chan, gsi);
 	if (kernel_thread_start(modem_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
