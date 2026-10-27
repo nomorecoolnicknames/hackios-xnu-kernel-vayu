@@ -1125,7 +1125,15 @@ opengl_es(void)
 	int wanted = -1, told = 0;
 
 	if (access(HAKIOS_GL, R_OK) != 0) {
-		return;                                 /* (an image built without it) */
+		/*
+		 * An image built without GL=1 (build.sh): nothing is wrong with this process or with the
+		 * GPU, and there is nothing to fall back to -- CoreAnimation draws every frame with its own
+		 * software rasterizer. Its own lines ("Software renderer! Simulating crash!") name the
+		 * fallback and not the reason, so the reason is said here, once per window server.
+		 */
+		say("hakios: %s is not in this image (built without GL=1): "
+		    "CoreAnimation keeps its software renderer\n", HAKIOS_GL);
+		return;
 	}
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 		functions_said_yes(arguments);
