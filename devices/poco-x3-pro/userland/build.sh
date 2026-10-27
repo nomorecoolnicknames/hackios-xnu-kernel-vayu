@@ -31,9 +31,29 @@ sign obj/media_import $V/media_import.entitlements
 # (extension-host, enumerate, both FileProvider app groups), which are Apple's own: read out of the
 # system image at build time, never kept in git (as run_migrator). Without them fileproviderd
 # refuses the client, so an unsigned copy is only a warning, not a usable program.
-$DYN -fobjc-arc -fblocks -framework Foundation -o obj/fp_enable $V/fp_enable.m
+# -framework FileProvider: FPDaemonConnection -- the class every call in fp_enable goes through -- is in
+# that framework, and Foundation alone does not load it: NSClassFromString(@"FPDaemonConnection") was nil
+# in TEST7, so fp_enable said "no connection to fileproviderd" at +45 s while launchd had just spawned
+# fileproviderd[120] and fileproviderctl answered "domain list" (exit 0) in the same run.
+$DYN -fobjc-arc -fblocks -framework Foundation -framework FileProvider -o obj/fp_enable $V/fp_enable.m
 if [ -f $IOS/rootfs/usr/bin/fileproviderctl ] &&
     ${LDID:-ldid} -e $IOS/rootfs/usr/bin/fileproviderctl > obj/fp_enable.entitlements 2>/dev/null; then
+	# The LocalStorage document storage is the app group container + "File Provider Storage", and
+	# fileproviderctl's own entitlements name no app group (it reads the storage through the daemon):
+	# add the group fp_enable makes the directory in. Without it the program finds the container by the
+	# container manager's metadata instead (group_container_path() in fp_enable.m), so this is the
+	# short way, not the only one.
+	python3 - obj/fp_enable.entitlements <<'PY' 2>/dev/null || true
+import plistlib, sys
+path = sys.argv[1]
+with open(path, 'rb') as handle:
+    entitlements = plistlib.load(handle)
+groups = set(entitlements.get('com.apple.security.application-groups', []))
+groups.add('group.com.apple.FileProvider.LocalStorage')
+entitlements['com.apple.security.application-groups'] = sorted(groups)
+with open(path, 'wb') as handle:
+    plistlib.dump(entitlements, handle)
+PY
 	sign obj/fp_enable obj/fp_enable.entitlements
 else
 	echo "build.sh: no fileproviderctl in the system image (or no ldid): fp_enable is unsigned, and fileproviderd may refuse it" >&2
@@ -46,7 +66,11 @@ $DYN -fobjc-arc -framework Foundation -framework AVFoundation -framework VideoTo
 $DYN -fobjc-arc -framework Foundation -framework AVFoundation -framework AudioToolbox -o obj/play_test $V/play_test.m
 # have LaunchServices rebuild its database of system applications and plug-ins; and run iOS's own first-boot
 # data migrators in one process (signed with datamigrator's entitlements, taken from the system image)
-$DYN -fobjc-arc -framework Foundation -o obj/ls_rebuild $V/ls_rebuild.m
+# -framework MobileCoreServices: LSApplicationWorkspace, LSPlugInKitProxy and LSApplicationProxy are in it
+# (CoreServices is its umbrella on iOS 16), and Foundation alone does not load it: TEST7's ls_rebuild found
+# "LSApplicationWorkspace MISSING, workspace nil" and reported "0 plug-ins registered" while the rebuild
+# call did nothing, so LaunchServices' records of the system's app extensions were never rebuilt.
+$DYN -fobjc-arc -framework Foundation -framework MobileCoreServices -o obj/ls_rebuild $V/ls_rebuild.m
 sign obj/ls_rebuild $V/ls_rebuild.entitlements
 $DYN -fobjc-arc -framework Foundation -o obj/run_migrator $V/run_migrator.m
 if command -v ${LDID:-ldid} >/dev/null && [ -f $IOS/rootfs/usr/libexec/datamigrator ] &&
