@@ -2137,6 +2137,16 @@ struct hfi_bw_table {
 static struct hfi_perf_table perf;
 static struct hfi_bw_table bw;
 static uint32_t hfi_number, core_speed, speed_levels;
+static bool hfi_quiet;                  /* a message that is not to be said on the way out (hfi_send; a speed vote of vayu_gpu_idle) */
+static bool hfi_taken;                  /* the GMU looked at the last message sent, answered or not (hfi_send) */
+/*
+ * How long a message waits for the GMU's answer, in 100 us (hfi_send). A second for the bring-up, where a
+ * stuck message is the thing to see; two milliseconds for a vote in the middle of a submission: the GMU
+ * does not answer message 30 until it has carried it out, and step 18 of every boot of the TEST5Q run saw
+ * that answer come late ("the GMU answers message 30 ... late: verdict 0", 73 of 73 boots) -- a submission
+ * that waited for it would hold the frame for a second (8.33 ms is a frame at 120 Hz).
+ */
+static uint32_t hfi_patience = 10000;
 static bool staged;                     /* vayu_adreno=N: the step-by-step bring-up, not the default path */
 static uint32_t hfi_late, hfi_late_verdict = ~0u;   /* a message whose answer may still come */
 static bool core_is_on, core_space_is_on, core_programmed, core_runs, core_stuck, zap_is_loaded, unsecured;
@@ -2174,7 +2184,8 @@ hfi_receive(unsigned which, uint32_t number, uint32_t *verdict)
 			if ((message[0] & 0xff) == HFI_ERROR) {         /* vendor's adreno_a6xx_receive_err_req */
 				printf("vayu: %u: THE GMU REPORTS AN ERROR: %u, %u, \"%s\"\n", step, message[1] >> 16,
 				    message[1] & 0xffff, (const char *)&message[2]);
-			} else {
+			} else if (!hfi_quiet) {
+				/* (not from the middle of a submission: a vote's late answer is drained here, some 9 ms of line) */
 				printf("vayu: %u: the GMU says (queue %u, %u words): %#x %#x %#x %#x %#x %#x\n", step, which, words,
 				    message[0], message[1], message[2], message[3], message[4], message[5]);
 			}
@@ -2186,17 +2197,45 @@ hfi_receive(unsigned which, uint32_t number, uint32_t *verdict)
 	return answered;
 }
 
+/*
+ * One message at a time. The idle thread's vote down and a submission's vote up go out from two threads
+ * and a message is a walk of the same queue (hfi->queue[0], its write with the words after it): two at
+ * once and the GMU reads one that is half of each. A frame whose commands were lost that way is a fence
+ * that never comes -- the display then waits for it and copies the surface anyway (500 ms), which is a
+ * frame that never finished.
+ */
+static uint32_t hfi_busy;
+
+static void
+hfi_take(void)
+{
+	while (__atomic_exchange_n(&hfi_busy, 1, __ATOMIC_ACQUIRE)) {
+		sleep_us(50);
+	}
+}
+
+static void
+hfi_give(void)
+{
+	__atomic_store_n(&hfi_busy, 0, __ATOMIC_RELEASE);
+}
+
 /* Send a message whose first word is yet to be made and wait for the GMU's verdict on it. */
 static bool
 hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 {
 	volatile struct hfi_queue *queue = &hfi->queue[0];
 	volatile uint32_t *data = (volatile uint32_t *)((vm_offset_t)hfi + HFI_QUEUE_AT(0));
-	uint32_t at = queue->write % HFI_QUEUE_WORDS, number = ++hfi_number & 0xfff, verdict = 0, waiting = 0;
+	uint32_t at, number, verdict = 0, waiting = 0;
 	bool answered = false;
 
+	hfi_take();                             /* (one message at a time: the idle vote and a submission's vote come from two threads) */
+	at = queue->write % HFI_QUEUE_WORDS;
+	number = ++hfi_number & 0xfff;
 	message[0] = id | words << 8 | number << 20;
-	printf("vayu: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
+	if (!hfi_quiet) {
+		printf("vayu: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
+	}
 	snprintf(last_write, sizeof(last_write), "step %u sent the GMU message %u (%s)", step, id, what);
 	hold(true);
 	for (uint32_t i = 0; i < (words + 3) / 4 * 4; i++) {
@@ -2206,7 +2245,7 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 	queue->write = at;
 	settle();
 	wr(gmu.base + GMU_HOST2GMU_INTR_SET, 1);
-	for (int i = 0; i < 10000 && !answered; i++) {
+	for (uint32_t i = 0; i < hfi_patience && !answered; i++) {
 		sleep_us(100);
 		waiting = rd(gmu.base + GMU_GMU2HOST_INTR_INFO);
 		if (waiting & 1) {
@@ -2222,7 +2261,16 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 		}
 	}
 	hfi_receive(2, ~0u, &waiting);
+	hfi_give();
 	if (!answered || verdict != 0) {
+		/*
+		 * Was it taken? read == write on queue 0: the GMU looked at the message (its answer may come later,
+		 * as message 30's did at step 18 of every boot of the TEST5Q run); read behind: it never did.
+		 */
+		hfi_taken = !answered && hfi->queue[0].read == hfi->queue[0].write;
+		if (hfi_quiet) {
+			return false;                   /* (a vote in the middle of a submission: no lines, the caller tells) */
+		}
 		printf("vayu: %u: the GMU %s (%#x) to %s; fw_init_result %#x, gmu2host_intr_info %#x\n", step,
 		    answered ? "says no" : "does not answer", verdict, what, rd(gmu.base + GMU_CM3_FW_INIT_RESULT),
 		    rd(gmu.base + GMU_GMU2HOST_INTR_INFO));
@@ -3211,6 +3259,14 @@ static uint32_t gpu_va_live, gpu_va_refused;
 static bool gpu_idle_on, gpu_idle_refused;
 static uint32_t gpu_boot_speed, gpu_idle_speed = 1, gpu_idle_ms = 500;
 static uint64_t gpu_last_submit;
+/*
+ * Is the display putting frames on the panel just now? iokit/Kernel/MiniIOMobileFramebuffer.cpp sets this
+ * (a frame copied to the panel within the last 100 ms answers 1); NULL before that driver has started.
+ * A core that is being drawn with is not voted down: the vote is a round trip to the GMU, the first
+ * frames after it run at the lower speed, and the messages of a vote go to the serial console from the
+ * middle of a submission (hfi_send: some 9 ms a line at 115200 baud, which at 120 fps is a frame).
+ */
+uint32_t (*hakios_display_frames)(void) = NULL;
 
 bool
 vayu_gpu_kept(void)
@@ -3221,9 +3277,16 @@ vayu_gpu_kept(void)
 /*
  * A speed vote after the bring-up: { ack_type 1 (blocking), speed index, bus index }
  * (a6xx_hfi.c:848-858), as step 18 sends it. Only a core this driver kept and runs is voted for.
+ *
+ * The answer is not the vote. The GMU applies a vote and answers after it, and the answer to message 30
+ * came late in every boot of the TEST5Q run (hfi_patience); so a vote the GMU has looked at counts as
+ * given, whether or not its answer came, and `core_speed` follows it. That is what the idle half needs:
+ * a vote recorded as refused would leave the driver thinking the core is still at 499 MHz while the GMU
+ * has taken it down to 257, and no submission would ever vote it back up. `quiet`: nothing on the way
+ * out, and hfi_patience short -- the vote is sent from the middle of a submission then.
  */
 static bool
-gpu_vote_speed(uint32_t speed, const char *what)
+gpu_vote_speed(uint32_t speed, const char *what, bool quiet)
 {
 	uint32_t message[4] = { 1, 0, 0, 0 };
 	uint32_t saved = step;
@@ -3235,12 +3298,20 @@ gpu_vote_speed(uint32_t speed, const char *what)
 	message[2] = speed;
 	message[3] = gpu_bus_index;
 	step = 0;                               /* (a vote after the bring-up is not a step) */
-	ok = hfi_send(what, HFI_GX_BW_PERF_VOTE, message, 4);
-	step = saved;
-	if (ok) {
-		core_speed = speed;
+	hfi_quiet = quiet;
+	hfi_taken = false;
+	if (quiet) {
+		hfi_patience = 20;              /* (2 ms: a frame at 120 Hz is 8.33) */
 	}
-	return ok;
+	ok = hfi_send(what, HFI_GX_BW_PERF_VOTE, message, 4);
+	hfi_patience = 10000;
+	hfi_quiet = false;
+	step = saved;
+	if (!ok && !hfi_taken) {
+		return false;                   /* (the GMU never looked at the queue: the vote was not given) */
+	}
+	core_speed = speed;
+	return true;
 }
 
 /* A register of the 3D core (by its word number) written by command (a "type 4" packet). */
@@ -3497,11 +3568,18 @@ uint32_t
 vayu_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
 	uint32_t wanted = 26 + 4 * count, room = 0;
+	bool ramped = false;
 
 	if (gpu_idle_on) {
 		if (core_speed != gpu_boot_speed) {
-			if (gpu_vote_speed(gpu_boot_speed, "the speed wanted (a submission comes)")) {
-				printf("vayu: gpu idle: a submission comes: %u MHz\n", core_speeds[core_speed].khz / 1000);
+			/*
+			 * The speed back BEFORE the commands go into the ring: the vote's answer comes when the GMU has
+			 * carried it out (hfi_send, ack_type 1), and the commands are written after it -- the first frame
+			 * of a burst is then not drawn at the idle speed. Quiet: its line would otherwise be printed
+			 * before the ring is written, some 9 ms of the serial console inside the submission (hfi_send).
+			 */
+			if (gpu_vote_speed(gpu_boot_speed, "the speed wanted (a submission comes)", true)) {
+				ramped = true;
 			} else {
 				gpu_idle_refused = true;
 				printf("vayu: gpu idle: the GMU did not take the speed back; the core stays at %u MHz\n",
@@ -3546,6 +3624,10 @@ vayu_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
 	ring(0);
 	ring(gpu_fence);
 	ring_send();
+	if (ramped) {
+		/* (said once the frame is in the ring: the line itself is not to be what holds the frame up) */
+		printf("vayu: gpu idle: a submission comes: %u MHz\n", core_speeds[core_speed].khz / 1000);
+	}
 	return gpu_fence;
 }
 
@@ -3610,9 +3692,16 @@ gpu_idle_thread(__unused void *arg, __unused wait_result_t wr)
 			uint64_t now = mach_absolute_time(), after;
 
 			nanoseconds_to_absolutetime((uint64_t)gpu_idle_ms * NSEC_PER_MSEC, &after);
-			if (gpu_last_submit != 0 && now - gpu_last_submit >= after) {
-				if (gpu_vote_speed(gpu_idle_speed, "the speed wanted (idle)")) {
-					printf("vayu: gpu idle: no submission for %u ms: %u MHz\n", gpu_idle_ms,
+			/*
+			 * Not while the core is still working on the last submission (a vote that changes the clock
+			 * under the commands of a frame that is being drawn), and not while the display is putting
+			 * frames on the panel: the first submission after a vote down finds the core at the idle
+			 * speed, and the frames of the animation that has just begun are the ones that come out late.
+			 */
+			if (gpu_last_submit != 0 && now - gpu_last_submit >= after && vayu_gpu_done(gpu_fence) &&
+			    (hakios_display_frames == NULL || !hakios_display_frames())) {
+				if (gpu_vote_speed(gpu_idle_speed, "the speed wanted (idle)", true)) {
+					printf("vayu: gpu idle: no submission for %u ms and no frame on the panel: %u MHz\n", gpu_idle_ms,
 					    core_speeds[core_speed].khz / 1000);
 				} else {
 					gpu_idle_refused = true;
