@@ -54,6 +54,12 @@
 #                                   and nothing changes (src/inject.c, opengl_es()).
 #                                   GL=test: only the library and bin/gl_test (a triangle, src/gl_test.c;
 #                                   RC_JOBS=rc.jobs.gltest runs it); the window server stays as it is.
+#                                   GL=1 is the default for a phone with devices/<name>/gl, which says
+#                                   the kernel starts and keeps its GPU (poco-x3-pro: vayu_adreno 1..22,
+#                                   boot-arg gpu=1 vayu_gpu=1). An image without the two libraries is
+#                                   not an error and not a fallback worth having: the GPU stays on, the
+#                                   window server draws every frame on the processor and says only
+#                                   "hakios: no accelerated renderer". GL= (empty) turns it off.
 #                      ADSP=1       with the audio DSP's firmware from ../fw-audio in fw/ (20 MB; for the
 #                                   kernel's adsp_step=N, bsd/dev/hakios.adsp.c, which runs before the root is
 #                                   mounted). Not beside GL=1: the two do not fit the 64 MB the loader takes with
@@ -90,6 +96,15 @@ LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
 DYN="xnu-clang -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1"
 IOS=../sysimage
 DEVICE=${DEVICE:-poco-x5-pro}       # the phone: devices/$DEVICE/ (see the hooks below)
+# The OpenGL ES path of the window server (see GL=1 above) is not a preference to be remembered at
+# every build: a phone whose GPU the kernel starts and keeps has devices/<name>/gl, and GL then
+# defaults to 1 -- without the two libraries CoreAnimation draws in software, which looks like a
+# broken renderer rather than like an image built with a variable unset.
+# GL=0 is what somebody will write to turn it off; empty is what the blocks below test for.
+case "$GL" in 0) GL= ;; esac
+if [ -f ../devices/$DEVICE/gl ]; then
+	GL=${GL-1}
+fi
 CACHE=$IOS/20F66__iPhone10,3_6
 # sysimage/rootfs and sysimage/cryptex must be this copy's own directories of hard links, the way
 # tools/new-workspace.sh makes them. A symlink to another copy's tree makes sysroot a symlink too, because
@@ -272,9 +287,24 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		if [ -n "$GL" ]; then
 			# the OpenGL ES library, and the table of functions that hands CoreAnimation's calls to it
 			# (Mesa says beside the library what it was built from: one from other patches is built again)
-			M=../xnu-deps/build/mesa/out
-			[ "$(cat $M/built-from 2>/dev/null)" = "$(cat ../tools/mesa/*.patch ../tools/mesa/hakios-drm/* | sha256sum)" ] ||
-				../tools/mk-mesa.sh
+			# MESA_OUT=DIR takes an out/ that is already built -- another working copy's, or one kept
+			# beside the tree: mk-mesa.sh is not run and nothing is fetched. DIR has to be a build of
+			# THIS tree's tools/mesa (its built-from is that hash), or the build stops here rather than
+			# ship a library whose winsys looks for another kernel's service name and quietly falls
+			# back to softpipe.
+			M=${MESA_OUT:-../xnu-deps/build/mesa/out}
+			mesa_patches=$(cat ../tools/mesa/*.patch ../tools/mesa/hakios-drm/* | sha256sum)
+			if [ -n "$MESA_OUT" ]; then
+				if [ "$(cat $M/built-from 2>/dev/null)" != "$mesa_patches" ]; then
+					echo "build.sh: MESA_OUT=$MESA_OUT is not a build of this tree's tools/mesa" >&2
+					echo "build.sh: (built-from there: $(cat $M/built-from 2>/dev/null))" >&2
+					echo "build.sh: (this tree's patches: $mesa_patches)" >&2
+					echo "build.sh: run tools/mk-mesa.sh in this tree and leave MESA_OUT unset" >&2
+					exit 1
+				fi
+			else
+				[ "$(cat $M/built-from 2>/dev/null)" = "$mesa_patches" ] || ../tools/mk-mesa.sh
+			fi
 			./mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
 			$DYN -dynamiclib -install_name /redwood/lib/libhakios.gl.dylib -Iobj -framework CoreFoundation \
 				-framework IOKit -framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libhakios.gl.dylib \
@@ -339,11 +369,20 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		cp src/audio_plugin.plist root/lib/HakiosAudio.driver/Info.plist
 	fi
 	if [ -n "$GL" ]; then
-		cp obj/libOSMesa.8.dylib root/lib/
-		cp obj/gl_test root/bin/
-		if [ -f obj/u2f_test ]; then cp obj/u2f_test root/bin/; fi   # an "if": see the inject.conf loop below
-		[ -f obj/air_run ] && cp obj/air_run root/bin/
-		[ "$GL" = test ] || cp obj/libhakios.gl.dylib root/lib/
+		# a PREBUILT build has none of these (../prebuilt/userland carries no Mesa, no gl_test):
+		# say so here, because the image would go out without the renderer and the window server
+		# would only say "no accelerated renderer" much later
+		if [ -f obj/libOSMesa.8.dylib ] && [ -f obj/libhakios.gl.dylib ]; then
+			cp obj/libOSMesa.8.dylib root/lib/
+			cp obj/gl_test root/bin/
+			if [ -f obj/u2f_test ]; then cp obj/u2f_test root/bin/; fi   # an "if": see the inject.conf loop below
+			[ -f obj/air_run ] && cp obj/air_run root/bin/
+			[ "$GL" = test ] || cp obj/libhakios.gl.dylib root/lib/
+		else
+			echo "build.sh: GL=$GL, but obj/ has not libOSMesa.8.dylib and libhakios.gl.dylib" >&2
+			echo "build.sh: (a PREBUILT build cannot make them: ../prebuilt/userland has neither)" >&2
+			echo "build.sh: the image goes on without the window server's OpenGL ES renderer." >&2
+		fi
 	fi
 	# a program is not started with a library that is not there: it would not start at all
 	echo "$INJECT" | while read -r library names; do
@@ -517,6 +556,19 @@ done
 [ -d root/lib/HakiosAudio.driver ] && ln -s /redwood/lib/HakiosAudio.driver root/hal/HakiosAudio.driver
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (bsd/dev/hakios.image.c)
+#
+# Before it is packed: an image that carries the GPU's firmware starts the GPU and keeps it (the
+# kernel's vayu_adreno.c ends with HakiosGPU), and if it has not the library behind the window
+# server's OpenGL ES renderer, every frame is drawn on the processor -- at run time the only trace
+# is "hakios: no accelerated renderer", a line that names the fallback and not the reason. Say it
+# here, where the cause is: the file that says the phone has a GPU (devices/<name>/gl) makes GL=1
+# the default at the top of this script, and an image without it is a choice, not an accident.
+if ls root/fw/*gmu.bin >/dev/null 2>&1 && [ ! -f root/lib/libOSMesa.8.dylib ]; then
+	echo "build.sh: WARNING: fw/ has the GPU's firmware: $(ls root/fw/*gmu.bin | xargs -n1 basename | paste -sd' ' -)" >&2
+	echo "build.sh: WARNING: but lib/ has no libOSMesa.8.dylib: the kernel will start the GPU and keep it," >&2
+	echo "build.sh: WARNING: and CoreAnimation will draw every frame on the processor (build with GL=1;" >&2
+	echo "build.sh: WARNING: devices/$DEVICE/gl should make that the default)." >&2
+fi
 python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
 [ -z "$CHECK" ] || ../tools/apfs/check-image.sh root.apfs redwood=root
 
