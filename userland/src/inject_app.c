@@ -529,6 +529,202 @@ t120_answer_screen_rate(const char *class_name, const char *selector)
 	sayf("hakios: %s: t120=1: -[%s %s] answers 120\n", who, class_name, selector);
 }
 
+/*
+ * Boot-arg t120_link=N (with t120=1): what an application asks a display link for, and what it is
+ * answered.
+ *
+ * t120=1 lifts QuartzCore's frame-rate restriction and makes UIScreen answer 120, and SpringBoard's
+ * own animations then run at 119 a second on this port (TEST9: 597 frames in 5004 ms, 576 of 597
+ * intervals under 10 ms). Scrolling in an application does not: 60 to 74 (TEST9: 346 frames in
+ * 5000 ms while the framebuffer driver, GPU fence and copy together, was busy less than half of
+ * every frame -- the frames were not asked for, they were not held up). What is left to look at is
+ * the rate the application asks its own display link for, so this says it and, when told to, answers
+ * it with the display's:
+ *
+ *   1: say the first 8 requests of a process, change nothing (the measurement);
+ *   2: and give a scroll view's link 120 where it asked for 60 or more (UIScrollView, UITableView,
+ *      UICollectionView, WKScrollView: the target's class name has "ScrollView" in it);
+ *   3: and every link that asked for 60 or more, scroll view or not.
+ *
+ * A link that asked for less than 60 (a 30 or a 24 fps animation) is left alone at every level: the
+ * point is the scroll, not to make everything in the system cost what 120 costs in heat and power.
+ * The five-second "the frames that came late ... neither" line in the kernel says whether this is
+ * even the right place: those are the frames nothing in the driver or the GPU delayed.
+ */
+typedef struct { float minimum, maximum, preferred; } t120_range;
+
+static void (*link_rate_original)(id, SEL, long);
+static void (*link_range_original)(id, SEL, t120_range);
+static id    (*link_factory_original)(id, SEL, id, SEL);
+static int   t120_link_said;
+static unsigned t120_link_changed;      /* links whose rate this raised, for the next 5 s line's sake */
+
+#define T120_LINKS      64
+static struct { id link; unsigned char scroll; } t120_link_table[T120_LINKS];
+static unsigned t120_link_next;
+
+static int
+t120_link_level(void)
+{
+	static int level = -1;
+
+	if (level < 0) {
+		char arguments[4096] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		level = 0;
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+			const char *at = strstr(arguments, "t120_link=");
+
+			if (at != NULL && at[10] >= '1' && at[10] <= '3') {
+				level = at[10] - '0';
+			}
+		}
+		if (level != 0) {
+			sayf("hakios: %s: t120_link=%d: display links %s\n", who, level,
+			    level == 1 ? "are to be said, not changed" :
+			    level == 2 ? "of scroll views are answered 120 where they asked for 60 or more" :
+			    "are answered 120 where they asked for 60 or more");
+		}
+	}
+	return level;
+}
+
+/* Does the link's target have "ScrollView" in its class name (UIScrollView and everything under it)? */
+static int
+t120_scroll_class(id target)
+{
+	for (Class cls = target != nil ? object_getClass(target) : Nil; cls != Nil; cls = class_getSuperclass(cls)) {
+		const char *name = class_getName(cls);
+
+		if (name != NULL && strstr(name, "ScrollView") != NULL) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void
+t120_link_remember(id link, int scroll)
+{
+	if (link == nil) {
+		return;
+	}
+	t120_link_next = (t120_link_next + 1) % T120_LINKS;
+	t120_link_table[t120_link_next].link = link;
+	t120_link_table[t120_link_next].scroll = (unsigned char) (scroll != 0);
+}
+
+/* 1 = a scroll view's, 0 = somebody else's, -1 = not seen being made (fb: no factory call) */
+static int
+t120_link_scroll(id link)
+{
+	for (unsigned i = 0; i < T120_LINKS; i++) {
+		if (t120_link_table[i].link == link) {
+			return t120_link_table[i].scroll;
+		}
+	}
+	return -1;
+}
+
+/* +[CADisplayLink displayLinkWithTarget:selector:]: remember what the link was made for. */
+static id
+t120_link_factory(id self, SEL cmd, id target, SEL selector)
+{
+	id link = link_factory_original != NULL ? link_factory_original(self, cmd, target, selector) : nil;
+
+	t120_link_remember(link, t120_scroll_class(target));
+	return link;
+}
+
+static void
+t120_link_say(id link, const char *what, const char *asked, const char *answered)
+{
+	int scroll = t120_link_scroll(link);
+
+	if (t120_link_said >= 8) {
+		return;
+	}
+	t120_link_said++;
+	sayf("hakios: %s: t120_link: %s%s: %s -> %s\n", who, what,
+	    scroll == 1 ? " on a scroll view's link" : scroll == 0 ? " on another link" : "", asked, answered);
+}
+
+static void
+t120_link_rate(id self, SEL cmd, long rate)
+{
+	int level = t120_link_level();
+	long wanted = rate;
+	char asked[48], answered[48];
+
+	if (level != 0 && ((level == 2 && t120_link_scroll(self) == 1) || level >= 3) && rate >= 60 && rate < 120) {
+		wanted = 120;
+		t120_link_changed++;
+	}
+	if (level != 0) {
+		snprintf(asked, sizeof(asked), "setPreferredFramesPerSecond: %ld a second", rate);
+		snprintf(answered, sizeof(answered), "%ld a second", wanted);
+		t120_link_say(self, "the rate", asked, answered);
+	}
+	if (link_rate_original != NULL) {
+		link_rate_original(self, cmd, wanted);
+	}
+}
+
+static void
+t120_link_range(id self, SEL cmd, t120_range range)
+{
+	int level = t120_link_level();
+	t120_range wanted = range;
+	char asked[64], answered[64];
+
+	if (level != 0 && ((level == 2 && t120_link_scroll(self) == 1) || level >= 3) && range.preferred >= 60 &&
+	    range.preferred < 120) {
+		wanted.minimum = range.minimum < 120 ? range.minimum : 120;
+		wanted.maximum = 120;
+		wanted.preferred = 120;
+		t120_link_changed++;
+	}
+	if (level != 0) {
+		snprintf(asked, sizeof(asked), "the range %g..%g, preferred %g", range.minimum, range.maximum, range.preferred);
+		snprintf(answered, sizeof(answered), "%g..%g, preferred %g", wanted.minimum, wanted.maximum, wanted.preferred);
+		t120_link_say(self, "the range", asked, answered);
+	}
+	if (link_range_original != NULL) {
+		link_range_original(self, cmd, wanted);
+	}
+}
+
+/* The class method; watch() below is for the instance ones. */
+static void
+t120_watch_class(const char *name, const char *selector, IMP ours, void *theirs)
+{
+	Class cls = objc_getClass(name);
+	Method method = cls != NULL ? class_getClassMethod(cls, sel_registerName(selector)) : NULL;
+
+	if (method != NULL && method_getImplementation(method) != ours) {
+		*(IMP *)theirs = method_setImplementation(method, ours);
+	}
+}
+
+/* Idempotent: called at the start and again after the process has settled (QuartzCore may be later). */
+static void
+t120_links(void)
+{
+	static int missing;
+
+	if (t120_link_level() == 0) {
+		return;
+	}
+	t120_watch_class("CADisplayLink", "displayLinkWithTarget:selector:", (IMP)t120_link_factory, &link_factory_original);
+	watch("CADisplayLink", "setPreferredFramesPerSecond:", (IMP)t120_link_rate, &link_rate_original);
+	watch("CADisplayLink", "setPreferredFrameRateRange:", (IMP)t120_link_range, &link_range_original);
+	if (!missing && link_factory_original == NULL && link_rate_original == NULL && link_range_original == NULL) {
+		missing = 1;
+		sayf("hakios: %s: t120_link: CADisplayLink has none of the three where this was written for; left alone\n", who);
+	}
+}
+
 static void
 t120_again(void)
 {
@@ -536,6 +732,7 @@ t120_again(void)
 	t120_answer_screen_rate("UIScreen", "maximumFramesPerSecond");
 	t120_answer_screen_rate("UIScreen", "_maximumFramesPerSecond");
 	t120_answer_screen_rate("CADisplay", "maximumFramesPerSecond");
+	t120_links();
 }
 
 static void
