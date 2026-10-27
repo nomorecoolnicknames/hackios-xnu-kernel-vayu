@@ -2850,6 +2850,8 @@ mic_slim_tx(void)
 	uint8_t def_act[10] = { 0x4a, 0x21, 0xff, 0, 0x24, 0x20, 0x83, 0, 0x87, 0x88 };  /* tid 7 */
 	uint8_t reconfig[5] = { 0x45, 0x24, 0xff, 0, 0 };                   /* RECONFIG_NOW, tid 3 */
 
+	/* what a previous capture left latched, before this one adds its own; then a clean status */
+	vayu_jack_mic_clear_status("before the TX ports are enabled");
 	if (!ifd_read(0x32, &v32) || !ifd_write(0x32, (uint8_t)(v32 | 0x80)) ||
 	    !ifd_read(0x33, &v33) || !ifd_write(0x33, (uint8_t)(v33 | 0x01))) {
 		return false;
@@ -2880,15 +2882,87 @@ mic_slim_tx(void)
 	    "acked\n");
 
 	def_act[3] = (uint8_t)(codec_pgd_la & 0x1f);
+	/*
+	 * The channel activation and the reconfiguration are not fatal here: the codec's ports are bound
+	 * (CONNECT_SRC above) but the AFE port that reads channels 135/136 is not up yet at a bring-up, and
+	 * whether the bus manager activates a channel nobody consumes is its business. vayu_jack_mic_kick()
+	 * says both again once the DSP's port is running, and that is the activation that counts.
+	 */
 	if (!user_msg(def_act, sizeof(def_act), 7)) {
-		return false;
+		say("vayu-jack: M7: DEF_ACT_CHAN 135/136 was not acked (the kick after the port start says it again)\n");
 	}
 	reconfig[4] = codec_pgd_la;
 	if (!user_msg(reconfig, sizeof(reconfig), 3)) {
+		say("vayu-jack: M7: RECONFIG_NOW was not acked (the kick after the port start says it again)\n");
+	} else {
+		say("vayu-jack: M7: DEF_ACT_CHAN 135/136 and RECONFIG_NOW acked\n");
+	}
+	{
+		char status[180];
+
+		if (vayu_jack_mic_status(status, sizeof(status))) {
+			say("vayu-jack: M7: TX port interrupts after the ports were enabled: %s\n", status);
+		}
+	}
+	return true;
+}
+
+/*
+ * The TX ports' interrupt latch: IFD 0x36/0x37 are PORT_INT_STATUS_TX_0/1, and the source of port 7/8 is
+ * PORT_INT_TX_SOURCE0 + port = 0x77/0x78 (wcd934x_registers.h:1839-1845). The bits are the vendor's
+ * (wcd934x.c:102-104): 1 overflow, 2 underflow, 4 port closed. The vendor reads them in its SLIMbus IRQ,
+ * counts them and CLEARS them (PORT_INT_CLR_TX_0/1 = 0x3A/0x3B, wcd934x.c:9869-9873); this driver never
+ * did. test10's second capture starts with "0x36=80 0x77=02" -- an underflow of TX7 latched during the
+ * M-off before it -- and nothing in the log says whether it happened then or during the capture. Reading
+ * and clearing them at every bring-up is what makes the next look at them this capture's own.
+ */
+static const char *
+mic_tx_source_name(uint8_t source)
+{
+	switch (source & 0x07) {
+	case 0x01: return "overflow";
+	case 0x02: return "underflow";
+	case 0x03: return "overflow+underflow";
+	case 0x04: return "port closed";
+	case 0x05: return "overflow+port closed";
+	case 0x06: return "underflow+port closed";
+	case 0x07: return "overflow+underflow+port closed";
+	default: return "nothing latched";
+	}
+}
+
+/* The latched TX port interrupts and their sources, read without clearing (for the capture's log). */
+bool
+vayu_jack_mic_status(char *line, size_t size)
+{
+	uint8_t status7 = 0, status8 = 0, source7 = 0, source8 = 0;
+
+	if (!jack_ready || line == NULL || size == 0) {
 		return false;
 	}
-	say("vayu-jack: M7: DEF_ACT_CHAN 135/136 and RECONFIG_NOW acked\n");
+	if (!ifd_read(0x36, &status7) || !ifd_read(0x37, &status8) || !ifd_read(0x77, &source7) ||
+	    !ifd_read(0x78, &source8)) {
+		return false;
+	}
+	snprintf(line, size, "TX7 %s (status %02x, source %02x), TX8 %s (status %02x, source %02x)",
+	    mic_tx_source_name(source7), status7, source7, mic_tx_source_name(source8), status8, source8);
 	return true;
+}
+
+/* Read what is latched, say it, then clear it (PORT_INT_CLR_TX_0/1): the next capture starts clean. */
+void
+vayu_jack_mic_clear_status(const char *why)
+{
+	char line[180];
+
+	if (!jack_ready) {
+		return;
+	}
+	if (vayu_jack_mic_status(line, sizeof(line))) {
+		say("vayu-jack: TX port interrupts (%s): %s\n", why, line);
+	}
+	(void)ifd_write(0x3a, 0xff);
+	(void)ifd_write(0x3b, 0xff);
 }
 
 /*
@@ -2920,8 +2994,8 @@ vayu_jack_mic_kick(const char *why)
 	(void)ifd_read(0x37, &s37);
 	(void)ifd_read(0x77, &s77);
 	(void)ifd_read(0x78, &s78);
-	say("vayu-jack: M-kick (%s): TX7/TX8 re-armed; ifd 0x36=%02x 0x37=%02x 0x77=%02x 0x78=%02x\n", why, s36, s37,
-	    s77, s78);
+	say("vayu-jack: M-kick (%s): TX7/TX8 re-armed; ifd 0x36=%02x 0x37=%02x 0x77=%02x 0x78=%02x "
+	    "(TX7 %s, TX8 %s)\n", why, s36, s37, s77, s78, mic_tx_source_name(s77), mic_tx_source_name(s78));
 	return true;
 }
 
@@ -2955,8 +3029,9 @@ vayu_jack_mic_state(char *line, size_t size)
 	(void)ifd_read(0x78, &src8);
 	snprintf(line, size, "SVS 0x0202=%02x 0x0601=%02x 0x0606=%02x MICB3/1 %02x/%02x ADC3/1 %02x/%02x "
 	    "TX7 ctl %02x cfg %02x TX8 ctl %02x cfg %02x (the decimator's clock %s/%s) ifd 0x34=%02x 0x36=%02x "
-	    "0x37=%02x src %02x/%02x", svs, master, supplies, micb3, micb1, adc3, adc1, tx7, cfg7, tx8, cfg8,
-	    tx7 & 0x20 ? "on" : "OFF", tx8 & 0x20 ? "on" : "OFF", s34, s36, s37, src7, src8);
+	    "0x37=%02x src %02x/%02x (TX7 %s, TX8 %s)", svs, master, supplies, micb3, micb1, adc3, adc1, tx7, cfg7, tx8,
+	    cfg8, tx7 & 0x20 ? "on" : "OFF", tx8 & 0x20 ? "on" : "OFF", s34, s36, s37, src7, src8,
+	    mic_tx_source_name(src7), mic_tx_source_name(src8));
 	return true;
 }
 
@@ -3138,6 +3213,13 @@ vayu_jack_mic_off(void)
 	} else {
 		say("vayu-jack: M-off: the mic biases did not go off\n");
 	}
+	/*
+	 * The TX port's interrupt latch is read and cleared: with the channels kept (vayu_mic_chan_keep=1)
+	 * the port stays enabled against a silent decimator and underflows during the whole idle time
+	 * (test10: 0x36=0x80, source 0x02 at the next capture's start); with them removed it sees the
+	 * channel close (test8: source 0x06). Either way the next capture must not inherit it.
+	 */
+	vayu_jack_mic_clear_status("at M-off");
 	chan_remove[3] = (uint8_t)(0x80 | (codec_pgd_la & 0x1f));
 	if (!mic_chan_keep_wanted()) {
 		if (user_msg(chan_remove, sizeof(chan_remove), 4)) {

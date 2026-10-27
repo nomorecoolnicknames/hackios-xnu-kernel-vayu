@@ -1563,10 +1563,40 @@ space_ensure(void)
 #define ASM_DATA_EVENT_READ_DONE_V2             0x00010d9au
 #define MIC_SESSION                             2               /* (the speakers' is 1) */
 #define MIC_STREAM_PORT                         (MIC_SESSION << 8 | 1)
-#define MIC_READ_TOKEN                          0x40000000u     /* | the period */
+/*
+ * The token of a read carries a generation as well as the period, and the DSP echoes it back in its
+ * READ_DONE. A capture that is taken down and built again (a rebuild) reuses the same 8 pages and the
+ * same tokens unless the generation changes, so a READ_DONE of the old capture would be taken for data
+ * of the new one and would put 20 ms of stale samples into the ring, out of order.
+ *
+ * The bits are chosen around the vendor's token layout (q6asm.c:62-72: u8 stream_id, session_id,
+ * buf_index, flags): the period stays in the low nibble, which this driver has always used as the
+ * stream-id field and which the DSP demonstrably echoes, and the generation goes into the flags byte's
+ * unused upper nibble (bits 26-29; bits 24/25 are the vendor's direction and no-wait flags, and bit 30
+ * is this driver's own marker). buf_index, session_id and the defined flags stay 0, as the vendor
+ * leaves them for a read.
+ */
+#define MIC_READ_TOKEN                          0x40000000u
+#define MIC_READ_PERIOD_MASK                    0xfu
+#define MIC_READ_GEN_SHIFT                      26
+#define MIC_READ_GEN_MASK                       0xfu
 #define MIC_PERIODS                             8
 #define MIC_PERIOD_FRAMES                       960             /* 20 ms at 48 kHz */
 #define MIC_PERIOD_BYTES                        (MIC_PERIOD_FRAMES * 4) /* 2 channels of 16 bits: 3840; one 4096-byte page each */
+/*
+ * asm_data_cmd_read_done_v2: 11 words (the vendor's q6asm.c:2260 wants (READDONE_IDX_SEQ_ID + 1) * 4
+ * bytes and test10's first capture got 44): status, address lsw, address msw, the map handle, the bytes
+ * written, the offset, two timestamp words, flags, ... and the seq id last. Word 3 is the handle we were
+ * given by ASM_CMD_SHARED_MEM_MAP_REGIONS and word 4 is the size (test10: 0xb0c3f138 and 0xf00 = 3840).
+ * Reading the size from word 3 turned every period into a full 3840-byte one (and hid the short and
+ * empty periods the "data available" accounting is for).
+ */
+#define MIC_READDONE_WORDS                      11
+#define MIC_READDONE_MIN_WORDS                  6               /* status, address lsw/msw, handle, size, offset */
+#define MIC_READDONE_HANDLE                     3
+#define MIC_READDONE_SIZE                       4
+#define MIC_READ_TIMEOUT_MS                     150             /* (7.5 periods: a read the DSP never answers) */
+#define MIC_ZERO_REBUILD_PERIODS                50              /* ~1 s of exact zeros after the codec's re-arm */
 
 static bool mapped, copp_open, stream_open;
 static uint32_t map_handle, copp;
@@ -1577,6 +1607,61 @@ static uint32_t mic_map_handle, mic_copp, mic_seconds, mic_peaks[2];
 static volatile uint32_t mic_read_ready, mic_reads_done, mic_read_errors;
 static volatile uint32_t mic_read_sizes[MIC_PERIODS];
 static volatile uint32_t mic_words_logged;
+static volatile uint32_t mic_generation;        /* the token tag of the reads in flight (see MIC_READ_TOKEN) */
+static volatile uint32_t mic_read_short;        /* periods the DSP filled with less than a whole period */
+static volatile uint32_t mic_size_order_said;   /* the other READ_DONE word order was seen, and said */
+
+/*
+ * The size word of an ASM_DATA_EVENT_READ_DONE_V2 (see MIC_READDONE_*): the bytes the DSP actually wrote.
+ * The handle word is checked against ours so that a size and a handle can never be confused: the opposite
+ * order is accepted only if the two words really are swapped, and said once. `*bad' is set for a reply
+ * that is not about this period at all (a status, a length, a handle or an address that does not fit).
+ */
+static uint64_t mic_address(void);      /* (the DSP's address of the capture's first period; defined below) */
+
+static uint32_t
+mic_read_done_size(const uint32_t *payload, uint32_t length, uint32_t period, bool *bad)
+{
+	uint64_t address = mic_address() + (uint64_t)4096 * period;
+	uint32_t size;
+
+	*bad = false;
+	if (length < MIC_READDONE_MIN_WORDS * 4 || payload[0] != 0) {
+		*bad = true;
+		return 0;
+	}
+	if (payload[MIC_READDONE_HANDLE] == mic_map_handle) {
+		size = payload[MIC_READDONE_SIZE];
+	} else if (payload[MIC_READDONE_SIZE] == mic_map_handle) {
+		if (!mic_size_order_said) {
+			mic_size_order_said = 1;
+			mic_say("the READ_DONE has the size in word 3 and the map handle in word 4 (the other order): "
+			    "word 3 is used from here on\n");
+		}
+		size = payload[MIC_READDONE_HANDLE];
+	} else {
+		*bad = true;            /* (not our mapping: a reply from another session, or a laid-out one this does not know) */
+		return 0;
+	}
+	/*
+	 * The DSP echoes the period's address; the vendor refuses a READ_DONE that names another one
+	 * (q6asm.c:2296-2315). Only the low word is compared: it already names the 4 KB page (0x10008000 +
+	 * 0x1000 x period), and the high word is the stream tag of AUDIO_STREAM_BITS rather than an address.
+	 */
+	if ((uint32_t)address != payload[1]) {
+		mic_say("a READ_DONE names %#x, not period %u's address %#x\n", payload[1], period, (uint32_t)address);
+		*bad = true;
+		return 0;
+	}
+	if (size > MIC_PERIOD_BYTES) {
+		size = MIC_PERIOD_BYTES;
+	}
+	/* the "data available" answer: an empty or a short period is data about the path, not an error of the copy */
+	if (size < MIC_PERIOD_BYTES) {
+		OSIncrementAtomic((volatile SInt32 *)&mic_read_short);
+	}
+	return size;
+}
 
 /* The DSP's events: every write's "done", underflows, the microphones' reads (on the GLINK edge's thread). */
 static void
@@ -1593,27 +1678,26 @@ sound_events(uint8_t service, uint32_t opcode, uint32_t token, const uint32_t *p
 		OSBitOrAtomic(1u << (token & 31), &returned);
 	} else if (opcode == ASM_SESSION_EVENT_RX_UNDERFLOW) {
 		OSIncrementAtomic((volatile SInt32 *)&underflows);
-	} else if ((token & MIC_READ_TOKEN) && (token & 0x3fffffff) < MIC_PERIODS) {
-		uint32_t period = token & 0x3fffffff;
+	} else if ((token & MIC_READ_TOKEN) && ((token >> MIC_READ_GEN_SHIFT) & MIC_READ_GEN_MASK) == mic_generation &&
+	    (token & MIC_READ_PERIOD_MASK) < MIC_PERIODS) {
+		uint32_t period = token & MIC_READ_PERIOD_MASK;
 
 		if (opcode == ASM_DATA_EVENT_READ_DONE_V2) {
-			uint32_t size = 0;
+			bool bad;
+			uint32_t size = mic_read_done_size(payload, length, period, &bad);
 
-			/* status, buffer address lsw, buffer address msw, size, offset (q6asm.c:2270-2273) */
-			if (length < 16 || payload[0] != 0) {
+			if (bad) {
 				OSIncrementAtomic((volatile SInt32 *)&mic_read_errors);
-			} else {
-				size = payload[3];
 			}
 			mic_read_sizes[period] = size;
 			OSIncrementAtomic((volatile SInt32 *)&mic_reads_done);
 			OSBitOrAtomic(1u << period, &mic_read_ready);
 			if (!mic_words_logged) {
-				char line[200];
+				char line[220];
 				int at = 0;
 
 				mic_words_logged = 1;
-				for (uint32_t i = 0; i < length / 4 && i < 10 && at < (int)sizeof(line) - 12; i++) {
+				for (uint32_t i = 0; i < length / 4 && i < MIC_READDONE_WORDS && at < (int)sizeof(line) - 12; i++) {
 					at += snprintf(line + at, sizeof(line) - (size_t)at, " %#x", payload[i]);
 				}
 				mic_say("the first READ_DONE: opcode %#x, token %#x, %u bytes:%s\n", opcode, token, length,
@@ -3313,8 +3397,10 @@ mic_read(uint32_t period)
 {
 	uint64_t address = mic_address() + (uint64_t)4096 * period;
 	uint32_t read[5] = { (uint32_t)address, (uint32_t)(address >> 32), mic_map_handle, MIC_PERIOD_BYTES, period };
+	uint32_t token = MIC_READ_TOKEN | ((mic_generation & MIC_READ_GEN_MASK) << MIC_READ_GEN_SHIFT) |
+	    (period & MIC_READ_PERIOD_MASK);
 
-	return apr_post(APR_SVC_ASM, MIC_STREAM_PORT, MIC_READ_TOKEN | period, ASM_DATA_CMD_READ_V2, read, sizeof(read));
+	return apr_post(APR_SVC_ASM, MIC_STREAM_PORT, token, ASM_DATA_CMD_READ_V2, read, sizeof(read));
 }
 
 /* The reads, the levels of each second, and the overall peaks. */
@@ -3374,7 +3460,14 @@ mic_listen(uint32_t secs)
 			{
 				int16_t *samples = (int16_t *)(mic_memory() + 4096 * p);
 
-				for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + MIC_PERIOD_BYTES; line += 64) {
+				/*
+				 * The bytes the DSP wrote, not the whole page: a short period's tail is not ours to
+				 * throw away or to read (test10's READ_DONE carries the size in word 4; see
+				 * MIC_READDONE_SIZE).
+				 */
+				__asm__ volatile ("dsb sy");
+				for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + ((size + 63) & ~63u);
+				    line += 64) {
 					__asm__ volatile ("dc ivac, %0" : : "r" (line));
 				}
 				__asm__ volatile ("dsb sy");
@@ -3503,20 +3596,27 @@ step_mic(void)
 		mic_say("1/8 the buffer and the SMMU: %u KB at %#llx%s\n", BUFFER_BYTES / 1024, mic_address(),
 		    space.passed ? " (the DSP's stream 0x1b21 already matches)" : " (a context of ours)");
 	}
+	/*
+	 * Android's order (MIC_TX.md 2.1 and 4): the codec's TX path up first (DAPM powers the widgets at
+	 * hw_params), the AFE port after it (the trigger). The other way round the SLIMbus master starts
+	 * listening to channels 135/136 before the codec has joined them; that is the only structural
+	 * difference left between this path and the vendor's, and the one that fits a capture that reads
+	 * full-size zeros with every register correct (test8, test10).
+	 */
 	if (failed == NULL) {
-		if (!mic_afe_on()) {
-			mic_say("2/8 the AFE port 0x4001: FAILED\n");
-			failed = "the AFE port 0x4001";
+		if (!vayu_jack_mic_on()) {
+			mic_say("2/8 the codec's microphone path: FAILED\n");
+			failed = "the codec's microphone path";
 		} else {
-			mic_say("2/8 the AFE port 0x4001: SLIMbus, 2 channels 135/136, 16 bits, 48 kHz, started\n");
+			mic_say("2/8 the codec's microphone path: TX7/TX8 on channels 135/136, on\n");
 		}
 	}
 	if (failed == NULL) {
-		if (!vayu_jack_mic_on()) {
-			mic_say("3/8 the codec's microphone path: FAILED\n");
-			failed = "the codec's microphone path";
+		if (!mic_afe_on()) {
+			mic_say("3/8 the AFE port 0x4001: FAILED\n");
+			failed = "the AFE port 0x4001";
 		} else {
-			mic_say("3/8 the codec's microphone path: TX7/TX8 on channels 135/136, on\n");
+			mic_say("3/8 the AFE port 0x4001: SLIMbus, 2 channels 135/136, 16 bits, 48 kHz, started\n");
 		}
 	}
 	if (failed == NULL) {
@@ -3541,6 +3641,7 @@ step_mic(void)
 			failed = "the run";
 		} else {
 			mic_say("6/8 the session (session 2), run\n");
+			(void)vayu_jack_mic_kick("the session is running");
 		}
 	}
 	if (failed == NULL) {
@@ -3576,7 +3677,8 @@ step_mic(void)
 #define IOS_RING_FRAMES         16384           /* 341 ms; a power of two */
 #define IOS_RING_KEEP           1920            /* 40 ms: how far behind the DSP a reader is kept */
 #define IOS_RING_MOST           4800            /* 100 ms: more than this waiting, and the oldest is skipped */
-#define MIC_REARMS              2               /* how often one capture may be re-armed before it is left as it is */
+#define MIC_REARMS              2               /* how often one capture may re-arm the codec's side before it is left as it is */
+#define MIC_REBUILDS            2               /* how often one capture may be taken down and built again */
 
 static int16_t *ios_ring;
 static vm_offset_t ios_ring_mem;
@@ -3716,6 +3818,18 @@ mic_path_down(void)
 	}
 	mic_ios_mode = true;
 	mic_say("taking the capture's path down\n");
+	/*
+	 * The reads in flight are this capture's no more: a READ_DONE that arrives while the stream is being
+	 * closed (or after the next capture has started) must not be taken for data of the capture that
+	 * replaced it.
+	 */
+	mic_generation = (mic_generation + 1) & MIC_READ_GEN_MASK;
+	if (mic_space_held) {
+		/* The evidence a capture that read zeros needs: did the DSP's writes get refused by the SMMU? */
+		lck_mtx_lock(&hakios_smmu_lock);
+		space_faults();
+		lck_mtx_unlock(&hakios_smmu_lock);
+	}
 	mic_off();
 	mic_ios_mode = false;
 	mic_path_live = false;
@@ -3725,7 +3839,7 @@ mic_path_down(void)
 static void
 mic_state_say(const char *what)
 {
-	char line[320];
+	char line[400];
 
 	if (vayu_jack_mic_state(line, sizeof(line))) {
 		mic_say("%s: %s\n", what, line);
@@ -3735,47 +3849,48 @@ mic_state_say(const char *what)
 }
 
 /*
- * The capture again, without the analog part, in the three layers a silent capture can be lost in: the
- * codec's SLIMbus port/channel part, the AFE port 0x4001 (down and up; its SLIMbus config stays in the
- * DSP) and the ADM route of session 2. For a capture whose periods are exactly zero: the codec's
- * registers read back correct in that state (M9 and the +10 s proof), and the DSP fills a full period
- * with silence whether the route or the codec is what is missing, so all three are said again.
+ * The codec's side of a capture whose periods are exactly zero, said again while the DSP keeps reading.
+ *
+ * What is NOT done any more (R12 did it): stopping the AFE port 0x4001 and routing session 2 again. In
+ * test10 that produced "the port 0x4001, started again (the re-arm) ... REFUSED: already" and from then
+ * on the DSP answered no READ at all ("NO DATA FROM THE DSP FOR 1.5 s (period 6, 14 reads posted)"), i.e.
+ * the re-arm turned 9 s of zeros into 0.12 s of data and a dead feed. A port stop while reads are in
+ * flight takes the session's read queue with it, and Android never stops the AFE port inside a stream
+ * (trigger STOP and hw_free come after ASM/ADM are closed).
+ *
+ * What is done: the codec's SLIMbus part only (the port enables, both CONNECT_SRC, DEF_ACT_CHAN and
+ * RECONFIG_NOW) -- the one layer that is cheap enough to say again while a capture runs -- and the TX
+ * port interrupt latches are read and cleared first, so that the next look at them belongs to this
+ * capture. If that does not bring samples back, the feed asks the thread to take the whole capture down
+ * and build it again (MIC_FEED_REBUILD), which is the only way to drop reads that are in flight.
  */
-static bool
+static void
 mic_rearm(const char *why)
 {
-	uint16_t stop[2] = { MIC_AFE_PORT, 0 };
-	uint16_t start[2] = { MIC_AFE_PORT, 0 };
-
-	mic_say("re-arming the capture (%s): the port 0x4001 down and up, the codec's TX7/TX8 re-armed\n", why);
-	if (!mic_step_command("the port 0x4001, stopped (the re-arm)", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop,
-	    sizeof(stop), 0)) {
-		return false;
-	}
-	mic_port_on = false;
-	vayu_jack_mic_kick("the re-arm");
-	if (!mic_step_command("the port 0x4001, started again (the re-arm)", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START,
-	    start, sizeof(start), 0)) {
-		return false;
-	}
-	mic_port_on = true;
-	if (!mic_route()) {
-		return false;
+	mic_say("re-arming the codec's side (%s): TX7/TX8 and channels 135/136 once more; the AFE port and "
+	    "the ADM route are left alone (a port stop with reads in flight kills the read queue)\n", why);
+	vayu_jack_mic_clear_status("before the re-arm");
+	if (!vayu_jack_mic_kick("the samples are exactly zero")) {
+		mic_say("the codec's SLIMbus part did not take the re-arm\n");
 	}
 	mic_state_say("after the re-arm");
-	return true;
 }
 
-/* Everything the capture needs, in the order vayu_sound=6 uses; false (path already down) on a failure. */
+/* Everything the capture needs; false (path already down) on a failure. */
 static bool
 mic_path_up(void)
 {
 	mic_ios_mode = true;
 	mic_path_live = false;
+	/*
+	 * A new capture's reads are not the previous capture's: from here on a READ_DONE whose token still
+	 * carries the old generation is ignored (see MIC_READ_TOKEN).
+	 */
+	mic_generation = (mic_generation + 1) & MIC_READ_GEN_MASK;
 	__atomic_store_n(&ios_ring_read, __atomic_load_n(&ios_ring_written, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
 	ios_ring_primed = false;
 	ios_ring_skipped = ios_ring_dry = 0;
-	mic_say("the path up: AFE 0x4001, codec TX7/TX8, ASM session 2, ADM live recording\n");
+	mic_say("the path up: codec TX7/TX8, AFE 0x4001, ASM session 2, ADM live recording\n");
 	if (!vayu_jack_ready()) {
 		mic_say("not vayu_jack>=2 (the codec): the path cannot come up\n");
 		mic_ios_mode = false;
@@ -3791,10 +3906,13 @@ mic_path_up(void)
 	if (mic_stopping) {
 		goto fail;                      /* (no DSP command after the way out has begun: see mic_path_down()) */
 	}
-	if (!mic_afe_on()) {
-		mic_say("the AFE port 0x4001 did not start\n");
-		goto fail;
-	}
+	/*
+	 * Android's order (MIC_TX.md 2.1, 4): the codec's TX path first -- its widgets are powered at
+	 * hw_params, the channels 135/136 are activated then -- and the AFE port after it (trigger). The
+	 * other way round the SLIMbus master is told to listen to channels the codec has not joined yet;
+	 * that is the one structural difference left from the vendor's sequence, and it fits the captures
+	 * that read full-size zeros with every register correct (test8, test10).
+	 */
 	if (!vayu_jack_mic_on()) {
 		mic_say("the codec's microphone path did not come up\n");
 		goto fail;
@@ -3802,6 +3920,10 @@ mic_path_up(void)
 	mic_say("the codec's microphone path is up: AMIC3 -> DEC7 -> SLIM TX7 (channel 135), AMIC1 -> DEC8 -> "
 	    "SLIM TX8 (channel 136)\n");
 	if (mic_stopping) {
+		goto fail;
+	}
+	if (!mic_afe_on()) {
+		mic_say("the AFE port 0x4001 did not start\n");
 		goto fail;
 	}
 	if (!mic_asm_on()) {
@@ -3822,11 +3944,10 @@ mic_path_up(void)
 	mic_say("the PATH IS UP: TX7/AMIC3 (channel 0) is what /dev/hakios-mic gives iOS, 16-bit signed, 1 channel, "
 	    "48 kHz\n");
 	/*
-	 * The DSP's port is running now, so this is the first moment the codec's SLIMbus port/channel part is
-	 * said to a master that has channels 135/136 in its frame. Until R12 it was said only during the
+	 * The DSP's port is running now, so this is the last moment the codec's SLIMbus port/channel part can
+	 * be said to a master that has channels 135/136 in its frame. Until R12 it was said only during the
 	 * bring-up, before the port existed: that path's own waits are 342 ms (M3 1.1 ms, M6 1.0 ms, M8's
-	 * 40 + 300 ms) plus the ~20 SLIMbus messages around them, and a capture that came up after an earlier
-	 * one delivered full-size zero periods with no error at all.
+	 * 40 + 300 ms) plus the ~20 SLIMbus messages around them.
 	 */
 	vayu_jack_mic_kick("the session is running");
 	return true;
@@ -3836,31 +3957,51 @@ fail:
 	return false;
 }
 
-/* The reads, the ring, and one level line every 10 s while the node is open. */
-static bool
+/* What one pass of the feed ended with: a clean stop (iOS closed the node), a capture to rebuild, or a failure. */
+enum mic_feed_result {
+	MIC_FEED_OK,
+	MIC_FEED_REBUILD,
+	MIC_FEED_FAILED
+};
+
+/*
+ * The reads, the ring, and one level line every 10 s while the node is open.
+ *
+ * The reads are the "read with buffer" commands of the stream: one per period, each naming its own 4096-byte
+ * page (the DSP's address of it) and our map handle, and one re-posted for every READ_DONE that comes back
+ * (asm_data_cmd_read_v2: address lsw/msw, map handle, size, seq id -- the vendor's q6asm.c:9142-9225). The
+ * "data available" event is READ_DONE, whose size word is handled by mic_read_done_size(); a period the DSP
+ * fills with fewer bytes is counted, not padded from the stale tail of the page.
+ *
+ * Nothing here stops the AFE port or routes ADM again: a capture whose reads stop being answered is taken
+ * down and built again by the caller (MIC_FEED_REBUILD), which is the only safe way to drop the reads that
+ * are in flight (test10: a port stop made the DSP answer no READ at all).
+ */
+static enum mic_feed_result
 mic_feed(void)
 {
 	uint64_t began = mach_absolute_time(), last_level = began, last_next = began, ns;
 	uint64_t frames = 0, posted = 0, window_frames = 0, sums[2] = { 0, 0 };
 	uint32_t next = 0, seconds = 0, periods = 0, peaks[2] = { 0, 0 }, all_peaks[2] = { 0, 0 };
-	uint32_t zero_periods = 0, rearms = 0;
-	bool ok = true;
+	uint32_t zero_periods = 0, zero_runs = 0, rearms = 0, short_before = 0;
+	bool ok = true, rebuild = false, short_said = false;
 	int16_t mono[MIC_PERIOD_FRAMES];
 
 	if (!ios_wants || mic_stopping) {
-		return true;
+		return MIC_FEED_OK;
 	}
 	mic_read_ready = 0;
 	mic_reads_done = 0;
 	mic_read_errors = 0;
 	mic_empty_periods = 0;
+	short_before = mic_read_short;
 	for (unsigned p = 0; p < MIC_PERIODS; p++) {
 		mic_read_sizes[p] = 0;
 	}
 	for (unsigned p = 0; p < MIC_PERIODS; p++) {
 		if (!mic_read(p)) {
 			mic_say("ASM read period %u (opcode %#x) could not be posted\n", p, ASM_DATA_CMD_READ_V2);
-			return false;
+			return MIC_FEED_FAILED;
 		}
 		posted++;
 		mic_say("ASM read period %u (opcode %#x, 20 ms, 3840 bytes): posted\n", p, ASM_DATA_CMD_READ_V2);
@@ -3880,9 +4021,18 @@ mic_feed(void)
 		if (!(mic_read_ready & (1u << next))) {
 			now = mach_absolute_time();
 			absolutetime_to_nanoseconds(now - last_next, &ns);
-			if (ns >= 1500 * NSEC_PER_MSEC) {
-				mic_say("NO DATA FROM THE DSP FOR 1.5 s (period %u, %llu reads posted)\n", next, posted);
+			if (ns >= MIC_READ_TIMEOUT_MS * NSEC_PER_MSEC) {
+				/*
+				 * Not "no data so far": a whole period late, with seven more reads posted behind it.
+				 * The DSP's read queue for session 2 is gone (a stopped AFE port, a closed path), and
+				 * no amount of re-posting brings a READ_DONE back. Take the capture down and build it
+				 * again; the token's generation makes the old capture's late READ_DONEs ignorable.
+				 */
+				mic_say("the DSP has not answered the read of period %u for %llu ms (%llu posted, %u done): "
+				    "its read queue is gone; the capture is rebuilt\n", next, ns / NSEC_PER_MSEC, posted,
+				    mic_reads_done);
 				ok = false;
+				rebuild = true;
 				break;
 			}
 			delay_for_interval(2, NSEC_PER_MSEC);
@@ -3928,26 +4078,39 @@ mic_feed(void)
 				all_peaks[0] = al > all_peaks[0] ? al : all_peaks[0];
 				all_peaks[1] = ar > all_peaks[1] ? ar : all_peaks[1];
 			}
+			if (!short_said && size < MIC_PERIOD_BYTES) {
+				short_said = true;
+				mic_say("the DSP filled a period with %u of %u bytes (a short period: only those are copied)\n",
+				    size, MIC_PERIOD_BYTES);
+			}
 			/*
 			 * A room's microphone never reads exact zeros in every sample of a 20 ms period: the analog
 			 * path's own noise is at least a few LSB (the working captures of test8 read peaks 56..262).
 			 * Exact zeros therefore mean the codec's TX port is not in the DSP's frame, not that it is
-			 * quiet, and the capture is re-armed rather than kept as a stream of silence for iOS.
+			 * quiet. The codec's side is said again (cheap, no port stop); if the zeros stay for a
+			 * second, the whole capture is rebuilt.
 			 */
 			zero_periods = silent ? zero_periods + 1 : 0;
-			if (silent && rearms < MIC_REARMS && (zero_periods == 3 || zero_periods == 50)) {
+			if (silent && zero_periods == 3 && rearms < MIC_REARMS) {
 				mic_say("the DSP's periods are exactly zero (%u in a row, %u frames, peak ch0 %u): the "
 				    "codec's TX ports are not reaching the port 0x4001\n", zero_periods, frames,
 				    all_peaks[0]);
 				rearms++;
-				zero_periods = 0;
-				if (mic_rearm("the samples are exactly zero")) {
-					/* the reads already posted keep their periods: nothing else changes */
-				}
+				zero_runs++;
+				mic_rearm("the samples are exactly zero");
+			}
+			if (silent && zero_periods >= MIC_ZERO_REBUILD_PERIODS && rearms <= MIC_REARMS) {
+				mic_say("the samples are still exactly zero (%u periods, %llu frames): the codec's side "
+				    "said again did not bring them back; the capture is rebuilt\n", zero_periods, frames);
+				ok = false;
+				rebuild = true;
 			}
 			ios_ring_put(mono, got);
 			frames += got;
 			window_frames += got;
+		}
+		if (!ok) {
+			break;
 		}
 		if (!mic_read(next)) {
 			mic_say("ASM read period %u could not be posted back (opcode %#x)\n", next, ASM_DATA_CMD_READ_V2);
@@ -3966,8 +4129,9 @@ mic_feed(void)
 
 			seconds += 10;
 			mic_say("+%u s open: ch0 TX7/AMIC3 peak %d rms %d (-%u dBFS); ch1 TX8/AMIC1 peak %d rms %d; %llu "
-			    "frames, %llu reads, %u errors; ring %llu skipped, %llu dry\n", seconds, (int)peaks[0], (int)rms0,
-			    under_full_scale(peaks[0]), (int)peaks[1], (int)rms1, window_frames, posted, mic_read_errors,
+			    "frames, %llu reads, %u errors, %u short; ring %llu skipped, %llu dry\n", seconds, (int)peaks[0],
+			    (int)rms0, under_full_scale(peaks[0]), (int)peaks[1], (int)rms1, window_frames, posted,
+			    mic_read_errors, mic_read_short - short_before,
 			    (unsigned long long)__atomic_load_n(&ios_ring_skipped, __ATOMIC_RELAXED),
 			    (unsigned long long)__atomic_load_n(&ios_ring_dry, __ATOMIC_RELAXED));
 			/* (the codec's own state while the capture runs: the same registers M9 read during the bring-up) */
@@ -3984,15 +4148,19 @@ mic_feed(void)
 	}
 	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
 	mic_say("the feed stopped after %llu.%02llu s: %llu frames from the DSP (peak ch0 %u, ch1 %u), %llu ASM reads "
-	    "posted, %u errors (%u periods with no bytes at all), %u periods, %u re-arms; ring %llu skipped, %llu "
-	    "dry%s\n", ns / NSEC_PER_SEC, ns % NSEC_PER_SEC / (NSEC_PER_SEC / 100), frames, all_peaks[0], all_peaks[1],
-	    posted, mic_read_errors, mic_empty_periods, periods, rearms,
-	    (unsigned long long)__atomic_load_n(&ios_ring_skipped, __ATOMIC_RELAXED),
-	    (unsigned long long)__atomic_load_n(&ios_ring_dry, __ATOMIC_RELAXED), ok ? "" : " (the capture failed)");
+	    "posted, %u errors (%u periods with no bytes at all, %u short), %u periods, %u re-arms (%u zero runs); "
+	    "ring %llu skipped, %llu dry%s\n", ns / NSEC_PER_SEC, ns % NSEC_PER_SEC / (NSEC_PER_SEC / 100), frames,
+	    all_peaks[0], all_peaks[1], posted, mic_read_errors, mic_empty_periods, mic_read_short - short_before, periods,
+	    rearms, zero_runs, (unsigned long long)__atomic_load_n(&ios_ring_skipped, __ATOMIC_RELAXED),
+	    (unsigned long long)__atomic_load_n(&ios_ring_dry, __ATOMIC_RELAXED), ok ? "" : rebuild ? " (the capture is rebuilt)" :
+	    " (the capture failed)");
 	if (all_peaks[0] == 0 && all_peaks[1] == 0) {
 		mic_state_say("the whole capture was exactly zero, the codec at its end");
 	}
-	return ok;
+	if (!ok && !rebuild) {
+		return MIC_FEED_FAILED;
+	}
+	return rebuild ? MIC_FEED_REBUILD : MIC_FEED_OK;
 }
 
 /* The node's thread: the path up when iOS opens it, down when it closes it; after three failures, off. */
@@ -4001,7 +4169,8 @@ ios_mic_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	mic_say("/dev/hakios-mic is up; the capture's path comes up when iOS opens it\n");
 	for (;;) {
-		bool ok;
+		bool ok = true;
+		unsigned rebuilds = 0;
 
 		while (!ios_wants && !mic_stopping) {
 			delay_for_interval(20, NSEC_PER_MSEC);
@@ -4031,7 +4200,35 @@ ios_mic_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		mic_active = true;
 		lck_mtx_unlock(&mic_lock);
-		ok = mic_feed();
+		/*
+		 * The feed runs until iOS closes the node, a failure, or a capture that has to be built again
+		 * (its reads are not answered, or it stays exactly zero after the codec's side was said again).
+		 * A rebuild is the only way to drop reads that are in flight; it is safe here because no read is
+		 * in flight while the stream is closed.
+		 */
+		for (;;) {
+			enum mic_feed_result result = mic_feed();
+
+			if (result == MIC_FEED_OK) {
+				ok = true;
+				break;
+			}
+			if (result == MIC_FEED_FAILED || rebuilds >= MIC_REBUILDS || !ios_wants || mic_stopping) {
+				ok = result == MIC_FEED_OK;
+				break;
+			}
+			rebuilds++;
+			mic_say("rebuilding the capture (%u of %u): the stream, the device path, the port and the codec's "
+			    "path again, in Android's order\n", rebuilds, MIC_REBUILDS);
+			lck_mtx_lock(&mic_lock);
+			mic_path_down();
+			if (!ios_wants || mic_stopping || !mic_path_up()) {
+				lck_mtx_unlock(&mic_lock);
+				ok = false;
+				break;
+			}
+			lck_mtx_unlock(&mic_lock);
+		}
 		lck_mtx_lock(&mic_lock);
 		mic_active = false;
 		mic_say("iOS's recording %u ended%s; the path down\n", mic_recordings, ok ? "" : " (the capture failed)");

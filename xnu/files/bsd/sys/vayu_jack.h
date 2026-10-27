@@ -41,6 +41,10 @@ bool vayu_jack_mic_kick(const char *why);
 /* One line of the capture's state as the codec sees it (SVS, supplies, biases, ADCs, the decimators' clock, the SLIMbus
  * port status), into `line'. False when the codec cannot be read. */
 bool vayu_jack_mic_state(char *line, size_t size);
+/* The TX ports' latched interrupt: which of overflow/underflow/port closed, per port (IFD 0x36/0x37, source 0x77/0x78). */
+bool vayu_jack_mic_status(char *line, size_t size);
+/* Say what is latched, then clear it (IFD 0x3A/0x3B), so the next capture's status is its own. */
+void vayu_jack_mic_clear_status(const char *why);
 #endif
 
 #endif /* _SYS_VAYU_JACK_H_ */
