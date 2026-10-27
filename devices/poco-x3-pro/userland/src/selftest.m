@@ -783,6 +783,36 @@ stage_files(double at)
 		stage_say("ls_rebuild: /redwood/bin/ls_rebuild is not in this image");
 	}
 
+	/*
+	 * R14: make pkd's own record of the appex explicit, and print it. -2001 is a provider the daemon
+	 * cannot resolve, and the daemon resolves providers through LaunchServices/pkd, so the first thing
+	 * the next log has to answer is whether pkd has the appex at all: "pluginkit -a" adds it when the
+	 * record is missing (on TEST9's boot it was: media_import's NSExtension lookup answered "NOT FOUND"
+	 * at 16:57:57, before ls_rebuild), "pluginkit -m -p com.apple.fileprovider-nonui" is the list the
+	 * daemon is supposed to see. Both are best effort: a missing pluginkit is a line, not a failure.
+	 */
+	if (access("/usr/bin/pluginkit", X_OK) == 0) {
+		static const char appex[] =
+		    "/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex";
+		char plugins[16384];
+
+		plugins[0] = '\0';
+		exit_code = run_capture((char *const[]){ (char *)"/usr/bin/pluginkit", (char *)"-a",
+		    (char *)appex, NULL }, plugins, sizeof(plugins), 30);
+		stage_say("pluginkit -a %s: exit %d (the appex in pkd's own database, before the daemon is asked)",
+		    appex, exit_code);
+		detail_text(plugins);
+		plugins[0] = '\0';
+		exit_code = run_capture((char *const[]){ (char *)"/usr/bin/pluginkit", (char *)"-m",
+		    (char *)"-p", (char *)"com.apple.fileprovider-nonui", NULL },
+		    plugins, sizeof(plugins), 30);
+		stage_say("pluginkit -m -p com.apple.fileprovider-nonui: exit %d", exit_code);
+		detail_text(plugins);
+	} else {
+		stage_say("pluginkit: /usr/bin/pluginkit is not in this image (pkd is asked through "
+		    "ls_rebuild only)");
+	}
+
 	list[0] = '\0';
 	exit_code = run_capture((char *const[]){ (char *)FILEPROVIDERCTL, (char *)"domain", (char *)"list", NULL },
 	    list, sizeof(list), 30);
@@ -810,7 +840,7 @@ stage_files(double at)
 	if (access("/redwood/bin/fp_enable", X_OK) == 0) {
 		enable[0] = '\0';
 		enable_exit = run_capture((char *const[]){ (char *)"/redwood/bin/fp_enable", (char *)"--wait=20",
-		    (char *)"--retry=120", NULL }, enable, sizeof(enable), 200);
+		    (char *)"--retry=120", (char *)"--restart=20", NULL }, enable, sizeof(enable), 260);
 		stage_say("fp_enable (fileprovider domain enable, as mobile): exit %d", enable_exit);
 		detail_text(enable);
 	} else {
@@ -906,7 +936,7 @@ stage_files(double at)
 	if ((!listed || !enabled) && access("/redwood/bin/fp_enable", X_OK) == 0) {
 		again[0] = '\0';
 		again_exit = run_capture((char *const[]){ (char *)"/redwood/bin/fp_enable", (char *)"--wait=10",
-		    (char *)"--retry=30", NULL }, again, sizeof(again), 90);
+		    (char *)"--retry=30", (char *)"--restart=20", NULL }, again, sizeof(again), 120);
 		stage_say("fp_enable again, later (the domain was %s after the first pass): exit %d",
 		    enabled ? "enabled" : "not enabled", again_exit);
 		detail_text(again);

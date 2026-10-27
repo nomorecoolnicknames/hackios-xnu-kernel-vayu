@@ -92,6 +92,10 @@
  *        --check   look only (domains, provider); change nothing
  *        --reset   remove this provider's domains first even if there are some (LocalStorage only: its files stay
  *                  in the app group; the daemon re-creates the default domain)
+ *        --restart[=SECONDS]  when a pass ends with no domain at all and no error, stop fileproviderd (SIGTERM,
+ *                  SIGKILL after SECONDS, default 20) and make launchd spawn a new one, then repeat the pass:
+ *                  a daemon that started before LaunchServices/pkd held the appex keeps a provider list that
+ *                  answers -2001 for it (R14, TEST9) and only a new process reads the completed registry
  *        as mobile, from root too; signed with fileproviderctl's entitlements
  *
  * exit: 0 the provider has a domain whose userEnabled is YES and every enable call answered without an
@@ -344,6 +348,101 @@ say_daemon_state(const char *when)
 }
 
 /*
+ * Any process whose comm is `name', the way daemon_processes() looks for fileproviderd. Needed for the two
+ * processes a -2001 is usually blamed on: pkd (the app-extension registry) and the provider's own extension
+ * (comm "LocalStorageFil", launchd truncates to 15 characters).
+ */
+static int
+named_processes(const char *name, pid_t *first_pid)
+{
+	int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+	size_t size = 0, count;
+	char *buffer;
+	int found = 0;
+
+	if (first_pid != NULL) {
+		*first_pid = 0;
+	}
+	if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || size == 0) {
+		return -1;
+	}
+	if ((buffer = malloc(size)) == NULL) {
+		return -1;
+	}
+	if (sysctl(mib, 3, buffer, &size, NULL, 0) != 0) {
+		free(buffer);
+		return -1;
+	}
+	count = size / sizeof(struct kinfo_proc);
+	for (size_t i = 0; i < count; i++) {
+		struct kinfo_proc *process = (struct kinfo_proc *)buffer + i;
+
+		if (strncmp(process->kp_proc.p_comm, name, sizeof(process->kp_proc.p_comm)) == 0) {
+			if (found == 0 && first_pid != NULL) {
+				*first_pid = process->kp_proc.p_pid;
+			}
+			found++;
+		}
+	}
+	free(buffer);
+	return found;
+}
+
+/*
+ * What a -2001 is usually blamed on, printed instead of assumed (R14). Four facts, in the order a failure
+ * needs them: pkd (the app-extension registry fileproviderd reads), the appex on disk, the executable its
+ * own Info.plist names, and the provider's extension process if one is running.
+ *
+ * The third line is not academic: the iOS 16.5 image we build /System from ships
+ * LocalStorageFileProvider.appex with Info.plist, InfoPlist.loctable and _CodeSignature only -- there is no
+ * LocalStorageFileProvider binary in the appex, and none in the dyld shared cache either (the cache's
+ * imagesText has no appex at all). TEST9's launchd log nevertheless shows "(pid/285 [LocalStorageFil])
+ * extension checked in as alive", so the device's root has a binary this tree's does not; printing both
+ * paths is what tells the two apart on the next run instead of guessing.
+ */
+static void
+say_registration_state(const char *appex)
+{
+	static const char *const suspects[] = { "pkd", "LocalStorageFil", "fileproviderd" };
+	NSFileManager *files = [NSFileManager defaultManager];
+	NSString *bundle = [NSString stringWithUTF8String:appex];
+	NSString *plist = [bundle stringByAppendingPathComponent:@"Info.plist"];
+	NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plist];
+
+	for (size_t i = 0; i < sizeof(suspects) / sizeof(suspects[0]); i++) {
+		pid_t pid = 0;
+		int count = named_processes(suspects[i], &pid);
+
+		if (count < 0) {
+			fprintf(stderr, "fp_enable: registry: %s: the process table is not readable (%s)\n",
+			    suspects[i], strerror(errno));
+		} else if (count == 0) {
+			fprintf(stderr, "fp_enable: registry: %s: not running\n", suspects[i]);
+		} else {
+			fprintf(stderr, "fp_enable: registry: %s: running as pid %d (%d process(es))\n",
+			    suspects[i], (int)pid, count);
+		}
+	}
+	fprintf(stderr, "fp_enable: registry: appex %s: %s\n", appex,
+	    [files fileExistsAtPath:plist] ? "Info.plist is there" : "NO Info.plist");
+	if (info != nil) {
+		NSString *executable = info[@"CFBundleExecutable"];
+		NSString *path = executable ? [bundle stringByAppendingPathComponent:executable] : nil;
+		NSDictionary *extension = info[@"NSExtension"];
+
+		fprintf(stderr, "fp_enable: registry:   CFBundleIdentifier = %s\n",
+		    [info[@"CFBundleIdentifier"] UTF8String] ?: "(none)");
+		fprintf(stderr, "fp_enable: registry:   NSExtensionPointIdentifier = %s\n",
+		    [extension[@"NSExtensionPointIdentifier"] UTF8String] ?: "(none)");
+		fprintf(stderr, "fp_enable: registry:   NSExtensionFileProviderEnabledByDefault = %s\n",
+		    [extension[@"NSExtensionFileProviderEnabledByDefault"] boolValue] ? "true" : "false/absent");
+		fprintf(stderr, "fp_enable: registry:   executable %s: %s\n", executable ? [executable UTF8String] : "(none)",
+		    path == nil ? "no CFBundleExecutable" :
+		    [files fileExistsAtPath:path] ? "is there" : "IS MISSING (the extension cannot be exec'd)");
+	}
+}
+
+/*
  * The trigger. A job with MachServices that is not running has launchd's demand port registered under the
  * service name: a client's lookup gets a send right to it, and the first message sent there is what makes
  * launchd spawn the job ("launching: ipc (mach)", then "Successfully spawned fileproviderd[NN] because ipc
@@ -396,6 +495,92 @@ poke_launchd(NSString *service)
 	}
 	xpc_connection_cancel(connection);
 	return pid > 0;
+}
+
+/*
+ * The restart, and why it is here (R14, FACT from TEST9's launchd log):
+ *
+ *   - 16:57:57  media_import: "extension com.apple.FileProvider.LocalStorage: NOT FOUND ((null))"  (the
+ *               appex is not in LaunchServices/pkd yet)
+ *   - 16:58:16  launchd: "Successfully spawned fileproviderd[121] because ipc (mach)"                (the
+ *               daemon starts and builds its FPDProviderDescriptor list from that incomplete registry)
+ *   - 16:58:18-20  /redwood/bin/ls_rebuild: "rebuilding (system, internal, user)", "rebuild says 1";
+ *               after it "com.apple.fileprovider-nonui: 8 found", LocalStorage among them
+ *
+ * A daemon that starts before the registry is complete is the one case the on-demand re-sync does not
+ * cover by itself: -[FPDXPCServicer ...] only re-syncs when a lookup already failed ("No provider found
+ * with identifier %@ for calling bundle %@. Syncing with LS and retrying.", 0x1c3c7123c; "... on second
+ * attempt.", 0x1c3c71300; -[FPDExtensionManager forceSynchronousProviderUpdate]), and the provider
+ * registry it then builds is the one the daemon was born with for everything else, including the
+ * startup step that creates the default domain from -[FPDProviderDescriptor enabledByDefault]. Stopping
+ * the process is the cheap way to make it read the registry again: launchd spawns the job on the next
+ * connection, which poke_launchd() makes, and the new process starts against a complete LaunchServices.
+ */
+static BOOL
+restart_daemon(NSString *service, double seconds)
+{
+	pid_t pid = 0, old_pid;
+	int tries;
+
+	(void)daemon_processes(&pid);
+	if (pid <= 0) {
+		fprintf(stderr, "fp_enable: restart: fileproviderd is not running, waking it instead\n");
+		return poke_launchd(service);
+	}
+	old_pid = pid;
+	fprintf(stderr, "fp_enable: restart: stopping fileproviderd pid %d so that it reads the "
+	    "LaunchServices/pkd registry again\n", (int)old_pid);
+	if (kill(old_pid, SIGTERM) != 0) {
+		fprintf(stderr, "fp_enable: restart: kill(%d, SIGTERM): %s\n", (int)old_pid, strerror(errno));
+	}
+	for (tries = 0; tries < (int)(seconds * 10.0); tries++) {
+		pid = 0;
+		(void)daemon_processes(&pid);
+		if (pid != old_pid) {
+			break;
+		}
+		usleep(100000);
+	}
+	if (pid == old_pid) {
+		fprintf(stderr, "fp_enable: restart: pid %d is still there after %.0f s, SIGKILL\n",
+		    (int)old_pid, seconds);
+		(void)kill(old_pid, SIGKILL);
+		for (tries = 0; tries < 50; tries++) {
+			pid = 0;
+			(void)daemon_processes(&pid);
+			if (pid != old_pid) {
+				break;
+			}
+			usleep(100000);
+		}
+	}
+	if (pid == old_pid) {
+		fprintf(stderr, "fp_enable: restart: fileproviderd pid %d did not go away\n", (int)old_pid);
+		return NO;
+	}
+	if (pid > 0) {
+		/* launchd's job came back by itself (KeepAlive): nothing to poke, and poke_launchd() would
+		 * answer NO for a daemon that is already up, which is not a failure */
+		fprintf(stderr, "fp_enable: restart: launchd already started a new fileproviderd, pid %d\n",
+		    (int)pid);
+		return YES;
+	}
+	fprintf(stderr, "fp_enable: restart: the old daemon is gone, asking launchd for a new one\n");
+	if (!poke_launchd(service)) {
+		fprintf(stderr, "fp_enable: restart: launchd did not start fileproviderd again\n");
+		return NO;
+	}
+	for (tries = 0; tries < (int)(seconds * 10.0); tries++) {
+		pid = 0;
+		if (daemon_processes(&pid) > 0 && pid != old_pid) {
+			fprintf(stderr, "fp_enable: restart: fileproviderd is running again as pid %d\n",
+			    (int)pid);
+			return YES;
+		}
+		usleep(100000);
+	}
+	fprintf(stderr, "fp_enable: restart: no new fileproviderd in %.0f s\n", seconds);
+	return NO;
 }
 
 static id
@@ -980,8 +1165,8 @@ main(int argc, char **argv)
 {
 	@autoreleasepool {
 		int index = 1;
-		BOOL check = NO, reset = NO, wait = NO;
-		double wait_seconds = 30.0, retry_seconds = 0;
+		BOOL check = NO, reset = NO, wait = NO, restart = NO, restarted = NO;
+		double wait_seconds = 30.0, retry_seconds = 0, restart_seconds = 20.0;
 		NSString *provider = @"com.apple.FileProvider.LocalStorage";
 		NSString *service = nil;
 		NSArray *services;
@@ -1014,6 +1199,14 @@ main(int argc, char **argv)
 					retry_seconds = 120.0;
 				}
 				index++;
+			} else if (strncmp(argv[index], "--restart", 9) == 0 &&
+			    (argv[index][9] == '\0' || argv[index][9] == '=')) {
+				restart = YES;
+				restart_seconds = argv[index][9] == '=' ? atof(argv[index] + 10) : 20.0;
+				if (restart_seconds <= 0) {
+					restart_seconds = 20.0;
+				}
+				index++;
 			} else {
 				fprintf(stderr, "fp_enable: %s: unknown option\n", argv[index]);
 				return 2;
@@ -1037,6 +1230,10 @@ main(int argc, char **argv)
 		fprintf(stderr, "fp_enable: running as uid %d gid %d (%s)\n", (int)getuid(), (int)getgid(),
 		    getuid() == MOBILE_ID ? "mobile" : "NOT mobile");
 		say_daemon_state("start");
+		if ([provider isEqualToString:@"com.apple.FileProvider.LocalStorage"]) {
+			say_registration_state(
+			    "/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex");
+		}
 		ensure_storage();
 		load_fileprovider();
 		services = mach_service_names(&service);
@@ -1072,6 +1269,27 @@ main(int argc, char **argv)
 				fprintf(stderr, "fp_enable: pass %u: %lu domain(s), %d enabled\n", attempt,
 				    (unsigned long)result.domains, result.enabled);
 				return 0;
+			}
+			/* R14: the provider is there and the reset was answered, but the daemon's list is
+			 * still empty -- the case TEST9 showed, where fileproviderd had started 1.4 s before
+			 * the LS/pkd rebuild finished. One restart, then the pass is repeated; a daemon born
+			 * against the complete registry is the only state difference a client can make. */
+			if (restart && !restarted && result.domains == 0 && result.failures == 0) {
+				restarted = YES;
+				fprintf(stderr, "fp_enable: pass %u: %lu domain(s) and no error, but no domain: "
+				    "the daemon may have started before the registry was complete; restarting it\n",
+				    attempt, (unsigned long)result.domains);
+				if (restart_daemon(service, restart_seconds)) {
+					daemon = wait ? wait_for_daemon(provider,
+					    MIN(10.0, MAX(1.0, restart_seconds)), service) : proxy();
+					if (daemon == nil) {
+						fprintf(stderr, "fp_enable: no connection to fileproviderd "
+						    "after the restart\n");
+						return 1;
+					}
+					continue;
+				}
+				fprintf(stderr, "fp_enable: the restart did not happen; the pass goes on as before\n");
 			}
 			if (deadline == 0 || now_seconds() >= deadline) {
 				fprintf(stderr, "fp_enable: pass %u: %lu domain(s), %d enabled, %d error(s); "
