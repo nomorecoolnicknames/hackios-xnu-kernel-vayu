@@ -745,9 +745,11 @@ static int
 stage_files(double at)
 {
 	static char list[65536], list2[65536], dump[65536], listing[65536], mobile_listing[16384], wrote[16384], enable[32768];
+	static char again[32768];
 	char name[80], path[PATH_MAX] = "", directory[PATH_MAX] = "", readback[32] = "";
 	char line[1024];
 	int listed = 0, enabled = 0, written = 0, seen = 0, mobile_seen = 0, exit_code, enable_exit = 0;
+	int again_exit = 0;
 	int extension_running;
 
 	g_stage = "files";
@@ -799,11 +801,16 @@ stage_files(double at)
 	 * mobile. It waits for the daemon first: at +45 s launchd may be starting fileproviderd on this very
 	 * connection (TEST5Q shows the spawn at 11:09:29 and a Cocoa 4099 right behind it). The verdict below
 	 * is read from the second domain list, not from the first.
+	 *
+	 * R13 (TEST8): the wait is not the whole story -- the daemon may be up while the domain, its extension
+	 * or the daemon's own state is not, so fp_enable is asked to repeat the pass itself (--retry=120) and,
+	 * if the domain is still not enabled when the stage has done everything else, it is asked once more,
+	 * later, and the domain list is read again (see "fp_enable again" below).
 	 */
 	if (access("/redwood/bin/fp_enable", X_OK) == 0) {
 		enable[0] = '\0';
-		enable_exit = run_capture((char *const[]){ (char *)"/redwood/bin/fp_enable", (char *)"--wait=20", NULL },
-		    enable, sizeof(enable), 120);
+		enable_exit = run_capture((char *const[]){ (char *)"/redwood/bin/fp_enable", (char *)"--wait=20",
+		    (char *)"--retry=120", NULL }, enable, sizeof(enable), 200);
 		stage_say("fp_enable (fileprovider domain enable, as mobile): exit %d", enable_exit);
 		detail_text(enable);
 	} else {
@@ -889,27 +896,56 @@ stage_files(double at)
 		stage_say("the provider did not list its storage from either client (the \"Could not find a matching "
 		    "provider\" -2001 of the earlier diagnostics looks like this)");
 	}
+	/*
+	 * R13: the same step again, later. Everything above took the files stage's own time (three
+	 * fileproviderctl calls and a file written through the domain), so this is a second process, tens of
+	 * seconds after the first, on the state the daemon has settled into since. It runs only when the domain
+	 * is not enabled -- a working enable is not disturbed -- and the domain list is read once more after it,
+	 * so the verdict below is the last word rather than the first pass's.
+	 */
+	if ((!listed || !enabled) && access("/redwood/bin/fp_enable", X_OK) == 0) {
+		again[0] = '\0';
+		again_exit = run_capture((char *const[]){ (char *)"/redwood/bin/fp_enable", (char *)"--wait=10",
+		    (char *)"--retry=30", NULL }, again, sizeof(again), 90);
+		stage_say("fp_enable again, later (the domain was %s after the first pass): exit %d",
+		    enabled ? "enabled" : "not enabled", again_exit);
+		detail_text(again);
+		list2[0] = '\0';
+		exit_code = run_capture((char *const[]){ (char *)FILEPROVIDERCTL, (char *)"domain", (char *)"list", NULL },
+		    list2, sizeof(list2), 30);
+		stage_say("fileproviderctl domain list, after the second enable: exit %d", exit_code);
+		detail_text(list2);
+		if (exit_code == 0) {
+			parse_domain_list(list2, &listed, &enabled);
+			stage_say("the LocalStorage domain after the second enable: listed=%s enabled=%s",
+			    listed ? "yes" : "NO", enabled ? "yes" : "NO");
+		}
+	}
 	extension_running = process_count("LocalStorageFileProvider") > 0;
 	stage_say("LocalStorageFileProvider: %s", extension_running ? "running" : "not seen (the ``ls`` above is the proof that matters)");
 	if (!listed || !enabled) {
-		stage_say("the domain is still not enabled after fp_enable: read its output above -- \"no connection "
-		    "to fileproviderd\" and \"no answer\" are different faults (this program's FileProvider link, "
-		    "then the daemon), an error 4 is a domain the daemon does not have (the reset creates it), and a "
-		    "domain that is listed and disabled is the daemon's own descriptor (see ls_rebuild above) -- "
-		    "then fileproviderd's log and whether LocalStorageFileProvider.appex is in the system image");
+		stage_say("the domain is still not enabled after fp_enable (two processes, the second one later): "
+		    "read its output above -- \"no connection to fileproviderd\" and \"no answer\" are different "
+		    "faults (this program's FileProvider link, then the daemon), \"the proxy says it does not answer\" "
+		    "means the call went out anyway (TEST8), an error 4 is a domain the daemon does not have (the "
+		    "reset creates it), and a domain that is listed and disabled is the daemon's own descriptor (see "
+		    "ls_rebuild above) -- then fileproviderd's log and whether LocalStorageFileProvider.appex is in "
+		    "the system image");
 	}
 
 	{
 		struct stat status;
 
 		if (path[0] != '\0' && stat(path, &status) == 0) {
-			snprintf(line, sizeof(line), "domain=%s+%s fp_enable_exit=%d file=%s size=%lld readback=%s provider_ls=%s",
-			    listed ? "listed" : "NOT-listed", enabled ? "enabled" : "NOT-enabled", enable_exit, path,
+			snprintf(line, sizeof(line), "domain=%s+%s fp_enable_exit=%d again_exit=%d file=%s size=%lld "
+			    "readback=%s provider_ls=%s", listed ? "listed" : "NOT-listed",
+			    enabled ? "enabled" : "NOT-enabled", enable_exit, again_exit, path,
 			    (long long)status.st_size, written ? "ok" : "no", seen ? "yes" : "NO");
 		} else {
-			snprintf(line, sizeof(line), "domain=%s+%s fp_enable_exit=%d file=%s readback=%s provider_ls=%s",
-			    listed ? "listed" : "NOT-listed", enabled ? "enabled" : "NOT-enabled", enable_exit,
-			    path[0] != '\0' ? path : "(none)", written ? "ok" : "no", seen ? "yes" : "NO");
+			snprintf(line, sizeof(line), "domain=%s+%s fp_enable_exit=%d again_exit=%d file=%s readback=%s "
+			    "provider_ls=%s", listed ? "listed" : "NOT-listed", enabled ? "enabled" : "NOT-enabled",
+			    enable_exit, again_exit, path[0] != '\0' ? path : "(none)", written ? "ok" : "no",
+			    seen ? "yes" : "NO");
 		}
 	}
 	stage_result(listed && enabled && written && seen, "%s", line);
@@ -1955,11 +1991,11 @@ run_all(const char *source, const char *track, double mic_seconds, int app_timeo
 	snprintf(results_arg, sizeof(results_arg), "--results=%s", g_results);
 
 	/* the timeouts are generous on purpose: the point of killing a stage is a hang, not a slow
-	 * phone. files: three fileproviderctl calls (30 s each), fp_enable's wait and work (120 s), the
-	 * write (60 s), vol_ls (20 s) and the provider's ls from both clients (30 s each); music: the
-	 * import's own 120 s alarm and three minutes of library work; camera: the 90 s wait for the
-	 * application plus its report. */
-	plan[0] = (struct stage_plan){ "files", AT_FILES, 240, { at_text, results_arg, NULL } };
+	 * phone. files: three fileproviderctl calls (30 s each), fp_enable's wait, retries and work (200 s),
+	 * the write (60 s), vol_ls (20 s), the provider's ls from both clients (30 s each) and fp_enable again,
+	 * later (90 s); music: the import's own 120 s alarm and three minutes of library work; camera: the 90 s
+	 * wait for the application plus its report. */
+	plan[0] = (struct stage_plan){ "files", AT_FILES, 480, { at_text, results_arg, NULL } };
 	plan[1] = (struct stage_plan){ "music", AT_MUSIC, 360, { at_text, results_arg, "--source", source,
 	    "--track", track, NULL } };
 	plan[2] = (struct stage_plan){ "mic", AT_MIC, 180, { at_text, results_arg, seconds_text, NULL } };
