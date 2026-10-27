@@ -181,6 +181,19 @@ void            MiniIOSurfacePoolInfo(uint32_t * slots, uint32_t * used);
 void            MiniIOSurfaceClearKept(void);
 /* Wait, for so many milliseconds at most, until the GPU is done with a surface's pixels (hakios.gpu.cpp). */
 bool            MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds);
+/*
+ * The fence of the last submission handed to the GPU when this is asked (0: none has been): what a
+ * swap is presented no sooner than, whatever the submission named (hakios.gpu.cpp).
+ */
+uint32_t        MiniIOSurfaceFenceNow(void);
+/* That fence, read from the surface instead: the last submission that named its pixels. */
+uint32_t        MiniIOSurfaceFence(MiniIOSurface * surface);
+/* Wait, for so many milliseconds at most, until submission `fence` is done. */
+bool            MiniIOSurfaceFenceDone(uint32_t fence, uint64_t milliseconds);
+/* Has the GPU been given the surface again since `fence`? (the pixels copied were being drawn over) */
+bool            MiniIOSurfaceRedrawn(MiniIOSurface * surface, uint32_t fence);
+/* Take the GPU's writes to a surface's pixels into this processor's view, before it reads them. */
+void            MiniIOSurfaceToCpu(MiniIOSurface * surface);
 MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */

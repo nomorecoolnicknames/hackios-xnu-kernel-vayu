@@ -39,6 +39,7 @@
 #include <mach/mach_time.h>
 #include <mach/vm_param.h>
 #include <sys/systm.h>
+#include <os/atomic_private.h>
 
 #include "MiniIOSurface.h"
 
@@ -214,18 +215,125 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	return false;
 }
 
+/*
+ * Wait for the 3D core to be done with submission `fence`, with no lock held: what the display's
+ * driver does with a frame (MiniIOSurfaceDrawn). A client's submission holds the clients' lock
+ * while it waits for room in the ring (up to two seconds, hakios_gpu_submit) and while it pushes
+ * its memory out of the cache; a frame that waited behind that would be shown half drawn, or late
+ * enough that the next one is. The fence is a word in memory the core writes: asking it again is
+ * what a wait is here (there are no interrupts).
+ */
+static bool
+gpuWaitFree(uint32_t fence, uint64_t milliseconds)
+{
+	uint64_t began = mach_absolute_time(), patience;
+
+	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
+	for (bool waited = false;; waited = true) {
+		if (hakios_gpu_done(fence)) {
+			if (waited && gGPULock != NULL) {
+				IOLockLock(gGPULock);           /* (only to count it) */
+				gGPUStat.waits++;
+				gGPUStat.waiting += mach_absolute_time() - began;
+				IOLockUnlock(gGPULock);
+			}
+			return true;
+		}
+		if (mach_absolute_time() - began >= patience || gGPUReported) {
+			break;                  /* (a GPU that has stopped answering is not waited for again) */
+		}
+		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
+	}
+	return false;
+}
+
+/*
+ * Wait, for so many milliseconds at most, until the GPU is done with a surface's pixels. The
+ * surface's fence is the last submission that NAMED it (submit()); a frame whose last submission
+ * ended the frame without naming it -- a blit into a mirror texture, freedreno's merged batches
+ * (userland/src/eagl.c) -- leaves the fence of the frame before, and this then returns at once.
+ * The display's driver waits for the swap's own fence first, which is what closes that
+ * (MiniIOSurfaceFenceNow, MiniIOMobileFramebuffer.cpp), and for this one after it.
+ */
 bool
 MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 {
-	uint32_t fence = surface->drawn;
-	bool done = true;
+	uint32_t fence = os_atomic_load(&surface->drawn, relaxed);
 
-	if (fence != 0 && gGPULock != NULL) {
-		IOLockLock(gGPULock);
-		done = !hakios_gpu_ready() || gpuWait(fence, milliseconds);
-		IOLockUnlock(gGPULock);
+	if (fence == 0 || !hakios_gpu_ready()) {
+		return true;                    /* (nothing of the GPU's names it: there is nothing to wait for) */
 	}
-	return done;
+	return gpuWaitFree(fence, milliseconds);
+}
+
+/*
+ * The last submission handed to any client (hakios_gpu_last()), or 0: the fence a swap starts from.
+ * Read with no lock: it is taken on the window server's thread in SwapEnd, and a client's submission may
+ * be holding the clients' lock for as long as the ring is full (up to two seconds). Both are plain words;
+ * the value is only a floor under the per-surface waits.
+ */
+uint32_t
+MiniIOSurfaceFenceNow(void)
+{
+	return hakios_gpu_ready() ? hakios_gpu_last() : 0;
+}
+
+uint32_t
+MiniIOSurfaceFence(MiniIOSurface * surface)
+{
+	return os_atomic_load(&surface->drawn, relaxed);
+}
+
+bool
+MiniIOSurfaceFenceDone(uint32_t fence, uint64_t milliseconds)
+{
+	if (fence == 0 || !hakios_gpu_ready()) {
+		return true;
+	}
+	return gpuWaitFree(fence, milliseconds);
+}
+
+/*
+ * Was the surface given to the GPU again while it was being copied to the panel? Then the frame
+ * shown is part of the next one: the swap came before the GPU had been given all of it, and the
+ * display's driver copied it anyway (it waited for what it had been told of, not for what came
+ * after). A frame at 120 Hz takes 8.33 ms; a submission that lands in the middle of the copy is
+ * what makes a frame come out with parts of it missing.
+ */
+bool
+MiniIOSurfaceRedrawn(MiniIOSurface * surface, uint32_t fence)
+{
+	uint32_t now = os_atomic_load(&surface->drawn, relaxed);
+
+	return fence != 0 && now != fence && (int32_t) (now - fence) > 0;
+}
+
+/*
+ * The GPU's writes to a surface's pixels, made visible to this processor before it reads them
+ * (dc civac of every line: clean, in case this processor wrote them too, and invalidate). The
+ * submission path does the same before the core is given a surface (submit()); a copy to the
+ * panel that follows a fence does not otherwise know that what it reads is not a line of the
+ * frame before still in the cache.
+ */
+void
+MiniIOSurfaceToCpu(MiniIOSurface * surface)
+{
+	uint8_t * base;
+	uint64_t size;
+
+	if (surface->scanout != NULL) {
+		base = surface->kpixels;
+		size = round_page_64(surface->info.allocSize);
+	} else if (surface->kbase != NULL) {
+		base = surface->kbase + PAGE_SIZE;
+		size = round_page_64(surface->info.allocSize);
+	} else {
+		return;
+	}
+	if (base == NULL || size == 0 || size > (256u << 20)) {
+		return;
+	}
+	hakios_gpu_to_memory(base, size);
 }
 
 /*
@@ -978,6 +1086,10 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 	 * display's driver waits for that before it puts one on the panel (MiniIOSurfaceDrawn()).
 	 * (freedreno names every buffer for reading and writing alike, so which it is cannot be
 	 * told; the last submission of a frame names the surface the frame is drawn into.)
+	 * The fence is stored with release: the display's driver reads it, waits for that fence, and
+	 * then reads the pixels the core wrote under it -- which is where frames came out half drawn
+	 * when the last submission of a frame named another surface than the frame's
+	 * (MiniIOSurfaceFenceNow() and MiniIOSurfaceRedrawn() are what tell of that).
 	 */
 	for (uint32_t i = 0; request->fence != 0 && i < request->nr_bos; i++) {
 		struct gpu_buffer * b = buffer(bos[i].handle);
@@ -985,7 +1097,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		if (b != NULL) {
 			b->fence = request->fence;
 			if (b->surface != NULL) {
-				b->surface->drawn = request->fence;
+				os_atomic_store(&b->surface->drawn, request->fence, release);
 			}
 		}
 	}

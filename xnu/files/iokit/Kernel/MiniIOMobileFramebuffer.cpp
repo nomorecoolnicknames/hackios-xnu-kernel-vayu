@@ -44,6 +44,32 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 static void fbLogProperty(const char * who, const OSSymbol * key, OSObject * value);
 
+extern "C" void loader_log_putc(char c);
+/*
+ * Every line of this driver also goes to the loader's log, which is the one a run's log keeps: IOLog
+ * alone does not reach it. (The TEST5Q run -- 73 boots, 2823889 lines, artifacts/vayu/test5-20261027 --
+ * has not one line of this driver in it, while the same boot's printf lines from bsd/dev/ are all
+ * there: "vayu: ...", "vayu-vsync: ...". A frame that comes out blank cannot be seen in a log that
+ * the driver of the panel does not write to.) The same way MiniAppleStockholm.cpp and vayu_vsync.c do it.
+ */
+static void fbLog(const char * format, ...) __printflike(1, 2);
+
+static void
+fbLog(const char * format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char * c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	(IOLog)("%s", line);                    /* (in parentheses: IOLog is this, below) */
+}
+#define IOLog(...)      fbLog(__VA_ARGS__)
+
 /*
  * The panel's backlight, if a driver has one (vayu: vayu_wled.c sets it with vayu_wled=2): called with false when
  * iOS asks for the display to be powered down (RequestPowerChange, in[0] == 0) and true when it asks for it back.
@@ -120,6 +146,7 @@ enum {
 #define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
 #define FRAME_PAUSE             90                      /* from so many on, nothing was moving: not a slow frame */
 #define SWAP_GPU_MS             500                     /* a frame the GPU has not drawn by then is shown as it is */
+#define SWAP_FENCE_MS           20                      /* the swap's own fence (a submission of anybody's before it) */
 #define SWAP_HELD_MS            700                     /* a swap that cannot be taken by then is not shown at all */
 
 #define FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
@@ -235,6 +262,24 @@ static TUNABLE(uint32_t, gVsyncDivisor, "fb_vsync_div", 0);
  */
 static TUNABLE(uint32_t, gFb120, "fb_120", 0);
 /*
+ * Boot-arg fb_swap_fence_ms=N (default 20): how long a swap waits for the GPU's last submission as of
+ * the SwapEnd that handed it over. The surfaces of a swap have fences of their own (the last submission
+ * that named them, MiniIOSurfaceDrawn) -- but the submission that ended the frame need not name the
+ * surface the frame is in (the GPU's blit into a mirror texture, freedreno's merged batches:
+ * userland/src/eagl.c), and the surface's fence then belongs to the frame before: the copy would read
+ * pixels the core is drawing into. Short, because a frame given to the GPU after the swap is not this
+ * frame's to wait for; it is a floor under the per-surface wait (SWAP_GPU_MS), not a wait for everything.
+ */
+static TUNABLE(uint32_t, gSwapFenceMs, "fb_swap_fence_ms", SWAP_FENCE_MS);
+/*
+ * Boot-arg fb_gpu_read=1 (default 0): before a surface is copied to the panel, its pixels are taken into
+ * this processor's view (MiniIOSurfaceToCpu: clean and invalidate, 11 MB of a 1125x2436 frame, some 1 to
+ * 2 ms). The GPU's submission path does that before the core is given a surface (hakios.gpu.cpp submit),
+ * which is enough when one submission a frame names it; this is for when that one was skipped (the 4 ms
+ * GPU_PUSH_AGAIN_MS of the same file) and the copy reads the frame before out of the cache.
+ */
+static TUNABLE(uint32_t, gGpuRead, "fb_gpu_read", 0);
+/*
  * Boot-arg fb_120_idle=1 (with fb_120=1): 120 Hz only while the screen is touched. The refreshes told to iOS come
  * every panel frame (120 a second) while a finger is down or was within fb_120_idle_ms (default 1000) ms, and every
  * second panel frame (60 a second) after that: CoreAnimation's frames follow the refreshes, so the window server
@@ -287,6 +332,26 @@ refreshHz(void)
 	uint32_t hz = gModeHz != 0 ? gModeHz : gRefreshHz;
 
 	return hz >= 1 && hz <= 240 ? hz : kFBRefreshHz;
+}
+/*
+ * Is a frame being put on the panel just now? bsd/dev/vayu_adreno.c asks this (hakios_display_frames)
+ * before it votes the GPU down: the vote is a round trip to the GMU, the first frames after it are
+ * drawn at the lower speed, and its own messages go to the serial console from the middle of a
+ * submission (hfi_send). A frame shown in the last 100 ms says that something is moving on the screen.
+ */
+extern "C" uint32_t (*hakios_display_frames)(void);
+static uint64_t gFBLastFrameShown;              /* mach_absolute_time of the last frame copied to the panel */
+
+static uint32_t
+fbFramesNow(void)
+{
+	uint64_t last = os_atomic_load(&gFBLastFrameShown, relaxed), limit, now = mach_absolute_time();
+
+	if (last == 0) {
+		return 0;
+	}
+	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &limit);
+	return now - last < limit ? 1 : 0;
 }
 static inline uint32_t
 recStep(void)
@@ -350,6 +415,7 @@ public:
 	IOLock *        fSwapLock;              /* around the next five */
 	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
 	MiniIOSurface * fSwapSurfaces[SWAP_QUEUE][SWAP_LAYERS]; /* ... their surfaces, held from SwapEnd on: their maker may let go of them */
+	uint32_t        fSwapFence[SWAP_QUEUE]; /* ... and the GPU's last submission when each came in (MiniIOSurfaceFenceNow) */
 	unsigned        fSwapFirst, fSwapsWaiting;
 	/*
 	 * ... and not whenever the GPU happens to be done, but on a beat of the refresh rate
@@ -373,6 +439,13 @@ public:
 	uint64_t        fSwapTime;              /* when the last swap was handed over */
 	uint32_t        fStatSwapsLate;         /* swaps that came more than a refresh and a quarter after the one before (and no pause) */
 	uint64_t        fStatWaiting;           /* how long frames waited for the GPU here */
+	/* the swap's own fence, and the surfaces it copied while the GPU was given them again */
+	uint32_t        fStatSwapFence;         /* swaps that waited for the fence of the last submission before them */
+	uint32_t        fStatSwapFenceLate;     /* ... that one was not done in fb_swap_fence_ms */
+	uint64_t        fStatSwapWait;          /* how long those waits took together */
+	uint32_t        fStatRedrawn;           /* surfaces given to the GPU again while they were copied */
+	uint32_t        fStatSeedChanged;       /* surfaces locked for drawing while they were copied (no GPU needed) */
+	uint32_t        fStatToCpu;             /* surfaces taken into this processor's view before the copy */
 	/* how the display is doing: frames and time spent drawing them here since fStatSince */
 	uint32_t        fStatFrames;
 	uint64_t        fStatSince, fStatDrawing;
@@ -399,7 +472,7 @@ public:
 	void publishModes(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
-	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void show(const uint8_t * swap, MiniIOSurface ** surfaces, uint32_t swapFence);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
@@ -604,6 +677,8 @@ IOMobileFramebuffer::start(IOService * provider)
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	/* for who draws with the GPU (userland/src/eagl.c): a frame need not be waited for before it is handed over */
 	setProperty("HakiosWaitsForGPU", kOSBooleanTrue);
+	/* ... and for who votes the GPU down (bsd/dev/vayu_adreno.c): not while frames are going to the panel */
+	hakios_display_frames = fbFramesNow;
 	publishModes();
 	setName("disp0");
 	registerService();
@@ -1043,6 +1118,13 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 
 		fSwapSurfaces[slot][layer] = sid != 0 ? MiniIOSurfaceCopy(sid) : NULL;
 	}
+	/*
+	 * The GPU's last submission as of this swap: the frame is presented no sooner than that, whatever
+	 * the submission named. Taken here, in SwapEnd's own order with the submissions of the program that
+	 * made the frame, and not later on the presenter's thread, where a submission of the next frame
+	 * would be in it too.
+	 */
+	fSwapFence[slot] = MiniIOSurfaceFenceNow();
 	fSwapsWaiting++;
 	IOLockWakeup(fSwapLock, fSwap, true);
 	IOLockUnlock(fSwapLock);
@@ -1061,14 +1143,17 @@ IOMobileFramebuffer::presenter(void)
 	MiniIOSurface * surfaces[SWAP_LAYERS];
 
 	for (;;) {
+		uint32_t swapFence;
+
 		IOLockLock(fSwapLock);
 		while (fSwapsWaiting == 0) {
 			IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
 		}
 		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
 		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
+		swapFence = fSwapFence[fSwapFirst];
 		IOLockUnlock(fSwapLock);
-		show(swap, surfaces);
+		show(swap, surfaces, swapFence);
 		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 			if (surfaces[layer] != NULL) {
 				MiniIOSurfaceDrop(surfaces[layer]);
@@ -1080,7 +1165,7 @@ IOMobileFramebuffer::presenter(void)
 
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
-IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint32_t swapFence)
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
@@ -1088,6 +1173,28 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	MiniIOSurface * recorded = NULL;
 	bool report;
 
+	/*
+	 * The swap's own fence first: the GPU's last submission when the swap came in. A frame is not to be
+	 * copied before the core has finished what the program that made it had given the core by then --
+	 * whether the submission named the surface or not (MiniIOSurfaceFenceNow). Then, surface by surface,
+	 * the fence of the last submission that named that surface, which is the longer wait of the two when
+	 * a frame was drawn in more than one submission.
+	 */
+	if (swapFence != 0) {
+		uint64_t fenceBegan = mach_absolute_time(), fenceDone;
+		bool done = MiniIOSurfaceFenceDone(swapFence, gSwapFenceMs);
+
+		fenceDone = mach_absolute_time();
+		fStatSwapWait += fenceDone - fenceBegan;
+		if (!done) {
+			fStatSwapFenceLate++;
+			if (fStatSwapFenceLate <= 4) {
+				IOLog("MiniIOMobileFramebuffer: swap %u: submission %u, the GPU's last when it came, is not done "
+				    "after %u ms; the frame is copied as it is\n", swapWord(swap, SWAP_ID), swapFence, gSwapFenceMs);
+			}
+		}
+	}
+	fStatSwapFence += swapFence != 0;       /* (how many swaps had a GPU fence at all: 0 = the GPU draws none of this) */
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
 			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
@@ -1244,18 +1351,59 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			fScanoutCopies++;
 		}
 		if (s->info.bytesPerElement == 4 && s->info.planeCount == 0) {
+			uint32_t drawnBefore = MiniIOSurfaceFence(s);
+			uint32_t seedBefore = s->shared()->seed;
+
 			if (!fGraphics) {
 				/* the first picture: the kernel's text console must stop drawing over it */
 				fGraphics = true;
 				PE_initialize_console(NULL, kPEGraphicsMode);
 			}
+			if (gGpuRead != 0) {
+				/*
+				 * The core wrote these pixels; this processor's cache may hold the frame before them.
+				 * Asked for with fb_gpu_read=1: it costs 1 to 2 ms of a frame (MiniIOSurfaceToCpu).
+				 */
+				MiniIOSurfaceToCpu(s);
+				fStatToCpu++;
+			}
 			drawLayer(s, src, dst);
 			if (layer == 0) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 			}
+			/*
+			 * Was the surface being drawn into while it was copied? The seed changes when somebody locks it
+			 * to write (MiniIOSurface.cpp), and the window server does that for every frame it draws: a seed
+			 * taken before the copy and another value after it says the frame that was copied is part of the
+			 * next one -- work of the processor's, which no fence of the GPU's covers (TEST5Q drew without
+			 * the GPU: R6).
+			 */
+			if (s->shared()->seed != seedBefore) {
+				fStatSeedChanged++;
+				if (fStatSeedChanged <= 4) {
+					IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u was locked for drawing while it "
+					    "was copied (seed %u -> %u): the frame is part of the next\n", swapWord(swap, SWAP_ID), layer,
+					    sid, seedBefore, s->shared()->seed);
+				}
+			}
+			/*
+			 * Was the surface given to the GPU again while it was copied? Then this frame is part of the
+			 * next one: the swap came before the GPU had been given all of the frame, and the copy read
+			 * pixels that were being drawn over. Says how a frame with parts of it missing happens --
+			 * with the frame's surface, which is the one that matters (tools/latency.py, R6).
+			 */
+			if (MiniIOSurfaceRedrawn(s, drawnBefore)) {
+				fStatRedrawn++;
+				if (fStatRedrawn <= 4) {
+					IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u was given to the GPU again "
+					    "while it was copied (submission %u came after %u): the frame is part of the next\n",
+					    swapWord(swap, SWAP_ID), layer, sid, MiniIOSurfaceFence(s), drawnBefore);
+				}
+			}
 		}
 	}
 	drawn = mach_absolute_time();
+	os_atomic_store(&gFBLastFrameShown, drawn, relaxed);
 	if (recorded != NULL) {
 		record(recorded);
 	}
@@ -1292,6 +1440,24 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate);
+		/*
+		 * The fences of the frames: how many swaps came with a GPU submission to wait for at all (0: the
+		 * GPU is not in the drawing of what is on the screen, and neither the idle vote nor a fence can
+		 * be the reason a frame came out blank), and how many were copied while the core was given the
+		 * same surface again (the frame was then copied before it was finished: R6).
+		 */
+		{
+			uint64_t swapWait;
+
+			absolutetime_to_nanoseconds(fStatSwapWait, &swapWait);
+			IOLog("MiniIOMobileFramebuffer: fences: %u swaps came with a submission of the GPU's (the last was waited for: "
+			    "%llu us of %u, %u of them %u ms or more); %u surfaces were given to the GPU again while they were copied; "
+			    "%u were locked for drawing while they were copied; %u were taken into the processor's view before the copy "
+			    "(fb_gpu_read)\n", fStatSwapFence, swapWait / NSEC_PER_USEC, fStatSwapFence, fStatSwapFenceLate, gSwapFenceMs,
+			    fStatRedrawn, fStatSeedChanged, fStatToCpu);
+			fStatSwapWait = 0;
+		}
+		fStatSwapFence = fStatSwapFenceLate = fStatRedrawn = fStatSeedChanged = fStatToCpu = 0;
 		if (gFb120 != 0) {
 			/*
 			 * Whether the compositor is on this driver's clock at all: refreshes told to user space.
