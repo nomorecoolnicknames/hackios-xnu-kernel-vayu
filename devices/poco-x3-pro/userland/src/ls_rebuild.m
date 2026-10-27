@@ -12,12 +12,42 @@
  */
 #import <Foundation/Foundation.h>
 #include <objc/message.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <grp.h>
 #include <string.h>
 #include <unistd.h>
 
 #define MOBILE_ID	501
+
+/*
+ * LSApplicationWorkspace, LSPlugInKitProxy and LSApplicationProxy live in MobileCoreServices (CoreServices is
+ * its umbrella on iOS 16), and a program that links only Foundation does not have them: NSClassFromString()
+ * answers nil, installedPlugins says 0, the rebuild call runs on nothing. TEST7's log is exactly that --
+ * "ls_rebuild: before: LSApplicationWorkspace MISSING, workspace nil, LSPlugInKitProxy MISSING" and
+ * "0 plug-ins registered" -- so LaunchServices' records of the system's app extensions were never rebuilt.
+ * build.sh links MobileCoreServices now; this is the belt for a build that does not, and it says so.
+ */
+static void
+load_launchservices(void)
+{
+	static const char *const paths[] = {
+		"/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices",
+		"/System/Library/Frameworks/CoreServices.framework/CoreServices",
+	};
+	unsigned i;
+
+	if (NSClassFromString(@"LSApplicationWorkspace") != Nil) {
+		return;
+	}
+	for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		if (dlopen(paths[i], RTLD_NOW | RTLD_GLOBAL) == NULL) {
+			fprintf(stderr, "ls_rebuild: dlopen %s: %s\n", paths[i], dlerror());
+		} else {
+			fprintf(stderr, "ls_rebuild: loaded %s\n", paths[i]);
+		}
+	}
+}
 
 static void
 report(const char *when, NSString *plugin)
@@ -163,6 +193,7 @@ main(int argc, char **argv)
 			setenv("HOME", "/var/mobile", 1);
 			setenv("CFFIXED_USER_HOME", "/var/mobile", 1);
 		}
+		load_launchservices();
 		report("before", plugin);
 		probe_points();
 		if (check) return 0;
