@@ -701,6 +701,9 @@ static volatile int touch_mode;
  */
 static int report_interval_us;
 
+/* t120=1 below (the frame-rate restriction of QuartzCore); declared here for service_set_property() */
+static int t120_wanted(void);
+
 /* What the event server tells a service of ours: said once per name, to learn what there is. */
 static Boolean
 service_set_property(__unused void *target, void *refcon, __unused IOHIDServiceClientRef service, CFStringRef key,
@@ -740,6 +743,18 @@ service_set_property(__unused void *target, void *refcon, __unused IOHIDServiceC
 			CFDictionarySetValue(((struct service *)refcon)->properties, CFSTR("ReportInterval"), kept);
 			CFRelease(kept);
 			say("hakios: input: ReportInterval 0 from the event server: kept %d us\n", report_interval_us);
+			/*
+			 * t120=1: refuse the zero as well. Keeping it in our dictionary was not enough: the
+			 * event server's own BKIOHIDService still printed "reportInterval:0 batchInterval:1"
+			 * when it attached the digitizer (TEST3, 21:50:21.092), so the number it caches is the
+			 * one it set, not the one copyProperty() answers afterwards. A set that fails leaves
+			 * the property as it was.
+			 */
+			if (t120_wanted()) {
+				say("hakios: input: t120=1: the event server's ReportInterval 0 refused; it stays %d us\n",
+				    report_interval_us);
+				return false;
+			}
 		}
 	}
 	if (told == NULL) {
