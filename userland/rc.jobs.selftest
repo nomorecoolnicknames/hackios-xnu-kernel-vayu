@@ -1,0 +1,38 @@
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+#
+# The unattended self-test as a job list (RC_JOBS=rc.jobs.selftest, built with SELFTEST=1). Every
+# line is gated at run time: selftest(1) reads kern.bootargs and, without "selftest=1", prints one
+# "SELFTEST: ... SKIP" line and exits. The times are after boot, not after the previous line, so a
+# stage that ran long does not move the ones behind it; a stage that is late says by how much.
+#
+# The same program is a launchd job of its own (userland/com.hakios.selftest.plist) for images that
+# use the ordinary rc.jobs; build.sh installs one or the other (SELFTEST=1 selects this list and
+# leaves the plist out), because two runners would do every stage twice. Should both be present,
+# each stage's lock in /var/mobile/Media/Selftest makes the second one say SKIP.
+#
+# What each line proves, and what its FAIL means:
+#   files   /usr/bin/fileproviderctl domain list/dump: the LocalStorage domain is listed and
+#           enabled; a file written as mobile into the provider's "File Provider Storage" is read
+#           back and then seen in the provider's own `ls` (the "On My iPhone" of Files.app).
+#   music   medialibraryd is alive, music_import put the track in the library, MediaPlayer's songs
+#           query returns it, and AVPlayer (then MPMusicPlayerController) reaches the playing state
+#           with the clock moving.
+#   mic     3 s through AVAudioRecorder, analyzed from the WAV itself: peak, RMS, distinct sample
+#           values. Silence (peak 0) and a stuck converter (every sample equal) are FAILs.
+#   camera  SelftestCamera.app, asked for through SpringBoard, takes one still and a 5 s movie; the
+#           checker verifies the still's size and magic and the movie's top-level atoms (moov
+#           present). The application is the foreground client on purpose: the capture stack gives
+#           frames only to one (userland/src/camera_avtest.m).
+#   summary the four results, one line: "SELFTEST: ... summary files=PASS ... RESULT n/4"
+#   poweroff with selftest_poweroff=1 as well: kern.hakios.var_save, sync, reboot(RB_HALT) -- the
+#           same path as "slide to power off"; the kernel logs var_store and PSCI SYSTEM_OFF.
+#
+# The source track is the one the earlier Files/Music diagnostics used. It has to be in the image
+# (build.sh EXTRA_SHARE=<dir with music/>); a boot whose image lacks it FAILs the music stage with
+# the path it looked for, which is the evidence, not a crash.
+/redwood/bin/selftest files --at=45
+/redwood/bin/selftest music --at=80 --source=/redwood/share/music/Тёмный_принц-Отвратительный_король.mp3 --track=RDWD.mp3
+/redwood/bin/selftest mic --at=140 --seconds=3
+/redwood/bin/selftest camera --at=170 --app-timeout=90
+/redwood/bin/selftest summary
+/redwood/bin/selftest poweroff

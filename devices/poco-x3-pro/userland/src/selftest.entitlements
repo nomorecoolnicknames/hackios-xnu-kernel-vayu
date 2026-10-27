@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	selftest(1): the unattended run's verifier. Signed with the entitlements of the programs whose
+	work it repeats and checks, because each of the four stages is a different daemon's client:
+
+	  files    media_import's app group (the LocalStorage provider's "File Provider Storage")
+	  music    music_import's Music identity and media-library access (MPMediaQuery, ML3, AVPlayer)
+	  mic      record_test's microphone TCC allowance
+	  camera   the camera TCC allowance; the frames themselves come from SelftestCamera.app, whose
+	           own signature carries the same allowance
+	  poweroff reboot(2), which root may call; no entitlement decides it
+
+	platform-application is the same pairing every /redwood/bin program in this port is signed
+	with (devices/poco-x3-pro/userland/build.sh): AMFI here accepts every signature, so the
+	entitlements are the only thing a signature buys.
+-->
+<plist version="1.0">
+<dict>
+	<key>platform-application</key>
+	<true/>
+	<key>application-identifier</key>
+	<string>com.apple.Music</string>
+	<key>com.apple.atc.private</key>
+	<true/>
+	<key>com.apple.security.assets.music.read-write</key>
+	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.apple.FileProvider.LocalStorage</string>
+	</array>
+	<key>com.apple.private.tcc.allow</key>
+	<array>
+		<string>kTCCServiceMediaLibrary</string>
+		<string>kTCCServiceMicrophone</string>
+		<string>kTCCServiceCamera</string>
+	</array>
+</dict>
+</plist>

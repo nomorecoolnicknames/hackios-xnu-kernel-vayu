@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	The unattended run's own job: selftest(1) as a launchd daemon, beside com.hakios.demo rather
+	than inside its rc.jobs list, so that the self-test does not have to be written into every
+	experiment's job file and cannot be left out of one by accident.
+
+	It is gated at run time, not at build time: the program reads kern.bootargs and exits at once
+	unless "selftest=1" is there (selftest.m, main), so this plist can stay in every image and an
+	ordinary boot pays one SKIP line. With the boot-arg it runs the four stages at +45/+80/+140/+170 s
+	after boot and, when "selftest_poweroff=1" is there too, ends the run with reboot(RB_HALT).
+
+	Standard output and error are the console, where the kernel's own log is: the SELFTEST: lines
+	and the kernel's var_store/PSCI lines thus end up in the same serial log. The program also
+	writes /var/mobile/Media/Selftest/, which var_store saves into the flash when the run ends.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.hakios.selftest</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/selftest</string>
+		<string>run</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- not a background job: the stages are timed against the boot, and a background job's
+	     timers are coalesced by a tenth of a second (the same reason com.hakios.demo is
+	     Interactive) -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+	<!-- the driver waits for its own stages, so nothing here has to keep it alive; ExitTimeOut
+	     bounds launchd's wait at the end of the run, when var_store answers the kernel -->
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+</dict>
+</plist>

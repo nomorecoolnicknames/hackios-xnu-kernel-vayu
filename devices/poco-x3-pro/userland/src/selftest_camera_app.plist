@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	Info.plist of SelftestCamera.app (src/selftest_camera_app.m), the application half of the
+	camera self-test. Its shape is HakiosMP3.app's (src/mp3_app.plist), because that is the
+	bundle LaunchServices on this port already registers; the differences are the URL scheme
+	hakiostest://camera (how selftest(1) asks SpringBoard to open it), the camera usage string
+	(iOS 16 wants one in the plist even when the entitlement grants the access), and no
+	UIBackgroundModes: this application has to be in the foreground for the capture stack to
+	give its session frames, and it exits when the still and the movie are made.
+
+	No UIApplicationSceneManifest, deliberately: without it UIKit uses the application
+	delegate's own window, which is the lifecycle src/selftest_camera_app.m implements.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Selftest Camera</string>
+	<key>CFBundleExecutable</key>
+	<string>SelftestCamera</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.hakios.selftest.camera</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>SelftestCamera</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>AppIcon60x60</string>
+			</array>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
+		</dict>
+	</dict>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.hakios.selftest.camera</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>hakiostest</string>
+			</array>
+		</dict>
+	</array>
+	<key>DTPlatformName</key>
+	<string>iphoneos</string>
+	<key>DTSDKName</key>
+	<string>iphoneos16.5</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>MinimumOSVersion</key>
+	<string>16.0</string>
+	<key>NSCameraUsageDescription</key>
+	<string>The self-test takes one photograph and records a five second movie, to prove the camera path works.</string>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+	</array>
+	<key>UIFileSharingEnabled</key>
+	<false/>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UILaunchScreen</key>
+		<dict/>
+	</dict>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UIStatusBarHidden</key>
+	<false/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<false/>
+</dict>
+</plist>

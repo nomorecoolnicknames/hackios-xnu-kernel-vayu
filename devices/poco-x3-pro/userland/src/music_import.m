@@ -1,6 +1,9 @@
 /*
  * music_import: put one MP3 into the Music library so the stock Music app lists it; usage:
- * music_import [--wait SECONDS] SOURCE.mp3 [DEST_NAME] (defaults 0 and RDWD.mp3). Root copies
+ * music_import [--wait SECONDS] [--no-late-checks] SOURCE.mp3 [DEST_NAME] (defaults 0 and RDWD.mp3).
+ * With --no-late-checks the three read-back checks at +60/+180/+420 s are skipped: a job list that
+ * runs this in the foreground (the unattended self-test, userland/rc.jobs.selftest) must not be
+ * held for seven minutes by them, and the row is read again by the caller anyway. Root copies
  * and hands the file to mobile, which reads the tags and inserts an ML3Track; a marker makes a
  * rerun a no-op.
  *
@@ -67,7 +70,7 @@ extern NSString *const ML3TrackPropertyIsCurrentlyRestricted;
 #define UTF8(s) ((s) ? [(s) UTF8String] : "(none)")
 
 static int usage(void) {
-	fprintf(stderr, "music_import: usage: music_import [--wait SECONDS] SOURCE.mp3 [DEST_NAME] | --query [NAME] | --repair [NAME] | --ml3 [NAME]\n");
+	fprintf(stderr, "music_import: usage: music_import [--wait SECONDS] [--no-late-checks] SOURCE.mp3 [DEST_NAME] | --query [NAME] | --repair [NAME] | --ml3 [NAME]\n");
 	fprintf(stderr, "music_import: --query/--repair work on a running phone: rows, songs count, sort map (no import);\n");
 	fprintf(stderr, "music_import: --repair rebuilds the sort map and the orders here, in SQL, without medialibraryd\n");
 	return 2;
@@ -1020,6 +1023,8 @@ ml3_probe(ML3MusicLibrary *library)
 }
 
 static BOOL ascii_names;
+/* --no-late-checks: no +60/+180/+420 s read-back after "done" (a foreground rc.jobs line would be held for them) */
+static int late_checks = 1;
 
 /*
  * Rows left by a half-finished import. The marker is written only after the row and its sort data are
@@ -1148,6 +1153,10 @@ static int import(int argc, char **argv) {
 		media_query("query", pid);
 		return 0;
 	}
+	if (index < argc && strcmp(argv[index], "--no-late-checks") == 0) {
+		late_checks = 0;
+		index++;
+	}
 	/* --ascii: the track's title, artist and album replaced by ASCII names (USB networking 2026-10-26: /var's ramfs compares
 	 * names byte by byte, Foundation hands it NFD, so a name with ё/й is not found; is that behind songs = 0?) */
 	if (index < argc && strcmp(argv[index], "--ascii") == 0) {
@@ -1260,16 +1269,22 @@ static int import(int argc, char **argv) {
 	}
 	fsync(marker); close(marker);
 	fprintf(stderr, "music_import: done\n");
-	/* and later again: does medialibraryd keep the row (a validation of its own could drop it)? */
 	alarm(0);
-	for (unsigned i = 0; i < 3; i++) {
-		static const unsigned after[] = { 60, 180, 420 };
-		char when[32];
+	/* and later again: does medialibraryd keep the row (a validation of its own could drop it)?
+	 * --no-late-checks leaves this to the caller: selftest(1) reads the row, the songs query and
+	 * the track's playback itself a few seconds later, and a foreground job list must not sleep. */
+	if (late_checks) {
+		for (unsigned i = 0; i < 3; i++) {
+			static const unsigned after[] = { 60, 180, 420 };
+			char when[32];
 
-		sleep(after[i] - (i ? after[i - 1] : 0));
-		snprintf(when, sizeof(when), "%u s later", after[i]);
-		dump_row([track persistentID], when);
-		media_query(when, [track persistentID]);
+			sleep(after[i] - (i ? after[i - 1] : 0));
+			snprintf(when, sizeof(when), "%u s later", after[i]);
+			dump_row([track persistentID], when);
+			media_query(when, [track persistentID]);
+		}
+	} else {
+		fprintf(stderr, "music_import: --no-late-checks: the +60/+180/+420 s read-backs are skipped\n");
 	}
 	return 0;
 }

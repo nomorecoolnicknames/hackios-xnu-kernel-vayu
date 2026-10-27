@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	SelftestCamera.app: the bundle identity HakiosMP3.app uses (mp3_app.entitlements) plus the
+	camera TCC allowance. SpringBoard starts it as mobile through RunningBoard, and the daemons on
+	that path ask about the bundle's identity and container; application-identifier, no-container,
+	no-sandbox, container-required = false and platform-application are that pairing here.
+-->
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>com.hakios.selftest.camera</string>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.private.security.container-required</key>
+	<false/>
+	<key>com.apple.private.tcc.allow</key>
+	<array>
+		<string>kTCCServiceCamera</string>
+	</array>
+</dict>
+</plist>

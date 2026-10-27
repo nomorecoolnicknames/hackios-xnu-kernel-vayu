@@ -87,6 +87,55 @@ for size, scale in ((120, 2), (180, 3)):
     open('%s/AppIcon60x60@%dx.png' % (out, scale), 'wb').write(png)
 PY
 
-DEVICE_BIN="bluetool_stub vayu_irtest music_import media_import video_test play_test ls_rebuild run_migrator"
+# The unattended self-test (src/selftest.m; installed either as the launchd job
+# com.hakios.selftest or as the job list rc.jobs.selftest, and in both cases gated by boot-arg
+# selftest=1). It needs the four frames' own daemons: MediaPlayer for the songs query, AVFoundation
+# for the microphone and the player, and the FileProvider app group for "On My iPhone".
+$DYN -fobjc-arc -fblocks -framework Foundation -framework AVFoundation -framework AudioToolbox \
+	-framework MediaPlayer -framework CoreMedia -o obj/selftest $V/selftest.m
+sign obj/selftest $V/selftest.entitlements
+
+# SelftestCamera.app: the camera stage has to be a foreground application for the capture stack to
+# give its session frames (src/selftest_camera_app.m says why); selftest(1) opens it through
+# SpringBoard with hakiostest://camera?run=N and verifies the still and the movie it leaves behind.
+$DYN -fobjc-arc -fblocks -framework Foundation -framework UIKit -framework AVFoundation \
+	-framework CoreMedia -o obj/SelftestCamera $V/selftest_camera_app.m
+sign obj/SelftestCamera $V/selftest_camera.entitlements
+rm -rf obj/SelftestCamera.app
+mkdir -p obj/SelftestCamera.app
+cp obj/SelftestCamera obj/SelftestCamera.app/
+cp $V/selftest_camera_app.plist obj/SelftestCamera.app/Info.plist
+printf 'APPL????' > obj/SelftestCamera.app/PkgInfo
+# its icon: a white lens in a rounded rectangle on a dark blue field (no alpha: iOS masks it)
+python3 - obj/SelftestCamera.app <<'PY'
+import struct, sys, zlib
+out = sys.argv[1]
+for size, scale in ((120, 2), (180, 3)):
+    rows = bytearray()
+    for y in range(size):
+        rows.append(0)
+        for x in range(size):
+            u, v = x / size, y / size
+            body = 0.16 < u < 0.84 and 0.28 < v < 0.74
+            hump = (u - 0.5) ** 2 / 0.05 + (v - 0.28) ** 2 / 0.01 < 1.0
+            lens = ((u - 0.5) ** 2 + (v - 0.51) ** 2) < 0.022
+            hole = ((u - 0.5) ** 2 + (v - 0.51) ** 2) < 0.010
+            if lens or hump:
+                colour = (245, 245, 245)
+            elif hole:
+                colour = (30, 40, 70)
+            elif body:
+                colour = (60, 90, 160)
+            else:
+                colour = (30, 40, 70)
+            rows += bytes(colour)
+    def chunk(kind, body):
+        return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
+    png = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0)) +
+           chunk(b'IDAT', zlib.compress(bytes(rows), 9)) + chunk(b'IEND', b''))
+    open('%s/AppIcon60x60@%dx.png' % (out, scale), 'wb').write(png)
+PY
+
+DEVICE_BIN="bluetool_stub vayu_irtest music_import media_import video_test play_test ls_rebuild run_migrator selftest"
 DEVICE_LIB="libhakios.motion.dylib libhakios.sensors.dylib"
-DEVICE_APPS="HakiosMP3.app"
+DEVICE_APPS="HakiosMP3.app SelftestCamera.app"

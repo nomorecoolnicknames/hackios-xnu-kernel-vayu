@@ -30,6 +30,11 @@
 #                      RC_JOBS=<file> what the job com.hakios.demo runs: rc.jobs (default), or
 #                                   rc.jobs.unlock, which also swipes the lock screen away (for the phone,
 #                                   where nothing else can touch the screen yet).
+#                      SELFTEST=1   the unattended self-test as the job list (rc.jobs.selftest) and
+#                                   without the com.hakios.selftest launchd job: both are the same
+#                                   stages, and two runners would do every one twice. Each stage is
+#                                   also gated at run time by the boot-arg selftest=1, so a list
+#                                   left in an image without that argument only says SKIP.
 #                                   A job list cannot assume a shell. iOS 16.5's own root has none at all
 #                                   -- /bin is df and ps, and nothing else -- so a line beginning /bin/sh
 #                                   fails with "No such file or directory" and status 127 on a flash-root
@@ -392,7 +397,13 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		done
 	fi
 	cp ${RC:-rc.launchd} root/etc/rc
-	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
+	# SELFTEST=1: the self-test's own job list instead of the ordinary one (see the header). The
+	# program itself is still gated by boot-arg selftest=1; this only chooses who carries the lines.
+	if [ -n "$SELFTEST" ]; then
+		cp ${RC_JOBS:-rc.jobs.selftest} root/etc/rc.jobs
+	else
+		cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
+	fi
 	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
 	# lines about its own business in the first minutes and pushes everything else out of the
 	# kernel's log; the daemons keep their own standard error on the console all the same.
@@ -404,6 +415,14 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# and not by what select-system.py extracted here (--root-volume; seven jobs turn on the difference,
 	# fairplayd among them).
 	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
+	# the unattended self-test's own job (src/selftest.m, devices/<name>/userland), which reads
+	# kern.bootargs and exits at once unless selftest=1 is there. Only when the device build made
+	# the program; with SELFTEST=1 the rc.jobs list above carries the same stages, so this job is
+	# deliberately left out then (two runners would do each stage twice; the stage locks would
+	# make the second one SKIP, but there is no reason to arrange that).
+	if [ -f obj/selftest ] && [ -z "$SELFTEST" ]; then
+		cp com.hakios.selftest.plist root/LaunchDaemons/
+	fi
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
