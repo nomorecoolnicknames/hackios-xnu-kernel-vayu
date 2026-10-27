@@ -22,6 +22,9 @@
  *   selftest summary [--results FILE]
  *   selftest poweroff        (also needs selftest_poweroff=1)
  *   selftest --write-file NAME     internal: write the Files test file as mobile
+ *   selftest --exec-mobile PROGRAM [ARG...]
+ *                internal: drop to mobile (501) and exec; the files stage runs the
+ *                provider's `fileproviderctl ls` this way, as the client Files.app is
  *
  * The log goes to stdout (the job's /dev/console) and to
  * /var/mobile/Media/Selftest/selftest-<bootsecs>.log; the machine-readable results to
@@ -696,13 +699,54 @@ write_test_file(const char *name)
 	return ok ? 0 : 1;
 }
 
+/*
+ * What `fileproviderctl domain list` says about the LocalStorage domain: LISTED when its name or
+ * identifier is in the text, ENABLED from the "(enabled)"/"(disabled)" word that follows it. The
+ * list is one entry over several lines, so the word is looked for on the next three lines only.
+ */
+static void
+parse_domain_list(const char *text, int *listed, int *enabled)
+{
+	const char *p = text;
+	int window = 0;
+
+	*listed = 0;
+	*enabled = 0;
+	while (*p != '\0') {
+		const char *end = strchr(p, '\n');
+		size_t length = end != NULL ? (size_t)(end - p) : strlen(p);
+		char lower[1024];
+		size_t copy = length < sizeof(lower) - 1 ? length : sizeof(lower) - 1;
+
+		for (size_t i = 0; i < copy; i++) {
+			char c = p[i];
+
+			lower[i] = (char)(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+		}
+		lower[copy] = '\0';
+		if (strstr(lower, "localstorage") != NULL || strstr(lower, "local storage") != NULL) {
+			*listed = 1;
+			window = 3;
+		}
+		if (window > 0) {
+			if (strstr(lower, "disabled") != NULL) {
+				*enabled = 0;
+			} else if (strstr(lower, "enabled") != NULL) {
+				*enabled = 1;
+			}
+			window--;
+		}
+		p = end != NULL ? end + 1 : p + length;
+	}
+}
+
 static int
 stage_files(double at)
 {
-	static char list[65536], dump[65536], listing[65536], wrote[16384];
+	static char list[65536], list2[65536], dump[65536], listing[65536], mobile_listing[16384], wrote[16384], enable[32768];
 	char name[80], path[PATH_MAX] = "", directory[PATH_MAX] = "", readback[32] = "";
 	char line[1024];
-	int listed = 0, enabled = 0, written = 0, seen = 0, exit_code;
+	int listed = 0, enabled = 0, written = 0, seen = 0, mobile_seen = 0, exit_code, enable_exit = 0;
 	int extension_running;
 
 	g_stage = "files";
@@ -718,38 +762,42 @@ stage_files(double at)
 	    list, sizeof(list), 30);
 	stage_say("fileproviderctl domain list: exit %d", exit_code);
 	detail_text(list);
-	{
-		const char *p = list;
-		int window = 0;
-
-		while (*p != '\0') {
-			const char *end = strchr(p, '\n');
-			size_t length = end != NULL ? (size_t)(end - p) : strlen(p);
-			char lower[1024];
-			size_t copy = length < sizeof(lower) - 1 ? length : sizeof(lower) - 1;
-
-			for (size_t i = 0; i < copy; i++) {
-				char c = p[i];
-
-				lower[i] = (char)(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
-			}
-			lower[copy] = '\0';
-			if (strstr(lower, "localstorage") != NULL || strstr(lower, "local storage") != NULL) {
-				listed = 1;
-				window = 3;
-			}
-			if (window > 0) {
-				if (strstr(lower, "disabled") != NULL) {
-					enabled = 0;
-				} else if (strstr(lower, "enabled") != NULL) {
-					enabled = 1;
-				}
-				window--;
-			}
-			p = end != NULL ? end + 1 : p + length;
-		}
-	}
+	parse_domain_list(list, &listed, &enabled);
 	stage_say("the LocalStorage domain: listed=%s enabled=%s", listed ? "yes" : "NO",
+	    enabled ? "yes" : "NO");
+
+	/*
+	 * The enable. On a fresh /var the domain is listed but not enabled (TEST5Q at +45 s:
+	 * "Local Storage (disabled)", and fileproviderctl ls -> -2001), because fileproviderd never ran
+	 * the path that makes the default domain. /redwood/bin/fp_enable (device build, signed with
+	 * fileproviderctl's entitlements) asks the daemon for the provider's domains, lets
+	 * removeAllDomainsForProviderIdentifier: create the default one, enables it, and drops to mobile
+	 * (501) itself -- the daemon serves user/501 and Files.app is mobile. It waits for the daemon
+	 * first: at +45 s launchd may be starting fileproviderd on this very connection (TEST5Q shows
+	 * the spawn at 11:09:29 and a Cocoa 4099 right behind it). The verdict below is read from the
+	 * second domain list, not from the first.
+	 */
+	if (access("/redwood/bin/fp_enable", X_OK) == 0) {
+		enable[0] = '\0';
+		enable_exit = run_capture((char *const[]){ (char *)"/redwood/bin/fp_enable", (char *)"--wait=20", NULL },
+		    enable, sizeof(enable), 120);
+		stage_say("fp_enable (fileprovider domain enable, as mobile): exit %d", enable_exit);
+		detail_text(enable);
+	} else {
+		stage_say("fp_enable: /redwood/bin/fp_enable is not in this image, the domain cannot be enabled here");
+	}
+
+	list2[0] = '\0';
+	exit_code = run_capture((char *const[]){ (char *)FILEPROVIDERCTL, (char *)"domain", (char *)"list", NULL },
+	    list2, sizeof(list2), 30);
+	stage_say("fileproviderctl domain list, after the enable: exit %d", exit_code);
+	detail_text(list2);
+	if (exit_code == 0) {
+		parse_domain_list(list2, &listed, &enabled);
+	} else {
+		stage_say("the second domain list failed; the first one's answer stands");
+	}
+	stage_say("the LocalStorage domain after the enable: listed=%s enabled=%s", listed ? "yes" : "NO",
 	    enabled ? "yes" : "NO");
 
 	dump[0] = '\0';
@@ -790,34 +838,52 @@ stage_files(double at)
 		detail_text(listing2);
 	}
 
+	/*
+	 * The listing exactly as TEST5Q made it -- as root -- so this run's PASS/FAIL is comparable with
+	 * that baseline: one variable changed (the domain enable), not the client too. The same call as
+	 * mobile follows as extra evidence, because that is the client Files.app is; a difference between
+	 * the two is logged and points at the client's connection, not at the domain.
+	 */
 	listing[0] = '\0';
 	exit_code = run_capture((char *const[]){ (char *)FILEPROVIDERCTL, (char *)"ls", (char *)PROVIDER_ID, NULL },
 	    listing, sizeof(listing), 30);
-	stage_say("fileproviderctl ls %s: exit %d", PROVIDER_ID, exit_code);
+	stage_say("fileproviderctl ls %s (the TEST5Q call, as root): exit %d", PROVIDER_ID, exit_code);
 	detail_text(listing);
 	seen = exit_code == 0 && strstr(listing, name) != NULL;
-	if (!seen && exit_code != 0) {
-		stage_say("the provider did not list its storage (the \"The file doesn't exist\" -2001 of the "
-		    "earlier diagnostics looks like this)");
+
+	mobile_listing[0] = '\0';
+	exit_code = run_capture((char *const[]){ (char *)"/redwood/bin/selftest", (char *)"--exec-mobile",
+	    (char *)FILEPROVIDERCTL, (char *)"ls", (char *)PROVIDER_ID, NULL }, mobile_listing, sizeof(mobile_listing), 30);
+	stage_say("fileproviderctl ls %s as mobile: exit %d", PROVIDER_ID, exit_code);
+	detail_text(mobile_listing);
+	mobile_seen = exit_code == 0 && strstr(mobile_listing, name) != NULL;
+	if (seen != mobile_seen) {
+		stage_say("the provider's listing differs by client: root=%s mobile=%s (the domain itself is %s)",
+		    seen ? "lists the file" : "does not list it", mobile_seen ? "lists it" : "does not",
+		    seen || mobile_seen ? "there" : "not the reason");
+	}
+	if (!seen && !mobile_seen) {
+		stage_say("the provider did not list its storage from either client (the \"Could not find a matching "
+		    "provider\" -2001 of the earlier diagnostics looks like this)");
 	}
 	extension_running = process_count("LocalStorageFileProvider") > 0;
 	stage_say("LocalStorageFileProvider: %s", extension_running ? "running" : "not seen (the ``ls`` above is the proof that matters)");
 	if (!listed || !enabled) {
-		stage_say("the domain is made by the FileProvider daemon's removeAllDomainsForProviderIdentifier: path; "
-		    "the B-task program that calls it, fp_enable, is not in this tree (the owner's decision), so this "
-		    "stage can only report what fileproviderd says");
+		stage_say("the domain is still not enabled after fp_enable: read its output above (removeAllDomains "
+		    "answering -2001 means fileproviderd's provider is invalidated), then fileproviderd's own log "
+		    "and whether LocalStorageFileProvider.appex is in the system image");
 	}
 
 	{
 		struct stat status;
 
 		if (path[0] != '\0' && stat(path, &status) == 0) {
-			snprintf(line, sizeof(line), "domain=%s+%s file=%s size=%lld readback=%s provider_ls=%s",
-			    listed ? "listed" : "NOT-listed", enabled ? "enabled" : "NOT-enabled", path,
+			snprintf(line, sizeof(line), "domain=%s+%s fp_enable_exit=%d file=%s size=%lld readback=%s provider_ls=%s",
+			    listed ? "listed" : "NOT-listed", enabled ? "enabled" : "NOT-enabled", enable_exit, path,
 			    (long long)status.st_size, written ? "ok" : "no", seen ? "yes" : "NO");
 		} else {
-			snprintf(line, sizeof(line), "domain=%s+%s file=%s readback=%s provider_ls=%s",
-			    listed ? "listed" : "NOT-listed", enabled ? "enabled" : "NOT-enabled",
+			snprintf(line, sizeof(line), "domain=%s+%s fp_enable_exit=%d file=%s readback=%s provider_ls=%s",
+			    listed ? "listed" : "NOT-listed", enabled ? "enabled" : "NOT-enabled", enable_exit,
 			    path[0] != '\0' ? path : "(none)", written ? "ok" : "no", seen ? "yes" : "NO");
 		}
 	}
@@ -1580,9 +1646,10 @@ run_all(const char *source, const char *track, double mic_seconds, int app_timeo
 	snprintf(results_arg, sizeof(results_arg), "--results=%s", g_results);
 
 	/* the timeouts are generous on purpose: the point of killing a stage is a hang, not a slow
-	 * phone. files: two fileproviderctl calls (30 s each), the write (60 s), vol_ls (20 s) and the
-	 * provider's ls (30 s); music: the import's own 120 s alarm and three minutes of library work;
-	 * camera: the 90 s wait for the application plus its report. */
+	 * phone. files: three fileproviderctl calls (30 s each), fp_enable's wait and work (120 s), the
+	 * write (60 s), vol_ls (20 s) and the provider's ls from both clients (30 s each); music: the
+	 * import's own 120 s alarm and three minutes of library work; camera: the 90 s wait for the
+	 * application plus its report. */
 	plan[0] = (struct stage_plan){ "files", AT_FILES, 240, { at_text, results_arg, NULL } };
 	plan[1] = (struct stage_plan){ "music", AT_MUSIC, 360, { at_text, results_arg, "--source", source,
 	    "--track", track, NULL } };
@@ -1666,6 +1733,7 @@ usage(void)
 	printf("selftest: run|files|music|mic|camera|summary|poweroff [--at=S] [--results=FILE]\n"
 	    "          [--source=FILE] [--track=NAME] [--seconds=N] [--app-timeout=N] [--again]\n"
 	    "          selftest --write-file NAME (internal)\n"
+	    "          selftest --exec-mobile PROGRAM [ARG...] (internal: drop to 501, exec)\n"
 	    "Everything is skipped unless selftest=1 is among the kernel's boot-args; the power-off\n"
 	    "also needs selftest_poweroff=1.\n");
 }
@@ -1689,6 +1757,25 @@ main(int argc, char **argv)
 		@autoreleasepool {
 			return argc > 2 ? write_test_file(argv[2]) : 2;
 		}
+	}
+	/*
+	 * The files stage's client-side checks (fileproviderctl ls) have to be what mobile sees, not what
+	 * root sees: fileproviderd serves user/501 and fileproviderctl warns about root itself. This mode
+	 * is the same drop write_test_file does, followed by exec, so the program keeps its own signature
+	 * and entitlements and its output lands in the caller's pipe.
+	 */
+	if (strcmp(command, "--exec-mobile") == 0) {
+		if (argc < 3) {
+			fprintf(stderr, "selftest: --exec-mobile needs a program\n");
+			return 2;
+		}
+		if (become_mobile() != 0) {
+			fprintf(stderr, "selftest: becoming mobile (501:501) failed: %s\n", strerror(errno));
+			return 1;
+		}
+		execv(argv[2], &argv[2]);
+		fprintf(stderr, "selftest: exec %s: %s\n", argv[2], strerror(errno));
+		return errno == ENOENT ? 127 : 126;
 	}
 	if (strcmp(command, "-h") == 0 || strcmp(command, "--help") == 0 || strcmp(command, "help") == 0) {
 		usage();

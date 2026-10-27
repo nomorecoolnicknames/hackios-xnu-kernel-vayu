@@ -25,6 +25,20 @@ sign obj/music_import $V/music_import.entitlements
 # files into the Files app's local storage and pictures into Photos
 $DYN -fobjc-arc -framework Foundation -framework Photos -o obj/media_import $V/media_import.m
 sign obj/media_import $V/media_import.entitlements
+# Files' "On My iPhone": ask fileproviderd for the LocalStorage provider's domains, make it create
+# and start the default one, enable it, and print every answer (src/fp_enable.m); the self-test's
+# files stage then reads the domain list again. It needs fileproviderctl's entitlements
+# (extension-host, enumerate, both FileProvider app groups), which are Apple's own: read out of the
+# system image at build time, never kept in git (as run_migrator). Without them fileproviderd
+# refuses the client, so an unsigned copy is only a warning, not a usable program.
+$DYN -fobjc-arc -fblocks -framework Foundation -o obj/fp_enable $V/fp_enable.m
+if [ -f $IOS/rootfs/usr/bin/fileproviderctl ] &&
+    ${LDID:-ldid} -e $IOS/rootfs/usr/bin/fileproviderctl > obj/fp_enable.entitlements 2>/dev/null; then
+	sign obj/fp_enable obj/fp_enable.entitlements
+else
+	echo "build.sh: no fileproviderctl in the system image (or no ldid): fp_enable is unsigned, and fileproviderd may refuse it" >&2
+	sign obj/fp_enable
+fi
 # video: decode (VideoToolbox hardware and software), AVPlayer, encode
 $DYN -fobjc-arc -framework Foundation -framework AVFoundation -framework VideoToolbox -framework CoreMedia \
 	-framework CoreVideo -o obj/video_test $V/video_test.m
@@ -136,6 +150,6 @@ for size, scale in ((120, 2), (180, 3)):
     open('%s/AppIcon60x60@%dx.png' % (out, scale), 'wb').write(png)
 PY
 
-DEVICE_BIN="bluetool_stub vayu_irtest music_import media_import video_test play_test ls_rebuild run_migrator selftest"
+DEVICE_BIN="bluetool_stub vayu_irtest music_import media_import fp_enable video_test play_test ls_rebuild run_migrator selftest"
 DEVICE_LIB="libhakios.motion.dylib libhakios.sensors.dylib"
 DEVICE_APPS="HakiosMP3.app SelftestCamera.app"

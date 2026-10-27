@@ -11,9 +11,11 @@
 # each stage's lock in /var/mobile/Media/Selftest makes the second one say SKIP.
 #
 # What each line proves, and what its FAIL means:
-#   files   /usr/bin/fileproviderctl domain list/dump: the LocalStorage domain is listed and
-#           enabled; a file written as mobile into the provider's "File Provider Storage" is read
-#           back and then seen in the provider's own `ls` (the "On My iPhone" of Files.app).
+#   files   /redwood/bin/fp_enable (as mobile, after fileproviderd answers) makes the daemon create
+#           and enable the LocalStorage domain; /usr/bin/fileproviderctl domain list/dump then show
+#           it listed and enabled, a file written as mobile into the provider's "File Provider
+#           Storage" is read back, and the provider's own `ls`, run as mobile, lists it (the
+#           "On My iPhone" of Files.app).
 #   music   medialibraryd is alive, music_import put the track in the library, MediaPlayer's songs
 #           query returns it, and AVPlayer (then MPMusicPlayerController) reaches the playing state
 #           with the clock moving.
