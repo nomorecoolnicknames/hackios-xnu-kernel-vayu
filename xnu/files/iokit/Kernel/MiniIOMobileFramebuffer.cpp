@@ -145,6 +145,9 @@ enum {
 
 #define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
 #define FRAME_PAUSE             90                      /* from so many on, nothing was moving: not a slow frame */
+#define FRAME_LATE_US           12000                   /* a frame this late did not come on a 120 or an 80 Hz beat */
+#define FENCE_LONG_US           4000                    /* a wait for the GPU that a 120 Hz frame cannot spare */
+#define COPY_LONG_US            3000                    /* ... and a copy that cannot */
 #define SWAP_GPU_MS             500                     /* a frame the GPU has not drawn by then is shown as it is */
 #define SWAP_FENCE_MS           20                      /* the swap's own fence (a submission of anybody's before it) */
 #define SWAP_HELD_MS            700                     /* a swap that cannot be taken by then is not shown at all */
@@ -271,6 +274,16 @@ static TUNABLE(uint32_t, gFb120, "fb_120", 0);
  * frame's to wait for; it is a floor under the per-surface wait (SWAP_GPU_MS), not a wait for everything.
  */
 static TUNABLE(uint32_t, gSwapFenceMs, "fb_swap_fence_ms", SWAP_FENCE_MS);
+/*
+ * Boot-arg fb_budget=0: no per-frame accounting of the frame's own three times (see frameBudget()).
+ * It is a few adds a frame, and on by default: "the frames come late -- whose?" is the question this
+ * driver kept being asked by its own log and could not answer. The five-second line it feeds says,
+ * of the frames that came later than FRAME_LATE_US after the one before, how many waited over
+ * FENCE_LONG_US for the GPU's fence and how many spent over COPY_LONG_US in the copy: a late frame
+ * with neither is one nothing asked for (the window server's own cadence), and no change here can
+ * make it come sooner.
+ */
+static TUNABLE(uint32_t, gBudget, "fb_budget", 1);
 /*
  * Boot-arg fb_gpu_read=1 (default 0): before a surface is copied to the panel, its pixels are taken into
  * this processor's view (MiniIOSurfaceToCpu: clean and invalidate, 11 MB of a 1125x2436 frame, some 1 to
@@ -443,9 +456,19 @@ public:
 	uint32_t        fStatSwapFence;         /* swaps that waited for the fence of the last submission before them */
 	uint32_t        fStatSwapFenceLate;     /* ... that one was not done in fb_swap_fence_ms */
 	uint64_t        fStatSwapWait;          /* how long those waits took together */
+	uint64_t        fStatSurfaceWait;       /* how long the surfaces' own fences took together (MiniIOSurfaceDrawn) */
 	uint32_t        fStatRedrawn;           /* surfaces given to the GPU again while they were copied */
 	uint32_t        fStatSeedChanged;       /* surfaces locked for drawing while they were copied (no GPU needed) */
 	uint32_t        fStatToCpu;             /* surfaces taken into this processor's view before the copy */
+	/* boot-arg fb_budget (frameBudget()): the frames that came late, and whether the driver was the reason */
+	uint32_t        fBudgetFrames;          /* frames counted (those with one before them) */
+	uint32_t        fBudgetLate;            /* ... that came over FRAME_LATE_US after the one before */
+	uint32_t        fBudgetLateFence;       /* ... and waited over FENCE_LONG_US for the GPU's fence */
+	uint32_t        fBudgetLateCopy;        /* ... and spent over COPY_LONG_US in the copy */
+	uint32_t        fBudgetLateNeither;     /* ... and neither: nothing asked for this frame on time */
+	uint32_t        fBudgetFence[6];        /* every frame's fence wait: under 0.5, 1, 2, 4, 8 ms, and longer */
+	uint32_t        fBudgetCopy[6];         /* ... and its copy the same */
+	uint32_t        fBudgetFenceLongest, fBudgetCopyLongest;
 	/* how the display is doing: frames and time spent drawing them here since fStatSince */
 	uint32_t        fStatFrames;
 	uint64_t        fStatSince, fStatDrawing;
@@ -476,6 +499,8 @@ public:
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
+	void reportFrameBudget(void);
+	void frameBudget(uint32_t intervalUs, uint32_t fenceUs, uint32_t copyUs);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
 	static void helperMain(void * self, wait_result_t result);
@@ -1083,6 +1108,75 @@ IOMobileFramebuffer::reportFrameTimes(void)
 	fFramePauses = fFrameLongest = 0;
 }
 
+/* The bucket of a time in microseconds: under 0.5, 1, 2, 4, 8 ms, and longer (6). */
+static unsigned
+timeBucket(uint32_t us)
+{
+	static const uint32_t limits[] = { 500, 1000, 2000, 4000, 8000 };
+
+	for (unsigned i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
+		if (us < limits[i]) {
+			return i;
+		}
+	}
+	return sizeof(limits) / sizeof(limits[0]);
+}
+
+/*
+ * One frame's three times, for the five-second line (fb_budget=0: not called). `intervalUs` is 0 for
+ * the first frame after a pause or the driver's start: it has no frame before it to be late after.
+ * Called with fLock held.
+ */
+void
+IOMobileFramebuffer::frameBudget(uint32_t intervalUs, uint32_t fenceUs, uint32_t copyUs)
+{
+	bool fenceLong = fenceUs > FENCE_LONG_US;
+	bool copyLong = copyUs > COPY_LONG_US;
+
+	fBudgetFence[timeBucket(fenceUs)]++;
+	fBudgetCopy[timeBucket(copyUs)]++;
+	fBudgetFenceLongest = fenceUs > fBudgetFenceLongest ? fenceUs : fBudgetFenceLongest;
+	fBudgetCopyLongest = copyUs > fBudgetCopyLongest ? copyUs : fBudgetCopyLongest;
+	if (intervalUs == 0) {
+		return;
+	}
+	fBudgetFrames++;
+	if (intervalUs > FRAME_LATE_US) {
+		fBudgetLate++;
+		fBudgetLateFence += fenceLong;
+		fBudgetLateCopy += copyLong;
+		fBudgetLateNeither += !fenceLong && !copyLong;
+	}
+}
+
+/*
+ * What the last five seconds' late frames were waiting for. The line to read first when a display
+ * that should run at 120 runs at 60: "of those %u neither" counts the frames that nothing in this
+ * driver and nothing in the GPU held up -- the window server simply did not ask for them on time.
+ */
+void
+IOMobileFramebuffer::reportFrameBudget(void)
+{
+	const uint32_t * f = fBudgetFence;
+	const uint32_t * c = fBudgetCopy;
+
+	if (gBudget == 0 || fBudgetFrames == 0) {
+		return;
+	}
+	IOLog("MiniIOMobileFramebuffer: the frames that came late: %u of %u over %u ms; of those, %u waited over %u ms for "
+	    "the GPU's fence, %u spent over %u ms in the copy, %u neither\n", fBudgetLate, fBudgetFrames, FRAME_LATE_US / 1000,
+	    fBudgetLateFence, FENCE_LONG_US / 1000, fBudgetLateCopy, COPY_LONG_US / 1000, fBudgetLateNeither);
+	IOLog("MiniIOMobileFramebuffer: the fence wait: %u %u %u %u %u %u frames under 0.5/1/2/4/8 ms and longer (the longest "
+	    "%u us); the copy: %u %u %u %u %u %u (the longest %u us); the surfaces' own fences: %llu us a frame\n", f[0], f[1],
+	    f[2], f[3], f[4], f[5], fBudgetFenceLongest, c[0], c[1], c[2], c[3], c[4], c[5], fBudgetCopyLongest,
+	    fStatFrames != 0 ? fStatSurfaceWait / fStatFrames / NSEC_PER_USEC : 0);
+	bzero(fBudgetFence, sizeof(fBudgetFence));
+	bzero(fBudgetCopy, sizeof(fBudgetCopy));
+	fBudgetFrames = fBudgetLate = fBudgetLateFence = fBudgetLateCopy = fBudgetLateNeither = 0;
+	fBudgetFenceLongest = fBudgetCopyLongest = 0;
+	fStatSurfaceWait = 0;
+}
+
 /* SwapEnd: the swap is handed to the thread that puts frames on the panel, as soon as that has no other waiting. */
 void
 IOMobileFramebuffer::present(const uint8_t * swap)
@@ -1171,6 +1265,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
 	uint32_t layers = 0;
 	MiniIOSurface * recorded = NULL;
+	uint32_t fenceUs = 0, copyUs = 0, intervalUs = 0;
 	bool report;
 
 	/*
@@ -1186,6 +1281,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 
 		fenceDone = mach_absolute_time();
 		fStatSwapWait += fenceDone - fenceBegan;
+		fenceUs = (uint32_t) micros(fenceDone - fenceBegan);
 		if (!done) {
 			fStatSwapFenceLate++;
 			if (fStatSwapFenceLate <= 4) {
@@ -1195,11 +1291,16 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 		}
 	}
 	fStatSwapFence += swapFence != 0;       /* (how many swaps had a GPU fence at all: 0 = the GPU draws none of this) */
-	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
-		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
-			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
-			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
+	{
+		uint64_t surfacesBegan = mach_absolute_time();
+
+		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+			if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
+				IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
+				    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
+			}
 		}
+		fStatSurfaceWait += mach_absolute_time() - surfacesBegan;
 	}
 	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();
@@ -1262,8 +1363,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 	IOLockUnlock(fSwapLock);
 	IOLockLock(fLock);
 	if (fLastFrame != 0) {
-		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
-		nanos /= NSEC_PER_MSEC;
+		uint64_t gap;
+
+		absolutetime_to_nanoseconds(began - fLastFrame, &gap);
+		intervalUs = (uint32_t) (gap / NSEC_PER_USEC);
+		nanos = gap / NSEC_PER_MSEC;
 		if (nanos >= FRAME_PAUSE) {
 			fFramePauses++;
 		} else {
@@ -1404,6 +1508,10 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 	}
 	drawn = mach_absolute_time();
 	os_atomic_store(&gFBLastFrameShown, drawn, relaxed);
+	copyUs = (uint32_t) micros(drawn - began);
+	if (gBudget != 0) {
+		frameBudget(intervalUs, fenceUs, copyUs);
+	}
 	if (recorded != NULL) {
 		record(recorded);
 	}
@@ -1480,21 +1588,26 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 		fStatSwapsLate = 0;
 		for (different = 0; different < 8 && fStatSurfaces[different] != 0; different++) {
 		}
-		if (different == 8 && fStatFrames > 8) {
+		if (fStatFrames > 8) {
 			uint32_t made, freed, again;
 			uint64_t making, freeing;
 
-			/* (CoreAnimation has made itself a new surface for every frame: see "the frames' surfaces" above) */
+			/*
+			 * How many display surfaces the bottom layer came in: two says double buffering, and then a
+			 * frame the driver (or the GPU) is still holding is one the window server cannot draw into --
+			 * the pipeline's latency, not its throughput, is what the frame rate is then made of.
+			 */
 			MiniIOSurfaceCost(&made, &making, &freed, &freeing, &again);
-			IOLog("MiniIOMobileFramebuffer: the frames came in surfaces %u, %u, %u, %u, %u and on, none twice; in that time "
+			IOLog("MiniIOMobileFramebuffer: the frames came in %u%s different surfaces%s; in that time "
 			    "%u surfaces of all kinds were made, in %llu us each (%u of them of memory kept from one before), and %u "
-			    "freed, in %llu us each\n", fStatSurfaces[0], fStatSurfaces[1], fStatSurfaces[2], fStatSurfaces[3],
-			    fStatSurfaces[4], made, making, again, freed, freeing);
+			    "freed, in %llu us each\n", different, different == 8 ? " (or more)" : "",
+			    different == 8 ? " -- none twice" : "", made, making, again, freed, freeing);
 		}
 		bzero(fStatSurfaces, sizeof(fStatSurfaces));
 		fStatHeld = fStatLost = fStatOnBeat = 0;
 		fStatWaiting = fStatBeatWait = 0;
 		reportFrameTimes();
+		reportFrameBudget();
 		if (fDiff) {
 			IOLog("MiniIOMobileFramebuffer: %llu pixels of the panel changed a frame, all within %u,%u to %u,%u\n",
 			    fDiffPixels / fStatFrames, fDiffLeft, fDiffTop, fDiffRight, fDiffBottom);
