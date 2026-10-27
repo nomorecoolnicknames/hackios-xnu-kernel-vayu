@@ -2840,6 +2840,32 @@ mic_dec_post(uint8_t *hpf7, uint8_t *hpf8)
 	return true;
 }
 
+/*
+ * The TX ports' enable bit (IFD 0x11C/0x120 bit 7). Writing 0x80 into a port that already reads 0x80
+ * is not a port start: the codec's SLIMbus port is a state machine, and only a 0 -> 1 transition
+ * re-joins it to the master's frame. M-off used to leave the ports enabled (vayu_mic_chan_keep=1) and
+ * the next M-on wrote 0x80 into 0x80 -- so the first capture of a boot (a real 0 -> 1 at power-up)
+ * works and every later one reads full-size zeros, which is exactly test11's pattern.
+ */
+static bool
+mic_slim_ports(bool on)
+{
+	uint8_t v7 = 0, v8 = 0;
+
+	if (!ifd_read(0x11c, &v7) || !ifd_read(0x120, &v8)) {
+		return false;
+	}
+	if (((v7 & 0x80) != 0) == on && ((v8 & 0x80) != 0) == on) {
+		return true;            /* already in the wanted state */
+	}
+	if (!ifd_write(0x11c, on ? 0x80 : 0x00) || !ifd_write(0x120, on ? 0x80 : 0x00)) {
+		return false;
+	}
+	say("vayu-jack: TX ports 0x11C/0x120: %02x/%02x -> %02x/%02x (%s)\n", v7, v8, on ? 0x80 : 0x00,
+	    on ? 0x80 : 0x00, on ? "enabled, a port start" : "disabled");
+	return true;
+}
+
 /* M7: the SLIM TX ports and channels (wcd9xxx-slimslave.c:349-456, wcd934x.c:1486-1528). */
 static bool
 mic_slim_tx(void)
@@ -2984,6 +3010,21 @@ vayu_jack_mic_kick(const char *why)
 	if (!jack_ready || !mic_live) {
 		say("vayu-jack: M-kick (%s): the microphone path is not up (ready %d live %d)\n", why, jack_ready ? 1 : 0,
 		    mic_live ? 1 : 0);
+		return false;
+	}
+	/*
+	 * A real re-join, not a rewrite: disable the two TX ports, let the bus see the close, then enable
+	 * them again and re-say CONNECT_SRC/DEF_ACT_CHAN/RECONFIG_NOW. The DSP's AFE port is running by
+	 * now, so this is the transition that puts the codec's channels into its frame.
+	 */
+	if (!mic_slim_ports(false)) {
+		say("vayu-jack: M-kick (%s): the TX ports did not go off\n", why);
+		return false;
+	}
+	vayu_jack_mic_clear_status("before the re-join");
+	spin_us(1000);
+	if (!mic_slim_ports(true)) {
+		say("vayu-jack: M-kick (%s): the TX ports did not go on again\n", why);
 		return false;
 	}
 	if (!mic_slim_tx()) {
@@ -3240,7 +3281,15 @@ vayu_jack_mic_off(void)
 		 * leaves behind in Android, and it is what keeps the channel map the same at the fourth
 		 * capture of a boot as at the first.
 		 */
-		say("vayu-jack: M-off: channels 135/136 stay defined and the TX ports enabled (vayu_mic_chan_keep=1)\n");
+		say("vayu-jack: M-off: channels 135/136 stay defined (vayu_mic_chan_keep=1)\n");
+	}
+	/*
+	 * The enable bit itself goes to 0 in both cases: the next M-on must be a 0 -> 1 transition (a real
+	 * port start against the master's frame), not a write of the value that is already there. The
+	 * channels, when they are kept, stay defined, so the port rejoins the same 135/136.
+	 */
+	if (!mic_slim_ports(false)) {
+		say("vayu-jack: M-off: the TX ports' enable bit did not go to 0\n");
 	}
 	mic_live = false;
 	say("vayu-jack: M-off: the microphone path is down\n");

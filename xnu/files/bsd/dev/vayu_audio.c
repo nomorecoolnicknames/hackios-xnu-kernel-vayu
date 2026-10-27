@@ -97,6 +97,8 @@ extern void loader_log_putc(char c);
 
 static uint32_t level, want_i2c, xnu_tlmm;
 static uint32_t mic_ios;                /* vayu_mic=1: /dev/hakios-mic for iOS's audio plug-in */
+static uint32_t mic_order = 1;          /* 1: the codec's TX first, then AFE 0x4001 (R15); 0: the AFE port first (test9) */
+static uint32_t mic_words_once;         /* the ASM read command's words, said once per boot */
 static uint32_t command_step = 4;       /* the step command()'s lines carry (6 while the microphones are up) */
 static vm_offset_t north, south;
 static bool sdz_driven;                 /* set once a step drives an SDZ pin; the quiesce only undoes what was done */
@@ -3400,6 +3402,13 @@ mic_read(uint32_t period)
 	uint32_t token = MIC_READ_TOKEN | ((mic_generation & MIC_READ_GEN_MASK) << MIC_READ_GEN_SHIFT) |
 	    (period & MIC_READ_PERIOD_MASK);
 
+	if (!mic_words_once) {
+		/* (the words as the DSP gets them: the next run must prove address, handle and size, not assume them) */
+		mic_words_once = 1;
+		mic_say("the read command's words (opcode %#x): address %#x %#x, map handle %#x, size %u, seq %u; the "
+		    "capture's base %#llx, the buffer %#lx\n", ASM_DATA_CMD_READ_V2, read[0], read[1], read[2], read[3],
+		    read[4], mic_address(), (unsigned long)mic_memory());
+	}
 	return apr_post(APR_SVC_ASM, MIC_STREAM_PORT, token, ASM_DATA_CMD_READ_V2, read, sizeof(read));
 }
 
@@ -3912,19 +3921,42 @@ mic_path_up(void)
 	 * other way round the SLIMbus master is told to listen to channels the codec has not joined yet;
 	 * that is the one structural difference left from the vendor's sequence, and it fits the captures
 	 * that read full-size zeros with every register correct (test8, test10).
+	 *
+	 * vayu_mic_order=0 is the other order, the one test9's working iOS capture used (AFE port, then
+	 * the codec). It is kept because test11's captures read zeros with every register and every
+	 * command identical to the boot test's, which leaves the order and the port's join state as the
+	 * only variables a boot can A/B without a code change.
 	 */
-	if (!vayu_jack_mic_on()) {
-		mic_say("the codec's microphone path did not come up\n");
-		goto fail;
-	}
-	mic_say("the codec's microphone path is up: AMIC3 -> DEC7 -> SLIM TX7 (channel 135), AMIC1 -> DEC8 -> "
-	    "SLIM TX8 (channel 136)\n");
-	if (mic_stopping) {
-		goto fail;
-	}
-	if (!mic_afe_on()) {
-		mic_say("the AFE port 0x4001 did not start\n");
-		goto fail;
+	mic_say("the order: %s first, then %s (vayu_mic_order=%u)\n", mic_order != 0 ? "the codec's TX" : "the AFE port",
+	    mic_order != 0 ? "AFE 0x4001" : "the codec's TX", mic_order);
+	if (mic_order != 0) {
+		if (!vayu_jack_mic_on()) {
+			mic_say("the codec's microphone path did not come up\n");
+			goto fail;
+		}
+		mic_say("the codec's microphone path is up: AMIC3 -> DEC7 -> SLIM TX7 (channel 135), AMIC1 -> DEC8 -> "
+		    "SLIM TX8 (channel 136)\n");
+		if (mic_stopping) {
+			goto fail;
+		}
+		if (!mic_afe_on()) {
+			mic_say("the AFE port 0x4001 did not start\n");
+			goto fail;
+		}
+	} else {
+		if (!mic_afe_on()) {
+			mic_say("the AFE port 0x4001 did not start\n");
+			goto fail;
+		}
+		if (mic_stopping) {
+			goto fail;
+		}
+		if (!vayu_jack_mic_on()) {
+			mic_say("the codec's microphone path did not come up\n");
+			goto fail;
+		}
+		mic_say("the codec's microphone path is up: AMIC3 -> DEC7 -> SLIM TX7 (channel 135), AMIC1 -> DEC8 -> "
+		    "SLIM TX8 (channel 136)\n");
 	}
 	if (!mic_asm_on()) {
 		mic_say("the ASM stream (session 2) did not open\n");
@@ -4100,6 +4132,12 @@ mic_feed(void)
 				mic_rearm("the samples are exactly zero");
 			}
 			if (silent && zero_periods >= MIC_ZERO_REBUILD_PERIODS && rearms <= MIC_REARMS) {
+				/*
+				 * Before the capture is thrown away: the SMMU's own answer to "did the DSP write
+				 * anything at all, or were its writes refused". Until R15 this was only read at
+				 * space_off, i.e. never during a capture.
+				 */
+				space_faults();
 				mic_say("the samples are still exactly zero (%u periods, %llu frames): the codec's side "
 				    "said again did not bring them back; the capture is rebuilt\n", zero_periods, frames);
 				ok = false;
@@ -4718,6 +4756,8 @@ vayu_audio_init(void)
 	thread_t thread;
 
 	PE_parse_boot_argn("vayu_mic", &mic_ios, sizeof(mic_ios));
+	PE_parse_boot_argn("vayu_mic_order", &mic_order, sizeof(mic_order));
+	mic_order = mic_order != 0;     /* anything else is the codec-first order */
 	if (!PE_parse_boot_argn("vayu_audio", &level, sizeof(level)) || level == 0) {
 		if (mic_ios) {
 			say("vayu-audio: mic: vayu_mic=1 needs vayu_audio>=3 (the DSP) and vayu_jack>=2 (the codec): not done\n");

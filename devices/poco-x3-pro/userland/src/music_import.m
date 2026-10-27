@@ -236,6 +236,8 @@ read_metadata(const char *path, NSString *fallback, NSString **title, NSString *
 	}
 }
 
+static BOOL column_exists(sqlite3 *h, const char *table, const char *column);
+
 /*
  * What the database itself says about the track, read straight from the file (run 005616: the insert went
  * through and Music showed nothing): its row, where the library's own copy of the database is, and the
@@ -267,8 +269,18 @@ dump_row(int64_t pid, const char *when)
 	for (unsigned q = 0; q < sizeof(queries) / sizeof(queries[0]); q++) {
 		sqlite3_stmt *st = NULL;
 		int rows = 0;
+		const char *sql = queries[q];
 
-		if (sqlite3_prepare_v2(h, queries[q], -1, &st, NULL) != SQLITE_OK) {
+		/*
+		 * test11: this library (user_version 2050080) has no item_extra.extended_content_rating, so
+		 * the explicit readback below failed to prepare and the explicit flags it exists for were
+		 * never printed. The column is optional; the flags are not.
+		 */
+		if (q == 4 && !column_exists(h, "item_extra", "extended_content_rating")) {
+			sql = "SELECT 'explicit', content_rating, content_rating_level, "
+			    "'no extended_content_rating in this schema' FROM item_extra WHERE item_pid = ?1";
+		}
+		if (sqlite3_prepare_v2(h, sql, -1, &st, NULL) != SQLITE_OK) {
 			fprintf(stderr, "music_import: %s: query %u: %s\n", when, q, sqlite3_errmsg(h));
 			continue;
 		}
@@ -409,6 +421,16 @@ media_query(const char *when, int64_t pid)
 	}
 	fprintf(stderr, "music_import: %s: songs with the system filters off %lu, restrictions off %lu, both off %lu\n", when,
 	    songs_count(YES, NO), songs_count(NO, YES), songs_count(YES, YES));
+	/*
+	 * The other views Music's Library tab is built on. A track can be in songsQuery and still leave
+	 * Albums/Artists/Genres/Playlists empty (no album/artist/container rows a view joins), which is
+	 * what test11's owner saw; these counts say which view is empty without the app.
+	 */
+	fprintf(stderr, "music_import: %s: the library's views: albums %lu, artists %lu, genres %lu, playlists %lu\n", when,
+	    (unsigned long)[[[MPMediaQuery albumsQuery] collections] count],
+	    (unsigned long)[[[MPMediaQuery artistsQuery] collections] count],
+	    (unsigned long)[[[MPMediaQuery genresQuery] collections] count],
+	    (unsigned long)[[[MPMediaQuery playlistsQuery] collections] count]);
 	if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
 		sqlite3_stmt *tables = NULL;
 		char line[1024];
