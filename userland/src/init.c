@@ -1407,6 +1407,40 @@ configure_vnodes(void)
 	}
 }
 
+/*
+ * The audio server's plug-in directory of the system image as it is on the root: the prebuilt images
+ * (system-ru4 to ru10) were made before the rename to hakios and hold one link,
+ *   RedwoodAudio.driver -> /redwood/lib/RedwoodAudio.driver,
+ * while this image has the bundle as /redwood/lib/HakiosAudio.driver (src/audio_plugin.c). The link
+ * dangles, mediaserverd loads no output device, iOS finds no audio route and nothing plays: TEST7 had
+ * AVAudioSession "outputs [(no outputs)]", the kernel's feeder "iOS wrote 0 frames (peak 0)" for the
+ * whole run, and AVPlayer waiting at t=0 with its item still AVPlayerItemStatusUnknown -- no error,
+ * because nothing failed, there was nowhere to play to. (TEST3, the same system image with a boot
+ * image from before the rename, played: 148237 frames, peak 3617.)
+ *
+ * So our directory goes in place of the image's, as it does for the iOS volume on the flash (flash_root:
+ * "our audio device, not Apple's"). The name the image was built with stops mattering, and a system
+ * image from either side of the rename is served.
+ */
+static void
+bind_audio_plugins(void)
+{
+	struct stat st, executable;
+
+	if (stat("/System/Library/Audio/Plug-Ins/HAL", &st) != 0) {
+		printf("  no /System/Library/Audio/Plug-Ins/HAL for our audio device: %s\n", strerror(errno));
+		return;
+	}
+	/* A bundle whose executable is missing is a plug-in the server cannot load, and it says nothing
+	 * about it (TEST7): say it here, where it is a build fault and not a mystery. */
+	if (stat(in_image("/hal/HakiosAudio.driver/HakiosAudio"), &executable) != 0) {
+		printf("  our audio device has no executable: %s: %s\n",
+		    in_image("/hal/HakiosAudio.driver/HakiosAudio"), strerror(errno));
+	}
+	check(bind_dir(in_image("/hal"), "/System/Library/Audio/Plug-Ins/HAL"),
+	    "our audio device, not the system image's plug-ins");
+}
+
 int
 main(int argc, char **argv, char **envp)
 {
@@ -1437,6 +1471,10 @@ main(int argc, char **argv, char **envp)
 
 		if (dev != NULL) {
 			flash_root(dev);
+		} else {
+			/* the root is the system image; its plug-in directory is as old as the image (see
+			 * bind_audio_plugins) */
+			bind_audio_plugins();
 		}
 	}
 
