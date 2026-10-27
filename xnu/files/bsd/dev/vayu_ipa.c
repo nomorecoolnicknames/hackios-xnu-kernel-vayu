@@ -32,6 +32,7 @@
 #define IPA_FILTER_TABLE_SIZE   0x2000   /* vayu default: no qcom,ipa-q6-smem-size in DT */
 
 extern void loader_log_putc(char c);
+extern void loader_checkpoint(uint64_t n);      /* osfmk/arm64/loader_return.c: "xl run N" stops there */
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 
 static struct vayu_rproc ipa_fw = {
@@ -43,6 +44,7 @@ static struct vayu_rproc ipa_fw = {
 };
 
 static bool ipa_enabled, ipa_prepared, ipa_fw_ready, ipa_smp2p_ready;
+static bool ipa_modem_loader;           /* vayu_ipa_loader=1: no AP PAS; watch what MPSS does */
 static uint32_t ipa_filter_item, ipa_our_item, ipa_restricted;
 static vm_offset_t ipa_regs;
 
@@ -302,7 +304,7 @@ vayu_ipa_firmware_ready(void)
 void
 vayu_ipa_prepare(void)
 {
-	uint32_t enabled = 0;
+	uint32_t enabled = 0, steps = 0, loader = 0;
 
 	if (!PE_parse_boot_argn("vayu_ipa", &enabled, sizeof(enabled)) || enabled != 1) {
 		if (enabled != 0) say("vayu-ipa: vayu_ipa=%u refused: only 1 enables IPA\n", enabled);
@@ -310,6 +312,16 @@ vayu_ipa_prepare(void)
 	}
 	if (ipa_prepared) return;
 	ipa_enabled = true;
+	if (PE_parse_boot_argn("vayu_ipa_pas", &steps, sizeof(steps))) {
+		vayu_pas_set_steps(steps);
+	}
+	say("vayu-ipa: PAS steps %#x (bit 0 forced shutdown, 1 image, 2 AUTH, 3 hardware init)\n",
+	    vayu_pas_steps());
+	if ((vayu_pas_steps() & VAYU_PAS_STEP_AUTH) && !(vayu_pas_steps() & VAYU_PAS_STEP_IMAGE)) {
+		say("vayu-ipa: vayu_ipa_pas asks for AUTH without an image: refused\n");
+		return;
+	}
+	loader_checkpoint(101);
 	say("vayu-ipa: prepare: IP0, SMEM/SMP2P, PAS ipa_fws before MPSS\n");
 	if (!vayu_soc_check("vayu-ipa")) {
 		say("vayu-ipa: not vayu's shared memory/command database\n");
@@ -318,6 +330,7 @@ vayu_ipa_prepare(void)
 	/* SM8150's IPA core clock is the RPMh IP0 resource (Linux: RPMH_IPA_CLK). The GCC branch writes at
 	 * +0x89014.. hung the phone on hardware, so they are opt-in: vayu_ipa_gcc=1. */
 	if (!ipa_clock_on()) return;
+	loader_checkpoint(102);
 	{
 		uint32_t gcc = 0;
 
@@ -328,9 +341,26 @@ vayu_ipa_prepare(void)
 		return;
 	}
 	ipa_smmu_survey();
+	loader_checkpoint(103);
 	if (!ipa_filter_table_prepare()) return;
 	if (!ipa_registers_check()) {
 		say("vayu-ipa: IPA CFG is not alive before PAS; no firmware start\n");
+		return;
+	}
+	loader_checkpoint(104);
+	if (PE_parse_boot_argn("vayu_ipa_loader", &loader, sizeof(loader)) && loader == 1) {
+		ipa_modem_loader = true;
+	}
+	if (ipa_modem_loader) {
+		/*
+		 * vayu_ipa_loader=1: the AP does not touch PAS(15) at all. The modem is started as usual
+		 * and vayu_ipa_modem_probe(), after MPSS is up, reads whether MPSS brought the GSI/IPA up
+		 * by itself. This is the zero-risk test of the "who loads the GSI" question: on vayu the DT
+		 * has qcom,pil-tz-generic (AP loader) and no qcom,gsi-loader, but the pil_ipa_gsi_region at
+		 * 0x98f10000 is unused by the AP tree, so the ownership is worth observing, not assuming.
+		 */
+		say("vayu-ipa: loader=modem: AP PAS(15) skipped; clock/SMMU/SMEM filter are prepared, the modem is watched\n");
+		ipa_prepared = true;
 		return;
 	}
 	if (!vayu_pas_supported(&ipa_fw)) {
@@ -341,20 +371,96 @@ vayu_ipa_prepare(void)
 		say("vayu-ipa: ipa_fws was not loaded\n");
 		return;
 	}
+	if (!(vayu_pas_steps() & VAYU_PAS_STEP_AUTH)) {
+		say("vayu-ipa: dry stop after the image: AUTH_AND_RESET and hardware init not done; IPA stays down\n");
+		ipa_prepared = true;
+		return;
+	}
 	if (!vayu_pas_start(&ipa_fw, 10000)) {
 		say("vayu-ipa: ipa_fws did not come up\n");
 		vayu_pas_stop(&ipa_fw, "IPA did not come up");
 		return;
 	}
-	ipa_hardware_init();
-	say("vayu-ipa: IPA firmware authenticated/reset (no own SMP2P item); modem item will carry \"ipa\"\n");
-	if (!ipa_smp2p_verify()) {
-		say("vayu-ipa: SMP2P prerequisite failed\n");
-		return;
+	if (vayu_pas_steps() & VAYU_PAS_STEP_HW) {
+		ipa_hardware_init();
+	} else {
+		say("vayu-ipa: hardware/SRAM init skipped (vayu_ipa_pas bit 3 off)\n");
 	}
+	loader_checkpoint(112);
+	say("vayu-ipa: IPA firmware authenticated/reset (no own SMP2P item); modem item will carry \"ipa\"\n");
+	/*
+	 * The modem's SMP2P item 428 does not exist until MPSS runs (a cold boot made the old
+	 * verify-before-MPSS circular: no item -> not ready -> no "ipa" entry -> the modem never
+	 * starts its IPA task). It is verified in vayu_ipa_modem_probe() after MPSS is up.
+	 */
 	ipa_fw_ready = true;
 	ipa_prepared = true;
-	say("vayu-ipa: firmware and modem prerequisites ready; next is QRTR INIT_MODEM_DRIVER\n");
+	say("vayu-ipa: firmware ready; the modem's SMP2P \"ipa\" entry is verified after MPSS starts, then QRTR INIT_MODEM_DRIVER\n");
+}
+
+/*
+ * Called by vayu_modem.c after MPSS is up (step 2). -1: vayu_ipa was not asked for; 0: not up;
+ * 1: IPA/GSI up. With vayu_ipa_loader=1 the AP did no PAS at all, so "up" can only have come from
+ * the modem: the SMP2P "ipa" entry, GSI MCS/STATUS, and IPA_VERSION are read and logged.
+ */
+int
+vayu_ipa_modem_probe(void)
+{
+	uint32_t enabled = 0, regs = 0, item, counts = 0, value = 0, version = 0, status = 0, mcs = 0, error = 0;
+	bool observe_regs = PE_parse_boot_argn("vayu_ipa_observe_regs", &regs, sizeof(regs)) && regs == 1;
+	vm_offset_t gsi = 0;
+	bool up;
+
+	if (!PE_parse_boot_argn("vayu_ipa", &enabled, sizeof(enabled)) || enabled != 1) {
+		return -1;
+	}
+	if (ipa_smp2p_ready) {
+		return 1;
+	}
+	if (!ipa_modem_loader && !ipa_fw_ready) {
+		say("vayu-ipa: after MPSS: the AP's IPA preparation did not complete; its SMP2P entry is not verified\n");
+		return 0;
+	}
+	item = vayu_smem_item(IPA_SM_HOST_MODEM, IPA_SMP2P_OURS, &(uint32_t){ 0 });
+	if (item != 0) {
+		counts = ipa_smem_word(item + 12);
+		value = ipa_smem_word(item + 36 + 20);
+	}
+	/*
+	 * Registers only when asked (vayu_ipa_observe_regs=1). The SMP2P item is safe to read; a
+	 * register read of a block the modem may have gated is exactly the class of access that
+	 * hangs this phone, and the observe mode must not become the next hang. Even then GSI is
+	 * read only after IPA_VERSION says the IPA block is alive.
+	 */
+	if (observe_regs && ipa_regs != 0) {
+		version = *(volatile uint32_t *)(ipa_regs + 0x34);
+	}
+	if (observe_regs && version != 0 && version != 0xffffffffU) {
+		gsi = ml_io_map_unmappable(0x1e04000, 0x28000, VM_WIMG_IO);
+		if (gsi != 0) {
+			status = *(volatile uint32_t *)(gsi + 0x0);
+			mcs = *(volatile uint32_t *)(gsi + 0xb000);
+			error = *(volatile uint32_t *)(gsi + 0x200);
+		}
+	}
+	say("vayu-ipa: after MPSS: loader=%s, SMP2P item %u counts %#x \"ipa\" %#x; registers %s (IPA_VERSION %#x, GSI_STATUS %#x, MCS_CFG %#x, ERROR_LOG %#x)\n",
+	    ipa_modem_loader ? "modem" : "AP", item, counts, value,
+	    observe_regs ? "read" : "not read (vayu_ipa_observe_regs=1 to read)",
+	    version, status, mcs, error);
+	up = ipa_smp2p_verify();                /* logs what it sees; sets ipa_smp2p_ready */
+	if (ipa_modem_loader) {
+		if (up || (observe_regs && ((mcs & 1) || (status & 1)))) {
+			say("vayu-ipa: THE MODEM HAS IPA/GSI UP (loader=modem): SMP2P %s%s%s\n",
+			    up ? "valid" : "not valid",
+			    observe_regs ? (mcs & 1 ? ", MCS runs" : ", MCS idle") : "",
+			    observe_regs ? (status & 1 ? ", GSI enabled" : ", GSI disabled") : "");
+			ipa_fw_ready = true;
+			return 1;
+		}
+		say("vayu-ipa: the modem did NOT bring IPA/GSI up (loader=modem, no AP PAS was done)\n");
+		return 0;
+	}
+	return up ? 1 : 0;
 }
 
 void

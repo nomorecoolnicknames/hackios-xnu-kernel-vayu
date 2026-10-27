@@ -1140,7 +1140,14 @@ static uint64_t sound_len;
 #define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
 #define START_SECONDS           5
-#define SILENCE_SECONDS         50
+/*
+ * How long without a heartbeat before the watching loader calls the kernel hung and writes its log
+ * to logdump. The kernel's heartbeat and its watchdog feed are the same timer, and the watchdog bites
+ * 30 s after the last feed (WDT_BITE_MS), so this must stay below 30: at 50 a kernel that hangs in an
+ * SMC (IPA PAS, 2026-10-27) was reset before its log could be saved. 20 leaves two heartbeat periods
+ * of margin and still wins by 10 s.
+ */
+#define SILENCE_SECONDS         20
 #define NOTE_SECONDS            24      /* how long the kernel's progress is written down as it happens */
 
 static void wdt_pet(void);

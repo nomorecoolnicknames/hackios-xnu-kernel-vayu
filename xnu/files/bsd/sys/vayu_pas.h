@@ -62,6 +62,23 @@ struct vayu_rproc {
 #define VAYU_RPROC_HANDOVER     (1u << 2)
 #define VAYU_RPROC_STOP_ACK     (1u << 3)
 
+/*
+ * vayu_ipa_pas=: which steps the IPA path (pas_id 15) takes, one bit each, so one run can change
+ * one thing. 1 = the forced PAS_SHUTDOWN before INIT_IMAGE, 2 = INIT_IMAGE/MEM_SETUP/image write,
+ * 4 = AUTH_AND_RESET, 8 = the hardware/SRAM init after it.
+ *
+ * The default is 0xE: the forced shutdown is opt-in. It is the same SMC that hung this phone for
+ * image 13 (3D stream, run 171242), and a cold boot has no running IPA to shut down. vayu_ipa_pas=15
+ * reproduces the old behaviour; vayu_ipa_pas=2 is the dry stop before AUTH_AND_RESET.
+ */
+#define VAYU_PAS_STEP_SHUTDOWN  (1u << 0)
+#define VAYU_PAS_STEP_IMAGE     (1u << 1)
+#define VAYU_PAS_STEP_AUTH      (1u << 2)
+#define VAYU_PAS_STEP_HW        (1u << 3)
+#define VAYU_PAS_STEPS_DEFAULT  (VAYU_PAS_STEP_IMAGE | VAYU_PAS_STEP_AUTH | VAYU_PAS_STEP_HW)
+void vayu_pas_set_steps(uint32_t steps);
+uint32_t vayu_pas_steps(void);
+
 /* The SoC's (true if the shared memory and RPMh's command database are where vayu has them). */
 bool vayu_soc_check(const char *who);
 /* A new item of that size in our partition with that host (zeroed), as Linux's qcom_smem_alloc(); one already there is kept. */

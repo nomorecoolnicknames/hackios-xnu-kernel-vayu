@@ -10,6 +10,9 @@ struct vayu_qrtr;
 
 /* Pre-modem stage: IPA PAS, clock, memory/SMMU and SMP2P prerequisites (opt-in vayu_ipa=1). */
 void vayu_ipa_prepare(void);
+/* After MPSS is up (vayu_modem.c step 2): -1 vayu_ipa not asked, 0 IPA/GSI not up, 1 up.
+ * With vayu_ipa_loader=1 the AP does no PAS, so 1 means the modem brought IPA/GSI up itself. */
+int vayu_ipa_modem_probe(void);
 /* QRTR stage: modem's IPA service 0x31, INIT_MODEM_DRIVER and the host indication path. */
 void vayu_ipa_start(struct vayu_qrtr *q);
 void vayu_ipa_stop(void);

@@ -50,6 +50,7 @@ extern uint64_t kvtophys(vm_offset_t va);
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm64/caches_asm.s */
 extern void loader_log_putc(char c);
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern void loader_checkpoint(uint64_t n);      /* osfmk/arm64/loader_return.c: "xl run N" stops there */
 
 /* (hakios.wifi.c's: whoever opens the mailbox or allocates in the shared memory takes them) */
 extern lck_mtx_t hakios_aop_mailbox_lock;
@@ -58,6 +59,21 @@ extern lck_mtx_t hakios_smem_alloc_lock;
 static LCK_GRP_DECLARE(pas_lock_group, "vayu-pas");
 static LCK_MTX_DECLARE(pas_lock, &pas_lock_group);      /* a processor being started or stopped */
 static LCK_MTX_DECLARE(rpmh_tcs_lock, &pas_lock_group); /* TCS 0 of the apps RSC: every vayu writer takes it */
+
+/* vayu_ipa_pas= (sys/vayu_pas.h): the IPA path's steps, so one run can leave one out. */
+static uint32_t pas_steps = VAYU_PAS_STEPS_DEFAULT;
+
+void
+vayu_pas_set_steps(uint32_t steps)
+{
+	pas_steps = steps;
+}
+
+uint32_t
+vayu_pas_steps(void)
+{
+	return pas_steps;
+}
 
 static uint32_t pause_ms = 2200;
 static bool leaving;                    /* on a panic's way back to the loader: no lock, no sleep, the loader's log only */
@@ -2092,6 +2108,18 @@ rproc_shutdown(struct vayu_rproc *rp, const char *why)
 			vayu_glink_down(rp->glink);
 		}
 	}
+	/*
+	 * The same SMC that hangs before INIT_IMAGE also hangs this phone at teardown for an
+	 * image that was never loaded. With the forced-shutdown bit off, the IPA is left running
+	 * for the loader/next boot to reset instead of calling PAS_SHUTDOWN(15) at all.
+	 */
+	if (rp->pas_id == 15 && !(pas_steps & VAYU_PAS_STEP_SHUTDOWN)) {
+		say("%s: %s: PAS_SHUTDOWN skipped (vayu_ipa_pas bit 0 off); the firmware is left for the next boot\n",
+		    rp->name, why);
+		rp->started = false;
+		rails_give_back(rp);
+		return true;
+	}
 	rp->stopped_by_its_word = ask_to_stop(rp, leaving ? 2000 : 5000);
 	result = scm(rp->name, "to shut it down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, rp->pas_id, 0, 0, &answer);
 	if (result != 0 || answer != 0) {
@@ -2121,15 +2149,31 @@ vayu_pas_load(struct vayu_rproc *rp)
 		goto out;
 	}
 	if (rp->smp2p_theirs == 0 && rp->pas_id == 15) {
-		/* vayu DT: qcom,pil-force-shutdown on ipa_fws. There is no IPA SMP2P
-		 * channel with which to ask first; Android does the same forced PAS shutdown. */
-		result = scm(rp->name, "to force-shutdown before INIT_IMAGE (qcom,pil-force-shutdown)",
-		    SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, rp->pas_id, 0, 0, &answer);
-		if (result != 0 || answer != 0) {
-			say("%s: forced shutdown returned %d, answer %#llx; AUTH will provide the next result\n",
-			    rp->name, result, answer);
+		/*
+		 * vayu DT: qcom,pil-force-shutdown on ipa_fws. There is no IPA SMP2P channel with which to
+		 * ask first. But the forced shutdown is only right if the image may be running. This phone's
+		 * first PAS_SHUTDOWN (image 13, run 171242) never returned, and upstream's IPA driver goes
+		 * from qcom_mdt_load straight to AUTH_AND_RESET (no PAS_SHUTDOWN). It is therefore opt-in
+		 * (vayu_ipa_pas bit 0); a cold boot goes straight to INIT_IMAGE, as the 150533 run did.
+		 */
+		if (rp->pas_id == 15) loader_checkpoint(105);
+		if (pas_steps & VAYU_PAS_STEP_SHUTDOWN) {
+			result = scm(rp->name, "to force-shutdown before INIT_IMAGE (qcom,pil-force-shutdown)",
+			    SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, rp->pas_id, 0, 0, &answer);
+			if (result != 0 || answer != 0) {
+				say("%s: forced shutdown returned %d, answer %#llx; INIT_IMAGE will provide the next result\n",
+				    rp->name, result, answer);
+			}
+		} else {
+			say("%s: forced shutdown skipped (vayu_ipa_pas bit 0 off): no running image at boot to shut down\n",
+			    rp->name);
 		}
 		rp->started = false;
+		if (rp->pas_id == 15) loader_checkpoint(106);
+	}
+	if (rp->pas_id == 15 && !(pas_steps & VAYU_PAS_STEP_IMAGE)) {
+		say("%s: INIT_IMAGE/MEM_SETUP/image skipped (vayu_ipa_pas bit 1 off)\n", rp->name);
+		goto out;
 	}
 	if (rp->smp2p_theirs != 0 && their_words(rp, &words) && (slave_state(&words) & VAYU_RPROC_READY)) {
 		show_words(rp, "it has left words in the shared memory and may be running", &words);
@@ -2158,6 +2202,7 @@ vayu_pas_load(struct vayu_rproc *rp)
 		goto out;
 	}
 	say("%s: TRUSTZONE ACCEPTS THE SIGNATURE (image %u)\n", rp->name, rp->pas_id);
+	if (rp->pas_id == 15) loader_checkpoint(107);
 	result = scm(rp->name, "where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, rp->pas_id, rp->memory, rp->image.size,
 	    &answer);
 	if (result != 0 || answer != 0) {
@@ -2165,8 +2210,10 @@ vayu_pas_load(struct vayu_rproc *rp)
 		goto out;
 	}
 	say("%s: TrustZone takes the place: %#x bytes at %#x\n", rp->name, rp->image.size, rp->memory);
+	if (rp->pas_id == 15) loader_checkpoint(108);
 	rp->image.written = image_write(rp);
 	loaded = rp->image.written;
+	if (rp->pas_id == 15) loader_checkpoint(109);
 out:
 	if (page != 0) {
 		kmem_free(kernel_map, page, PAGE_SIZE);
@@ -2209,8 +2256,16 @@ vayu_pas_start(struct vayu_rproc *rp, uint32_t wait_ms)
 	if (strcmp(rp->name, "ipa") != 0 && !vayu_aop_send(text)) {
 		goto undo;
 	}
+	if (rp->pas_id == 15) {
+		loader_checkpoint(110);
+		if (!(pas_steps & VAYU_PAS_STEP_AUTH)) {
+			say("%s: AUTH_AND_RESET skipped (vayu_ipa_pas bit 2 off)\n", rp->name);
+			goto undo;
+		}
+	}
 	result = scm(rp->name, "to authenticate the image and let it out of reset", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE,
 	    rp->pas_id, 0, 0, &answer);
+	if (rp->pas_id == 15) loader_checkpoint(111);   /* reached only if AUTH returned */
 	started = now_us();
 	rp->image.written = false;
 	if (result != 0 || answer != 0) {

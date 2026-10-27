@@ -330,6 +330,11 @@ modem_thread(void *arg __unused, wait_result_t wr __unused)
 		/* IPA firmware and its SMP2P/filter prerequisites must exist before MPSS starts. */
 		vayu_ipa_prepare();
 		if (step_up()) {
+			int ipa = vayu_ipa_modem_probe();
+
+			if (ipa >= 0) {
+				say("vayu-modem: 2: IPA after the modem: %s\n", ipa ? "UP" : "not up");
+			}
 			if (level >= 3) {
 				step_link();
 			} else {
