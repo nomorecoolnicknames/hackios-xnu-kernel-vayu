@@ -1150,6 +1150,10 @@ static UInt64 mic_frames, mic_heard, mic_short;
 static int mic_peak;
 static time_t mic_retry_at;
 static int mic_retry_said;
+static UInt64 mic_zero_reads, mic_zero_frames;   /* reads the kernel filled with exact zeros, and their frames */
+static UInt64 mic_empty_reads;                  /* reads that gave nothing at all */
+static time_t mic_empty_since;
+static unsigned mic_reopens;
 
 static void
 codec_open(void)
@@ -1157,6 +1161,9 @@ codec_open(void)
 	mic = open("/dev/hakios-mic", O_RDONLY | O_NONBLOCK);
 	mic_frames = mic_heard = mic_short = 0;
 	mic_peak = 0;
+	mic_zero_reads = mic_zero_frames = mic_empty_reads = 0;
+	mic_empty_since = 0;
+	mic_reopens = 0;
 	say("hakios: audio: the microphone is listened to (/dev/hakios-mic: %s)\n", mic < 0 ? strerror(errno) : "open");
 	/* what iOS is offered as its built-in microphone (R10), for the record of a run */
 	say("hakios: audio: the microphone's input: built in, 1 channel, %d Hz, 16-bit signed (the HAL's \"Codec\")\n",
@@ -1167,14 +1174,18 @@ static void
 codec_close(void)
 {
 	say("hakios: audio: the microphone stops: %llu.%02llu s asked for, %llu.%02llu s of it from the kernel (peak %d of 32768), "
-	    "%llu reads short\n", mic_frames / HAKIOS_AUDIO_RATE, mic_frames % HAKIOS_AUDIO_RATE * 100 / HAKIOS_AUDIO_RATE,
-	    mic_heard / HAKIOS_AUDIO_RATE, mic_heard % HAKIOS_AUDIO_RATE * 100 / HAKIOS_AUDIO_RATE, mic_peak, mic_short);
+	    "%llu reads short, %llu of them with exact zeros (%llu.%02llu s), %llu with nothing at all\n",
+	    mic_frames / HAKIOS_AUDIO_RATE, mic_frames % HAKIOS_AUDIO_RATE * 100 / HAKIOS_AUDIO_RATE,
+	    mic_heard / HAKIOS_AUDIO_RATE, mic_heard % HAKIOS_AUDIO_RATE * 100 / HAKIOS_AUDIO_RATE, mic_peak, mic_short,
+	    mic_zero_reads, mic_zero_frames / HAKIOS_AUDIO_RATE, mic_zero_frames % HAKIOS_AUDIO_RATE * 100 / HAKIOS_AUDIO_RATE,
+	    mic_empty_reads);
 	if (mic >= 0) {
 		close(mic);
 	}
 	mic = -1;
 	mic_retry_at = 0;
 	mic_retry_said = 0;
+	mic_empty_since = 0;
 }
 
 static void
@@ -1207,6 +1218,46 @@ codec_read(int16_t *samples, UInt32 frames)
 	if (have > 0 && mic_heard == 0) {
 		say("hakios: audio: the microphone's first samples, %llu.%02llu s after the input started\n",
 		    mic_frames / HAKIOS_AUDIO_RATE, mic_frames % HAKIOS_AUDIO_RATE * 100 / HAKIOS_AUDIO_RATE);
+	}
+	if (have == 0) {
+		/*
+		 * Nothing at all, not even the ring's silence: the kernel's capture is not feeding. Its node
+		 * keeps the state it had, so closing and opening it is what makes the kernel take the capture's
+		 * path down and up again (vayu_audio.c: ios_mic_close/ios_mic_open, ios_wants).
+		 */
+		mic_empty_reads++;
+		if (mic >= 0 && mic_reopens < 3) {
+			time_t now = time(NULL);
+
+			if (mic_empty_since == 0) {
+				mic_empty_since = now;
+			} else if (now - mic_empty_since >= 1) {
+				mic_reopens++;
+				say("hakios: audio: /dev/hakios-mic gave nothing for a second: reopening it (the kernel's capture "
+				    "path starts again; %u of 3)\n", mic_reopens);
+				close(mic);
+				mic = open("/dev/hakios-mic", O_RDONLY | O_NONBLOCK);
+				mic_empty_since = 0;
+				if (mic < 0) {
+					say("hakios: audio: /dev/hakios-mic did not open again (%s)\n", strerror(errno));
+				}
+			}
+		}
+	} else {
+		bool zero = true;
+
+		for (UInt32 i = 0; i < have && zero; i++) {
+			zero = samples[i] == 0;
+		}
+		mic_empty_since = 0;
+		if (zero) {
+			mic_zero_reads++;
+			mic_zero_frames += have;
+			if (mic_zero_reads == 1) {
+				say("hakios: audio: the kernel's samples are exactly zero (%u at once): the DSP's capture is "
+				    "silent, not the room\n", have);
+			}
+		}
 	}
 	for (UInt32 i = 0; i < have; i++) {
 		int v = samples[i] < 0 ? -samples[i] : samples[i];

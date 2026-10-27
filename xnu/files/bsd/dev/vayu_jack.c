@@ -2671,6 +2671,24 @@ mic_bias_wanted(void)
 	return !PE_parse_boot_argn("vayu_mic_bias", &bias, sizeof(bias)) || bias != 0;
 }
 
+/*
+ * vayu_mic_chan_keep=0: the channels 135/136 are removed from the bus at the end of every capture,
+ * as this driver did until R12. The default keeps them: the vendor adds a channel once, when the
+ * stream is opened (wcd9xxx-slimslave.c: the channel map of a codec port is a bus resource that
+ * outlives the stream, slim_ch_alloc/slim_ch_free around the ASoC stream), and removes it only when
+ * the codec goes away. Removing them while the TX ports stayed enabled (M-off leaves IFD 0x1F7/0x1F8
+ * at 0x02) made every capture depend on the one before it: an iOS boot has four captures (the kernel's
+ * 3 s test, the music stage's two streams, the self-test's recorder) and the fourth one read exact
+ * zeros in every boot of test8 (run 121732).
+ */
+static bool
+mic_chan_keep_wanted(void)
+{
+	uint32_t keep;
+
+	return !PE_parse_boot_argn("vayu_mic_chan_keep", &keep, sizeof(keep)) || keep != 0;
+}
+
 /* AMIC_3_4/AMIC_1_2 PWR MODE, bits [6:5] (wcd934x.c:119-124), as the vendor names it. */
 static const char *
 mic_pwr_name(uint8_t adc)
@@ -2874,6 +2892,75 @@ mic_slim_tx(void)
 }
 
 /*
+ * The SLIMbus side once more, after the DSP's AFE port is running: the same port enables, the two
+ * CONNECT_SRC, DEF_ACT_CHAN and RECONFIG_NOW ("the kick"). Nothing analog, nothing that touches the
+ * decimators, so it is cheap enough to repeat while a capture runs.
+ *
+ * Why: the AFE port start is what puts channels 135/136 in the SLIMbus master's frame. Everything the
+ * codec was told before that was told to a master that had no such channels, and a port that starts
+ * against a codec it cannot hear is where a capture that reads full-size zeros with no error at all
+ * comes from (the DSP happily reports 3840 bytes a period: there was nothing in them). Saying the
+ * port's part last makes the codec's channel map the last word instead of the first.
+ */
+bool
+vayu_jack_mic_kick(const char *why)
+{
+	uint8_t s36 = 0, s37 = 0, s77 = 0, s78 = 0;
+
+	if (!jack_ready || !mic_live) {
+		say("vayu-jack: M-kick (%s): the microphone path is not up (ready %d live %d)\n", why, jack_ready ? 1 : 0,
+		    mic_live ? 1 : 0);
+		return false;
+	}
+	if (!mic_slim_tx()) {
+		say("vayu-jack: M-kick (%s): the SLIM TX ports did not take it\n", why);
+		return false;
+	}
+	(void)ifd_read(0x36, &s36);
+	(void)ifd_read(0x37, &s37);
+	(void)ifd_read(0x77, &s77);
+	(void)ifd_read(0x78, &s78);
+	say("vayu-jack: M-kick (%s): TX7/TX8 re-armed; ifd 0x36=%02x 0x37=%02x 0x77=%02x 0x78=%02x\n", why, s36, s37,
+	    s77, s78);
+	return true;
+}
+
+/*
+ * One line of the capture's state as the codec sees it, for vayu_audio's own log: the registers and
+ * the SLIMbus port status that tell a working capture from a silent one. The proof M9 prints once,
+ * during the bring-up; this prints the same things while the capture runs, which is where the two
+ * differ (test8: M9 read the same values in the captures that worked and in the one that did not).
+ * IFD 0x34 is the RX ports' overflow counter, there for the comparison with the headphone path.
+ */
+bool
+vayu_jack_mic_state(char *line, size_t size)
+{
+	uint8_t svs = 0, master = 0, supplies = 0, micb3 = 0, micb1 = 0, adc3 = 0, adc1 = 0;
+	uint8_t tx7 = 0, cfg7 = 0, tx8 = 0, cfg8 = 0, s34 = 0, s36 = 0, s37 = 0, src7 = 0, src8 = 0;
+
+	if (!jack_ready || line == NULL || size == 0) {
+		return false;
+	}
+	if (!wcd_read_raw(0x0202, &svs) || !wcd_read_raw(0x0601, &master) || !wcd_read_raw(0x0606, &supplies) ||
+	    !wcd_read_raw(0x0625, &micb3) || !wcd_read_raw(0x0622, &micb1) ||
+	    !wcd_read_raw(0x0610, &adc3) || !wcd_read_raw(0x060e, &adc1) ||
+	    !wcd_read_raw(0x0aa1, &tx7) || !wcd_read_raw(0x0aa2, &cfg7) ||
+	    !wcd_read_raw(0x0ab1, &tx8) || !wcd_read_raw(0x0ab2, &cfg8)) {
+		return false;
+	}
+	(void)ifd_read(0x34, &s34);
+	(void)ifd_read(0x36, &s36);
+	(void)ifd_read(0x37, &s37);
+	(void)ifd_read(0x77, &src7);
+	(void)ifd_read(0x78, &src8);
+	snprintf(line, size, "SVS 0x0202=%02x 0x0601=%02x 0x0606=%02x MICB3/1 %02x/%02x ADC3/1 %02x/%02x "
+	    "TX7 ctl %02x cfg %02x TX8 ctl %02x cfg %02x (the decimator's clock %s/%s) ifd 0x34=%02x 0x36=%02x "
+	    "0x37=%02x src %02x/%02x", svs, master, supplies, micb3, micb1, adc3, adc1, tx7, cfg7, tx8, cfg8,
+	    tx7 & 0x20 ? "on" : "OFF", tx8 & 0x20 ? "on" : "OFF", s34, s36, s37, src7, src8);
+	return true;
+}
+
+/*
  * M8: the vendor's two delayed works done inline (tx_unmute_delay 40 ms, wcd934x.c:494-497 and
  * 4361-4378; the HPF work at 300 ms, wcd934x.c:4326-4358). The DSP stream is already running.
  */
@@ -3052,16 +3139,26 @@ vayu_jack_mic_off(void)
 		say("vayu-jack: M-off: the mic biases did not go off\n");
 	}
 	chan_remove[3] = (uint8_t)(0x80 | (codec_pgd_la & 0x1f));
-	if (user_msg(chan_remove, sizeof(chan_remove), 4)) {
-		say("vayu-jack: M-off: CHAN_CTRL remove for channels 135/136 acked\n");
+	if (!mic_chan_keep_wanted()) {
+		if (user_msg(chan_remove, sizeof(chan_remove), 4)) {
+			say("vayu-jack: M-off: CHAN_CTRL remove for channels 135/136 acked (vayu_mic_chan_keep=0)\n");
+		} else {
+			say("vayu-jack: M-off: CHAN_CTRL remove for channels 135/136 was not acked\n");
+		}
+		reconfig[4] = codec_pgd_la;
+		if (user_msg(reconfig, sizeof(reconfig), 3)) {
+			say("vayu-jack: M-off: RECONFIG_NOW acked\n");
+		} else {
+			say("vayu-jack: M-off: RECONFIG_NOW was not acked\n");
+		}
 	} else {
-		say("vayu-jack: M-off: CHAN_CTRL remove for channels 135/136 was not acked\n");
-	}
-	reconfig[4] = codec_pgd_la;
-	if (user_msg(reconfig, sizeof(reconfig), 3)) {
-		say("vayu-jack: M-off: RECONFIG_NOW acked\n");
-	} else {
-		say("vayu-jack: M-off: RECONFIG_NOW was not acked\n");
+		/*
+		 * The ports stay enabled and the channels stay defined, muted: the next capture re-sends
+		 * CONNECT_SRC/DEF_ACT_CHAN/RECONFIG (M7) and unmutes 40 ms later. This is what a stream stop
+		 * leaves behind in Android, and it is what keeps the channel map the same at the fourth
+		 * capture of a boot as at the first.
+		 */
+		say("vayu-jack: M-off: channels 135/136 stay defined and the TX ports enabled (vayu_mic_chan_keep=1)\n");
 	}
 	mic_live = false;
 	say("vayu-jack: M-off: the microphone path is down\n");
