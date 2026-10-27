@@ -40,6 +40,7 @@
 
 #include "selftest_util.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -917,6 +918,231 @@ stage_files(double at)
 
 /* ---- music ---------------------------------------------------------------------------------- */
 
+/*
+ * What the music stage learned, for the result line and for a log that can be read without the
+ * source: the last AVPlayerItem status and error, and how many audio outputs the session had.
+ * TEST7's "status=failed" was this file's word for "did not play", read as if it were the item's own
+ * status; the item's was AVPlayerItemStatusUnknown (0) for all twelve seconds, with no error at all.
+ */
+static long g_av_status = -1;
+static char g_av_error[512];
+static long g_av_outputs = -1;   /* outputs on the audio session's route */
+
+static const char *
+av_status_name(long status)
+{
+	if (status == AVPlayerItemStatusReadyToPlay) {
+		return "readyToPlay";
+	}
+	if (status == AVPlayerItemStatusFailed) {
+		return "failed";
+	}
+	if (status == AVPlayerItemStatusUnknown) {
+		return "unknown";
+	}
+	return "none";
+}
+
+static const char *
+error_text(NSError *error, char *buffer, size_t capacity)
+{
+	if (error == nil) {
+		snprintf(buffer, capacity, "(none)");
+	} else {
+		snprintf(buffer, capacity, "%s %ld: %s", [[error domain] UTF8String], (long)[error code],
+		    [[error localizedDescription] UTF8String]);
+	}
+	return buffer;
+}
+
+/*
+ * AVFoundation tells AVPlayerItem about its status, and the player about timeControlStatus, through
+ * the main queue: a stage that busy-waits in usleep() never drains it. In TEST7 the item sat at
+ * AVPlayerItemStatusUnknown for the whole twelve seconds with item.error nil -- what a blocked main
+ * queue looks like, and the same reason the other AVFoundation tools of this port wait by running
+ * the run loop (play_test.m, video_test.m). Running it also lets AVURLAsset's asynchronous loads
+ * finish, which is where the asset's own error would come from.
+ */
+static void
+pump_main(double seconds)
+{
+	CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, false);
+}
+
+static void
+log_error_log(AVPlayerItem *item)
+{
+	NSArray *events = [item errorLog] != nil ? [[item errorLog] events] : nil;
+	AVPlayerItemAccessLog *access = [item accessLog];
+
+	stage_say("AVPlayer: errorLog %lu event(s), accessLog %lu event(s)",
+	    (unsigned long)[events count], (unsigned long)[[access events] count]);
+	for (AVPlayerItemErrorLogEvent *event in events) {
+		stage_say("AVPlayer: errorLog: status %ld, domain %s, comment %s",
+		    (long)[event errorStatusCode],
+		    event.errorDomain != nil ? [event.errorDomain UTF8String] : "(none)",
+		    event.errorComment != nil ? [event.errorComment UTF8String] : "(none)");
+	}
+}
+
+/*
+ * The asset's own answer, asked the way AVFoundation asks it: loadValuesAsynchronouslyForKeys with
+ * the run loop turning while it happens. If none of the keys ever loads, the asset layer is the
+ * fault; if they load and the item still stays unknown, the player has no render pipeline to build
+ * (the audio route: see the HAL lines).
+ */
+static void
+probe_asset(NSURL *url)
+{
+	AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+	char text[512];
+	char *buffer = text;            /* a block cannot capture an array; a pointer to it, it can */
+	__block volatile int loaded = 0;
+	double started;
+
+	if (asset == nil) {
+		stage_say("AVURLAsset: nil for %s", [[url absoluteString] UTF8String]);
+		return;
+	}
+	[asset loadValuesAsynchronouslyForKeys:@[ @"playable", @"duration", @"tracks" ] completionHandler:^{
+		loaded = 1;
+	}];
+	started = now_seconds();
+	while (!loaded && now_seconds() - started < 3.0) {
+		pump_main(0.1);
+	}
+	stage_say("AVURLAsset %s: keys loaded %s after %.1f s", [[url absoluteString] UTF8String],
+	    loaded ? "yes" : "NO", now_seconds() - started);
+	void (^key_status)(NSString *key) = ^(NSString *key) {
+		NSError *error = nil;
+		long status = (long)[asset statusOfValueForKey:key error:&error];
+
+		stage_say("AVURLAsset: %s status %ld (%s)", [key UTF8String], status,
+		    error_text(error, buffer, sizeof(text)));
+	};
+
+	key_status(@"playable");
+	key_status(@"duration");
+	key_status(@"tracks");
+	if (loaded) {
+		stage_say("AVURLAsset: playable %d, duration %.3f s, %lu track(s)", (int)[asset isPlayable],
+		    CMTimeGetSeconds([asset duration]), (unsigned long)[[asset tracks] count]);
+	}
+}
+
+static void
+join_ports(NSArray *ports, char *buffer, size_t capacity)
+{
+	size_t used = 0;
+
+	buffer[0] = 0;
+	for (AVAudioSessionPortDescription *port in ports) {
+		int n = snprintf(buffer + used, capacity - used, "%s%s/%s", used > 0 ? ", " : "",
+		    [[port portType] UTF8String], [[port portName] UTF8String]);
+
+		if (n < 0 || (size_t)n >= capacity - used) {
+			break;
+		}
+		used += (size_t)n;
+	}
+}
+
+static long
+log_audio_route(const char *when)
+{
+	AVAudioSession *session = [AVAudioSession sharedInstance];
+	AVAudioSessionRouteDescription *route = [session currentRoute];
+	char outputs[512], inputs[256];
+
+	join_ports([route outputs], outputs, sizeof(outputs));
+	join_ports([route inputs], inputs, sizeof(inputs));
+	stage_say("the audio session's route %s: category %s, %lu output(s) [%s], %lu input(s) [%s], "
+	    "%.0f Hz, I/O buffer %.4f s, volume %.2f", when, [[session category] UTF8String],
+	    (unsigned long)[[route outputs] count], outputs, (unsigned long)[[route inputs] count], inputs,
+	    [session sampleRate], [session IOBufferDuration], [session outputVolume]);
+	g_av_outputs = (long)[[route outputs] count];
+	return g_av_outputs;
+}
+
+/*
+ * The route is built by the audio server out of the devices its HAL plug-ins publish, and one that
+ * has just loaded can be a moment behind the session's activation: wait a few seconds before calling
+ * the absence of a route a player failure (it is not: it is the reason there is nothing to play to).
+ */
+static void
+wait_for_route(double seconds)
+{
+	AVAudioSession *session = [AVAudioSession sharedInstance];
+	double started = now_seconds();
+	long outputs = log_audio_route("after activation");
+
+	while (outputs == 0 && now_seconds() - started < seconds) {
+		pump_main(0.25);
+		outputs = (long)[[session currentRoute] outputs].count;
+	}
+	if (outputs == 0) {
+		stage_say("the audio session has NO OUTPUT ROUTE after %.1f s: mediaserverd has no output "
+		    "device, so a player has nowhere to play to (the HAL plug-in did not load: see the HAL "
+		    "lines)", now_seconds() - started);
+		g_av_outputs = 0;
+	} else {
+		log_audio_route("with the device up");
+	}
+}
+
+/*
+ * Where the audio device has to come from, in the log: the audio server's plug-in directory of the
+ * system image (as old as the image -- the prebuilt ones name the bundle RedwoodAudio.driver, which
+ * this tree no longer ships), our own copy of it, and the kernel's device. A link whose target is
+ * missing is exactly TEST7's fault, so it is said in one line.
+ */
+static void
+hal_report(void)
+{
+	static const char *dirs[] = { "/System/Library/Audio/Plug-Ins/HAL", "/redwood/hal" };
+	struct stat st;
+
+	for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		DIR *dir = opendir(dirs[i]);
+		struct dirent *entry;
+		unsigned count = 0;
+
+		if (dir == NULL) {
+			stage_say("HAL %s: %s", dirs[i], strerror(errno));
+			continue;
+		}
+		while ((entry = readdir(dir)) != NULL && count < 16) {
+			char path[PATH_MAX], target[PATH_MAX], resolved[PATH_MAX];
+			ssize_t length;
+
+			if (entry->d_name[0] == '.') {
+				continue;
+			}
+			snprintf(path, sizeof(path), "%s/%s", dirs[i], entry->d_name);
+			length = readlink(path, target, sizeof(target) - 1);
+			if (length >= 0) {
+				target[length] = 0;
+				if (target[0] == '/') {
+					snprintf(resolved, sizeof(resolved), "%s", target);
+				} else {
+					snprintf(resolved, sizeof(resolved), "%s/%s", dirs[i], target);
+				}
+				stage_say("HAL %s: %s -> %s: %s", dirs[i], entry->d_name, target,
+				    access(resolved, R_OK) == 0 ? "present" : "MISSING (no such file)");
+			} else {
+				stage_say("HAL %s: %s", dirs[i], entry->d_name);
+			}
+			count++;
+		}
+		closedir(dir);
+		if (count == 0) {
+			stage_say("HAL %s: EMPTY: the audio server has nothing to load", dirs[i]);
+		}
+	}
+	stage_say("the kernel's /dev/hakios-audio: %s",
+	    stat("/dev/hakios-audio", &st) == 0 ? "present" : strerror(errno));
+}
+
 static unsigned long
 songs_count(unsigned long *without_filters)
 {
@@ -984,45 +1210,87 @@ log_error(const char *what, NSError *error)
 static int
 play_with_avplayer(NSURL *url, double seconds)
 {
-	AVPlayer *player = [AVPlayer playerWithURL:url];
+	AVPlayer *player;
 	AVPlayerItem *item = nil;
-	double last = 0;
-	int reached = 0;
+	char text[512];
+	double started, last_position = 0;
+	long last_status = -1;
+	int reached = 0, said_error = 0;
 
+	probe_asset(url);
+	player = [AVPlayer playerWithURL:url];
 	if (player == nil) {
 		stage_say("AVPlayer: playerWithURL gave nil");
 		return 0;
 	}
 	item = [player currentItem];
 	stage_say("AVPlayer: playing %s", [[url absoluteString] UTF8String]);
+	if (item != nil) {
+		stage_say("AVPlayer: item status %s (%ld), duration %.3f s, error %s",
+		    av_status_name((long)[item status]), (long)[item status],
+		    CMTimeGetSeconds([item duration]), error_text([item error], text, sizeof(text)));
+	}
 	[player play];
-	for (double elapsed = 0; elapsed < seconds; elapsed += 0.1) {
-		double position = CMTimeGetSeconds([player currentTime]);
+	started = now_seconds();
+	while (now_seconds() - started < seconds) {
+		double position;
 
-		usleep(100000);
-		if (item.status == AVPlayerItemStatusFailed) {
-			stage_say("AVPlayer: the item failed at %.2f s", position);
-			log_error("AVPlayer item error", [item error]);
-			break;
+		pump_main(0.1);
+		position = CMTimeGetSeconds([player currentTime]);
+		if (item == nil) {
+			continue;
 		}
-		if (position - last >= 1.0 || elapsed < 0.2) {
-			stage_say("AVPlayer: t=%.2f s, status=%ld, timeControlStatus=%ld, rate=%.1f, waiting=%s",
-			    position, (long)item.status, (long)[player timeControlStatus], (double)[player rate],
+		if ((long)[item status] != last_status) {
+			last_status = (long)[item status];
+			g_av_status = last_status;
+			stage_say("AVPlayer: item status is now %s (%ld) at t=%.2f s",
+			    av_status_name(last_status), last_status, position);
+		}
+		if ([item error] != nil) {
+			snprintf(g_av_error, sizeof(g_av_error), "%s",
+			    error_text([item error], text, sizeof(text)));
+			if (!said_error) {
+				said_error = 1;
+				stage_say("AVPlayer: the item's error: %s", g_av_error);
+				log_error_log(item);
+			}
+		}
+		if (position - last_position >= 1.0 || now_seconds() - started < 0.25) {
+			stage_say("AVPlayer: t=%.2f s, status=%s (%ld), timeControlStatus=%ld, rate=%.1f, "
+			    "waiting=%s, ranges=%lu, likely=%d", position,
+			    av_status_name((long)[item status]), (long)[item status],
+			    (long)[player timeControlStatus], (double)[player rate],
 			    [player reasonForWaitingToPlay] != nil ?
-			    [[player reasonForWaitingToPlay] UTF8String] : "(nothing)");
-			last = position;
+			    [[player reasonForWaitingToPlay] UTF8String] : "(nothing)",
+			    (unsigned long)[[item loadedTimeRanges] count],
+			    (int)[item isPlaybackLikelyToKeepUp]);
+			last_position = position;
 		}
 		if ([player timeControlStatus] == AVPlayerTimeControlStatusPlaying && position > 0.25) {
 			reached = 1;
-			stage_say("AVPlayer: playing at t=%.2f s after %.1f s", position, elapsed);
+			stage_say("AVPlayer: playing at t=%.2f s after %.1f s", position,
+			    now_seconds() - started);
+			break;
+		}
+		if ((long)[item status] == AVPlayerItemStatusFailed) {
+			stage_say("AVPlayer: the item failed at t=%.2f s", position);
 			break;
 		}
 	}
 	if (!reached) {
-		stage_say("AVPlayer: it did NOT reach the playing state (t=%.2f s, timeControlStatus=%ld, rate=%.1f)",
-		    CMTimeGetSeconds([player currentTime]), (long)[player timeControlStatus], (double)[player rate]);
-		if (item != nil && [item error] != nil) {
-			log_error("AVPlayer item error", [item error]);
+		stage_say("AVPlayer: it did NOT reach the playing state (t=%.2f s, status=%s (%ld), "
+		    "timeControlStatus=%ld, rate=%.1f)", CMTimeGetSeconds([player currentTime]),
+		    item != nil ? av_status_name((long)[item status]) : "no item",
+		    item != nil ? (long)[item status] : -1, (long)[player timeControlStatus],
+		    (double)[player rate]);
+		if (item != nil) {
+			g_av_status = (long)[item status];
+			if ([item error] != nil && !said_error) {
+				snprintf(g_av_error, sizeof(g_av_error), "%s",
+				    error_text([item error], text, sizeof(text)));
+				stage_say("AVPlayer: the item's error: %s", g_av_error);
+			}
+			log_error_log(item);
 		}
 	}
 	[player pause];
@@ -1060,7 +1328,7 @@ play_with_music_player(MPMediaItem *item, double seconds)
 		long state = (long)((NSInteger (*)(id, SEL))objc_msgSend)(player, @selector(playbackState));
 		double position = ((double (*)(id, SEL))objc_msgSend)(player, @selector(currentPlaybackTime));
 
-		usleep(100000);
+		pump_main(0.1);
 		if (elapsed < 0.2 || ((int)(elapsed * 10)) % 10 == 0) {
 			stage_say("MPMusicPlayerController: state=%ld t=%.2f s", state, position);
 		}
@@ -1097,6 +1365,9 @@ stage_music(double at, const char *source, const char *track_name)
 	if (!claim_stage()) {
 		return 0;
 	}
+	g_av_status = -1;
+	g_av_error[0] = 0;
+	g_av_outputs = -1;
 	wait_until(at);
 	/* it may well not be running yet: launchd starts it when the importer asks. This first look is
 	 * only for the log; the one that counts is after the import. */
@@ -1174,10 +1445,15 @@ stage_music(double at, const char *source, const char *track_name)
 			log_error("the playback audio session", audio_error);
 		}
 	}
+	/* where the output device has to come from, and whether it is there: TEST7's player had no route
+	 * at all, and nothing below could have played (the HAL plug-in was not loaded; see the report) */
+	hal_report();
+	wait_for_route(5.0);
 	if (item != nil && [item assetURL] != nil) {
 		played = play_with_avplayer([item assetURL], 12.0);
 		played_with = "AVPlayer";
 		if (!played) {
+			log_audio_route("after the ipod-library attempt failed");
 			played = play_with_music_player(item, 12.0);
 			played_with = played ? "MPMusicPlayerController" : "neither";
 		}
@@ -1200,9 +1476,10 @@ stage_music(double at, const char *source, const char *track_name)
 		played_with = "none";
 	}
 	stage_result(alive && import_ok && songs > 0 && played,
-	    "medialibraryd=%d imported=%s songs=%lu play=%s timeControlStatus=%s status=%s explicit=%s",
+	    "medialibraryd=%d imported=%s songs=%lu play=%s timeControlStatus=%s item=%s route=%ld explicit=%s",
 	    alive ? 1 : 0, import_ok ? "yes" : "no", songs, played_with,
-	    played ? "playing" : "not-playing", played ? "ok" : "failed",
+	    played ? "playing" : "not-playing",
+	    g_av_status < 0 ? "none" : av_status_name(g_av_status), g_av_outputs,
 	    explicit < 0 ? "unknown" : explicit ? "yes" : "no");
 	return alive && import_ok && songs > 0 && played;
 }
