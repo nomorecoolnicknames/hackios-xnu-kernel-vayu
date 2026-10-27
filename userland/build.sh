@@ -378,6 +378,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		mkdir -p root/lib/HakiosAudio.driver
 		cp obj/HakiosAudio root/lib/HakiosAudio.driver/
 		cp src/audio_plugin.plist root/lib/HakiosAudio.driver/Info.plist
+		# the system images (system-ru10) name this plug-in RedwoodAudio.driver -> /redwood/lib/RedwoodAudio.driver;
+		# without that name the link dangles and the HAL loads no device (no output, no input). One bundle, two names.
+		ln -sfn HakiosAudio.driver root/lib/RedwoodAudio.driver
 	fi
 	if [ -n "$GL" ]; then
 		# a PREBUILT build has none of these (../prebuilt/userland carries no Mesa, no gl_test):
