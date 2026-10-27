@@ -284,6 +284,29 @@ read_file(const char *path, char *out, size_t size)
 }
 
 /* The rest of the line that begins with NEEDLE (or follows it on the same line), trimmed. */
+/*
+ * One key=value of a single-line summary ("... storage=nil crashed=0 result=FAIL reason=no-storage-url").
+ * R17: fp_enable's summary is read for the fields the self-test needs to name the fault, not just PASS.
+ */
+static int
+summary_field(const char *summary, const char *key, char *out, size_t size)
+{
+	const char *where = summary != NULL ? strstr(summary, key) : NULL;
+	size_t length;
+
+	if (where == NULL || size == 0) {
+		return 0;
+	}
+	where += strlen(key);
+	length = strcspn(where, " \r\n");
+	if (length >= size) {
+		length = size - 1;
+	}
+	memcpy(out, where, length);
+	out[length] = '\0';
+	return 1;
+}
+
 static int
 line_after(const char *text, const char *needle, char *out, size_t size)
 {
@@ -758,8 +781,13 @@ stage_files(double at)
 	int listed = 0, enabled = 0, written = 0, seen = 0, mobile_seen = 0, exit_code, enable_exit = 0;
 	int again_exit = 0;
 	/* R16: fp_enable's own verdict (the provider object) next to fileproviderctl's list (the same object,
-	 * printed). summary_seen is what decides which one the stage believes. */
+	 * printed). summary_seen is what decides which one the stage believes. R17: the summary also carries
+	 * storage= (the daemon's document storage URL: yes/nil/unknown), crashed= (fileproviderd died under
+	 * the calls) and reason= (no-provider / no-storage-url / not-enabled / hidden / daemon-crashed), which
+	 * is what turns "known=0 enabled=-1" into a named fault. */
 	int summary_seen = 0, summary_ok = 0, summary_hidden = 0;
+	char summary_storage[16] = "unknown", summary_reason[32] = "";
+	int summary_crashed = 0;
 	int domain_ok;
 	int extension_running;
 
@@ -859,7 +887,25 @@ stage_files(double at)
 			summary_seen = 1;
 			summary_ok = strstr(summary, "result=PASS") != NULL;
 			summary_hidden = strstr(summary, "hidden=1") != NULL;
+			(void)summary_field(summary, "storage=", summary_storage, sizeof(summary_storage));
+			(void)summary_field(summary, "reason=", summary_reason, sizeof(summary_reason));
+			summary_crashed = strstr(summary, "crashed=1") != NULL;
 			stage_say("fp_enable's own verdict (R16, the provider object): %s", summary);
+			if (summary_crashed) {
+				stage_say("fileproviderd died under fp_enable's calls (R17): every read-back after that "
+				    "is Cocoa 4099 \"the connection ... was invalidated\", which an older fp_enable "
+				    "printed as known=0 enabled=-1. The abort is in the console log beside this line "
+				    "(\"- [NSFileManager createDirectoryAtURL:...]: URL is nil\" in TEST11) and the "
+				    "reason is in fp_enable's own output above.");
+			} else if (strcmp(summary_storage, "nil") == 0) {
+				stage_say("the daemon has no document storage URL for the provider (R17, storage=nil): "
+				    "FileProviderDaemon makes <documentStorageURL>/File Provider Storage before it "
+				    "starts a domain, so a domain created now cannot start -- this is the state in "
+				    "which the same call aborted fileproviderd in TEST11. fp_enable's preflight above "
+				    "printed the appex's NSExtensionFileProviderDocumentGroup, the group container and "
+				    "the appex's own com.apple.security.application-groups; those three are the chain "
+				    "the URL is resolved from.");
+			}
 		} else {
 			stage_say("fp_enable printed no summary line (an older binary): the fileproviderctl list below "
 			    "is the verdict");
@@ -946,6 +992,17 @@ stage_files(double at)
 	if (!seen && !mobile_seen) {
 		stage_say("the provider did not list its storage from either client (the \"Could not find a matching "
 		    "provider\" -2001 of the earlier diagnostics looks like this)");
+		/* R17: the owner's "it opened empty". An empty listing is only the extension's answer if the
+		 * storage itself has something in it: say how many entries are there, so "0 items because the
+		 * domain never started" and "0 items because the storage is empty" are told apart. */
+		if (directory[0] != '\0') {
+			NSArray *entries = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:
+			    [NSString stringWithUTF8String:directory] error:NULL];
+
+			stage_say("the storage itself (%s) holds %lu entr%s: an empty listing with files there means "
+			    "the extension did not enumerate, not that the storage is empty", directory,
+			    (unsigned long)[entries count], [entries count] == 1 ? "y" : "ies");
+		}
 	}
 	/*
 	 * R13: the same step again, later. Everything above took the files stage's own time (three
@@ -965,6 +1022,9 @@ stage_files(double at)
 			summary_seen = 1;
 			summary_ok = strstr(summary, "result=PASS") != NULL;
 			summary_hidden = strstr(summary, "hidden=1") != NULL;
+			(void)summary_field(summary, "storage=", summary_storage, sizeof(summary_storage));
+			(void)summary_field(summary, "reason=", summary_reason, sizeof(summary_reason));
+			summary_crashed = strstr(summary, "crashed=1") != NULL;
 			stage_say("fp_enable's own verdict, second process: %s", summary);
 		}
 		list2[0] = '\0';
@@ -986,14 +1046,35 @@ stage_files(double at)
 	 * it is empty for LocalStorage's default domain while the daemon is still using it. */
 	domain_ok = summary_seen ? summary_ok : (listed && enabled);
 	if (!domain_ok) {
-		stage_say("the provider is still not enabled and visible after fp_enable (two processes, the second "
-		    "one later): read its output above -- \"no connection to fileproviderd\" and \"no answer\" are "
-		    "different faults (this program's FileProvider link, then the daemon), \"the proxy says it does "
-		    "not answer\" means the call went out anyway (TEST8), an error 4 is a domain the daemon does not "
-		    "have (the fallback reset creates it), \"hidden=1\" without an error is the hidden default domain "
-		    "the daemon ignores at startup (R16: setHiddenByUser:NO did not take, its visibility may be "
-		    "fixed), and a domain that is listed and disabled is the daemon's own descriptor (see ls_rebuild "
-		    "above) -- then fileproviderd's log and whether LocalStorageFileProvider.appex is in the image");
+		if (summary_reason[0] != '\0') {
+			stage_say("files: the fault fp_enable named is reason=%s (summary above); domain=%s, provider=%s",
+			    summary_reason, listed ? (enabled ? "listed+enabled" : "listed+NOT-enabled") : "not listed",
+			    summary_seen ? (summary_ok ? "enabled+visible" : summary_hidden ? "enabled+hidden" :
+			    "not-enabled") : "unreported");
+		}
+		if (summary_crashed) {
+			stage_say("the provider is not enabled because fileproviderd DIED under the enable, not "
+			    "because it refused it (R17): the next pass finds a new pid and a domain list that is "
+			    "empty again, and its own calls answer Cocoa 4099. Look for the daemon's abort line in "
+			    "this log (\"*** Terminating app due to uncaught exception\") and the crash report "
+			    "fp_enable printed.");
+		} else if (strcmp(summary_storage, "nil") == 0) {
+			stage_say("the provider is not enabled because the daemon has no document storage URL for "
+			    "it (R17, storage=nil): the enable is not refused, there is nothing to start. This is "
+			    "the LocalStorage storage chain: the appex's NSExtensionFileProviderDocumentGroup "
+			    "(group.com.apple.FileProvider.LocalStorage), the appex's own signature "
+			    "com.apple.security.application-groups, and the group container the container manager "
+			    "hands to that identity -- fp_enable's preflight printed all three.");
+		} else {
+			stage_say("the provider is still not enabled and visible after fp_enable (two processes, the second "
+			    "one later): read its output above -- \"no connection to fileproviderd\" and \"no answer\" are "
+			    "different faults (this program's FileProvider link, then the daemon), \"the proxy says it does "
+			    "not answer\" means the call went out anyway (TEST8), an error 4 is a domain the daemon does not "
+			    "have, \"hidden=1\" without an error is the hidden default domain the daemon ignores at startup "
+			    "(R16: setHiddenByUser:NO did not take, its visibility may be fixed), and a domain that is "
+			    "listed and disabled is the daemon's own descriptor (see ls_rebuild above) -- then "
+			    "fileproviderd's log and whether LocalStorageFileProvider.appex is in the image");
+		}
 	} else if (summary_seen && summary_hidden) {
 		stage_say("the provider is enabled but hidden (R16): Files.app gets no location for it even though "
 		    "fp_enable's enable calls answered without an error -- this is the remaining fault to chase");
@@ -1004,18 +1085,20 @@ stage_files(double at)
 
 		if (path[0] != '\0' && stat(path, &status) == 0) {
 			snprintf(line, sizeof(line), "domain=%s+%s provider=%s fp_enable_exit=%d again_exit=%d file=%s "
-			    "size=%lld readback=%s provider_ls=%s", listed ? "listed" : "NOT-listed",
+			    "size=%lld readback=%s provider_ls=%s storage=%s crashed=%d reason=%s", listed ? "listed" : "NOT-listed",
 			    enabled ? "enabled" : "NOT-enabled",
 			    summary_seen ? (summary_ok ? "enabled+visible" : summary_hidden ? "enabled+hidden" :
 			    "not-enabled") : "unreported", enable_exit, again_exit, path,
-			    (long long)status.st_size, written ? "ok" : "no", seen ? "yes" : "NO");
+			    (long long)status.st_size, written ? "ok" : "no", seen ? "yes" : "NO", summary_storage,
+			    summary_crashed, summary_reason[0] != '\0' ? summary_reason : "unreported");
 		} else {
 			snprintf(line, sizeof(line), "domain=%s+%s provider=%s fp_enable_exit=%d again_exit=%d file=%s "
-			    "readback=%s provider_ls=%s", listed ? "listed" : "NOT-listed",
+			    "readback=%s provider_ls=%s storage=%s crashed=%d reason=%s", listed ? "listed" : "NOT-listed",
 			    enabled ? "enabled" : "NOT-enabled",
 			    summary_seen ? (summary_ok ? "enabled+visible" : summary_hidden ? "enabled+hidden" :
 			    "not-enabled") : "unreported", enable_exit, again_exit, path[0] != '\0' ? path : "(none)",
-			    written ? "ok" : "no", seen ? "yes" : "NO");
+			    written ? "ok" : "no", seen ? "yes" : "NO", summary_storage, summary_crashed,
+			    summary_reason[0] != '\0' ? summary_reason : "unreported");
 		}
 	}
 	stage_result(domain_ok && written && seen, "%s", line);

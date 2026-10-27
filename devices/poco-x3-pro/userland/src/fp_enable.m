@@ -118,7 +118,58 @@
  *    userEnabled, but the daemon cannot remove the default domain ("Default domain cannot be removed."),
  *    so it must not be the first move.
  *
- * usage: fp_enable [--wait[=SECONDS]] [--retry[=SECONDS]] [--trace] [--check] [--reset] [PROVIDER_ID]
+ * R17 (TEST11, log artifacts/vayu/test11-20261027/run/005834-run.log; "SELFTEST: [+ 191.92 s] files:
+ * fp_enable's own verdict ... known=0 enabled=-1 hidden=-1 domains=0 errors=3 result=FAIL" at :744668):
+ * the daemon does not merely fail the enable -- it DIES with it, and that is what "known=0 enabled=-1"
+ * is. The lines, 12 times between 00:58:57 and 01:02:27:
+ *
+ *   2026-10-28 00:58:57.439 fileproviderd[97:929] *** Terminating app due to uncaught exception
+ *       'NSInvalidArgumentException', reason: '*** -[NSFileManager createDirectoryAtURL:
+ *       withIntermediateDirectories:attributes:error:]: URL is nil'
+ *   (launchd) exited due to SIGABRT / process exited in a dirty state / service has crashed 1 times in a row
+ *
+ * one second after the daemon had spawned LocalStorageFileProvider (the extension is a process-scoped
+ * service of fileproviderd and is SIGKILLed with it: "exited due to SIGKILL ... during teardown of
+ * process-scoped services after host exited"). The call that precedes every abort is
+ * setEnabled:YES on the identifier NSFileProviderDomainDefaultIdentifier after the fallback
+ * removeAllDomains; the call that follows it answers 4099 "The connection to service named
+ * com.apple.FileProvider was invalidated from this process". FileProviderDaemon 16.5 builds a domain's
+ * root as <documentStorageURL>/File Provider Storage ("File Provider Storage" is in its __cstring at
+ * 0x1c3d0f003; the directory is made with createDirectoryAtURL at 0x1c3caecfc, in the method that also
+ * logs "Error preparing documentStorage directory %@ for provider %@: %@"), and this daemon's
+ * documentStorageURL for LocalStorage is nil all run long: every provider object it ever printed in
+ * TEST11 says `url:(null) db:(null)`, while TEST10's said `<GroupContainers>/8128A991-.../File Provider
+ * Storage` -- that is the difference between the two runs. A nil URL + URLByAppendingPathComponent: is
+ * nil, and createDirectoryAtURL: with a nil URL raises exactly the exception above.
+ *
+ * The document group itself is not the problem: the appex ships
+ * NSExtensionFileProviderDocumentGroup = group.com.apple.FileProvider.LocalStorage, and its own signature
+ * (the system image's binary, LC_CODE_SIGNATURE -> SuperBlob -> CSSLOT_ENTITLEMENTS) carries
+ * com.apple.security.application-groups with that group and application-identifier
+ * com.apple.FileProvider.LocalStorage. The daemon resolves the group container for the extension's
+ * identity (it has com.apple.private.MobileContainerManager.otherIdLookup, and its own
+ * com.apple.security.application-groups names only group.com.apple.FileProvider.ReadOnly); until that
+ * resolution answers, the domain cannot be started, so creating one is the one action that turns a
+ * missing URL into a dead daemon.
+ *
+ * So this version separates the two jobs:
+ *  - it never creates a domain unless --create is asked for. Enabling a domain that exists is the path
+ *    Files.app takes (setEnabled:forDomainIdentifier:providerIdentifier: on the identifier the daemon
+ *    itself lists, no removeAllDomains), and it cannot abort the daemon. When the provider is known but
+ *    reports url:(null), the pass says "storage=nil", explains it and stops -- with the daemon alive.
+ *  - the preflight prints what the storage resolution needs and creates what a fresh /var lacks: the
+ *    appex's document group and its entitlements out of its own code signature, the group container and
+ *    its container-manager metadata, <group>/File Provider Storage, and the daemon's per-provider state
+ *    directory under /var/mobile/Library/Application Support/FileProvider.
+ *  - it watches fileproviderd's pid across the calls that can restart it and reports a death
+ *    ("fileproviderd died: pid N -> M") instead of letting the next readback call it "unknown"
+ *    (known=0/-1 is a dead connection, not a provider the daemon does not have); the crash report is
+ *    printed when there is one.
+ *  - the summary line keeps its fields and gains storage= and crashed=, which is what the self-test
+ *    needs to tell "no storage URL" (the daemon cannot start a domain) from "not enabled" (a state) and
+ *    from "the daemon died under the call" (a crash).
+ *
+ * usage: fp_enable [--wait[=SECONDS]] [--retry[=SECONDS]] [--trace] [--check] [--create] [--reset] [PROVIDER_ID]
  *        --wait    wait up to SECONDS (default 30) for fileproviderd to answer before doing anything: the
  *                  unattended self-test calls this at +45 s and launchd may be starting the daemon on this
  *                  very first connection (the call itself makes the daemon run), so "no connection yet" is
@@ -127,10 +178,14 @@
  *                  SECONDS (default 120) have gone by; the domain, its extension and the daemon's own state
  *                  are all allowed to settle late
  *        --check   look only (domains, provider); change nothing
+ *        --create  allow the pass to CREATE the provider's default domain (removeAllDomains, the daemon's
+ *                  _recreateDefaultDomainIfNeeded path). Off by default since R17: on a provider whose
+ *                  document storage URL is nil that call aborts fileproviderd (TEST11). Only useful once
+ *                  the preflight shows the group container resolving for the extension.
  *        --reset   ask the daemon to remove this provider's domains before the pass even when one is
- *                  listed (LocalStorage only: its files stay in the app group, and the daemon re-creates
- *                  the default domain; it cannot remove the default domain itself, but the call also
- *                  lifts userEnabled -- see R16 above)
+ *                  listed (implies --create; LocalStorage only: its files stay in the app group, and the
+ *                  daemon re-creates the default domain; it cannot remove the default domain itself, but
+ *                  the call also lifts userEnabled -- see R16 above)
  *        --restart[=SECONDS]  when a pass ends with no enabled, visible provider and no error, stop
  *                  fileproviderd (SIGTERM, SIGKILL after SECONDS, default 20) and make launchd spawn a new
  *                  one, then repeat the pass: a daemon that started before LaunchServices/pkd held the
@@ -152,6 +207,7 @@
 #include <grp.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -716,11 +772,51 @@ domain_identifier(id domain)
  * daemon may not list a hidden default domain at all (see the R16 note in the header), so this is the
  * verdict the pass uses. Returns NO when the daemon has no provider object for the identifier.
  */
+/*
+ * Does the provider object have a document storage URL? The daemon renders it into the description it
+ * returns ("url:<GroupContainers>/…" or "url:(null)"), and that is the field a domain is started from:
+ * FPDDomain makes <documentStorageURL>/File Provider Storage before it starts the extension, and a nil
+ * URL there is the NSInvalidArgumentException of TEST11 (R17). 1: there is one, 0: there is not,
+ * -1: the object did not say.
+ */
+static int
+provider_url_state(id object)
+{
+	NSString *text;
+
+	if (object == nil) {
+		return -1;
+	}
+	@try {
+		id url = nil;
+
+		for (NSString *key in @[ @"documentStorageURL", @"url" ]) {
+			if ([object respondsToSelector:NSSelectorFromString(key)]) {
+				url = [object valueForKey:key];
+				break;
+			}
+		}
+		if (url != nil && url != [NSNull null]) {
+			return 1;
+		}
+	} @catch (NSException *exception) {
+		(void)exception;
+	}
+	text = [object description] ?: @"";
+	if ([text rangeOfString:@"url:(null)"].location != NSNotFound) {
+		return 0;
+	}
+	if ([text rangeOfString:@"url:"].location != NSNotFound) {
+		return 1;
+	}
+	return -1;
+}
+
 static BOOL
-provider_flags(id daemon, NSString *provider, int *out_enabled, int *out_hidden, const char *when)
+provider_flags(id daemon, NSString *provider, int *out_enabled, int *out_hidden, int *out_url, const char *when)
 {
 	__block BOOL known = NO;
-	__block int enabled = -1, hidden = -1;
+	__block int enabled = -1, hidden = -1, url_state = -1;
 	dispatch_semaphore_t done = dispatch_semaphore_create(0);
 
 	if (out_enabled != NULL) {
@@ -728,6 +824,9 @@ provider_flags(id daemon, NSString *provider, int *out_enabled, int *out_hidden,
 	}
 	if (out_hidden != NULL) {
 		*out_hidden = -1;
+	}
+	if (out_url != NULL) {
+		*out_url = -1;
 	}
 	proxy_claims(daemon, @selector(providerDomainForIdentifier:completionHandler:),
 	    "providerDomainForIdentifier:completionHandler:");
@@ -745,6 +844,7 @@ provider_flags(id daemon, NSString *provider, int *out_enabled, int *out_hidden,
 				if ([object respondsToSelector:NSSelectorFromString(@"isHidden")]) {
 					hidden = [[object valueForKey:@"isHidden"] boolValue] ? 1 : 0;
 				}
+				url_state = provider_url_state(object);
 			}
 			if (error != nil) {
 				fprintf(stderr, "fp_enable: %s: providerDomainForIdentifier: %s\n", when,
@@ -765,6 +865,9 @@ provider_flags(id daemon, NSString *provider, int *out_enabled, int *out_hidden,
 	}
 	if (out_hidden != NULL) {
 		*out_hidden = hidden;
+	}
+	if (out_url != NULL) {
+		*out_url = url_state;
 	}
 	return known;
 }
@@ -1130,15 +1233,207 @@ group_container_path(NSString *group)
 	return nil;
 }
 
+/* ---- R17: what the daemon needs before a domain can start ---- */
+
+static uint32_t
+be32(const uint8_t *bytes)
+{
+	return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) | bytes[3];
+}
+
+/*
+ * The entitlements a Mach-O carries in its own code signature: LC_CODE_SIGNATURE -> SuperBlob ->
+ * CSSLOT_ENTITLEMENTS (5), an XML plist. The signature is what the system believes about an image, so
+ * this is the answer to "may the appex use its document group" -- the Info.plist only names the group.
+ * The SuperBlob and its index are big-endian (code signing format), the Mach-O header is not.
+ * Returns nil with a reason when there is no signature to read.
+ */
+static NSDictionary *
+macho_entitlements(NSString *path, const char **out_why)
+{
+	static const uint32_t mach_header_64_magic = 0xfeedfacf, lc_code_signature = 0x1d;
+	NSData *data = [NSData dataWithContentsOfFile:path];
+	const uint8_t *bytes;
+	NSUInteger length, offset;
+	uint32_t ncmds, index;
+	NSDictionary *result = nil;
+
+	if (out_why != NULL) {
+		*out_why = "the file is not there";
+	}
+	if (data == nil) {
+		return nil;
+	}
+	bytes = [data bytes];
+	length = [data length];
+	if (length < 32 || ((const uint32_t *)bytes)[0] != mach_header_64_magic) {
+		if (out_why != NULL) {
+			*out_why = "not a 64-bit Mach-O";
+		}
+		return nil;
+	}
+	ncmds = ((const uint32_t *)bytes)[4];
+	offset = 32;
+	for (index = 0; index < ncmds && offset + 8 <= length; index++) {
+		uint32_t cmd = ((const uint32_t *)bytes)[offset / 4];
+		uint32_t size = ((const uint32_t *)bytes)[offset / 4 + 1];
+
+		if (size < 8 || offset + size > length) {
+			break;
+		}
+		if (cmd == lc_code_signature && size >= 16) {
+			uint32_t dataoff = ((const uint32_t *)bytes)[offset / 4 + 2];
+			uint32_t datasize = ((const uint32_t *)bytes)[offset / 4 + 3];
+
+			if ((NSUInteger)dataoff + datasize > length || datasize < 20) {
+				if (out_why != NULL) {
+					*out_why = "the LC_CODE_SIGNATURE range is outside the file";
+				}
+			} else if (be32(bytes + dataoff) != 0xfade0cc0u) {
+				if (out_why != NULL) {
+					*out_why = "the code signature is not a SuperBlob";
+				}
+			} else {
+				uint32_t count = be32(bytes + dataoff + 8), slot;
+
+				for (slot = 0; slot < count; slot++) {
+					uint32_t type, at, blob_length;
+					NSData *xml;
+
+					if (12 + (slot + 1) * 8 > datasize) {
+						break;
+					}
+					type = be32(bytes + dataoff + 12 + slot * 8);
+					at = be32(bytes + dataoff + 16 + slot * 8);
+					if (type != 5 || (NSUInteger)at + 8 > datasize ||
+					    be32(bytes + dataoff + at) != 0xfade7171u) {
+						continue;
+					}
+					blob_length = be32(bytes + dataoff + at + 4);
+					if (blob_length <= 8 || (NSUInteger)at + blob_length > datasize) {
+						continue;
+					}
+					xml = [NSData dataWithBytes:bytes + dataoff + at + 8 length:blob_length - 8];
+					result = [NSPropertyListSerialization propertyListWithData:xml
+					    options:NSPropertyListImmutable format:NULL error:NULL];
+					if (result == nil && out_why != NULL) {
+						*out_why = "the entitlements blob is not a plist";
+					}
+					break;
+				}
+			}
+		}
+		offset += size;
+	}
+	if (result == nil && out_why != NULL && *out_why == NULL) {
+		*out_why = "no LC_CODE_SIGNATURE in the file";
+	}
+	return result;
+}
+
+/* The three things the daemon's documentStorageURL is made of, printed where a run can see them. */
+static void
+say_appex_storage(NSString *appex)
+{
+	NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+	    [appex stringByAppendingPathComponent:@"Info.plist"]];
+	NSDictionary *extension = info[@"NSExtension"];
+	NSString *executable = info[@"CFBundleExecutable"];
+	NSString *group = extension[@"NSExtensionFileProviderDocumentGroup"];
+	NSDictionary *entitlements;
+	const char *why = NULL;
+	id groups;
+
+	fprintf(stderr, "fp_enable: storage: NSExtensionFileProviderDocumentGroup = %s\n",
+	    group != nil ? [group UTF8String] : "(absent: the daemon has no document storage for this "
+	    "extension at all -- see the \"key not found in Info.plist\" line FileProviderDaemon logs)");
+	fprintf(stderr, "fp_enable: storage: NSExtensionFileProviderSupportsEnumeration = %s\n",
+	    extension[@"NSExtensionFileProviderSupportsEnumeration"] != nil
+	    ? ([extension[@"NSExtensionFileProviderSupportsEnumeration"] boolValue] ? "true" : "false")
+	    : "absent");
+	if (executable == nil) {
+		fprintf(stderr, "fp_enable: storage: the appex names no CFBundleExecutable; its signature cannot be "
+		    "read\n");
+		return;
+	}
+	entitlements = macho_entitlements([appex stringByAppendingPathComponent:executable], &why);
+	if (entitlements == nil) {
+		fprintf(stderr, "fp_enable: storage: %s: %s\n", [executable UTF8String], why != NULL ? why : "no "
+		    "entitlements");
+		return;
+	}
+	fprintf(stderr, "fp_enable: storage: the appex's signature: application-identifier = %s\n",
+	    [entitlements[@"application-identifier"] isKindOfClass:[NSString class]]
+	    ? [entitlements[@"application-identifier"] UTF8String] : "(none)");
+	groups = entitlements[@"com.apple.security.application-groups"];
+	fprintf(stderr, "fp_enable: storage: the appex's signature: com.apple.security.application-groups = %s\n",
+	    [groups isKindOfClass:[NSArray class]]
+	    ? [[groups componentsJoinedByString:@", "] UTF8String] : "(none: MCM cannot give the extension its "
+	    "group container and the daemon's documentStorageURL is nil)");
+	fprintf(stderr, "fp_enable: storage: the appex's signature: app-sandbox = %s\n",
+	    entitlements[@"com.apple.security.app-sandbox"] != nil
+	    ? ([entitlements[@"com.apple.security.app-sandbox"] boolValue] ? "true" : "false") : "absent");
+	if (group != nil && [groups isKindOfClass:[NSArray class]] && ![groups containsObject:group]) {
+		fprintf(stderr, "fp_enable: storage: the document group %s is NOT in the appex's signature: the daemon "
+		    "resolves the group container for the extension's identity, so this is exactly the state where "
+		    "a domain it creates cannot be started (R17)\n", [group UTF8String]);
+	}
+}
+
+/*
+ * The group container as the container manager records it: the directory is not enough, its metadata
+ * plist is the identity MCM answers lookups from (MCMMetadataIdentifier is the group, MCMMetadataUUID
+ * is the container MCM will hand out). A directory made by hand without this is a path, not a container.
+ */
+static void
+say_group_metadata(NSString *group)
+{
+	static const char *const metadata_name = ".com.apple.mobile_container_manager.metadata.plist";
+	NSString *path = group_container_path(group);
+	NSDictionary *metadata;
+	struct stat status;
+
+	if (path == nil) {
+		fprintf(stderr, "fp_enable: storage: no app group container carries MCMMetadataIdentifier %s\n",
+		    [group UTF8String]);
+		return;
+	}
+	fprintf(stderr, "fp_enable: storage: the app group container: %s\n", [path UTF8String]);
+	if (stat([path fileSystemRepresentation], &status) == 0) {
+		fprintf(stderr, "fp_enable: storage:   owner %d:%d mode %o\n", (int)status.st_uid,
+		    (int)status.st_gid, status.st_mode & 07777);
+	}
+	metadata = [NSDictionary dictionaryWithContentsOfFile:[path stringByAppendingPathComponent:
+	    [NSString stringWithUTF8String:metadata_name]]];
+	for (NSString *key in @[ @"MCMMetadataIdentifier", @"MCMMetadataUUID", @"MCMMetadataSerialNumber",
+	    @"MCMMetadataInfoPlist" ]) {
+		id value = metadata[key];
+
+		if (value != nil) {
+			NSString *text = [value description];
+
+			fprintf(stderr, "fp_enable: storage:   %s = %s\n", [key UTF8String],
+			    [[text substringToIndex:MIN((NSUInteger)300, [text length])] UTF8String]);
+		}
+	}
+}
+
+/* fileproviderd's own per-provider state directory (entitled by home-relative-path.read-write). */
+static NSString *
+support_directory(NSString *provider)
+{
+	return [@"/var/mobile/Library/Application Support/FileProvider" stringByAppendingPathComponent:provider];
+}
+
 /* The LocalStorage extension's document storage: app group + "File Provider Storage" (media_import does the same). */
 static void
-ensure_storage(void)
+ensure_storage(NSString *provider)
 {
 	NSFileManager *manager = [NSFileManager defaultManager];
 	NSURL *container = [manager containerURLForSecurityApplicationGroupIdentifier:
 	    @"group.com.apple.FileProvider.LocalStorage"];
 	NSError *error = nil;
-	NSString *directory;
+	NSString *directory, *support;
 
 	fprintf(stderr, "fp_enable: group group.com.apple.FileProvider.LocalStorage: %s\n",
 	    container ? [[container path] UTF8String] : "(none)");
@@ -1151,17 +1446,45 @@ ensure_storage(void)
 	}
 	if (container == nil || [[container path] length] == 0) {
 		fprintf(stderr, "fp_enable: group group.com.apple.FileProvider.LocalStorage: (none)\n");
-		return;
-	}
-	directory = [[container path] stringByAppendingPathComponent:@"File Provider Storage"];
-	if (![manager fileExistsAtPath:directory]) {
-		if ([manager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:&error]) {
-			fprintf(stderr, "fp_enable: made %s\n", [directory UTF8String]);
+	} else {
+		directory = [[container path] stringByAppendingPathComponent:@"File Provider Storage"];
+		if (![manager fileExistsAtPath:directory]) {
+			if ([manager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil
+			    error:&error]) {
+				fprintf(stderr, "fp_enable: made %s\n", [directory UTF8String]);
+			} else {
+				fprintf(stderr, "fp_enable: %s: %s\n", [directory UTF8String],
+				    [[error description] UTF8String]);
+			}
 		} else {
-			fprintf(stderr, "fp_enable: %s: %s\n", [directory UTF8String], [[error description] UTF8String]);
+			fprintf(stderr, "fp_enable: %s is there\n", [directory UTF8String]);
+		}
+	}
+	/*
+	 * R17: the daemon's own state directory for this provider. It is where fileproviderd keeps the
+	 * domain records (its entitlement home-relative-path.read-write names
+	 * /Library/Application Support/FileProvider/), and a fresh /var does not have it; the boot script
+	 * that used to make it is not part of this program, so a probe started without that script found no
+	 * directory and no storage. Made here, by the same program that asks for the domain.
+	 */
+	support = support_directory(provider);
+	if (![manager fileExistsAtPath:support]) {
+		if ([manager createDirectoryAtPath:support withIntermediateDirectories:YES attributes:nil
+		    error:&error]) {
+			fprintf(stderr, "fp_enable: made %s\n", [support UTF8String]);
+		} else {
+			fprintf(stderr, "fp_enable: %s: %s\n", [support UTF8String], [[error description] UTF8String]);
 		}
 	} else {
-		fprintf(stderr, "fp_enable: %s is there\n", [directory UTF8String]);
+		fprintf(stderr, "fp_enable: %s is there\n", [support UTF8String]);
+	}
+	{
+		struct stat status;
+
+		if (stat([support fileSystemRepresentation], &status) == 0) {
+			fprintf(stderr, "fp_enable: the daemon's state directory: owner %d:%d mode %o\n",
+			    (int)status.st_uid, (int)status.st_gid, status.st_mode & 07777);
+		}
 	}
 }
 
@@ -1173,6 +1496,7 @@ struct pass_result {
 	int		enabled;		/* domains the list calls userEnabled */
 	int		provider_enabled;	/* the provider object's isEnabled */
 	int		provider_hidden;	/* the provider object's isHidden (the "userHidden" of its description) */
+	int		provider_url;		/* the provider object's document storage URL: 1 there, 0 nil, -1 unknown */
 	BOOL		provider_known;
 	int		failures;
 };
@@ -1215,11 +1539,93 @@ read_state(id daemon, NSString *provider, struct pass_result *result, const char
 	result->domains = [domains count];
 	result->enabled = enabled_count(domains);
 	result->provider_known = provider_flags(daemon, provider, &result->provider_enabled,
-	    &result->provider_hidden, when);
-	fprintf(stderr, "fp_enable: %s: provider object: known=%s enabled=%d hidden=%d\n", when,
-	    result->provider_known ? "yes" : "NO", result->provider_enabled, result->provider_hidden);
+	    &result->provider_hidden, &result->provider_url, when);
+	fprintf(stderr, "fp_enable: %s: provider object: known=%s enabled=%d hidden=%d storage=%s\n", when,
+	    result->provider_known ? "yes" : "NO", result->provider_enabled, result->provider_hidden,
+	    result->provider_url == 1 ? "yes" : result->provider_url == 0 ? "nil" : "unknown");
 	if (out_domains != NULL) {
 		*out_domains = domains;
+	}
+}
+
+/* R17: the pid fileproviderd has right now (0 when there is none). */
+static pid_t
+daemon_pid_now(void)
+{
+	pid_t pid = 0;
+
+	(void)daemon_processes(&pid);
+	return pid;
+}
+
+/*
+ * R17: a call that can make the daemon create or start a domain is also a call that can end it. The
+ * read-backs that follow a death answer Cocoa 4099 ("the connection ... was invalidated"), which the
+ * self-test printed as known=0 enabled=-1 -- a fact about the connection, not about the provider. Say
+ * which call it was, and let the pass stop reading a daemon that is gone.
+ */
+static BOOL
+note_daemon_death(pid_t before, const char *when)
+{
+	pid_t after = daemon_pid_now();
+
+	if (before > 0 && after == before) {
+		return NO;
+	}
+	if (before == 0 && after > 0) {
+		/* launchd started it during the call: not a death */
+		return NO;
+	}
+	fprintf(stderr, "fp_enable: fileproviderd died %s: pid %d -> %d%s\n", when, (int)before, (int)after,
+	    after > 0 ? " (launchd started a new one)" : " (no process now)");
+	return YES;
+}
+
+/* R17: the crash report, when ReportCrash wrote one (it does not always run on this image). */
+static void
+say_crash_reports(void)
+{
+	NSFileManager *files = [NSFileManager defaultManager];
+	NSMutableArray *paths = [NSMutableArray array];
+	NSString *newest = nil;
+	NSDate *newest_date = nil;
+	NSData *data;
+	NSString *text;
+	NSArray *lines;
+
+	for (NSString *root in @[ @"/var/mobile/Library/Logs/CrashReporter",
+	    @"/var/mobile/Library/Logs/CrashReporter/DiagnosticLogs" ]) {
+		for (NSString *entry in [files contentsOfDirectoryAtPath:root error:NULL]) {
+			if ([entry rangeOfString:@"fileproviderd"].location != NSNotFound) {
+				[paths addObject:[root stringByAppendingPathComponent:entry]];
+			}
+		}
+	}
+	if ([paths count] == 0) {
+		fprintf(stderr, "fp_enable: crash reports: no fileproviderd report under "
+		    "/var/mobile/Library/Logs/CrashReporter (ReportCrash did not write one; the abort line is on "
+		    "the console)\n");
+		return;
+	}
+	for (NSString *path in paths) {
+		NSDictionary *attributes = [files attributesOfItemAtPath:path error:NULL];
+		NSDate *date = attributes[NSFileModificationDate];
+
+		if (newest == nil || (date != nil && newest_date != nil && [date compare:newest_date] == NSOrderedDescending)) {
+			newest = path;
+			newest_date = date;
+		}
+	}
+	fprintf(stderr, "fp_enable: crash reports: %lu fileproviderd report(s), newest %s\n",
+	    (unsigned long)[paths count], [newest UTF8String]);
+	data = [NSData dataWithContentsOfFile:newest];
+	text = data != nil ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+	if (text == nil) {
+		return;
+	}
+	lines = [text componentsSeparatedByString:@"\n"];
+	for (NSUInteger i = [lines count] > 60 ? [lines count] - 60 : 0; i < [lines count]; i++) {
+		fprintf(stderr, "fp_enable: crash report: %s\n", [lines[i] UTF8String]);
 	}
 }
 
@@ -1244,21 +1650,51 @@ read_state(id daemon, NSString *provider, struct pass_result *result, const char
  *    it lifts userEnabled -- but the daemon cannot remove the default domain, so it is not the first move.
  */
 static struct pass_result
-enable_pass(id daemon, NSString *provider, BOOL reset, BOOL check)
+enable_pass(id daemon, NSString *provider, BOOL reset, BOOL check, BOOL create)
 {
-	struct pass_result result = { 0, 0, -1, -1, NO, 0 };
+	struct pass_result result = { 0, 0, -1, -1, -1, NO, 0 };
 	NSArray *domains = nil;
-	BOOL recreated = NO;
+	BOOL recreated = NO, died = NO;
 	NSString *identifier;
+	pid_t pid_before;
 
 	show_provider(daemon, provider, "provider");
 	read_state(daemon, provider, &result, "before", &domains);
 	if (check) {
 		show_provider(daemon, provider, "after (no change)");
-		fprintf(stderr, "fp_enable: --check: provider enabled=%d hidden=%d, %d of %lu listed domain(s) enabled\n",
-		    result.provider_enabled, result.provider_hidden, result.enabled, (unsigned long)result.domains);
+		fprintf(stderr, "fp_enable: --check: provider enabled=%d hidden=%d storage=%s, %d of %lu listed "
+		    "domain(s) enabled\n", result.provider_enabled, result.provider_hidden,
+		    result.provider_url == 1 ? "yes" : result.provider_url == 0 ? "nil" : "unknown",
+		    result.enabled, (unsigned long)result.domains);
 		return result;
 	}
+	/*
+	 * R17: the state that aborts fileproviderd. A provider whose document storage URL is nil cannot be
+	 * started: FPDDomain appends "File Provider Storage" to that URL and calls createDirectoryAtURL: with
+	 * it, and a nil URL there raises NSInvalidArgumentException (TEST11: the daemon died 1 s after it
+	 * spawned the extension, 12 times). removeAllDomains/setEnabled are what make it try, so neither is
+	 * sent unless --create says the experiment is wanted. This is also the honest answer to the
+	 * self-test: "known=0 enabled=-1" is a daemon that died under the call, not a provider the daemon
+	 * does not have.
+	 */
+	if (!create && result.provider_known && result.provider_url == 0) {
+		fprintf(stderr, "fp_enable: storage=nil: the daemon knows %s but has no document storage URL for "
+		    "it (url:(null) in the provider object above). A domain it creates cannot be started -- "
+		    "FileProviderDaemon makes <documentStorageURL>/File Provider Storage with "
+		    "createDirectoryAtURL: and a nil URL raises NSInvalidArgumentException, which is the abort "
+		    "TEST11 shows (fileproviderd[n]: '... URL is nil', then SIGABRT and a new pid). The enable "
+		    "and the reset are skipped, and fileproviderd is left alive: doing either here is what "
+		    "kills it and turns the next read-back into the 4099/known=0 of TEST11. The storage comes "
+		    "from the appex's NSExtensionFileProviderDocumentGroup and the group container the daemon "
+		    "resolves for the extension's identity; the preflight above prints both, and --create runs "
+		    "the old pass anyway.\n", [provider UTF8String]);
+		fprintf(stderr, "fp_enable: summary: provider=%s known=%d enabled=%d hidden=%d domains=%lu "
+		    "errors=%d storage=nil crashed=0 result=FAIL reason=no-storage-url\n",
+		    [provider UTF8String], result.provider_known ? 1 : 0, result.provider_enabled,
+		    result.provider_hidden, (unsigned long)result.domains, result.failures);
+		return result;
+	}
+	pid_before = daemon_pid_now();
 	if (reset) {
 		NSError *failure;
 		BOOL sent = NO;
@@ -1271,63 +1707,98 @@ enable_pass(id daemon, NSString *provider, BOOL reset, BOOL check)
 		say_error("removeAllDomains error", failure, 0);
 		recreated = YES;
 		sleep(1);
+		died = note_daemon_death(pid_before, "after removeAllDomains (--reset)");
 		read_state(daemon, provider, &result, "after the reset", &domains);
 	}
 	identifier = target_domain_identifier(domains);
 	fprintf(stderr, "fp_enable: the domain identifier the enable/unhide calls will use: \"%s\"%s\n",
 	    [identifier UTF8String], [identifier length] == 0 ? " (the default domain, R16)" : "");
 	/* the toggle itself: one call for the domain, whatever the daemon says the state is; an "already
-	 * enabled" no-op costs one message and keeps the path the same for every state */
+	 * enabled" no-op costs one message and keeps the path the same for every state. This is the call
+	 * Files.app makes (setEnabled:forDomainIdentifier:providerIdentifier:); it creates nothing. */
 	if (result.provider_enabled != 1 || result.domains == 0) {
 		result.failures += set_enabled(daemon, provider, identifier) != 0;
+		died = note_daemon_death(pid_before, "after setEnabled:YES") || died;
 	}
 	if (result.provider_known && result.provider_hidden == 1) {
 		result.failures += set_hidden_by_user(daemon, provider, identifier, NO) != 0;
+		died = note_daemon_death(pid_before, "after setHiddenByUser:NO") || died;
 	}
-	read_state(daemon, provider, &result, "after the enable and the unhide", &domains);
-	if (result.provider_enabled != 1 && ![identifier isEqualToString:provider]) {
+	if (!died) {
+		read_state(daemon, provider, &result, "after the enable and the unhide", &domains);
+	}
+	if (!died && result.provider_enabled != 1 && ![identifier isEqualToString:provider]) {
 		/* one more attempt with the provider's own identifier: it costs nothing and covers a daemon
 		 * that keys a legacy provider-wide toggle by provider instead of by domain (the three guesses
 		 * fp_enable 15:18 sent were this, the provider id and the empty string) */
 		fprintf(stderr, "fp_enable: still not enabled with \"%s\"; one more attempt with the provider "
 		    "identifier as the domain identifier\n", [identifier UTF8String]);
 		result.failures += set_enabled(daemon, provider, provider) != 0;
-		read_state(daemon, provider, &result, "after the second enable", &domains);
+		died = note_daemon_death(pid_before, "after the second setEnabled:YES") || died;
+		if (!died) {
+			read_state(daemon, provider, &result, "after the second enable", &domains);
+		}
 	}
-	if (result.provider_known && result.provider_hidden == 1 && ![identifier isEqualToString:provider]) {
+	if (!died && result.provider_known && result.provider_hidden == 1 &&
+	    ![identifier isEqualToString:provider]) {
 		result.failures += set_hidden_by_user(daemon, provider, provider, NO) != 0;
-		read_state(daemon, provider, &result, "after the second unhide", &domains);
+		died = note_daemon_death(pid_before, "after the second setHiddenByUser:NO") || died;
+		if (!died) {
+			read_state(daemon, provider, &result, "after the second unhide", &domains);
+		}
 	}
 	/* The daemon does not know the provider (no object at all): the default domain has never been
 	 * created for this provider. removeAllDomains is the daemon's own way to make it create one. Done
-	 * once, and only in that state -- not as a first move (R16). */
-	if ((!result.provider_known || (result.provider_enabled != 1 && result.domains == 0)) && !recreated) {
+	 * once, only in that state, and only when it cannot abort the daemon: --create asks for it, and a
+	 * provider object that reports a document storage URL is the proof that the domain it creates has a
+	 * directory to start from (R17; TEST11's provider said url:(null) and this call killed it). */
+	if (!died && (create || result.provider_url == 1) &&
+	    (!result.provider_known || (result.provider_enabled != 1 && result.domains == 0)) && !recreated) {
 		NSError *failure;
 		BOOL sent = NO;
 
 		fprintf(stderr, "fp_enable: the daemon has %s; asking it to (re)create the default domain "
-		    "(removeAllDomains, the daemon's own _recreateDefaultDomainIfNeeded path)\n",
+		    "(removeAllDomains, the daemon's own _recreateDefaultDomainIfNeeded path; --create)\n",
 		    result.provider_known ? "no enabled domain" : "no provider object");
 		failure = remove_all_domains(daemon, provider, &sent);
 		fprintf(stderr, "fp_enable: removeAllDomains (fallback): %s%s\n",
 		    failure ? [[failure description] UTF8String] : "done", sent ? "" : " (not sent)");
 		say_error("removeAllDomains (fallback) error", failure, 0);
 		sleep(1);
-		read_state(daemon, provider, &result, "after the fallback", &domains);
-		identifier = target_domain_identifier(domains);
-		if (result.provider_enabled != 1) {
-			result.failures += set_enabled(daemon, provider, identifier) != 0;
+		died = note_daemon_death(pid_before, "after removeAllDomains (fallback)");
+		if (!died) {
+			read_state(daemon, provider, &result, "after the fallback", &domains);
+			identifier = target_domain_identifier(domains);
+			if (result.provider_enabled != 1) {
+				result.failures += set_enabled(daemon, provider, identifier) != 0;
+				died = note_daemon_death(pid_before, "after the enable of the new domain") || died;
+			}
+			if (!died && result.provider_known && result.provider_hidden == 1) {
+				result.failures += set_hidden_by_user(daemon, provider, identifier, NO) != 0;
+				died = note_daemon_death(pid_before, "after the unhide of the new domain") || died;
+			}
+			if (!died) {
+				read_state(daemon, provider, &result, "at the end", &domains);
+			}
 		}
-		if (result.provider_known && result.provider_hidden == 1) {
-			result.failures += set_hidden_by_user(daemon, provider, identifier, NO) != 0;
-		}
-		read_state(daemon, provider, &result, "at the end", &domains);
 	}
-	fprintf(stderr, "fp_enable: verdict: %s: known=%s enabled=%d hidden=%d domains=%lu errors=%d -> %s\n",
-	    [provider UTF8String], result.provider_known ? "yes" : "NO", result.provider_enabled,
-	    result.provider_hidden, (unsigned long)result.domains, result.failures,
+	if (died) {
+		say_crash_reports();
+	}
+	fprintf(stderr, "fp_enable: verdict: %s: known=%s enabled=%d hidden=%d storage=%s domains=%lu "
+	    "errors=%d crashed=%d -> %s\n", [provider UTF8String], result.provider_known ? "yes" : "NO",
+	    result.provider_enabled, result.provider_hidden,
+	    result.provider_url == 1 ? "yes" : result.provider_url == 0 ? "nil" : "unknown",
+	    (unsigned long)result.domains, result.failures, died ? 1 : 0,
 	    (result.provider_known && result.provider_enabled == 1 && result.provider_hidden == 0) ?
 	    "PASS" : "FAIL");
+	if (died) {
+		fprintf(stderr, "fp_enable: fileproviderd died under the calls above (a pid change, or no process "
+		    "at all): every read-back after that point answers Cocoa 4099 \"the connection ... was "
+		    "invalidated\", which is what the self-test printed as known=0 enabled=-1. The abort reason "
+		    "is on the console (TEST11: '-[NSFileManager createDirectoryAtURL:...]: URL is nil') and in "
+		    "the crash report above when ReportCrash wrote one.\n");
+	}
 	if (result.provider_known && result.provider_enabled == 1 && result.provider_hidden != 0) {
 		fprintf(stderr, "fp_enable: the provider is enabled but hidden (userHidden): the daemon ignores "
 		    "a hidden default domain, so Files.app gets no location and its contents are never "
@@ -1345,10 +1816,16 @@ enable_pass(id daemon, NSString *provider, BOOL reset, BOOL check)
 		    "same object\n");
 	}
 	fprintf(stderr, "fp_enable: summary: provider=%s known=%d enabled=%d hidden=%d domains=%lu errors=%d "
-	    "result=%s\n", [provider UTF8String], result.provider_known ? 1 : 0, result.provider_enabled,
-	    result.provider_hidden, (unsigned long)result.domains, result.failures,
+	    "storage=%s crashed=%d result=%s reason=%s\n", [provider UTF8String],
+	    result.provider_known ? 1 : 0, result.provider_enabled, result.provider_hidden,
+	    (unsigned long)result.domains, result.failures,
+	    result.provider_url == 1 ? "yes" : result.provider_url == 0 ? "nil" : "unknown", died ? 1 : 0,
 	    (result.provider_known && result.provider_enabled == 1 && result.provider_hidden == 0) ?
-	    "PASS" : "FAIL");
+	    "PASS" : "FAIL",
+	    died ? "daemon-crashed" : !result.provider_known ? "no-provider" :
+	    result.provider_url == 0 ? "no-storage-url" :
+	    result.provider_enabled != 1 ? "not-enabled" :
+	    result.provider_hidden != 0 ? "hidden" : "ok");
 	return result;
 }
 
@@ -1357,7 +1834,7 @@ main(int argc, char **argv)
 {
 	@autoreleasepool {
 		int index = 1;
-		BOOL check = NO, reset = NO, wait = NO, restart = NO, restarted = NO;
+		BOOL check = NO, reset = NO, wait = NO, restart = NO, restarted = NO, create = NO;
 		double wait_seconds = 30.0, retry_seconds = 0, restart_seconds = 20.0;
 		NSString *provider = @"com.apple.FileProvider.LocalStorage";
 		NSString *service = nil;
@@ -1375,6 +1852,10 @@ main(int argc, char **argv)
 				index++;
 			} else if (strcmp(argv[index], "--reset") == 0) {
 				reset = YES;
+				create = YES;
+				index++;
+			} else if (strcmp(argv[index], "--create") == 0) {
+				create = YES;
 				index++;
 			} else if (strncmp(argv[index], "--wait", 6) == 0 &&
 			    (argv[index][6] == '\0' || argv[index][6] == '=')) {
@@ -1425,8 +1906,14 @@ main(int argc, char **argv)
 		if ([provider isEqualToString:@"com.apple.FileProvider.LocalStorage"]) {
 			say_registration_state(
 			    "/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex");
+			/* R17: the storage chain, in the order the daemon walks it: the appex's Info.plist names the
+			 * document group, the appex's signature says whether the extension may use it, and the
+			 * container manager's metadata is what its resolution is answered from. */
+			say_appex_storage(
+			    @"/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex");
+			say_group_metadata(@"group.com.apple.FileProvider.LocalStorage");
 		}
-		ensure_storage();
+		ensure_storage(provider);
 		load_fileprovider();
 		services = mach_service_names(&service);
 		fprintf(stderr, "fp_enable: the job's service: %s%s\n", service ? [service UTF8String] : "(none)",
@@ -1451,7 +1938,7 @@ main(int argc, char **argv)
 
 			snprintf(when, sizeof(when), "pass %u", attempt);
 			say_daemon_state(when);
-			result = enable_pass(daemon, provider, reset, check);
+			result = enable_pass(daemon, provider, reset, check, create);
 			/* R16: the provider object read back is the verdict -- enabled and not hidden. The
 			 * domain list may legitimately be empty (the hidden default domain of LocalStorage is
 			 * not in it), so a count of 0 is not a failure any more, and a call that answered with
@@ -1467,6 +1954,15 @@ main(int argc, char **argv)
 				    "listed, %d error(s)\n", attempt, (unsigned long)result.domains,
 				    result.failures);
 				return 0;
+			}
+			/* R17: a provider with no document storage URL is not a state to retry -- no number of
+			 * passes gives it one, and every pass that tries to create a domain aborts the daemon.
+			 * The preflight above printed the chain (document group, appex signature, container). */
+			if (result.provider_known && result.provider_url == 0 && !create) {
+				fprintf(stderr, "fp_enable: pass %u: storage=nil; the retry cannot change it (the "
+				    "daemon has no document storage URL for this provider) -- giving up without "
+				    "touching the daemon\n", attempt);
+				return 1;
 			}
 			/* R14: the provider is unknown or not enabled -- the case TEST9 showed, where
 			 * fileproviderd had started 1.4 s before the LS/pkd rebuild finished. One restart, then
