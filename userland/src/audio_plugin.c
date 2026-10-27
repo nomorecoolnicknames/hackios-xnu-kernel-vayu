@@ -160,6 +160,7 @@ enum {
 	kAudioDevicePropertyDeviceUID = 'uid ', kAudioDevicePropertyModelUID = 'muid', kAudioDevicePropertyTransportType = 'tran',
 	kAudioDevicePropertyRelatedDevices = 'akin', kAudioDevicePropertyClockDomain = 'clkd',
 	kAudioDevicePropertyDeviceIsAlive = 'livn', kAudioDevicePropertyDeviceIsRunning = 'goin',
+	kAudioDevicePropertyDeviceIsRunningSomewhere = 'gone', kAudioDevicePropertyHogMode = 'oink',
 	kAudioDevicePropertyDeviceCanBeDefaultDevice = 'dflt', kAudioDevicePropertyDeviceCanBeDefaultSystemDevice = 'sflt',
 	kAudioDevicePropertyLatency = 'ltnc', kAudioDevicePropertyStreams = 'stm#', kAudioObjectPropertyControlList = 'ctrl',
 	kAudioDevicePropertySafetyOffset = 'saft', kAudioDevicePropertyNominalSampleRate = 'nsrt',
@@ -767,11 +768,28 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			WORD(1);
 			break;
 		case kAudioDevicePropertyDeviceCanBeDefaultDevice:
+			/*
+			 * By scope, as an input-only device needs (R10): the Codec has no output, and
+			 * answering the output's "no" for every scope (this said `d->output != 0`) is
+			 * what a device the audio server will not take as the microphone looks like.
+			 */
+			WORD(scope == kAudioObjectPropertyScopeInput ? d->input != 0 :
+			    scope == kAudioObjectPropertyScopeOutput ? d->output != 0 : d->input != 0 || d->output != 0);
+			break;
 		case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
+			/* the system's own sounds are played: an input alone is never that */
 			WORD(d->output != 0);
 			break;
 		case kAudioDevicePropertyDeviceIsRunning:
 			WORD(d->running != 0);
+			break;
+		case kAudioDevicePropertyDeviceIsRunningSomewhere:
+			/* the Codec is watched by the HAL for a while after its I/O stops (R10) */
+			WORD(d->running != 0);
+			break;
+		case kAudioDevicePropertyHogMode:
+			/* nobody has the device to themselves */
+			WORD((UInt32)-1);
 			break;
 		case kAudioObjectPropertyOwnedObjects:
 		case kAudioDevicePropertyStreams:
@@ -1076,6 +1094,10 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		pthread_mutex_lock(&lock);
 		inactive[object] = *(const UInt32 *)data == 0;
 		pthread_mutex_unlock(&lock);
+		/* the microphone's stream, on or off: the run's record of whether iOS takes the input (R10) */
+		if (device_of(object) != NULL && device_of(object)->input == object) {
+			say("hakios: audio: the microphone's stream is %s\n", *(const UInt32 *)data != 0 ? "on" : "off");
+		}
 		return 0;
 	}
 	if (address->mSelector == kAudioDevicePropertyNominalSampleRate) {
@@ -1136,6 +1158,9 @@ codec_open(void)
 	mic_frames = mic_heard = mic_short = 0;
 	mic_peak = 0;
 	say("hakios: audio: the microphone is listened to (/dev/hakios-mic: %s)\n", mic < 0 ? strerror(errno) : "open");
+	/* what iOS is offered as its built-in microphone (R10), for the record of a run */
+	say("hakios: audio: the microphone's input: built in, 1 channel, %d Hz, 16-bit signed (the HAL's \"Codec\")\n",
+	    HAKIOS_AUDIO_RATE);
 }
 
 static void
