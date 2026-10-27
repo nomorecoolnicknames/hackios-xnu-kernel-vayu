@@ -272,6 +272,7 @@ static uint8_t  gSpmiTermios[72];       /* TIOCSETA-shaped, zeros until nfcd set
  */
 static uint32_t gIosLevel;
 static uint32_t gHwSpoof;               /* vayu_nfc_hwspoof=1: CORE_INIT_RSP hardware byte 0x41 shown to nfcd as 0x42 */
+static uint32_t gPropInit;              /* vayu_nfc_propinit=1: also answer the 2F 06 and 2F 00 init steps (filter()) */
 static uint8_t  gCtlReassembly[1024];
 static size_t   gCtlReassemblyLength;
 static uint32_t gFilterDecisions, gBridgeRxErrors, gForwardErrors, gAnswerErrors;
@@ -471,6 +472,48 @@ filter(const uint8_t * packet, unsigned length)
 		return;
 	}
 	if (gid == 0x0f) {                      /* NXP proprietary */
+		/*
+		 * 2F 03 = "configure the HSU baud rate" (builder phNciNfc_PropConfigHsuBr 0x1f4546f9c,
+		 * label "phLibNfc_ConfigHsuBrCmd" 0x1f4548a20). On an iPhone the controller sits behind
+		 * HSU; here nfcd's bytes go to the PN553 over I2C (bsd/dev/vayu_nfc.c), so there is no
+		 * baud rate to change and the chip must not see the command. It cannot be refused either:
+		 * phNciNfc_ConfigHsuBrCmdRsp 0x1f4581154 accepts only payload status 0 (44/0x2C means
+		 * "retry" one level up, phLibNfc_ConfigHsuBrResp 0x1f454c548), the failure reaches
+		 * phLibNfc as 0x00FF, and the init dies with "Stack load failed with 0x10" ->
+		 * "_openDriver: Failed to start stack : 16" (TEST10: the third command of the session,
+		 * 2F 03 08 10 00 00 5A 05 DC 02 04 -> the old blanket 4F 03 01 01). Status 0 with no
+		 * payload is what phTmlNfc_ConfigHsuBaudRate() then needs; the kctl accepts the ioctl.
+		 */
+		if (oid == 0x03) {
+			static const uint8_t hsu_ok[] = { 0x4f, 0x03, 0x01, 0x00 };
+
+			filterLog(packet, length, "answer 4f 03 01 00 (no HSU here)");
+			answerNfcd(hsu_ok, sizeof(hsu_ok));
+			return;
+		}
+		/*
+		 * The rest of the 2F family stays refused; vayu_nfc_propinit=1 additionally answers the
+		 * two proprietary init steps that come after the HSU one, locally and never to the chip:
+		 * 2F 06 GET_FW_TYPE - phLibNfc_GetFwTypeProc 0x1f45e37a0 (pInfo at 0x1f45e3860) passes the
+		 * status through, and with status 0 an empty payload only makes it clamp the fw type to 3
+		 * (0x1f45e38a4);
+		 * 2F 00 standby - phLibNfc_SetStandbyModeProcess 0x1f458f76c returns 255 on any non-zero
+		 * status. Off by default so the next run still proves one variable at a time.
+		 */
+		if (gPropInit != 0 && oid == 0x06) {
+			static const uint8_t fwtype_ok[] = { 0x4f, 0x06, 0x01, 0x00 };
+
+			filterLog(packet, length, "answer 4f 06 01 00 (fw type 3)");
+			answerNfcd(fwtype_ok, sizeof(fwtype_ok));
+			return;
+		}
+		if (gPropInit != 0 && oid == 0x00) {
+			static const uint8_t standby_ok[] = { 0x4f, 0x00, 0x01, 0x00 };
+
+			filterLog(packet, length, "answer 4f 00 01 00 (standby)");
+			answerNfcd(standby_ok, sizeof(standby_ok));
+			return;
+		}
 		if (oid == 0x02) {
 			forwardPacket(packet, length, packet, length, "forward");
 		} else {
@@ -754,6 +797,11 @@ MiniAppleStockholmStart(void)
 	 */
 	if (gHwSpoof != 0) {
 		stockholmLog("MiniAppleStockholm: hwspoof: on (CORE_INIT_RSP hardware byte 0x41 -> 0x42 for nfcd)\n");
+	}
+	(void)PE_parse_boot_argn("vayu_nfc_propinit", &gPropInit, sizeof(gPropInit));
+	if (gPropInit != 0) {
+		stockholmLog("MiniAppleStockholm: propinit: on (2F 06 GET_FW_TYPE and 2F 00 standby get a local "
+		    "status 0; the rest of the 2F family stays refused)\n");
 	}
 	resources = IOService::getResourceService();
 	if (resources == NULL) return;
