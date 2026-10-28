@@ -79,6 +79,10 @@ set -e
 linkcopy() { if [ "$(uname)" = Darwin ]; then cp -cRp "$1" "$2"; else cp -al "$1" "$2"; fi; }
 cd "$(dirname "$(readlink -f "$0")")"
 source ../xnu-env.sh
+if [ -z "${DEVICE:-}" ] && [ -f ../.config ]; then
+	DEVICE=$(sed -n 's/^CONFIG_DEVICE="\(.*\)"$/\1/p' ../.config | head -1)
+fi
+DEVICE=${DEVICE:-redwood}
 
 CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protector -fno-builtin -Wall -Wextra"
 LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
@@ -584,7 +588,7 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# This stages the files; a separate XNU MPSS driver is still required to start the modem.
 	if [ -n "$MODEM" ]; then
 		[ -f ../fw-modem/modem.mdt ] || { echo "build.sh: MODEM=1 needs ../fw-modem/modem.mdt" >&2; exit 1; }
-		../devices/redwood/tools/modem_firmware.py --dtb ../devices/redwood/prebuilt/device-tree.dtb --firmware-dir ../fw-modem \
+		../devices/$DEVICE/tools/modem_firmware.py --dtb ../devices/$DEVICE/prebuilt/device-tree.dtb --firmware-dir ../fw-modem \
 			--node /soc/qcom,mss@4080000 >/dev/null
 		mkdir -p sysroot/fw
 		cp ../fw-modem/modem.mdt ../fw-modem/modem.b[0-9][0-9] sysroot/fw/

@@ -16,17 +16,50 @@ import argparse, gzip, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MU = os.path.join(HERE, 'Mu-Silicium')
-PREBUILT = os.path.join(HERE, 'devices', 'redwood', 'prebuilt')
-FD_BASE, FD_SIZE = 0x9FD00000, 0x200000
 PAYLOAD_BASE, PAYLOAD_MAX = 0xF0000000, 0x04000000
 
+
+def default_device():
+    if os.environ.get('DEVICE'):
+        return os.environ['DEVICE']
+    cfg = os.path.join(HERE, '.config')
+    if os.path.isfile(cfg):
+        for line in open(cfg, encoding='utf-8'):
+            if line.startswith('CONFIG_DEVICE="') and line.rstrip().endswith('"'):
+                return line.strip().split('"', 2)[1]
+    return 'redwood'
+
+
+def boot_conf(dev_dir):
+    conf = {}
+    path = os.path.join(dev_dir, 'boot.conf')
+    if os.path.isfile(path):
+        for line in open(path, encoding='utf-8'):
+            line = line.split('#', 1)[0].strip()
+            if '=' in line:
+                k, v = line.split('=', 1)
+                conf[k.strip()] = v.strip()
+    return conf
+
+
 ap = argparse.ArgumentParser()
+ap.add_argument('-d', '--device', default=default_device())
 ap.add_argument('-p', '--payload')
-ap.add_argument('-o', '--output', default=os.path.join(HERE, 'xnu-redwood.img'))
+ap.add_argument('-o', '--output')
 ap.add_argument('--mode', default='RELEASE')
 args = ap.parse_args()
 
-fd_path = os.path.join(MU, f'Build/redwoodPkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
+DEV_DIR = os.path.join(HERE, 'devices', args.device)
+PREBUILT = os.path.join(DEV_DIR, 'prebuilt')
+CONF = boot_conf(DEV_DIR)
+UEFI_PKG = CONF.get('UEFI_PKG', f'{args.device}Pkg')
+UEFI_DTB = CONF.get('UEFI_DTB', f'{args.device}.dtb')
+FD_BASE = int(CONF.get('FD_BASE', '0x9FD00000'), 0)
+FD_SIZE = int(CONF.get('FD_SIZE', '0x200000'), 0)
+if not args.output:
+    args.output = os.path.join(HERE, f'xnu-{args.device}.img')
+
+fd_path = os.path.join(MU, f'Build/{UEFI_PKG}/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
 if os.path.isfile(fd_path):
     shim_dir = os.path.join(MU, 'BootShim')
     for f in ('BootShim.elf', 'BootShim.bin'):
@@ -36,7 +69,7 @@ if os.path.isfile(fd_path):
                            f'CFLAGS=--target=aarch64-linux-gnu -DPAYLOAD_BASE={PAYLOAD_BASE:#x}'],
                           cwd=shim_dir, stdout=subprocess.DEVNULL)
     parts = {'shim': os.path.join(shim_dir, 'BootShim.bin'), 'fd': fd_path,
-             'dtb': os.path.join(MU, 'Resources/DTBs/redwood.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
+             'dtb': os.path.join(MU, 'Resources/DTBs', UEFI_DTB), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
              'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
 else:
     parts = {'shim': os.path.join(PREBUILT, 'BootShim.bin'), 'fd': os.path.join(PREBUILT, 'SILICIUM_UEFI.fd'),

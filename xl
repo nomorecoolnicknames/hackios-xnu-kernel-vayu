@@ -54,6 +54,15 @@ cd "$(dirname "$(readlink -f "$0")")" || exit 1
 # On a Mac: flock, GNU timeout and stat, and Android's platform-tools, from tools/macos-bin (see its README)
 [ "$(uname)" = Darwin ] && PATH=$PWD/tools/macos-bin:$PWD/tools/macos-bin/platform-tools:$PATH
 # the kernel and the loader built here, or else the ones that come with the repository
+# The target phone: DEVICE from the environment, else CONFIG_DEVICE from .config, else redwood.
+if [ -z "${DEVICE:-}" ] && [ -f .config ]; then
+	DEVICE=$(sed -n 's/^CONFIG_DEVICE="\(.*\)"$/\1/p' .config | head -1)
+fi
+DEVICE=${DEVICE:-redwood}
+PLATFORM=
+if [ -f "devices/$DEVICE/boot.conf" ]; then
+	PLATFORM=$(sed -n 's/^PLATFORM=\([^#[:space:]]*\).*/\1/p' "devices/$DEVICE/boot.conf" | head -1)
+fi
 K=hakios-kernel                 # make kernel makes it
 [ -f $K ] || K=prebuilt/hakios-kernel
 L=xnuloader/loader.efi
@@ -129,8 +138,8 @@ enter() {
 		[ "$(state)" = absent ] && { echo "xl: phone not reachable"; return 1; }
 		enter; return ;;
 	esac
-	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L --usb >/dev/null &&
-		./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img >/dev/null || { echo "xl: image build failed"; return 1; }
+	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L ${PLATFORM:+--platform "$PLATFORM"} --usb >/dev/null &&
+		./mkxnuimg.py -d "$DEVICE" -p usb-payload.bin -o xnu-usb.img >/dev/null || { echo "xl: image build failed"; return 1; }
 	# Right after the phone enters fastboot the first "boot" is sometimes not taken: try twice.
 	local try
 	for try in 1 2; do
@@ -193,7 +202,7 @@ run() { # run <oem command> <label>
 		case " $args " in
 		*" wifi="*|*" wifi_step="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
 		esac
-		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
+		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} ${PLATFORM:+--platform "$PLATFORM"} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
 		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || { echo "xl: upload failed"; return 1; }
 	fi
 	local live=; live_loader && live=1
