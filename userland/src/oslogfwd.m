@@ -759,45 +759,13 @@ ev_get(id ev, const char *sel_name, id fallback)
 
 /* An integer-returning method has to be called through its IMP: an objc_msgSend cast that
  * says "id" makes ARC treat the number as an object and retain it. */
-/* X5: ...and only when the method really is a no-argument getter of an integer scalar.
- * respondsToSelector: alone is not enough on a private class: a selector that returns a
- * struct by value is called with a hidden result pointer in x8, and an (unsigned long
- * (*)(id, SEL)) call passes garbage there -- a memory write into nowhere.  The encoding
- * ("Q16@0" and the like) says which ABI the callee expects, so the ones this cast cannot
- * serve are skipped instead of guessed at. */
-static int
-ev_is_uint_getter(id ev, SEL sel)
-{
-	Method m;
-	const char *enc;
-
-	if (![ev respondsToSelector:sel]) {
-		return 0;
-	}
-	m = class_getInstanceMethod(object_getClass(ev), sel);
-	if (!m) {
-		return 0;
-	}
-	enc = method_getTypeEncoding(m);
-	if (!enc || !enc[0] || !strchr(enc, ':')) {
-		return 0;
-	}
-	switch (enc[0]) {
-	case 'c': case 'C': case 's': case 'S': case 'i': case 'I':
-	case 'l': case 'L': case 'q': case 'Q': case 'B':
-		return 1;
-	default:
-		return 0;               /* struct, float, object, pointer, array, ... */
-	}
-}
-
 static unsigned long
 ev_uint(id ev, const char *sel_name)
 {
 	SEL sel = sel_getUid(sel_name);
 	unsigned long (*fn)(id, SEL);
 
-	if (!ev_is_uint_getter(ev, sel)) {
+	if (![ev respondsToSelector:sel]) {
 		return 0;
 	}
 	fn = (unsigned long (*)(id, SEL))(void *)[ev methodForSelector:sel];

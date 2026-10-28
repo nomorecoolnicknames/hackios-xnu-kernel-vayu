@@ -255,33 +255,6 @@ say_plugin_record(NSString *identifier)
  *
  * Returns the number of bundles that were offered to registerPlugin:.
  */
-/*
- * F8: LSPlugInKitProxy has no -identifier; TEST18's boot --plugins crashed on the first proxy whose
- * bundleURL was nil with "-[LSPlugInKitProxy identifier]: unrecognized selector sent to instance"
- * (13:14:27.222, killed by signal 6), so the pass never reached LocalStorage or its rebuild. The
- * proxy names a plug-in with -pluginIdentifier; -bundleIdentifier is the fallback (report() already
- * asks the NSExtension object for -identifier, which is a different class and stays as it is).
- */
-static NSString *
-plug_in_identifier(id proxy)
-{
-	if ([proxy respondsToSelector:@selector(pluginIdentifier)]) {
-		id value = [proxy performSelector:@selector(pluginIdentifier)];
-
-		if ([value isKindOfClass:[NSString class]]) {
-			return value;
-		}
-	}
-	if ([proxy respondsToSelector:@selector(bundleIdentifier)]) {
-		id value = [proxy performSelector:@selector(bundleIdentifier)];
-
-		if ([value isKindOfClass:[NSString class]]) {
-			return value;
-		}
-	}
-	return nil;
-}
-
 static unsigned
 reregister_file_providers(NSString *plugin)
 {
@@ -299,7 +272,6 @@ reregister_file_providers(NSString *plugin)
 		NSURL *url = nil;
 
 		if (![proxy respondsToSelector:@selector(pluginKitDictionary)]) { continue; }
-		identifier = plug_in_identifier(proxy);
 		dictionary = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(pluginKitDictionary));
 		if (![dictionary isKindOfClass:[NSDictionary class]]) { continue; }
 		point = [dictionary objectForKey:@"NSExtensionPointIdentifier"];
