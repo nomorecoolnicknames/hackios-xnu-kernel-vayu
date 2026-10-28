@@ -427,6 +427,55 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 	forwardPacket(packet, length, rebuilt, 4 + written, decision);
 }
 
+/*
+ * CORE_GET_CONFIG_CMD. The first config nfcd reads after the init sequence is 0xA00F, the
+ * controller's EEPROM user data. iOS 16.5 (libNFC_Comet 20F66) expects a 64-byte value
+ * there and nothing else: phNciNfc_ProcessRfParams 0x1f45eb608 takes a 0xA0/0xA1 parameter
+ * as a two-byte id and the length from the third byte (0x1f45ebc78 ldrb w8,[x10,#2]!,
+ * 0x1f45ebc80 cbz), and its 0xA00F branch is 0x1f45ebe7c (ldrb w8,[x23,#1]; cmp w8,#15),
+ * 0x1f45ebe8c (cmp w8,#64; b.ne 0x1f45ecb00 -> w21=1). Any other length, including the
+ * 0x20 bytes the PN553 sends, fails the parse; phLibNfc_GetEepromParamsProc 0x1f458f7c0
+ * then runs with status 1 and returns 255 (0x1f458f7fc cbnz w20 -> 0x1f458f844), so
+ * phLibNfc_Mgt_Initialize completes with 1 and _NFDriverLoadMW 0x1f13e5570 prints
+ * "status=0x0001" (0x1f13e5bac) and "Stack load failed with 0x10" (via NFDriverLoadStack).
+ *
+ * Answer it locally with the 64-byte block phLibNfc_SetEepromParams 0x1f458fe84 writes
+ * after a successful configuration: wCurrMwVer 0x0134 (0x1f458ff00), wCurrFwVer (read only
+ * by the "EEPROM User param - wCurrFwVer" log line, 0x1f458f910), bConfig 0xC3C3A5A5 which
+ * makes phLibNfc_GetEepromParamsProc 0x1f458f9bc say "Skipping set config" and advance the
+ * sequence by five steps, then 56 zero bytes - the same 8 + 56 layout SetEepromParams
+ * zeroes and fills at ctx+4053 (= the descriptor's A00F value, ctx+3440+613). The chip is
+ * still asked nothing: every CORE_SET_CONFIG carrying an 0xA0xx parameter is stripped in
+ * filterSetConfig(), so the PN553's own 32-byte 0xA00F is never a source of truth here.
+ */
+static void
+filterGetConfig(const uint8_t * packet, unsigned length)
+{
+	/* 20 03 03 01 a0 0f: one parameter, 0xA00F, no value. */
+	if (length == 6 && packet[2] == 3 && packet[3] == 1 && packet[4] == 0xa0 && packet[5] == 0x0f) {
+		static const uint8_t eepromUserData[64] = {
+			0x34, 0x01,             /* wCurrMwVer = 0x0134, as phLibNfc_SetEepromParams writes it */
+			0x00, 0x00,             /* wCurrFwVer: read only by phLibNfc_LogEepromUserData */
+			0xa5, 0xa5, 0xc3, 0xc3, /* bConfig = 0xC3C3A5A5: "Skipping set config" */
+		};
+		uint8_t answer[3 + 1 + 1 + 3 + sizeof(eepromUserData)];
+
+		answer[0] = 0x40;                       /* CORE_GET_CONFIG_RSP */
+		answer[1] = 0x03;
+		answer[2] = (uint8_t)(sizeof(answer) - 3);
+		answer[3] = 0x00;                       /* status OK */
+		answer[4] = 0x01;                       /* one parameter */
+		answer[5] = 0xa0;                       /* 0xA00F */
+		answer[6] = 0x0f;
+		answer[7] = (uint8_t)sizeof(eepromUserData);
+		memcpy(answer + 8, eepromUserData, sizeof(eepromUserData));
+		filterLog(packet, length, "answer 40 03 45 .. a0 0f 40 (64-byte EEPROM user data)");
+		answerNfcd(answer, sizeof(answer));
+		return;
+	}
+	forwardPacket(packet, length, packet, length, "forward");
+}
+
 static void
 filter(const uint8_t * packet, unsigned length)
 {
@@ -450,10 +499,12 @@ filter(const uint8_t * packet, unsigned length)
 		switch (oid) {
 		case 0x00:                      /* CORE_RESET */
 		case 0x01:                      /* CORE_INIT */
-		case 0x03:                      /* CORE_GET_CONFIG */
 		case 0x04:                      /* CORE_CONN_CREATE */
 		case 0x05:                      /* CORE_CONN_CLOSE */
 			forwardPacket(packet, length, packet, length, "forward");
+			return;
+		case 0x03:                      /* CORE_GET_CONFIG: 0xA00F is answered locally */
+			filterGetConfig(packet, length);
 			return;
 		case 0x02:                      /* CORE_SET_CONFIG */
 			filterSetConfig(packet, length);
