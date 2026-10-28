@@ -32,9 +32,13 @@ void vayu_jack_finish(void);
 /* After the AFE port 0x4001 (SLIMBUS_0_TX) is started: the handset microphones (AMIC3 -> DEC7 -> SLIM TX7, AMIC1 -> DEC8
  * -> SLIM TX8, mic biases 3 and 1) powered, codec ports 7/8 connected, channels 135/136 active. Needs vayu_jack_ready(). */
 bool vayu_jack_mic_on(void);
-/* Before the AFE port 0x4001 is stopped: the microphones' path down (idempotent). The channels 135/136 stay defined unless
- * vayu_mic_chan_keep=0. */
+/* Before the AFE port 0x4001 is stopped: the microphones' path down (idempotent). The channels 135/136 are removed unless
+ * vayu_mic_chan_keep=1. */
 void vayu_jack_mic_off(void);
+/* The channels 135/136 taken off the framer again, for a capture that is being re-initialised: called by vayu_audio
+ * BEFORE the codec's M7 and the AFE port come up, so that M7's CONNECT_SRC/DEF_ACT_CHAN define them from scratch.
+ * False when the codec is not up, the microphone path is still live, or the message was not acked. */
+bool vayu_jack_mic_chan_clear(const char *why);
 /* The SLIMbus side of the capture again (ports 7/8, CONNECT_SRC, DEF_ACT_CHAN, RECONFIG_NOW), with nothing analog: for
  * when the DSP's port is running and the samples are zeros. False when the codec is not up or the path is down. */
 bool vayu_jack_mic_kick(const char *why);
