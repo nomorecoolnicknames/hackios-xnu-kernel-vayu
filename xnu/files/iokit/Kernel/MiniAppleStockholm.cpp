@@ -36,12 +36,34 @@
  * The bridge now emulates the SPMI CRC in deliverToNfcd() (append) and ctlReassemblyAppend()
  * (verify/strip); nciCrc16() is CRC-16/CCITT-FALSE, poly 0x1021, init 0xFFFF, big-endian on the
  * wire. CRC(40 00 03 00 10 00) = 0xFCAF, exactly the number in the TEST22C log.
+ *
+ * N12 (TEST23C): the CRC emulation itself was right - every frame of the re-init, including the
+ * second CORE_RESET (20 00 01 00 80 bf) and the chip's answers on the second cycle, was verified
+ * and stripped/appended - but the log could not show it: both frames were #9 and #10 on counters
+ * whose printout stopped at 8 (see the limits that N12 removed: ctlSend/filterLog/deliverToNfcd/
+ * ctlReassemblyAppend/... now print every frame, each line with the time since boot in us).
+ * The status 0x89 of TEST23C is not a parse error: it arrives exactly 2.033 s after the CORE_RESET
+ * of the A0BF re-init, i.e. two expiries of the 1000 ms init watchdog phLibNfc_InitCompleteWdTimer
+ * (0x1f4559874, armed by phLibNfc_InitializeComplete 0x1f45533d8 / ReInitializeComplete 0x1f455a350),
+ * whose callback 0x1f45d48b0 calls phLibNfc_ReleaseLibNfcContext(ctx, 137) when the re-init flag
+ * ctx[2755] is set - that prints "LibNfc Init/Re-init Failed" (0x1f4593e08) and completes ioctl 226
+ * with 137 = "NFCC Re-Init failed" (0x1f456be3c), which _NFDriverEnableCRC 0x1f13e67c0 turns into
+ * 13 = 0xd. The re-init is waiting for the CORE_RESET_NTF that vayu_nfc_resetntf=0 does not send.
+ * It is NOT phNciNfc_RspTimeOutCb (0x1f45a6f08): its "NCI RSP : Timer expired" line never appears
+ * in that window. With the NTF (TEST23B) the stack instead runs
+ * phLibNfc_ResetNtfHandler 0x1f45960ec -> phLibNfc_LibNfcRecovery 0x1f45921ac, which reads the
+ * NFCC assert dump (20 03 09 04 a0 1a a0 1b a0 1c a0 27 -> 40 03 92 ...), gets zeros and reports
+ * 0x00FF: the synthetic NTF is a dead end either way. vayu_nfc_hwbyte=NN is the N12 way out:
+ * phLibNfc_GetPlatformInfo (libPN548_API 0x1f1401f74) maps the CORE_INIT_RSP hardware byte to a
+ * controller generation and _NFDriverEnableCRC 0x1f13e6638 skips the whole A0BF/CRC/re-init step
+ * when that generation is < 5; 0x42 maps to 5 (step 2 runs, as TEST23B/C show), 0x06 maps to 1.
  */
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/kern_control.h>
@@ -68,22 +90,71 @@ extern "C" void loader_log_putc(char c);
 /*
  * IOLog alone did not reach the run log (a test run: no MiniAppleStockholm line at all), so
  * every line also goes to the loader's log, as bsd/dev/vayu_nfc.c's say() does.
+ *
+ * N12: every line now ends with the time since boot in microseconds ([+123.456789]). The merged
+ * log has no kernel timestamps for these lines, so TEST23C's decisive frames could not be put
+ * next to nfcd's NCIDump without arithmetic on unrelated lines. The stamp makes that trivial and
+ * is the same clock the tl: lines of the run log use (clock_get_uptime / 1000).
  */
 static void stockholmLog(const char * format, ...) __printflike(1, 2);
+
+static uint64_t
+stockholmUptime(void)
+{
+	uint64_t now = 0;
+
+	clock_get_uptime(&now);
+	return now / 1000ULL;
+}
 
 static void
 stockholmLog(const char * format, ...)
 {
-	char line[400];
+	char line[1200];
+	char stamped[1248];
 	va_list list;
+	size_t used = 0;
+	uint64_t us;
 
 	va_start(list, format);
 	vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
-	for (const char * c = line; *c != 0; c++) {
+	while (line[used] != 0 && used + 1 < sizeof(line)) used++;
+	if (used > 0 && line[used - 1] == '\n') line[used - 1] = 0;
+	us = stockholmUptime();
+	snprintf(stamped, sizeof(stamped), "%s [+%llu.%06llu]\n", line,
+	    (unsigned long long)(us / 1000000ULL), (unsigned long long)(us % 1000000ULL));
+	for (const char * c = stamped; *c != 0; c++) {
 		loader_log_putc(*c);
 	}
-	IOLog("%s", line);
+	IOLog("%s", stamped);
+}
+
+/*
+ * N12: the full frame as hex, not the first eight bytes. 8 bytes were enough for a header and a
+ * status, not for an NCI answer whose payload decides what the stack does next (the 149-byte
+ * assert dump, the 28-byte CORE_INIT_RSP, the two CRC bytes of a frame). The buffer must hold
+ * 3 * length + 1; longer frames are cut and marked with "...".
+ */
+static const char *
+hexAll(const uint8_t * bytes, unsigned length, char * out, size_t out_size)
+{
+	static const char hexdig[] = "0123456789abcdef";
+	size_t used = 0;
+	unsigned shown = 0;
+
+	while (shown < length && used + 4 < out_size) {
+		out[used++] = hexdig[bytes[shown] >> 4];
+		out[used++] = hexdig[bytes[shown] & 0xf];
+		if (shown + 1 < length) out[used++] = ' ';
+		shown++;
+	}
+	if (shown < length && used + 4 <= out_size) {
+		out[used++] = '.'; out[used++] = '.'; out[used++] = '.';
+	}
+	if (used == 0) out[used++] = '-';
+	out[used] = 0;
+	return out;
 }
 
 enum {
@@ -290,6 +361,7 @@ static uint8_t  gSpmiTermios[72];       /* TIOCSETA-shaped, zeros until nfcd set
  */
 static uint32_t gIosLevel;
 static uint32_t gHwSpoof;               /* vayu_nfc_hwspoof=1: CORE_INIT_RSP hardware byte 0x41 shown to nfcd as 0x42 */
+static uint32_t gNfcHwByte = 0x42;      /* vayu_nfc_hwbyte=NN: the byte hwspoof writes (N12: 0x06 -> controller generation 1) */
 static uint32_t gPropInit;              /* vayu_nfc_propinit=1: also answer the 2F 06 and 2F 00 init steps (filter()) */
 static uint32_t gNfceeMode;             /* vayu_nfc_nfcee=2: answer 0 NFCEEs locally; otherwise forward 22 00/22 01 */
 static uint32_t gNfceeNtfFilter = 1;    /* vayu_nfc_nfcee_ntf=0: pass every 62 00, do not cut after the RSP count */
@@ -333,29 +405,26 @@ static uint32_t gResetNtfInjected;
  */
 static uint32_t gNfcCrc = 1;            /* vayu_nfc_crc=0: no CRC emulation (diagnostic) */
 static uint32_t gCrcAppended, gCrcStripped, gCrcPlainFromNfcd;
+static uint32_t gNfcdTxCrc;             /* N12: last nfcd frame seen with a valid CRC (1) or plain (0) */
 static int32_t  gLogConns[4] = { -1, -1, -1, -1 };      /* logical conn ids created by a successful CORE_CONN_CREATE_RSP */
 static uint32_t gCreditsInjected, gCreditsErrors;
 static uint8_t  gCtlReassembly[1024];
 static size_t   gCtlReassemblyLength;
 static uint32_t gFilterDecisions, gBridgeRxErrors, gForwardErrors, gAnswerErrors;
 
-/* The filter's and the bridge's "one line per packet, then every 20th after 400" log. */
+/*
+ * N12: one line per frame, the whole frame, no limit. The old code printed the first 400
+ * decisions and then every 20th; the TEST23C re-init alone spends 11, and the frame after that
+ * (2F 00 01 01 at 00:40:51.631) fell into the hidden window - the one frame that ended the step.
+ */
 static void
 filterLog(const uint8_t * packet, unsigned length, const char * decision)
 {
-	static const char hexdig[] = "0123456789abcdef";
-	char hex[3 * 8 + 1];
-	unsigned shown = length < 8 ? length : 8;
-	size_t used = 0;
+	char hex[3 * 300 + 8];
 
-	for (unsigned i = 0; i < shown; i++) {
-		hex[used++] = hexdig[packet[i] >> 4];
-		hex[used++] = hexdig[packet[i] & 0xf];
-		hex[used++] = i + 1 < shown ? ' ' : '\0';
-	}
-	if (shown == 0) hex[0] = '\0';
-	if (++gFilterDecisions > 400 && (gFilterDecisions % 20) != 0) return;
-	stockholmLog("MiniAppleStockholm: filter: %s -> %s\n", hex, decision);
+	gFilterDecisions++;
+	stockholmLog("MiniAppleStockholm: filter: %s -> %s\n",
+	    hexAll(packet, length, hex, sizeof(hex)), decision);
 }
 
 /*
@@ -395,12 +464,17 @@ spmiCrcEnabled(void)
  * bridge and the PN553 I2C link has no CRC). Every producer - the filter's answers, the
  * forwarded chip packets, the synthetic 60 06 credits and the synthetic 60 00 reset NTF -
  * must come through here, or nfcd rejects the frame with status 34 (0x22) and flushes TML.
+ *
+ * N12: every delivery is logged with the bytes that actually leave the bridge (frame + CRC),
+ * not a sample. This is the only place that can prove what nfcd saw on the second cycle.
  */
 static errno_t
 deliverToNfcd(kern_ctl_ref ref, uint32_t unit, const uint8_t * packet, unsigned length,
     const char * what)
 {
 	uint8_t framed[262];
+	char hex[3 * 270 + 8];
+	errno_t error;
 
 	if (spmiCrcEnabled() && length + 2 <= sizeof(framed)) {
 		uint16_t crc = nciCrc16(packet, length);
@@ -408,13 +482,25 @@ deliverToNfcd(kern_ctl_ref ref, uint32_t unit, const uint8_t * packet, unsigned 
 		memcpy(framed, packet, length);
 		framed[length] = (uint8_t)(crc >> 8);
 		framed[length + 1] = (uint8_t)(crc & 0xff);
-		if (++gCrcAppended <= 8 || (gCrcAppended % 100) == 0) {
-			stockholmLog("MiniAppleStockholm: crc: %s %u bytes + crc %02x %02x (#%u)\n", what,
-			    length, framed[length], framed[length + 1], gCrcAppended);
-		}
-		return ctl_enqueuedata(ref, unit, framed, length + 2, 0);
+		gCrcAppended++;
+		error = ctl_enqueuedata(ref, unit, framed, length + 2, 0);
+		stockholmLog("MiniAppleStockholm: crc: %s %u bytes + crc %02x %02x (#%u)%s: %s\n", what,
+		    length, framed[length], framed[length + 1], gCrcAppended,
+		    error == 0 ? "" : " NOT DELIVERED",
+		    hexAll(framed, length + 2, hex, sizeof(hex)));
+		return error;
 	}
-	return ctl_enqueuedata(ref, unit, (void *)(uintptr_t)packet, length, 0);
+	if (spmiCrcEnabled()) {
+		stockholmLog("MiniAppleStockholm: crc: %s %u bytes does not fit with a CRC: sent plain "
+		    "(#%u): %s\n", what, length, gCrcAppended, hexAll(packet, length, hex, sizeof(hex)));
+	}
+	error = ctl_enqueuedata(ref, unit, (void *)(uintptr_t)packet, length, 0);
+	if (spmiCrcEnabled() || error != 0) {
+		stockholmLog("MiniAppleStockholm: tx: %s %u bytes%s%s: %s\n", what, length,
+		    spmiCrcEnabled() ? "" : " (plain, no CRC asked for)",
+		    error == 0 ? "" : " NOT DELIVERED", hexAll(packet, length, hex, sizeof(hex)));
+	}
+	return error;
 }
 
 static void
@@ -428,10 +514,8 @@ answerNfcd(const uint8_t * bytes, unsigned length)
 	error = deliverToNfcd(ref, unit, bytes, length, "answer");
 	if (error != 0) {
 		gAnswerErrors++;
-		if (gAnswerErrors <= 8 || (gAnswerErrors % 100) == 0) {
-			stockholmLog("MiniAppleStockholm: filter: answer of %u bytes not delivered: %d%s\n",
-			    length, error, error == ENOBUFS ? " (ENOBUFS)" : "");
-		}
+		stockholmLog("MiniAppleStockholm: filter: answer of %u bytes not delivered: %d%s (#%u)\n",
+		    length, error, error == ENOBUFS ? " (ENOBUFS)" : "", gAnswerErrors);
 	}
 }
 
@@ -439,16 +523,22 @@ static void
 forwardPacket(const uint8_t * log_packet, unsigned log_length,
     const uint8_t * packet, unsigned length, const char * decision)
 {
+	char hex[3 * 270 + 8];
 	errno_t error;
 
 	filterLog(log_packet, log_length, decision);
+	/*
+	 * N12: the exact bytes the PN553 gets. "filter: ... -> forward" says what nfcd asked;
+	 * this says what crossed the SPMI link after the rewrite (CRC stripped, params cut,
+	 * hwspoof), and it is the line the next analysis needs when a chip answer looks wrong.
+	 */
+	stockholmLog("MiniAppleStockholm: pn553 <- %u bytes: %s\n", length,
+	    hexAll(packet, length, hex, sizeof(hex)));
 	error = vayu_nfc_bridge_send(packet, length);
 	if (error != 0) {
 		gForwardErrors++;
-		if (gForwardErrors <= 8 || (gForwardErrors % 100) == 0) {
-			stockholmLog("MiniAppleStockholm: filter: forward of %u bytes failed: %d%s\n",
-			    length, error, error == EIO ? " (EIO)" : "");
-		}
+		stockholmLog("MiniAppleStockholm: filter: forward of %u bytes failed: %d%s (#%u)\n",
+		    length, error, error == EIO ? " (EIO)" : "", gForwardErrors);
 	}
 }
 
@@ -511,17 +601,13 @@ injectConnCredits(kern_ctl_ref ref, uint32_t unit, uint8_t conn)
 	error = deliverToNfcd(ref, unit, ntf, sizeof(ntf), "credits");
 	if (error == 0) {
 		gCreditsInjected++;
-		if (gCreditsInjected <= 8 || (gCreditsInjected % 20) == 0) {
-			stockholmLog("MiniAppleStockholm: credits: synthetic 60 06 03 01 %02x %02x "
-			    "(conn %u, %u credits, #%u)\n", conn, (uint8_t)gNfcCredits, conn,
-			    gNfcCredits, gCreditsInjected);
-		}
+		stockholmLog("MiniAppleStockholm: credits: synthetic 60 06 03 01 %02x %02x "
+		    "(conn %u, %u credits, #%u)\n", conn, (uint8_t)gNfcCredits, conn,
+		    gNfcCredits, gCreditsInjected);
 	} else {
 		gCreditsErrors++;
-		if (gCreditsErrors <= 8 || (gCreditsErrors % 100) == 0) {
-			stockholmLog("MiniAppleStockholm: credits: 60 06 for conn %u not delivered: %d%s\n",
-			    conn, error, error == ENOBUFS ? " (ENOBUFS)" : "");
-		}
+		stockholmLog("MiniAppleStockholm: credits: 60 06 for conn %u not delivered: %d%s (#%u)\n",
+		    conn, error, error == ENOBUFS ? " (ENOBUFS)" : "", gCreditsErrors);
 	}
 }
 
@@ -1005,6 +1091,7 @@ filter(const uint8_t * packet, unsigned length)
 static bool
 ctlReassemblyAppend(const uint8_t * bytes, size_t count, bool final)
 {
+	(void)final;    /* N12: the CRC decision no longer depends on the mbuf boundary */
 	if (count > sizeof(gCtlReassembly) - gCtlReassemblyLength) {
 		stockholmLog("MiniAppleStockholm: reassembly: %zu bytes do not fit with %zu held: dropped\n",
 		    count, gCtlReassemblyLength);
@@ -1017,54 +1104,84 @@ ctlReassemblyAppend(const uint8_t * bytes, size_t count, bool final)
 		size_t packet_length = 3u + gCtlReassembly[2];
 		size_t consumed = packet_length;
 		uint8_t mt = gCtlReassembly[0] >> 5;
+		char hex[3 * 300 + 8];
 
 		if (mt != 0 && mt != 1) {
-			stockholmLog("MiniAppleStockholm: reassembly: desync (first byte 0x%02x, MT %u): "
-			    "dropping %zu bytes\n", gCtlReassembly[0], mt, gCtlReassemblyLength);
+			stockholmLog("MiniAppleStockholm: reassembly: desync (first byte 0x%02x, MT %u, "
+			    "%zu bytes held): dropping %zu bytes: %s\n", gCtlReassembly[0], mt,
+			    gCtlReassemblyLength, gCtlReassemblyLength,
+			    hexAll(gCtlReassembly, (unsigned)gCtlReassemblyLength, hex, sizeof(hex)));
 			gCtlReassemblyLength = 0;
 			break;
 		}
 		/*
-		 * N11: with the SPMI CRC on, nfcd appends the two checksum bytes itself
+		 * N11/N12: with the SPMI CRC on, nfcd appends the two checksum bytes itself
 		 * (phNciNfc_CorePktSendToTml 0x1f454d8e0 -> phNciNfc_CoreUtilsAppendCrc 0x1f4550054)
 		 * once phNciNfc_UpdateCrcChkFlag has armed the flag. The flag becomes active only in
 		 * phNciNfc_ProcessResetRsp (0x1f458087c copies ctx+5825 to ctx+5824), so the first
-		 * CORE_RESET after the A0BF ioctl can still be plain. Decide per frame by checking:
-		 * a frame whose last two bytes are its CRC is stripped, anything else is passed on as
-		 * plain NCI (and counted, so the log says which case happened).
+		 * CORE_RESET after the A0BF ioctl is plain; every frame after it - including the
+		 * CORE_RESET of a *second* re-init, which is what TEST23C shows at 00:40:51.660 - is
+		 * sent with a CRC that must be stripped.
+		 *
+		 * The decision is per frame and is logged with both numbers, because the cases look
+		 * identical from the outside: a frame whose last two bytes are its CRC (strip), a frame
+		 * that has no CRC at all (pass plain: the first reset of a session, or a stack that
+		 * cleared its own TX flag without telling the TML), a frame whose last byte is missing
+		 * (wait), and a frame with exactly one spare byte (wait only if that byte is the first
+		 * half of the CRC, otherwise it belongs to the next frame - TEST23C's "frame 3 bytes"
+		 * line came from exactly that mistake).
 		 */
 		if (spmiCrcEnabled()) {
-			if (gCtlReassemblyLength >= packet_length + 2) {
-				uint16_t received = (uint16_t)(((uint16_t)gCtlReassembly[packet_length] << 8) |
-				    gCtlReassembly[packet_length + 1]);
-				uint16_t calculated = nciCrc16(gCtlReassembly, (unsigned)packet_length);
+			bool have_crc_bytes = gCtlReassemblyLength >= packet_length + 2;
+			bool reset_frame = gCtlReassembly[0] == 0x20 && gCtlReassembly[1] == 0x00;
+			uint16_t received = 0;
+			uint16_t calculated = 0;
 
-				if (received == calculated) {
-					consumed = packet_length + 2;
-					if (++gCrcStripped <= 8 || (gCrcStripped % 100) == 0) {
-						stockholmLog("MiniAppleStockholm: crc: nfcd frame %zu bytes "
-						    "crc %04x verified and stripped (#%u)\n", packet_length,
-						    calculated, gCrcStripped);
-					}
-				} else {
-					gCrcPlainFromNfcd++;
-					if (gCrcPlainFromNfcd <= 8) {
-						stockholmLog("MiniAppleStockholm: crc: nfcd frame %zu bytes "
-						    "has no CRC (read %04x, expected %04x): passing plain "
-						    "(#%u)\n", packet_length, received, calculated,
-						    gCrcPlainFromNfcd);
-					}
-				}
-			} else if (!final) {
-				/* the rest of this frame (and maybe its CRC) may still arrive */
-				break;
-			} else if (gCtlReassemblyLength >= packet_length) {
+			if (gCtlReassemblyLength >= packet_length) {
+				calculated = nciCrc16(gCtlReassembly, (unsigned)packet_length);
+			}
+			if (have_crc_bytes) {
+				received = (uint16_t)(((uint16_t)gCtlReassembly[packet_length] << 8) |
+				    gCtlReassembly[packet_length + 1]);
+			}
+			if (have_crc_bytes && received == calculated) {
+				consumed = packet_length + 2;
+				gNfcdTxCrc = 1;
+				gCrcStripped++;
+				stockholmLog("MiniAppleStockholm: crc: nfcd frame %zu bytes crc %04x verified and "
+				    "stripped (#%u): %s\n", packet_length, calculated, gCrcStripped,
+				    hexAll(gCtlReassembly, (unsigned)(packet_length + 2), hex, sizeof(hex)));
+			} else if (have_crc_bytes) {
+				gNfcdTxCrc = 0;
 				gCrcPlainFromNfcd++;
-				if (gCrcPlainFromNfcd <= 8) {
-					stockholmLog("MiniAppleStockholm: crc: nfcd frame %zu bytes is "
-					    "too short to carry a CRC: passing plain (#%u)\n",
-					    packet_length, gCrcPlainFromNfcd);
-				}
+				stockholmLog("MiniAppleStockholm: crc: nfcd frame %zu bytes has no CRC (read "
+				    "%04x, expected %04x): passing plain (#%u): %s\n", packet_length,
+				    received, calculated, gCrcPlainFromNfcd,
+				    hexAll(gCtlReassembly, (unsigned)gCtlReassemblyLength, hex, sizeof(hex)));
+			} else if (gCtlReassemblyLength < packet_length) {
+				/* the rest of this frame is still in flight */
+				break;
+			} else if (gCtlReassemblyLength > packet_length &&
+			    gCtlReassembly[packet_length] == (uint8_t)(calculated >> 8)) {
+				/*
+				 * Exactly one spare byte and it is the high half of this frame's CRC: the low
+				 * half is in the next write. Nothing is emitted until it arrives, so the frame
+				 * cannot be handed to the filter half-checked.
+				 */
+				stockholmLog("MiniAppleStockholm: crc: nfcd frame %zu bytes has the first CRC byte "
+				    "(%02x of %04x): waiting for the second (%zu bytes held): %s\n", packet_length,
+				    gCtlReassembly[packet_length], calculated, gCtlReassemblyLength,
+				    hexAll(gCtlReassembly, (unsigned)gCtlReassemblyLength, hex, sizeof(hex)));
+				break;
+			} else {
+				gCrcPlainFromNfcd++;
+				stockholmLog("MiniAppleStockholm: crc: nfcd frame %zu bytes is too short to carry a "
+				    "CRC%s: passing plain (#%u): %s\n", packet_length,
+				    reset_frame ? " (a CORE_RESET, the one command nfcd may send before its flag is "
+				    "active)" : (gNfcdTxCrc != 0 ? " (the previous frame from nfcd had one)"
+				    : " (nfcd is sending plain frames)"), gCrcPlainFromNfcd,
+				    hexAll(gCtlReassembly, (unsigned)gCtlReassemblyLength, hex, sizeof(hex)));
+				gNfcdTxCrc = 0;
 			}
 		}
 		if (gCtlReassemblyLength < packet_length) break;
@@ -1106,7 +1223,14 @@ bridgeRx(const uint8_t * packet, unsigned length)
 	uint32_t unit = gKctlUnit;
 	errno_t error;
 	uint8_t spoofed[260];
+	char hex[3 * 270 + 8];
 
+	/*
+	 * N12: the PN553's answer as it came off the SPMI link, before hwspoof rewrites one byte
+	 * and before any filter drops it. One line per answer, always.
+	 */
+	stockholmLog("MiniAppleStockholm: pn553 -> %u bytes: %s\n", length,
+	    hexAll(packet, length, hex, sizeof(hex)));
 	if (ref == NULL) return;
 	/*
 	 * vayu_nfc_hwspoof=1. iOS's NXP stack checks the CORE_INIT_RSP hardware byte right after INIT
@@ -1120,12 +1244,14 @@ bridgeRx(const uint8_t * packet, unsigned length)
 	    length == 3u + packet[2] && packet[2] >= 6) {
 		unsigned n = packet[3 + 5];
 		unsigned hw = 3 + 13 + n;
+		uint8_t wanted = (uint8_t)gNfcHwByte;
 
-		if (hw < length && packet[hw] == 0x41) {
+		if (hw < length && packet[hw] != wanted) {
 			memcpy(spoofed, packet, length);
-			spoofed[hw] = 0x42;
-			stockholmLog("MiniAppleStockholm: hwspoof: CORE_INIT_RSP hardware byte 0x41 -> 0x42 for nfcd "
-			    "(offset %u)\n", hw);
+			spoofed[hw] = wanted;
+			stockholmLog("MiniAppleStockholm: hwspoof: CORE_INIT_RSP hardware byte 0x%02x -> 0x%02x for "
+			    "nfcd (offset %u; phLibNfc_GetPlatformInfo maps it to the controller generation that "
+			    "_NFDriverEnableCRC compares with 5)\n", packet[hw], wanted, hw);
 			packet = spoofed;
 		}
 	}
@@ -1162,10 +1288,8 @@ bridgeRx(const uint8_t * packet, unsigned length)
 	error = deliverToNfcd(ref, unit, packet, length, "rx");
 	if (error != 0) {
 		gBridgeRxErrors++;
-		if (gBridgeRxErrors <= 8 || (gBridgeRxErrors % 100) == 0) {
-			stockholmLog("MiniAppleStockholm: bridge rx: %u bytes not delivered: %d%s (error %u)\n",
-			    length, error, error == ENOBUFS ? " (ENOBUFS)" : "", gBridgeRxErrors);
-		}
+		stockholmLog("MiniAppleStockholm: bridge rx: %u bytes not delivered: %d%s (error %u)\n",
+		    length, error, error == ENOBUFS ? " (ENOBUFS)" : "", gBridgeRxErrors);
 		return;
 	}
 	/*
@@ -1230,6 +1354,7 @@ ctlConnect(kern_ctl_ref kctlref, struct sockaddr_ctl * sac, void ** unitinfo)
 	gCtlReassemblyLength = 0;
 	gCoreInits = 0;         /* N9: a new session starts with its own first CORE_RESET (no synthetic NTF) */
 	gSpmiCrc = 0;           /* N11: nfcd turns the SPMI CRC on again after its A0BF, per session */
+	gNfcdTxCrc = 0;         /* N12: no CRC frame seen in this session yet */
 	stockholmLog("MiniAppleStockholm: %s[%d] connected unit %u\n", procname, proc_selfpid(), gKctlUnit);
 	if (gIosLevel >= 2) {
 		int error = vayu_nfc_bridge_start(bridgeRx);
@@ -1260,6 +1385,7 @@ ctlDisconnect(kern_ctl_ref kctlref, u_int32_t unit, void * unitinfo)
 	 */
 	gCoreInits = 0;
 	gSpmiCrc = 0;
+	gNfcdTxCrc = 0;
 	for (unsigned i = 0; i < sizeof(gLogConns) / sizeof(gLogConns[0]); i++) {
 		gLogConns[i] = -1;
 	}
@@ -1272,30 +1398,29 @@ static errno_t
 ctlSend(kern_ctl_ref kctlref, u_int32_t unit, void * unitinfo, mbuf_t m, int flags)
 {
 	uint8_t data[300];
-	char line[3 * 64 + 4] = "", procname[32] = "?";
-	size_t total = 0, copied, shown;
-	mbuf_t cur;
+	char line[3 * 300 + 8] = "", procname[32] = "?";
+	size_t total = 0, copied;
 
 	if (m != NULL && (mbuf_flags(m) & MBUF_PKTHDR)) {
 		total = mbuf_pkthdr_len(m);
 	} else {
+		mbuf_t cur;
+
 		for (cur = m; cur != NULL; cur = mbuf_next(cur)) total += mbuf_len(cur);
 	}
 	copied = total > sizeof(data) ? sizeof(data) : total;
 	if (copied > 0 && mbuf_copydata(m, 0, copied, data) != 0) copied = 0;
 	proc_selfname(procname, sizeof(procname));
-	/* after the first 200 writes only every 50th is reported */
-	if (++gKctlWrites <= 200 || (gKctlWrites % 50) == 0) {
-		static const char hexdig[] = "0123456789abcdef";
-		shown = copied < 64 ? copied : 64;
-		for (size_t i = 0; i < shown; i++) {
-			line[3 * i] = hexdig[data[i] >> 4];
-			line[3 * i + 1] = hexdig[data[i] & 0xf];
-			line[3 * i + 2] = i + 1 < shown ? ' ' : '\0';
-		}
-		stockholmLog("MiniAppleStockholm: %s[%d] write %u bytes: %s%s\n", procname, proc_selfpid(),
-		    (uint32_t) total, line, total > shown ? " ..." : "");
-	}
+	/*
+	 * N12: every write, whole, no "after the first 200 only every 50th". The old limit kept
+	 * the 2F 00 01 01 of TEST23C visible but hid nothing else that mattered - still, a log
+	 * that silently drops frames is exactly what made TEST23C's second CORE_RESET look like a
+	 * parse bug.
+	 */
+	gKctlWrites++;
+	stockholmLog("MiniAppleStockholm: %s[%d] write %u bytes: %s%s\n", procname, proc_selfpid(),
+	    (uint32_t) total, hexAll(data, (unsigned)copied, line, sizeof(line)),
+	    total > copied ? " ..." : "");
 	if (gIosLevel >= 2 && total != 0) {
 		ctlReassemblyMbuf(m, total);
 	}
@@ -1418,13 +1543,27 @@ MiniAppleStockholmStart(void)
 	if (!PE_parse_boot_argn("vayu_nfc_ios", &gIosLevel, sizeof(gIosLevel)) || gIosLevel == 0) return;
 	(void)PE_parse_boot_argn("vayu_nfc_hwspoof", &gHwSpoof, sizeof(gHwSpoof));
 	/*
+	 * N12: which byte hwspoof writes. The PN553 reports 0x41, which phLibNfc_GetPlatformInfo
+	 * (libPN548_API 0x1f1401f74) maps to 0 ("unknown"); 0x42 maps to 5, and 5 is exactly what
+	 * _NFDriverEnableCRC 0x1f13e6638 needs to run - i.e. the A0BF/CRC/re-init step that dead-ends
+	 * in 0x89 without a CORE_RESET_NTF and in 0xFF with one. Any byte that maps below 5 makes the
+	 * step return 0 and the stack goes on to step 3. The table in 0x1f1401f74:
+	 *   6..8 -> 1, 13 -> 2, 29 -> 3, 65/unknown -> 0, 66 -> 5, 163 -> 7, 164 -> 8,
+	 *   177/178 -> 10/11/12, 186 -> 20, 209 -> 14, 210/211 -> 15/16.
+	 * vayu_nfc_hwbyte=0x06 is the N12 experiment (generation 1 < 5, step 2 skipped).
+	 */
+	(void)PE_parse_boot_argn("vayu_nfc_hwbyte", &gNfcHwByte, sizeof(gNfcHwByte));
+	gNfcHwByte &= 0xff;
+	if (gNfcHwByte == 0) gNfcHwByte = 0x42;
+	/*
 	 * Say it here and not only when a packet is rewritten: a test run had vayu_nfc_hwspoof=1 in the
 	 * command line and not a single line about it, because nfcd never started and no CORE_INIT_RSP
 	 * ever crossed the bridge (the kernel's own probe at vayu_nfc.c is a different path). This line
 	 * makes the next log answer "was the option seen?" before the answer "was a byte rewritten?".
 	 */
 	if (gHwSpoof != 0) {
-		stockholmLog("MiniAppleStockholm: hwspoof: on (CORE_INIT_RSP hardware byte 0x41 -> 0x42 for nfcd)\n");
+		stockholmLog("MiniAppleStockholm: hwspoof: on (CORE_INIT_RSP hardware byte -> 0x%02x for nfcd)\n",
+		    (uint8_t)gNfcHwByte);
 	}
 	(void)PE_parse_boot_argn("vayu_nfc_propinit", &gPropInit, sizeof(gPropInit));
 	if (gPropInit != 0) {

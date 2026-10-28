@@ -177,6 +177,8 @@ next_tid(void)
 #define PIN_CFG_DRIVE(cfg)      ((cfg >> 6) & 7)
 #define PIN_CFG_OE              (1u << 9)
 
+static vm_offset_t jack_reset_pin;              /* GPIO 143's page, mapped at J0 and kept for the reset pulse */
+
 static bool
 step_pins(void)
 {
@@ -189,6 +191,7 @@ step_pins(void)
 		return fail(0, "the reset/interrupt pins cannot be mapped (reset %#lx irq %#lx)", (unsigned long)reset,
 		    (unsigned long)irq);
 	}
+	jack_reset_pin = reset;                 /* kept: J9's recovery pulses this pin through the same mapping */
 	cfg = rd(reset);
 	io = rd(reset + 4);
 	say("vayu-jack: J0: gpio%u (codec reset, active low): cfg %#x: function %u, pull %u, %u mA, %s, in %u out %u\n",
@@ -207,6 +210,41 @@ step_pins(void)
 		return false;
 	}
 	say("vayu-jack: J0: the codec's reset is out of reset (gpio%u: function 0, output high)\n", PIN_JACK_RESET);
+	return true;
+}
+
+/*
+ * The codec's reset line, driven from the AP for the first time here. Stock's wcd9xxx_reset does exactly
+ * this before it touches a codec that stopped answering (wcd9xxx-utils.c:690-735): reset_n low, 20 ms,
+ * high, 20 ms. The debugfs power-cycle (wcd9xxx-core.c:750-760) uses 1-2 ms; the 20/20 pair is the one
+ * the SLIMbus core itself uses, and a shorter low pulse is not enough for the WCD934x's POR.
+ * The pin is left as the loader configured it (function 0, output, no pull). On this TLMM the OUT bit is
+ * bit 1, not bit 0: pinctrl-sm8150.c:71-72 has in_bit = 0, out_bit = 1, and the loader drives it the
+ * same way (xnuloader/loader.c:vayu_jack_pins, "aud_wr(+4, 2)" for high, 0 for low). J0 prints it as
+ * "in (io & 1), out (io >> 1)" for the same reason.
+ */
+static bool
+jack_reset_pulse(unsigned step, const char *why)
+{
+	uint32_t cfg, io;
+
+	if (jack_reset_pin == 0) {
+		return fail(step, "the codec's reset line was not mapped at J0");
+	}
+	cfg = rd(jack_reset_pin);
+	io = rd(jack_reset_pin + 4);
+	if (PIN_CFG_FUNCTION(cfg) != 0 || !(cfg & PIN_CFG_OE)) {
+		return fail(step, "gpio%u is not a GPIO output (cfg %#x), the codec cannot be reset", PIN_JACK_RESET, cfg);
+	}
+	say("vayu-jack: J%u: reset (%s): gpio%u low for 20 ms, then high for 20 ms\n", step, why, PIN_JACK_RESET);
+	wr(jack_reset_pin + 4, io & ~3u);              /* OUT (bit 1) = 0: reset asserted (active low) */
+	delay_for_interval(20, NSEC_PER_MSEC);
+	wr(jack_reset_pin + 4, (io & ~3u) | 2u);       /* OUT (bit 1) = 1: released */
+	delay_for_interval(20, NSEC_PER_MSEC);
+	if (!(rd(jack_reset_pin + 4) & 2u)) {
+		return fail(step, "after the reset pulse gpio%u reads back low", PIN_JACK_RESET);
+	}
+	say("vayu-jack: J%u: reset done: gpio%u is high again (io %#x)\n", step, PIN_JACK_RESET, rd(jack_reset_pin + 4));
 	return true;
 }
 
@@ -229,6 +267,7 @@ static uint32_t jack_node, jack_service_port;
 static bool jack_powered;                       /* POWER ACTIVE succeeded (finish/paths send INACTIVE) */
 static bool jack_mclk_on;                       /* LN_BB_CLK2 was voted on (J9) */
 static bool jack_ready;                         /* vayu_jack=2 and J9 done: the codec is up, MCLK on */
+static uint32_t jack_reset_retries = 2;         /* vayu_jack_reset_retries: full resets after a failed J9 (0..4) */
 static uint32_t jack_run;                       /* boot-arg vayu_jack=N, kept for vayu_jack_keep() */
 static volatile bool path_live;                 /* J2-B: the headphone path is up (read by the proof thread) */
 static volatile bool proof_done;                /* J2-B: the proof thread has left */
@@ -783,9 +822,9 @@ rx_take_addr_reply(uint8_t tid, uint8_t *la)
 }
 
 static bool
-addr_query(unsigned step, const char *what, const uint8_t *ea, uint8_t *la)
+addr_query(unsigned step, const char *what, const uint8_t *ea, uint8_t *la, uint32_t wait_ms, unsigned tries_max)
 {
-	for (unsigned tries = 1; tries <= 10; tries++) {
+	for (unsigned tries = 1; tries <= tries_max; tries++) {
 		uint8_t frame[10] = { 0x4a, 0x0d, 0xff };      /* L 10, MT 2, MC 0x0d, LA 0xff; TID; EA */
 		uint8_t tid = next_tid();
 		uint64_t began;
@@ -804,7 +843,7 @@ addr_query(unsigned step, const char *what, const uint8_t *ea, uint8_t *la)
 					found = true;
 					break;
 				}
-				if (now_ms() - began >= 100) {
+				if (now_ms() - began >= wait_ms) {
 					break;
 				}
 				delay_for_interval(1, NSEC_PER_MSEC);
@@ -817,9 +856,11 @@ addr_query(unsigned step, const char *what, const uint8_t *ea, uint8_t *la)
 		if (error != 0) {
 			say("vayu-jack: J%u: %s ADDR_QUERY try %u: TX error %d\n", step, what, tries, error);
 		} else {
-			say("vayu-jack: J%u: %s ADDR_QUERY try %u: no reply in 100 ms\n", step, what, tries);
+			say("vayu-jack: J%u: %s ADDR_QUERY try %u: no reply in %u ms\n", step, what, tries, wait_ms);
 		}
-		delay_for_interval(100, NSEC_PER_MSEC);
+		if (tries < tries_max) {
+			delay_for_interval(wait_ms, NSEC_PER_MSEC);
+		}
 	}
 	return false;
 }
@@ -830,14 +871,14 @@ step_addresses(uint8_t *pgd_la, uint8_t *ifd_la)
 	say("vayu-jack: J5: the codec's elemental addresses: PGD %02x %02x %02x %02x %02x %02x, IFD %02x %02x %02x %02x %02x %02x\n",
 	    codec_pgd_ea[0], codec_pgd_ea[1], codec_pgd_ea[2], codec_pgd_ea[3], codec_pgd_ea[4], codec_pgd_ea[5],
 	    codec_ifd_ea[0], codec_ifd_ea[1], codec_ifd_ea[2], codec_ifd_ea[3], codec_ifd_ea[4], codec_ifd_ea[5]);
-	if (!addr_query(5, "PGD", codec_pgd_ea, pgd_la)) {
+	if (!addr_query(5, "PGD", codec_pgd_ea, pgd_la, 100, 10)) {
 		return fail(5, "the codec is not on the bus");
 	}
 	say("vayu-jack: J5: PGD logical address %#x\n", *pgd_la);
 	if (*pgd_la == 0xff) {
 		return fail(5, "the codec is not on the bus");
 	}
-	if (!addr_query(5, "IFD", codec_ifd_ea, ifd_la)) {
+	if (!addr_query(5, "IFD", codec_ifd_ea, ifd_la, 100, 10)) {
 		*ifd_la = 0xff;
 		say("vayu-jack: J5: IFD logical address: no reply\n");
 	} else {
@@ -1430,7 +1471,10 @@ static void
 mclk_off(void)
 {
 	wcd_update(0x0202, 0x01, 0x00);         /* the SVS vote, released with the clock (tavil_vote_svs(false)) */
+	/* the clock top J9's MCLK-on now sets (resmgr-v2.c:248-253) goes off the same way (321-330) */
+	wcd_update(0x0602, 0x04, 0x00);
 	wcd_update(0x0711, 0x81, 0x00);
+	wcd_update(0x0602, 0x80, 0x00);
 	wcd_update(0x0606, 0x04, 0x00);
 	spin_us(110);                           /* 100-110 us */
 	wcd_update(0x0606, 0x03, 0x00);
@@ -1442,36 +1486,52 @@ mclk_off(void)
 }
 
 /*
- * The codec still answering after the SIDO source switch? a test run's retry (run 223422) did the same J9 writes as
- * run 220922, read back 0x0606 = 07, and from the next message on every REQUEST_VALUE was NACKed (INT_STAT bit 25,
- * TX_NACKED_2) -- the codec had left the bus or come back at another logical address. HYPOTHESIS: the digital
- * supply's switch to RCO/BG can drop the codec's SLIMbus interface for a moment. So: wait a little, read 0x0011;
- * if that fails, ask the manager again for the PGD and IFD logical addresses and try once more. Every attempt is
- * logged; this is evidence either way.
+ * The codec still answering after the SIDO source switch? Four runs (TEST14, TEST22 192053-bt, TEST22E, TEST23B)
+ * NACKed the very first message after 0x0606 <- 0x07 while the manager still gave the old PGD/IFD addresses
+ * (0xcf/0xce): the
+ * codec's SLIMbus interface stopped ACKing, it did not move. So: wait, read 0x0011; if that fails, ask the
+ * manager again for the PGD and IFD addresses (one try each, never ten: this path stays bounded) and try again.
+ * The waits grow 1-5-10-20-40 ms; the whole probe is over in ~76 ms plus the address queries.
  */
 static bool
 codec_still_there(unsigned step, const char *after)
 {
+	static const uint32_t wait_ms[] = { 1, 5, 10, 20, 40 };
 	uint8_t v = 0, la = 0xff;
 
-	for (unsigned attempt = 1; attempt <= 5; attempt++) {
-		delay_for_interval(attempt == 1 ? 1 : 10, NSEC_PER_MSEC);
+	for (unsigned attempt = 1; attempt <= sizeof(wait_ms) / sizeof(wait_ms[0]); attempt++) {
+		uint8_t buck = 0;
+		bool read_back;
+
+		delay_for_interval(wait_ms[attempt - 1], NSEC_PER_MSEC);
 		if (wcd_read_raw(0x0011, &v)) {
-			if (attempt > 1) {
-				say("vayu-jack: J%u: after %s the codec answers again on try %u (0x0011=%02x)\n", step, after, attempt, v);
+			/*
+			 * Answering is not enough: a brownout can leave the codec at its reset defaults with the
+			 * bus alive again, and then J9's tables are gone. 0x0606 is the last register written
+			 * before this probe; if its high-accuracy bit is still there, the codec kept the state.
+			 */
+			read_back = wcd_read_raw(0x0606, &buck);
+			if (read_back && (buck & 0x04)) {
+				if (attempt > 1) {
+					say("vayu-jack: J%u: after %s the codec answers again on try %u (0x0011=%02x 0x0606=%02x)\n",
+					    step, after, attempt, v, buck);
+				}
+				return true;
 			}
-			return true;
+			say("vayu-jack: J%u: after %s the codec answers but does not keep its state (0x0606=%s%02x, wanted bit 2)\n",
+			    step, after, read_back ? "" : "?", buck);
+		} else {
+			say("vayu-jack: J%u: after %s the codec does not answer (try %u of %u): asking the manager for its address again\n",
+			    step, after, attempt, (unsigned)(sizeof(wait_ms) / sizeof(wait_ms[0])));
 		}
-		say("vayu-jack: J%u: after %s the codec does not answer (try %u): asking the manager for its address again\n",
-		    step, after, attempt);
-		if (addr_query(step, "PGD", codec_pgd_ea, &la) && la != 0xff) {
+		if (addr_query(step, "PGD", codec_pgd_ea, &la, 100, 1) && la != 0xff) {
 			if (la != codec_pgd_la) {
 				say("vayu-jack: J%u: the codec's PGD came back at LA %#x (was %#x)\n", step, la, codec_pgd_la);
 			}
 			codec_pgd_la = la;
 			wcd_page_written = -1;
 		}
-		if (addr_query(step, "IFD", codec_ifd_ea, &la) && la != 0xff) {
+		if (addr_query(step, "IFD", codec_ifd_ea, &la, 100, 1) && la != 0xff) {
 			codec_ifd_la = la;
 		}
 	}
@@ -1479,7 +1539,7 @@ codec_still_there(unsigned step, const char *after)
 }
 
 static bool
-step_mclk_init(void)
+mclk_init_once(unsigned attempt __unused)
 {
 	uint8_t v11, v711, v0d41, v606, v601;
 
@@ -1530,7 +1590,14 @@ step_mclk_init(void)
 	}
 	say("vayu-jack: J9: MCLK2 (0x0712 m60 v20)\n");
 
-	/* 7. MCLK on (wcd934x.c:9244-9285; M1 skipped: the digital core is up after bring-up) */
+	/*
+	 * 7. MCLK on (wcd934x.c:9244-9285; M1 skipped: the digital core is up after bring-up). The clock top first:
+	 * stock's wcd_resmgr_enable_clk_mclk writes ANA_CLK_TOP 0x0602 (0x80 on, 0x08 off, 0x04 on) before the
+	 * MCLK program register (wcd9xxx-resmgr-v2.c:248-253). J9 did not, and all four J9 failures (TEST14,
+	 * TEST22 192053-bt, TEST22E, TEST23B) NACKed the first message after the SIDO switch: without 0x0602 the
+	 * core is not clocked from the external MCLK and stays on its internal (reset-default) clock path, exactly
+	 * the block the SIDO re-reference disturbs. Stock's order and values are kept.
+	 */
 	if (!wcd_read_raw(0x0011, &v11)) {
 		return fail(9, "0x0011 cannot be read before MCLK on");
 	}
@@ -1545,6 +1612,10 @@ step_mclk_init(void)
 	if (!wcd_update(0x0601, 0x40, 0x00) || !wcd_update(0x0601, 0x20, 0x00)) {
 		return fail(9, "the master bias (0x0601 m40/m20) did not settle");
 	}
+	if (!wcd_update(0x0602, 0x80, 0x80) || !wcd_update(0x0602, 0x08, 0x00) ||
+	    !wcd_update(0x0602, 0x04, 0x04)) {
+		return fail(9, "the clock top (0x0602 m80/m08/m04) did not go");
+	}
 	if (!wcd_update(0x0711, 0x80, 0x80) || !wcd_update(0x0711, 0x30, 0x10) ||
 	    !wcd_update(0x0711, 0x02, 0x00) || !wcd_update(0x0711, 0x01, 0x01) ||
 	    !wcd_update(0x0711, 0x02, 0x00) || !wcd_update(0x0d42, 0x01, 0x01) ||
@@ -1552,6 +1623,17 @@ step_mclk_init(void)
 		return fail(9, "the MCLK block (0x0711/0x0D42/0x0D41/0x0002) did not go");
 	}
 	spin_us(15);                            /* 10-15 us (wcd9xxx-resmgr-v2.c:289) */
+	{
+		/*
+		 * The state the next failure will be read against: stock leaves here with 0x0602 bits 7 and 2 set,
+		 * 0x0603 = 0 and 0x0606 = 0. Read, do not fail: this is evidence, not a step.
+		 */
+		uint8_t c602 = 0xff, c603 = 0xff, c606 = 0xff;
+		bool r602 = wcd_read_raw(0x0602, &c602), r603 = wcd_read_raw(0x0603, &c603), r606 = wcd_read_raw(0x0606, &c606);
+
+		say("vayu-jack: J9: before the SIDO switch: 0x0602=%s%02x 0x0603=%s%02x 0x0606=%s%02x (stock: 0x0602 bits 7 and 2 set)\n",
+		    r602 ? "" : "?", c602, r603 ? "" : "?", c603, r606 ? "" : "?", c606);
+	}
 	if (!wcd_update(0x0603, 0x80, 0x80)) {
 		return fail(9, "the RCO (0x0603 m80) did not go");
 	}
@@ -1594,6 +1676,136 @@ step_mclk_init(void)
 	say("vayu-jack: J9: codec ready: 0x0011=%02x 0x0711=%02x 0x0D41=%02x 0x0606=%02x 0x0601=%02x\n", v11, v711,
 	    v0d41, v606, v601);
 	return true;
+}
+
+/* ---- J9-R: the codec stopped answering: full reset, SLIMbus re-enumeration, another J9 ----------- */
+
+#define JACK_REACQUIRE_MS       1000    /* ngd: LADDR_RETRY x 20 ms after a framer boot (slim-msm-ngd.c:1666-1676) */
+#define JACK_REACQUIRE_STEP_MS  20      /* stock's sleep between the logical-address retries */
+
+static void
+jack_rx_flush(void)
+{
+	uint32_t words[JACK_RX_WORDS], length;
+
+	while (rx_take(words, &length)) {
+	}
+}
+
+/*
+ * The codec is on the bus again? The manager on the ADSP owns enumeration, so the most the AP can do
+ * is ask it exactly as stock's SLIMbus core does after a framer boot: slim_get_logical_addr() in a
+ * loop, 20 ms apart (slim-msm-ngd.c:1666-1676). Drop our cached addresses first: a reset codec can
+ * come back at a new logical address (the PGD is the one J5 makes mandatory, the IFD is optional there).
+ */
+static bool
+codec_reacquire(unsigned step, uint32_t budget_ms)
+{
+	uint8_t pgd = 0xff, ifd = 0xff;
+	uint64_t began = now_ms();
+
+	codec_pgd_la = 0xff;
+	codec_ifd_la = 0xff;
+	wcd_page_written = -1;
+	jack_rx_flush();
+	{
+		/* A NACK left over from the failed attempt must not be taken for the next message's answer. */
+		uint32_t stale = rd(ngd + NGD_INT_STAT) & (NGD_INT_TX_ERRORS | NGD_INT_RX_RCVD);
+
+		if (stale != 0) {
+			ngd_clear(step, stale);
+		}
+	}
+	for (;;) {
+		if (codec_pgd_la == 0xff && addr_query(step, "PGD", codec_pgd_ea, &pgd, 100, 1) && pgd != 0xff) {
+			codec_pgd_la = pgd;
+			say("vayu-jack: J%u: after the reset the codec's PGD answers at LA %#x\n", step, pgd);
+		}
+		if (codec_pgd_la != 0xff && codec_ifd_la == 0xff &&
+		    addr_query(step, "IFD", codec_ifd_ea, &ifd, 100, 1) && ifd != 0xff) {
+			codec_ifd_la = ifd;
+			say("vayu-jack: J%u: after the reset the codec's IFD answers at LA %#x\n", step, ifd);
+		}
+		if (codec_pgd_la != 0xff && codec_ifd_la != 0xff) {
+			return true;
+		}
+		if (now_ms() - began >= budget_ms) {
+			break;
+		}
+		delay_for_interval(JACK_REACQUIRE_STEP_MS, NSEC_PER_MSEC);
+	}
+	if (codec_pgd_la == 0xff) {
+		say("vayu-jack: J%u: the codec is not back on the bus after %u ms (no PGD address)\n", step, budget_ms);
+	} else {
+		say("vayu-jack: J%u: the codec is back at PGD LA %#x but its IFD did not answer in %u ms\n", step,
+		    codec_pgd_la, budget_ms);
+	}
+	return false;
+}
+
+/*
+ * One recovery attempt after a failed J9. The codec stopped ACKing SLIMbus, so no register write can
+ * reach it: the reset line is the only out-of-band control we have. Stock's wcd9xxx_reset (called by
+ * the SLIMbus core when a device reports absent) pulls it low for 20 ms and high for 20 ms
+ * (wcd9xxx-utils.c:690-735); wcd934x_bring_up then rewrites the eight bring-up registers
+ * (wcd9xxx-rst.c:316-325). Here the same order is used: MCLK vote off, reset pulse, wait for the
+ * manager to hand out the logical addresses again, then J7 and the caller's J9 retry.
+ */
+static bool
+codec_reset_and_reinit(unsigned attempt)
+{
+	(void)vayu_rpmh_write("lnbclka2", 4, 0);        /* the clock of a codec that is off the bus */
+	jack_mclk_on = false;
+	say("vayu-jack: J9: attempt %u: the codec does not answer; reset and bring-up again\n", attempt);
+	if (!jack_reset_pulse(9, "the codec stopped answering after the SIDO switch")) {
+		return false;
+	}
+	if (!codec_reacquire(9, JACK_REACQUIRE_MS)) {
+		/*
+		 * The NGD is ours and it is still up, but the framer may have dropped the satellite state
+		 * with the codec. Repeat the J3 register writes once (same values, no capability exchange:
+		 * the manager does not resend MASTER_CAPABILITY for a codec reset, only for a framer boot).
+		 */
+		say("vayu-jack: J9: asking again after the NGD's own bring-up\n");
+		ngd_enable(9);
+		if (!codec_reacquire(9, JACK_REACQUIRE_MS)) {
+			return fail(9, "the codec did not come back on SLIMbus after the reset (attempt %u)", attempt);
+		}
+	}
+	wcd_step = 7;
+	if (!step_codec()) {
+		return fail(9, "the codec answers, but the bring-up writes after the reset did not go (attempt %u)", attempt);
+	}
+	return true;
+}
+
+/*
+ * J9 with a bounded number of full resets. One attempt is the stock sequence; a failure is either the
+ * codec gone after the SIDO switch (all four observed failures) or a later step. Either way the codec
+ * is reset and J7+J9 are replayed from scratch, at most 1 + vayu_jack_reset_retries times (0..4).
+ */
+static bool
+step_mclk_init(void)
+{
+	if (codec_ifd_la == 0xff) {
+		/* J5 could not find the IFD; a reset pulse cannot invent it, so do not recycle the codec for it. */
+		return fail(9, "the codec's IFD logical address is not known (J5)");
+	}
+	for (unsigned attempt = 1; ; attempt++) {
+		if (mclk_init_once(attempt)) {
+			if (attempt > 1) {
+				say("vayu-jack: J9: the codec is up on attempt %u after the reset\n", attempt);
+			}
+			return true;
+		}
+		if (attempt > jack_reset_retries) {
+			return fail(9, "the codec did not come up in %u attempt%s (reset retries %u)", attempt,
+			    attempt == 1 ? "" : "s", jack_reset_retries);
+		}
+		if (!codec_reset_and_reinit(attempt)) {
+			return false;
+		}
+	}
 }
 
 /* ---- J10: everything is up; the headphone path is vayu_audio's step 4 ---------------------------- */
@@ -1861,6 +2073,15 @@ vayu_jack_run(struct vayu_qrtr *q)
 	jack_ready = false;
 	jack_run = run;
 	jack_mclk_on = false;
+	jack_reset_pin = 0;
+	/*
+	 * vayu_jack_reset_retries=N: how many full codec resets J9 may do after a failed attempt. Default 2
+	 * (three attempts in all), capped at 4 so a codec that never comes back cannot hold the boot.
+	 */
+	if (PE_parse_boot_argn("vayu_jack_reset_retries", &jack_reset_retries, sizeof(jack_reset_retries)) &&
+	    jack_reset_retries > 4) {
+		jack_reset_retries = 4;
+	}
 	jack_q = NULL;
 	jack_powered = false;
 	jack_state_sysctl = -1;
