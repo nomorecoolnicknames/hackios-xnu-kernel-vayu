@@ -1261,11 +1261,38 @@ save_once(void)
 	return ok;
 }
 
+/*
+ * launchd tears the services down BEFORE it calls reboot(2) (services killed 3 s before reboot(2)
+ * is called), so a saver that dies of the shutdown's SIGTERM can never answer the kernel. The kernel asks for the
+ * volume the moment the shutdown starts (kern.hakios.var_save = WANTED, from the "kext loading off" that launchd
+ * does first); the saver must live to answer it, so SIGTERM and SIGHUP are ignored here (the raw sigaction
+ * syscall: this program has no libc and a handler would need a signal trampoline) and the job's ExitTimeOut is
+ * what bounds the wait. A saver that was never asked is ended by launchd's SIGKILL after that time.
+ */
+#define VAR_SYS_SIGACTION       46
+#define VAR_SIG_IGN             1L
+
+static void
+ignore_shutdown_signals(void)
+{
+	struct {
+		long handler;
+		long trampoline;
+		unsigned mask;
+		int flags;
+	} act = { VAR_SIG_IGN, 0, 0, 0 };
+
+	(void)mini_syscall(VAR_SYS_SIGACTION, 15 /* SIGTERM */, (long)&act, 0, 0, 0, 0);
+	(void)mini_syscall(VAR_SYS_SIGACTION, 1 /* SIGHUP */, (long)&act, 0, 0, 0, 0);
+}
+
 static int
 watch(int seconds)
 {
 	uint64_t last = 0;
 	int asked = 0;
+
+	ignore_shutdown_signals();
 
 	fd = open(DEVICE, O_RDWR, 0);
 	if (fd < 0) {
