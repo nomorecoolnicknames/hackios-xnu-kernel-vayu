@@ -35,7 +35,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 STATES = ("works", "partial", "missing")
 AREAS = ("display", "touch", "buttons", "cpu", "gpu", "storage", "audio", "battery", "haptic", "camera", "torch", "wifi",
-         "bluetooth", "cellular", "network", "thermal", "usb", "sensors")
+         "bluetooth", "cellular", "network", "thermal", "usb", "sensors", "nfc")
 DEVICE_KEYS = {"title", "vendor", "soc", "defconfig", "firmware", "maintainer", "status", "repository", "revision", "path"}
 SOC_KEYS = {"title", "vendor", "cores", "gpu", "maintainer", "repository", "revision", "path"}
 

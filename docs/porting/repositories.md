@@ -50,7 +50,7 @@ device redwood
 | `defconfig` | its defconfig, in its `configs/` |
 | `firmware` | the script that pulls its firmware |
 | `maintainer` | who answers for it |
-| `status <area> works\|partial\|missing <note>` | how far a part works, **as seen on this device**; the note says how it is turned on and what is not done. Areas: display, touch, buttons, cpu, gpu, storage, audio, battery, haptic, camera, torch, wifi, bluetooth, cellular, network, thermal, usb, sensors |
+| `status <area> works\|partial\|missing <note>` | how far a part works, **as seen on this device**; the note says how it is turned on and what is not done. Areas: display, touch, buttons, cpu, gpu, storage, audio, battery, haptic, camera, torch, wifi, bluetooth, cellular, network, thermal, usb, sensors, nfc |
 
 The device's page in this documentation ([redwood](../devices/redwood.md)) and the table of [all devices](../devices/index.md)
 are made from it by `tools/docs-gen.py`: the status is written once, next to the code it describes.
