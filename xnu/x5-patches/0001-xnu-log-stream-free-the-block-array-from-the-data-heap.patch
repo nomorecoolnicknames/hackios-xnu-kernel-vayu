@@ -1,0 +1,22 @@
+--- a/bsd/kern/subr_log_stream.c
++++ b/bsd/kern/subr_log_stream.c
+@@ -653,7 +653,18 @@
+ 		kfree_data(ls->ls_buf, buf_size);
+ 	}
+ 	if (ls->ls_blk) {
+-		kfree_type(uint8_t, ls->ls_blk_count, ls->ls_blk);
++		/*
++		 * X5: the block array is kalloc_data() (log_stream_make) and the error path
++		 * there frees it with kfree_data() too.  kfree_type() is only equivalent on a
++		 * build made by Apple's clang, which marks uint8_t[] KT_DATA_ONLY and so
++		 * redirects the type view to the data heap.  With stock clang (xnu-deps/
++		 * hostinc/xnu_clang_compat.h: no __builtin_xnu_type_summary) the view stays
++		 * "mixed" and kfree_zone() panics with
++		 *   kfree: addr ..., size N found in heap data.* instead of *
++		 * on every close of /dev/oslog_stream -- i.e. any user process that makes
++		 * diagnosticd drop its live stream panics the kernel.
++		 */
++		kfree_data(ls->ls_blk, ls->ls_blk_count);
+ 	}
+ 	bzero(ls, sizeof(*ls));
+ }
