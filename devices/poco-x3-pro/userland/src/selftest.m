@@ -787,6 +787,7 @@ stage_files(double at)
 	 * is what turns "known=0 enabled=-1" into a named fault. */
 	int summary_seen = 0, summary_ok = 0, summary_hidden = 0;
 	char summary_storage[16] = "unknown", summary_reason[32] = "";
+	char summary_pkd[16] = "unknown", summary_mcm[16] = "unknown";
 	int summary_crashed = 0;
 	int domain_ok;
 	int extension_running;
@@ -889,6 +890,11 @@ stage_files(double at)
 			summary_hidden = strstr(summary, "hidden=1") != NULL;
 			(void)summary_field(summary, "storage=", summary_storage, sizeof(summary_storage));
 			(void)summary_field(summary, "reason=", summary_reason, sizeof(summary_reason));
+			/* F5: the two inputs of the daemon's documentStorageURL that fp_enable asks from this
+			 * side -- pkd= (the extension record PlugInKit hands out) and mcm= (the container
+			 * manager's answer for the document group). They name the failing link. */
+			(void)summary_field(summary, "pkd=", summary_pkd, sizeof(summary_pkd));
+			(void)summary_field(summary, "mcm=", summary_mcm, sizeof(summary_mcm));
 			summary_crashed = strstr(summary, "crashed=1") != NULL;
 			stage_say("fp_enable's own verdict (R16, the provider object): %s", summary);
 			if (summary_crashed) {
@@ -898,13 +904,19 @@ stage_files(double at)
 				    "(\"- [NSFileManager createDirectoryAtURL:...]: URL is nil\" in TEST11) and the "
 				    "reason is in fp_enable's own output above.");
 			} else if (strcmp(summary_storage, "nil") == 0) {
-				stage_say("the daemon has no document storage URL for the provider (R17, storage=nil): "
-				    "FileProviderDaemon makes <documentStorageURL>/File Provider Storage before it "
-				    "starts a domain, so a domain created now cannot start -- this is the state in "
-				    "which the same call aborted fileproviderd in TEST11. fp_enable's preflight above "
-				    "printed the appex's NSExtensionFileProviderDocumentGroup, the group container and "
-				    "the appex's own com.apple.security.application-groups; those three are the chain "
-				    "the URL is resolved from.");
+				/* F5: nil before the domain exists is the normal state (TEST10), so this line is
+				 * only worth printing when the enable did not produce a URL either. The pkd=/mcm=
+				 * fields name the link: pkd=no is the extension record PlugInKit hands out,
+				 * mcm=no is the container manager's answer for the document group, and pkd=yes
+				 * mcm=yes with a daemon still at nil is the daemon's own descriptor (its process
+				 * predates the registry -- the --restart pass in fp_enable is for that). */
+				stage_say("the daemon still reports no document storage URL after the enable "
+				    "(storage=nil; pkd=%s mcm=%s). TEST10 shows the URL appearing when the domain "
+				    "starts, so this is now either the extension record (pkd=no), the container "
+				    "(mcm=no) or the daemon's own descriptor (pkd=yes mcm=yes); fp_enable's "
+				    "preflight above printed the appex Info.plist, its signature and the container "
+				    "metadata, and its recovery line says whether fileproviderd died trying.",
+				    summary_pkd, summary_mcm);
 			}
 		} else {
 			stage_say("fp_enable printed no summary line (an older binary): the fileproviderctl list below "
@@ -1024,6 +1036,11 @@ stage_files(double at)
 			summary_hidden = strstr(summary, "hidden=1") != NULL;
 			(void)summary_field(summary, "storage=", summary_storage, sizeof(summary_storage));
 			(void)summary_field(summary, "reason=", summary_reason, sizeof(summary_reason));
+			/* F5: the two inputs of the daemon's documentStorageURL that fp_enable asks from this
+			 * side -- pkd= (the extension record PlugInKit hands out) and mcm= (the container
+			 * manager's answer for the document group). They name the failing link. */
+			(void)summary_field(summary, "pkd=", summary_pkd, sizeof(summary_pkd));
+			(void)summary_field(summary, "mcm=", summary_mcm, sizeof(summary_mcm));
 			summary_crashed = strstr(summary, "crashed=1") != NULL;
 			stage_say("fp_enable's own verdict, second process: %s", summary);
 		}
@@ -1059,12 +1076,12 @@ stage_files(double at)
 			    "this log (\"*** Terminating app due to uncaught exception\") and the crash report "
 			    "fp_enable printed.");
 		} else if (strcmp(summary_storage, "nil") == 0) {
-			stage_say("the provider is not enabled because the daemon has no document storage URL for "
-			    "it (R17, storage=nil): the enable is not refused, there is nothing to start. This is "
-			    "the LocalStorage storage chain: the appex's NSExtensionFileProviderDocumentGroup "
-			    "(group.com.apple.FileProvider.LocalStorage), the appex's own signature "
-			    "com.apple.security.application-groups, and the group container the container manager "
-			    "hands to that identity -- fp_enable's preflight printed all three.");
+			stage_say("the provider is still not enabled and the daemon still has no document storage "
+			    "URL (storage=nil, pkd=%s mcm=%s): the enable is not refused, the domain was never "
+			    "started. TEST10 proves nil is the state before the first domain, so the link that "
+			    "did not resolve is the one named by pkd/mcm -- the extension record, the container, "
+			    "or the daemon's descriptor (see fp_enable's recovery and restart lines above).",
+			    summary_pkd, summary_mcm);
 		} else {
 			stage_say("the provider is still not enabled and visible after fp_enable (two processes, the second "
 			    "one later): read its output above -- \"no connection to fileproviderd\" and \"no answer\" are "
@@ -1085,20 +1102,21 @@ stage_files(double at)
 
 		if (path[0] != '\0' && stat(path, &status) == 0) {
 			snprintf(line, sizeof(line), "domain=%s+%s provider=%s fp_enable_exit=%d again_exit=%d file=%s "
-			    "size=%lld readback=%s provider_ls=%s storage=%s crashed=%d reason=%s", listed ? "listed" : "NOT-listed",
-			    enabled ? "enabled" : "NOT-enabled",
+			    "size=%lld readback=%s provider_ls=%s storage=%s pkd=%s mcm=%s crashed=%d reason=%s",
+			    listed ? "listed" : "NOT-listed", enabled ? "enabled" : "NOT-enabled",
 			    summary_seen ? (summary_ok ? "enabled+visible" : summary_hidden ? "enabled+hidden" :
 			    "not-enabled") : "unreported", enable_exit, again_exit, path,
 			    (long long)status.st_size, written ? "ok" : "no", seen ? "yes" : "NO", summary_storage,
-			    summary_crashed, summary_reason[0] != '\0' ? summary_reason : "unreported");
+			    summary_pkd, summary_mcm, summary_crashed,
+			    summary_reason[0] != '\0' ? summary_reason : "unreported");
 		} else {
 			snprintf(line, sizeof(line), "domain=%s+%s provider=%s fp_enable_exit=%d again_exit=%d file=%s "
-			    "readback=%s provider_ls=%s storage=%s crashed=%d reason=%s", listed ? "listed" : "NOT-listed",
-			    enabled ? "enabled" : "NOT-enabled",
+			    "readback=%s provider_ls=%s storage=%s pkd=%s mcm=%s crashed=%d reason=%s",
+			    listed ? "listed" : "NOT-listed", enabled ? "enabled" : "NOT-enabled",
 			    summary_seen ? (summary_ok ? "enabled+visible" : summary_hidden ? "enabled+hidden" :
 			    "not-enabled") : "unreported", enable_exit, again_exit, path[0] != '\0' ? path : "(none)",
-			    written ? "ok" : "no", seen ? "yes" : "NO", summary_storage, summary_crashed,
-			    summary_reason[0] != '\0' ? summary_reason : "unreported");
+			    written ? "ok" : "no", seen ? "yes" : "NO", summary_storage, summary_pkd, summary_mcm,
+			    summary_crashed, summary_reason[0] != '\0' ? summary_reason : "unreported");
 		}
 	}
 	stage_result(domain_ok && written && seen, "%s", line);
@@ -1912,6 +1930,15 @@ stage_camera(double at, int app_timeout)
 			(void)run_capture((char *const[]){ (char *)"/redwood/bin/ls_rebuild", (char *)"--check", NULL },
 			    lscheck, sizeof(lscheck), 60);
 			stage_say("/redwood/bin/ls_rebuild --check:");
+			detail_text(lscheck);
+			/* F5: and the question that decides the camera stage -- is the *application* in
+			 * LaunchServices at all, i.e. does any bundle claim hakiostest://? SpringBoard answered
+			 * NO (battery_test: "it REFUSES"); "not registered" here is the reason, "registered"
+			 * moves the fault to SpringBoard's open path or the application itself. */
+			memset(lscheck, 0, sizeof(lscheck));
+			(void)run_capture((char *const[]){ (char *)"/redwood/bin/ls_rebuild", (char *)"--app",
+			    (char *)"com.hakios.selftest.camera", NULL }, lscheck, sizeof(lscheck), 30);
+			stage_say("/redwood/bin/ls_rebuild --app com.hakios.selftest.camera:");
 			detail_text(lscheck);
 		}
 		stage_result(0, "the application left no result (see its log and the LaunchServices check above)");
