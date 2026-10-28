@@ -141,19 +141,33 @@ static void
 touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time, bool from_driver)
 {
 	struct hakios_touch *t;
+	uint64_t stamp;
 
+	/*
+	 * S6: the "tl: p" line is made before the queue's lock is taken, not under it.
+	 *
+	 * hakios_tl() goes to loader_log_line(), which masks interrupts and spins on the loader log's
+	 * lock (osfmk/arm64/loader_return.c) for as long as another processor holds it -- and the
+	 * reader of this queue is a thread in backboardd (userland/src/inject.c) that needs touch_lock
+	 * for every sample. A console write inside the critical section therefore delays the very
+	 * thread the touch is for, once per sample, at 240 samples a second. In TEST20B the damage was
+	 * small -- the longest gap between two reads inside a drag was 4.7 ms (the 350 ms ones are the
+	 * self-test's own pause between swipes) -- but it is a cost with no reason to be there: the
+	 * stamp is what the line is about, and it is taken first either way.
+	 */
+	stamp = time != 0 ? time : mach_absolute_time();
+	if (latency_lines()) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(stamp, &ns);
+		hakios_tl("tl: p %u %u %u %u at %llu\n", type, finger, x, y, ns / 1000);
+	}
 	lck_mtx_lock(&touch_lock);
 	if (touch_tail - touch_head == TOUCH_QUEUE) {
 		touch_head++;                   /* nobody reads: drop the oldest */
 	}
 	t = &touch_queue[touch_tail++ % TOUCH_QUEUE];
-	t->time = time != 0 ? time : mach_absolute_time();
-	if (latency_lines()) {
-		uint64_t ns;
-
-		absolutetime_to_nanoseconds(t->time, &ns);
-		hakios_tl("tl: p %u %u %u %u at %llu\n", type, finger, x, y, ns / 1000);
-	}
+	t->time = stamp;
 	t->type = type;
 	t->finger = finger;
 	t->x = x > 65535 ? 65535 : x;
