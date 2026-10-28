@@ -824,6 +824,14 @@ static LCK_GRP_DECLARE(vayu_audio_lock_group, "vayu-audio");
 static LCK_MTX_DECLARE(apr_lock, &vayu_audio_lock_group);       /* one APR command and its answer at a time */
 static LCK_MTX_DECLARE(mic_lock, &vayu_audio_lock_group);       /* the capture path's state, for the node and quiesce */
 
+/*
+ * R18: a command that got no answer at all (apr_ask timed out) says the DSP is gone, and a teardown that
+ * follows must not spend its 1000 ms per command on it: a path taken down after the DSP has stopped
+ * answering is four commands (stream close, device path close, port stop, unmap) = four seconds of a
+ * kernel thread asleep on a mutex that will never be answered. Set where apr_ask fails, cleared by any
+ * answer; mic_off() uses it to skip the DSP's part and says so once.
+ */
+static bool mic_dsp_gone;
 
 #define APR_SVC_AFE             4
 #define APR_SVC_ASM             7
@@ -864,9 +872,11 @@ command_words(const char *what, uint8_t service, uint16_t port, uint32_t opcode,
 	lck_mtx_lock(&apr_lock);
 	if (!apr_ask(service, port, opcode, payload, length, 1000)) {
 		say("vayu-audio: %u: %s (opcode %#x to service %u, port %#x): NO ANSWER\n", command_step, what, opcode, service, port);
+		mic_dsp_gone = true;
 		lck_mtx_unlock(&apr_lock);
 		return false;
 	}
+	mic_dsp_gone = false;
 	if (apr_answer.opcode == APR_BASIC_RSP_RESULT && apr_answer.words[0] == opcode) {
 		say("vayu-audio: %u: %s: %s%s\n", command_step, what, apr_answer.words[1] == 0 ? "done" : "REFUSED: ",
 		    apr_answer.words[1] == 0 ? "" : dsp_error(apr_answer.words[1]));
@@ -912,9 +922,11 @@ mic_command_words(const char *what, uint8_t service, uint16_t port, uint32_t opc
 	lck_mtx_lock(&apr_lock);
 	if (!apr_ask(service, port, opcode, payload, length, 1000)) {
 		say("vayu-audio: mic: %s (opcode %#x to service %u, port %#x): NO ANSWER\n", what, opcode, service, port);
+		mic_dsp_gone = true;
 		lck_mtx_unlock(&apr_lock);
 		return false;
 	}
+	mic_dsp_gone = false;
 	if (apr_answer.opcode == APR_BASIC_RSP_RESULT && apr_answer.words[0] == opcode) {
 		say("vayu-audio: mic: %s (opcode %#x, service %u, port %#x): %s%s\n", what, opcode, service, port,
 		    apr_answer.words[1] == 0 ? "done" : "REFUSED: ", apr_answer.words[1] == 0 ? "" : dsp_error(apr_answer.words[1]));
@@ -3611,15 +3623,30 @@ mic_off(void)
 {
 	uint32_t handle = mic_map_handle;
 	uint16_t stop[2] = { mic_port_id, 0 };
+	/*
+	 * R18: the DSP's part of the teardown stops as soon as one of ITS commands goes unanswered (a
+	 * timeout sets mic_dsp_gone, any answer clears it): the session, the device path and the port die
+	 * with the DSP, and the loader resets it a few lines after this. The codec's own part below is
+	 * always done. This keeps the teardown bounded: without it, four commands that will never be
+	 * answered cost four apr_ask timeouts (4 x 1000 ms) in the very thread that is taking the path down
+	 * -- the thread the quiesce path waits for.
+	 */
+	bool dsp_gone = false;
 
 	if (mic_stream_open) {
-		mic_step_command("the stream (session 2), closed", APR_SVC_ASM, MIC_STREAM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0, 0);
+		if (!dsp_gone && !mic_step_command("the stream (session 2), closed", APR_SVC_ASM, MIC_STREAM_PORT,
+		    ASM_STREAM_CMD_CLOSE, NULL, 0, 0)) {
+			dsp_gone = mic_dsp_gone;
+		}
 		mic_stream_open = false;
 		/* (the DSP lets session 2 go before it is opened again: a re-open right after a close) */
 		delay_for_interval(2, NSEC_PER_MSEC);
 	}
 	if (mic_copp_open) {
-		mic_step_command("the device path, closed", APR_SVC_ADM, (uint16_t)mic_copp, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 0);
+		if (!dsp_gone && !mic_step_command("the device path, closed", APR_SVC_ADM, (uint16_t)mic_copp,
+		    ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 0)) {
+			dsp_gone = mic_dsp_gone;
+		}
 		mic_copp_open = false;
 	}
 	vayu_jack_mic_off();
@@ -3627,13 +3654,21 @@ mic_off(void)
 		char what[64];
 
 		snprintf(what, sizeof(what), "the port %#x, stopped", mic_port_id);
-		mic_step_command(what, APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0);
+		if (!dsp_gone && !mic_step_command(what, APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0)) {
+			dsp_gone = mic_dsp_gone;
+		}
 		mic_port_on = false;
 	}
 	if (mic_mapped) {
-		mic_step_command("our periods, unmapped (the microphones)", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &handle,
-		    sizeof(handle), 0);
+		if (!dsp_gone && !mic_step_command("our periods, unmapped (the microphones)", APR_SVC_ASM, 0,
+		    ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &handle, sizeof(handle), 0)) {
+			dsp_gone = mic_dsp_gone;
+		}
 		mic_mapped = false;
+	}
+	if (dsp_gone) {
+		mic_say("the DSP has not answered: what was left of the stream, the device path, the port and the "
+		    "mapping is not asked for (they die with it); the codec's path is down\n");
 	}
 	if (!mic_space_held) {
 		lck_mtx_lock(&hakios_smmu_lock);
@@ -3963,6 +3998,7 @@ mic_path_up(void)
 	 * carries the old generation is ignored (see MIC_READ_TOKEN).
 	 */
 	mic_generation = (mic_generation + 1) & MIC_READ_GEN_MASK;
+	mic_dsp_gone = false;                   /* (a new capture: the DSP's answers are looked for again) */
 	/*
 	 * R18: `previous' is the number of captures that CAME UP before this one. A bring-up that fails half
 	 * way does not count (its port is taken down again by fail:), so the count and the
