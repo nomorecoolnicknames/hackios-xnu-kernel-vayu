@@ -1,0 +1,22 @@
+--- a/userland/build.sh
++++ b/userland/build.sh
+@@ -393,6 +393,19 @@
+ 	# check at the end says so if the image that will be booted does not have them.
+ 	[ -n "$DEVICE_APPS" ] && mkdir -p root/Applications
+ 	for f in $DEVICE_APPS; do [ -d obj/$f ] && cp -a obj/$f root/Applications/; done
++	# F10: the LocalStorage appex with the FileProvider keys also under
++	# NSExtension.NSExtensionAttributes. FileProviderDaemon's -[FPDProviderDescriptor initWithExtension:]
++	# reads exactly that nested dictionary from the bundle's Info.plist (0x1c3c6551c: [NSBundle infoDictionary]
++	# -> NSExtension -> NSExtensionAttributes -> NSExtensionFileProviderDocumentGroup); with the keys only at
++	# the NSExtension level the descriptor has no document group, extensionStorageURLs is empty and
++	# documentStorageURL stays nil. init puts this copy over the system image's appex (src/init.c,
++	# bind_fp_appex), so the system image does not have to be remade for this 1.5 KB plist.
++	if [ -d ../devices/$DEVICE/userland/share/fp-localstorage/LocalStorageFileProvider.appex ]; then
++		mkdir -p root/share/fp-localstorage
++		cp -a ../devices/$DEVICE/userland/share/fp-localstorage/LocalStorageFileProvider.appex \
++		    root/share/fp-localstorage/
++		echo "build.sh: F10: LocalStorageFileProvider.appex with NSExtensionAttributes -> root/share/fp-localstorage"
++	fi
+ 	for f in $EXTRA; do cp "$f" root/bin/; done
+ 	# /dev and /private/var exist so that this image can also be the root on its own:
+ 	# devfs is mounted on /dev, and init puts a ramfs on /private/var

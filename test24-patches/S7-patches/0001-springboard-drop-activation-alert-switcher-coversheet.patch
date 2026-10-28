@@ -1,0 +1,555 @@
+--- a/userland/src/inject_sb.c
++++ b/userland/src/inject_sb.c
+@@ -747,91 +747,467 @@
+ 
+ #define UNLOCK_SOURCE_COVER_SHEET       24      /* what the lock screen itself passes */
+ 
++/*
++ * S7: the thing that actually ate the touches.
++ *
++ * The S6 run went looking for a cover sheet and did not find one: the window stack of TEST22B/E
++ * (artifacts/vayu/test22-lead2-20261028, com.hakios.layers) has no SBCoverSheetWindow at all.
++ * What it does have, from boot on, is
++ *
++ *     window SBAlertItemWindow level 2000, context 0x5c18e2a6
++ *       _SBAlertController, two labels, two buttons, a full-screen 20% dimming view
++ *
++ * and backboardd's touchstats for every synthetic touch name exactly that context:
++ * "destinations: { SpringBoard.10 contextID 5C18E2A6: ... }". An alert item is modal: it makes
++ * SpringBoard's scene the active one and leaves the application's scene foreground-inactive, so
++ * the application is visible (its scene is foreground) but receives nothing and redraws nothing
++ * -- the "1 frame a second" of TEST20B is that, not the renderer.
++ *
++ * The item is SBActivationFailedAlertItem, and it comes from the fake modem: in SpringBoard 16.5
++ * (20F66) -[SBTelephonyManager _provisioningUpdateWithStatus:slot:] (0x1c4b29ef4) builds it with
++ * -initWithFailureCount:slot: (classref 0x1de7c9498 = SBActivationFailedAlertItem) and hands it
++ * to -[SBTelephonyManager _setCurrentActivationAlertItem:] (0x1c4b29e50), which deactivates the
++ * old item and calls -[SBAlertItemsController activateAlertItem:]. The fake SIM of vayu_cell
++ * never reports "activated", so the alert never goes away by itself and there is no human here
++ * to tap Try Again.
++ *
++ * So with boot-arg s7=1:
++ *   - _setCurrentActivationAlertItem: is replaced: an item is logged and dropped (the original is
++ *     called with nil, which is how it deactivates whatever was up);
++ *   - com.hakios.ready dismisses any alert that was already presented before the hook,
++ *     dismisses the application switcher (the prefs: launch leaves an unbalanced
++ *     SBSwitcherViewController behind), and, if it is up, presents the cover sheet as gone
++ *     through the real setter of SBCoverSheetPresentationManager;
++ *   - the same is done at +6 s and +12 s after SpringBoard starts and after every unlock.
++ * The methods are looked up by name and the state is printed before and after, so a run without
++ * s7=1 behaves as before and a run with it says exactly what it found.
++ */
++
++static bool
++s7_wanted(void)
++{
++	static int wanted = -1;
++
++	if (wanted < 0) {
++		char arguments[4096] = "";
++		size_t size = sizeof(arguments) - 1;
++
++		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "s7=1") != NULL;
++	}
++	return wanted;
++}
++
++/* The method of an object's class, or NULL (an object that is nil has none). */
++static Method
++method_of(id object, const char *selector)
++{
++	return object != NULL ? class_getInstanceMethod(object_getClass(object), sel_registerName(selector)) : NULL;
++}
++
++static Method
++class_method_of(Class cls, const char *selector)
++{
++	return cls != NULL ? class_getClassMethod(cls, sel_registerName(selector)) : NULL;
++}
++
++/*
++ * Every way SBActivationFailedAlertItem can be taken down, in the order that is safest:
++ *   1. deactivateAlertItemsOfClass:reason:animated: with the class itself -- works even when
++ *      "visibleAlertItem" is not the super-modal one;
++ *   2. the item visibleAlertItem names;
++ *   3. deactivateAlertForMenuClickOrSystemGestureWithAnimation: -- the path a menu click takes,
++ *      for an item that is presentable that way;
++ *   4. _clearAllQueuedAlertItems for anything still queued.
++ * Returns how many of those calls were made.
++ */
++static unsigned
++dismiss_alerts(void)
++{
++	Class cls = objc_getClass("SBAlertItemsController");
++	Class failed = objc_getClass("SBActivationFailedAlertItem");
++	id controller;
++	id item = nil;
++	BOOL has = NO, can = NO;
++	unsigned done = 0;
++
++	if (cls == NULL || class_method_of(cls, "sharedInstance") == NULL) {
++		say("hakios: alerts: there is no SBAlertItemsController in this SpringBoard\n");
++		return 0;
++	}
++	controller = ((id (*)(Class, SEL))objc_msgSend)(cls, sel_registerName("sharedInstance"));
++	if (controller == NULL) {
++		say("hakios: alerts: no SBAlertItemsController yet\n");
++		return 0;
++	}
++	if (method_of(controller, "hasVisibleAlert") != NULL) {
++		has = ((BOOL (*)(id, SEL))objc_msgSend)(controller, sel_registerName("hasVisibleAlert"));
++	}
++	if (method_of(controller, "visibleAlertItem") != NULL) {
++		item = ((id (*)(id, SEL))objc_msgSend)(controller, sel_registerName("visibleAlertItem"));
++	}
++	if (method_of(controller, "canDeactivateAlertForMenuClickOrSystemGesture") != NULL) {
++		can = ((BOOL (*)(id, SEL))objc_msgSend)(controller,
++		    sel_registerName("canDeactivateAlertForMenuClickOrSystemGesture"));
++	}
++	say("hakios: alerts: hasVisibleAlert %d, canDeactivate %d, visible item %s\n", has, can,
++	    item != NULL ? object_getClassName(item) : "none");
++	if (failed != NULL) {
++		if (method_of(controller, "deactivateAlertItemsOfClass:") != NULL) {
++			((void (*)(id, SEL, Class))objc_msgSend)(controller,
++			    sel_registerName("deactivateAlertItemsOfClass:"), failed);
++			done++;
++			say("hakios: alerts: deactivateAlertItemsOfClass:SBActivationFailedAlertItem\n");
++		} else if (method_of(controller, "deactivateAlertItemsOfClass:reason:") != NULL) {
++			((void (*)(id, SEL, Class, long))objc_msgSend)(controller,
++			    sel_registerName("deactivateAlertItemsOfClass:reason:"), failed, 0);
++			done++;
++			say("hakios: alerts: deactivateAlertItemsOfClass:SBActivationFailedAlertItem reason:0\n");
++		} else if (method_of(controller, "deactivateAlertItemsOfClass:reason:animated:") != NULL) {
++			((void (*)(id, SEL, Class, long, BOOL))objc_msgSend)(controller,
++			    sel_registerName("deactivateAlertItemsOfClass:reason:animated:"), failed, 0, NO);
++			done++;
++			say("hakios: alerts: deactivateAlertItemsOfClass:SBActivationFailedAlertItem reason:0 animated:NO\n");
++		}
++	}
++	if (item != NULL && method_of(controller, "deactivateAlertItem:") != NULL) {
++		((void (*)(id, SEL, id))objc_msgSend)(controller, sel_registerName("deactivateAlertItem:"), item);
++		done++;
++		say("hakios: alerts: deactivateAlertItem:%s\n", object_getClassName(item));
++	} else if (item != NULL && method_of(controller, "deactivateAlertItem:reason:animated:") != NULL) {
++		((void (*)(id, SEL, id, long, BOOL))objc_msgSend)(controller,
++		    sel_registerName("deactivateAlertItem:reason:animated:"), item, 0, NO);
++		done++;
++		say("hakios: alerts: deactivateAlertItem:%s reason:0 animated:NO\n", object_getClassName(item));
++	} else if (has && can && method_of(controller, "deactivateAlertForMenuClickOrSystemGestureWithAnimation:") != NULL) {
++		((void (*)(id, SEL, BOOL))objc_msgSend)(controller,
++		    sel_registerName("deactivateAlertForMenuClickOrSystemGestureWithAnimation:"), NO);
++		done++;
++		say("hakios: alerts: deactivateAlertForMenuClickOrSystemGestureWithAnimation:NO\n");
++	}
++	if (method_of(controller, "_clearAllQueuedAlertItems") != NULL) {
++		((void (*)(id, SEL))objc_msgSend)(controller, sel_registerName("_clearAllQueuedAlertItems"));
++		done++;
++	}
++	has = method_of(controller, "hasVisibleAlert") != NULL ?
++	    ((BOOL (*)(id, SEL))objc_msgSend)(controller, sel_registerName("hasVisibleAlert")) : has;
++	say("hakios: alerts: %u request(s) made, hasVisibleAlert now %d\n", done, has);
++	return done;
++}
++
++/* Whether a window of this class is in UIApplication's list and not hidden. */
++static BOOL
++window_of_class_on_screen(const char *class_name)
++{
++	Class app = objc_getClass("UIApplication");
++	id application = app != NULL ? ((id (*)(Class, SEL))objc_msgSend)(app, sel_registerName("sharedApplication")) : nil;
++	Method windows_method = method_of(application, "windows");
++	id windows;
++	BOOL found = NO;
++
++	if (windows_method == NULL) {
++		return NO;
++	}
++	windows = ((id (*)(id, SEL))objc_msgSend)(application, sel_registerName("windows"));
++	for (unsigned i = 0; i < ((unsigned (*)(id, SEL))objc_msgSend)(windows, sel_registerName("count")); i++) {
++		id window = ((id (*)(id, SEL, unsigned))objc_msgSend)(windows, sel_registerName("objectAtIndex:"), i);
++
++		if (window != NULL && strcmp(object_getClassName(window), class_name) == 0 &&
++		    !((BOOL (*)(id, SEL))objc_msgSend)(window, sel_registerName("isHidden"))) {
++			found = YES;
++		}
++	}
++	return found;
++}
++
++/*
++ * The application switcher. It is not the primary thief (level 5 against the alert's 2000), but
++ * the prefs:/App-Prefs: launch leaves an unbalanced SBSwitcherViewController behind and its
++ * SBMainSwitcherWindow then covers the application: with the alert gone, the touches would go
++ * there instead. dismissAllSwitchersNoninteractivelyAnimated: is what the coordinator offers for
++ * exactly this (no gesture behind the request).
++ */
+ static void
+-unlock(void)
++dismiss_switcher(void)
++{
++	Class cls = objc_getClass("SBMainSwitcherControllerCoordinator");
++	id coordinator;
++	BOOL visible = NO;
++	bool window = false;
++
++	if (cls == NULL || class_method_of(cls, "sharedInstance") == NULL) {
++		say("hakios: switcher: there is no SBMainSwitcherControllerCoordinator in this SpringBoard\n");
++		return;
++	}
++	coordinator = ((id (*)(Class, SEL))objc_msgSend)(cls, sel_registerName("sharedInstance"));
++	if (coordinator == NULL) {
++		say("hakios: switcher: no coordinator yet\n");
++		return;
++	}
++	if (method_of(coordinator, "isMainSwitcherVisible") != NULL) {
++		visible = ((BOOL (*)(id, SEL))objc_msgSend)(coordinator, sel_registerName("isMainSwitcherVisible"));
++	} else if (method_of(coordinator, "isAnySwitcherVisible") != NULL) {
++		visible = ((BOOL (*)(id, SEL))objc_msgSend)(coordinator, sel_registerName("isAnySwitcherVisible"));
++	}
++	window = window_of_class_on_screen("SBMainSwitcherWindow");
++	say("hakios: switcher: isVisible %d, SBMainSwitcherWindow on screen %s\n", visible, window ? "yes" : "no");
++	if (!visible && !window) {
++		return;
++	}
++	if (method_of(coordinator, "dismissMainSwitcherNoninteractivelyAnimated:") != NULL) {
++		((void (*)(id, SEL, BOOL))objc_msgSend)(coordinator,
++		    sel_registerName("dismissMainSwitcherNoninteractivelyAnimated:"), NO);
++		say("hakios: switcher: dismissMainSwitcherNoninteractivelyAnimated:NO\n");
++	}
++	if (method_of(coordinator, "dismissAllSwitchersNoninteractivelyAnimated:") != NULL) {
++		((void (*)(id, SEL, BOOL))objc_msgSend)(coordinator,
++		    sel_registerName("dismissAllSwitchersNoninteractivelyAnimated:"), NO);
++		say("hakios: switcher: dismissAllSwitchersNoninteractivelyAnimated:NO\n");
++	}
++}
++
++static BOOL
++lock_state(void)
+ {
+ 	Class cls = objc_getClass("SBLockScreenManager");
+-	SEL shared = sel_registerName("sharedInstance"), locked = sel_registerName("isUILocked");
+-	SEL unlock_ui = sel_registerName("unlockUIFromSource:withOptions:");
+ 	id manager;
++	BOOL locked = YES;
+ 
+-	if (cls == NULL || class_getClassMethod(cls, shared) == NULL || class_getInstanceMethod(cls, locked) == NULL ||
+-	    class_getInstanceMethod(cls, unlock_ui) == NULL) {
+-		say("hakios: unlock: SBLockScreenManager is not what it was\n");
+-		return;
++	if (cls == NULL || class_method_of(cls, "sharedInstance") == NULL) {
++		say("hakios: lockscreen: there is no SBLockScreenManager\n");
++		return locked;
+ 	}
+-	manager = ((id (*)(Class, SEL))objc_msgSend)(cls, shared);
++	manager = ((id (*)(Class, SEL))objc_msgSend)(cls, sel_registerName("sharedInstance"));
+ 	if (manager == NULL) {
+-		say("hakios: unlock: no lock screen manager yet\n");
+-	} else if (!((BOOL (*)(id, SEL))objc_msgSend)(manager, locked)) {
+-		say("hakios: unlock: not locked\n");
+-	} else {
+-		BOOL done = ((BOOL (*)(id, SEL, long, id))objc_msgSend)(manager, unlock_ui, UNLOCK_SOURCE_COVER_SHEET, NULL);
+-
+-		say("hakios: unlock: asked, answer %d\n", done);
++		say("hakios: lockscreen: no manager yet\n");
++		return locked;
++	}
++	if (method_of(manager, "isUILocked") != NULL) {
++		locked = ((BOOL (*)(id, SEL))objc_msgSend)(manager, sel_registerName("isUILocked"));
+ 	}
++	say("hakios: lockscreen: isUILocked %d, isLockScreenActive %d, isLockScreenVisible %d, isUIUnlocking %d, "
++	    "hasUIEverBeenLocked %d\n",
++	    method_of(manager, "isUILocked") != NULL ? ((BOOL (*)(id, SEL))objc_msgSend)(manager, sel_registerName("isUILocked")) : -1,
++	    method_of(manager, "isLockScreenActive") != NULL ? ((BOOL (*)(id, SEL))objc_msgSend)(manager, sel_registerName("isLockScreenActive")) : -1,
++	    method_of(manager, "isLockScreenVisible") != NULL ? ((BOOL (*)(id, SEL))objc_msgSend)(manager, sel_registerName("isLockScreenVisible")) : -1,
++	    method_of(manager, "isUIUnlocking") != NULL ? ((BOOL (*)(id, SEL))objc_msgSend)(manager, sel_registerName("isUIUnlocking")) : -1,
++	    method_of(manager, "hasUIEverBeenLocked") != NULL ? ((BOOL (*)(id, SEL))objc_msgSend)(manager, sel_registerName("hasUIEverBeenLocked")) : -1);
++	return locked;
+ }
+ 
+ /*
+- * S6: the cover sheet, asked to leave for real.
+- *
+- * TEST20B (2026-10-28) had Preferences in the foreground -- its scene went foreground 1.9 s
+- * before the first synthetic swipe and back to inactive 0.3 s after the last -- and the four
+- * swipes still went to a SpringBoard window: backboardd's touchstats read
+- *
+- *     destinations: { SpringBoard.10 contextID 85290874: { touchIDs: 1-4; }; }
+- *
+- * with no hit-test destination of the application's at all, so nothing scrolled and the screen
+- * had nothing to redraw (11 frames in 7965 ms). The unlock this library does at boot is the
+- * programmatic one (SBLockScreenManager, unlockUIFromSource:), and at the same moment the cover
+- * sheet says "Unbalanced calls to begin/end appearance transitions for
+- * <SBCoverSheetPrimarySlidingViewController>" -- an appearance transition that was left in the
+- * air. A cover sheet whose dismissal never finished is a full-screen SpringBoard window that is
+- * still in the hit-test stack: the application stays visible (drawing and touch eligibility are
+- * different things) and every touch goes to SpringBoard, which does nothing with a drag.
+- *
+- * So the self-test asks for the dismissal on com.hakios.coversheet, and this answers. Both the
+- * manager and its selector are checked first; when either is not there, the line says so and
+- * nothing else happens. The notification is only posted when the run asks for it (boot-arg
+- * s6_coversheet=1, devices/poco-x3-pro/userland/src/selftest.m), so no other run is changed.
++ * S6 asked for -dismissCoverSheetAnimated:completion: and was right that it does not exist: that
++ * selector belongs to SBCoverSheetSlidingViewController as -_dismissCoverSheetAnimated:withCompletion:
++ * (0x1c4a7e378). The presentation manager has setCoverSheetPresented:animated:withCompletion:
++ * (0x1c4a937f4) and setCoverSheetPresented:animated:options:withCompletion: (0x1c4a7e2c0); it is
++ * the one that owns the window, the lock state and the dismissal observers, so it is the one to
++ * call. isPresented is the property the public name isCoverSheetPresented mirrored in S6.
+  */
+ static void
+ coversheet(void)
+ {
+ 	Class cls = objc_getClass("SBCoverSheetPresentationManager");
+ 	SEL shared = sel_registerName("sharedInstanceIfExists"), shared_alt = sel_registerName("sharedInstance");
+-	SEL dismiss = sel_registerName("dismissCoverSheetAnimated:completion:");
+-	SEL presented = sel_registerName("isCoverSheetPresented");
++	SEL presented = sel_registerName("isPresented"), presented_alt = sel_registerName("isCoverSheetPresented");
++	SEL visible = sel_registerName("isVisible"), dismissed_boot = sel_registerName("hasBeenDismissedSinceBoot");
+ 	id manager = NULL;
++	BOOL up = NO, shown = NO;
+ 
+ 	if (cls == NULL) {
+ 		say("hakios: coversheet: there is no SBCoverSheetPresentationManager in this SpringBoard\n");
+ 		return;
+ 	}
+-	if (class_getClassMethod(cls, shared) != NULL) {
++	if (class_method_of(cls, "sharedInstanceIfExists") != NULL) {
+ 		manager = ((id (*)(Class, SEL))objc_msgSend)(cls, shared);
+-	} else if (class_getClassMethod(cls, shared_alt) != NULL) {
++	} else if (class_method_of(cls, "sharedInstance") != NULL) {
+ 		manager = ((id (*)(Class, SEL))objc_msgSend)(cls, shared_alt);
+ 	}
+ 	if (manager == NULL) {
+ 		say("hakios: coversheet: no manager yet\n");
+ 		return;
+ 	}
+-	if (class_getInstanceMethod(cls, presented) != NULL) {
+-		BOOL up = ((BOOL (*)(id, SEL))objc_msgSend)(manager, presented);
++	if (method_of(manager, "isPresented") != NULL) {
++		up = ((BOOL (*)(id, SEL))objc_msgSend)(manager, presented);
++	} else if (method_of(manager, "isCoverSheetPresented") != NULL) {
++		up = ((BOOL (*)(id, SEL))objc_msgSend)(manager, presented_alt);
++	}
++	if (method_of(manager, "isVisible") != NULL) {
++		shown = ((BOOL (*)(id, SEL))objc_msgSend)(manager, visible);
++	}
++	say("hakios: coversheet: isPresented %d, isVisible %d, hasBeenDismissedSinceBoot %d\n", up, shown,
++	    method_of(manager, "hasBeenDismissedSinceBoot") != NULL ?
++	    ((BOOL (*)(id, SEL))objc_msgSend)(manager, dismissed_boot) : -1);
++	if (!up && !shown) {
++		say("hakios: coversheet: nothing to dismiss\n");
++		return;
++	}
++	if (method_of(manager, "setCoverSheetPresented:animated:withCompletion:") != NULL) {
++		((void (*)(id, SEL, BOOL, BOOL, id))objc_msgSend)(manager,
++		    sel_registerName("setCoverSheetPresented:animated:withCompletion:"), NO, NO, NULL);
++		say("hakios: coversheet: setCoverSheetPresented:NO animated:NO withCompletion:nil\n");
++	} else if (method_of(manager, "setCoverSheetPresented:animated:options:withCompletion:") != NULL) {
++		((void (*)(id, SEL, BOOL, BOOL, unsigned long, id))objc_msgSend)(manager,
++		    sel_registerName("setCoverSheetPresented:animated:options:withCompletion:"), NO, NO, 0, NULL);
++		say("hakios: coversheet: setCoverSheetPresented:NO animated:NO options:0 withCompletion:nil\n");
++	} else {
++		say("hakios: coversheet: no setCoverSheetPresented:... on the manager; left alone\n");
++		return;
++	}
++	if (method_of(manager, "isPresented") != NULL) {
++		up = ((BOOL (*)(id, SEL))objc_msgSend)(manager, presented);
++	}
++	say("hakios: coversheet: isPresented %d after the request\n", up);
++}
+ 
+-		say("hakios: coversheet: presented %d before the dismissal\n", up);
+-		if (!up) {
+-			say("hakios: coversheet: nothing to dismiss\n");
+-			return;
++/*
++ * The last resort: if the alert and the switcher are gone but the application's scene is still
++ * inactive (a transition that did not finish), ask SpringBoard for the same activation a tap on
++ * the icon asks for. SBUIController is the object that owns that request; the application object
++ * comes from SBApplicationController by bundle id. The icon, settings and actions can be nil --
++ * every use of them in that path is an Objective-C message, and the app is already running, so
++ * nothing has to be launched. The state is printed before and after; this is only posted by the
++ * self-test when the probe tap did not arrive.
++ */
++static void
++activate_preferences(void)
++{
++	Class app_controller_class = objc_getClass("SBApplicationController");
++	Class ui_controller_class = objc_getClass("SBUIController");
++	id app_controller, ui_controller, application;
++
++	if (app_controller_class == NULL || class_method_of(app_controller_class, "sharedInstance") == NULL ||
++	    ui_controller_class == NULL || class_method_of(ui_controller_class, "sharedInstance") == NULL) {
++		say("hakios: activate: SBApplicationController/SBUIController are not what they were\n");
++		return;
++	}
++	app_controller = ((id (*)(Class, SEL))objc_msgSend)(app_controller_class, sel_registerName("sharedInstance"));
++	ui_controller = ((id (*)(Class, SEL))objc_msgSend)(ui_controller_class, sel_registerName("sharedInstance"));
++	if (app_controller == NULL || ui_controller == NULL) {
++		say("hakios: activate: no controllers yet\n");
++		return;
++	}
++	application = ((id (*)(id, SEL, id))objc_msgSend)(app_controller,
++	    sel_registerName("applicationWithBundleIdentifier:"), (id)CFSTR("com.apple.Preferences"));
++	if (application == NULL) {
++		say("hakios: activate: com.apple.Preferences is not known to SBApplicationController\n");
++		return;
++	}
++	say("hakios: activate: %s isFrontmost %d, processState %d before\n", object_getClassName(application),
++	    method_of(application, "isFrontmost") != NULL ?
++	    ((BOOL (*)(id, SEL))objc_msgSend)(application, sel_registerName("isFrontmost")) : -1,
++	    method_of(application, "processState") != NULL ?
++	    ((int (*)(id, SEL))objc_msgSend)(application, sel_registerName("processState")) : -1);
++	if (method_of(ui_controller, "activateApplication:fromIcon:location:activationSettings:actions:") == NULL) {
++		say("hakios: activate: SBUIController has no activateApplication:fromIcon:...; left alone\n");
++		return;
++	}
++	((void (*)(id, SEL, id, id, long, id, id))objc_msgSend)(ui_controller,
++	    sel_registerName("activateApplication:fromIcon:location:activationSettings:actions:"),
++	    application, nil, 0, nil, nil);
++	say("hakios: activate: activateApplication:fromIcon:nil location:0 activationSettings:nil actions:nil asked\n");
++}
++
++/*
++ * Ask SBLockScreenManager to unlock, without the alert/switcher cleanup. Returns YES when the UI
++ * was already unlocked or the request was taken; NO when there is no manager or it refused.
++ */
++static BOOL
++ask_unlock(void)
++{
++	Class cls = objc_getClass("SBLockScreenManager");
++	SEL shared = sel_registerName("sharedInstance"), locked = sel_registerName("isUILocked");
++	SEL unlock_ui = sel_registerName("unlockUIFromSource:withOptions:");
++	id manager;
++
++	if (cls == NULL || class_method_of(cls, "sharedInstance") == NULL || class_getInstanceMethod(cls, locked) == NULL ||
++	    class_getInstanceMethod(cls, unlock_ui) == NULL) {
++		say("hakios: unlock: SBLockScreenManager is not what it was\n");
++		return NO;
++	}
++	manager = ((id (*)(Class, SEL))objc_msgSend)(cls, shared);
++	if (manager == NULL) {
++		say("hakios: unlock: no lock screen manager yet\n");
++		return NO;
++	}
++	if (!((BOOL (*)(id, SEL))objc_msgSend)(manager, locked)) {
++		say("hakios: unlock: not locked\n");
++		return YES;
++	}
++	BOOL done = ((BOOL (*)(id, SEL, long, id))objc_msgSend)(manager, unlock_ui, UNLOCK_SOURCE_COVER_SHEET, NULL);
++
++	say("hakios: unlock: asked, answer %d\n", done);
++	return done;
++}
++
++/*
++ * The S7 remote control: com.hakios.ready. The alert goes first (it is the super-modal one), then
++ * the switcher, then, only when the UI is not locked, the cover sheet. `unlock_if_locked` is true
++ * for the late automatic run and for the self-test's requests (long after the +10 s unlock) and
++ * false for the +6 s one, which must not race SpringBoard's own startup unlock.
++ */
++static void
++s7_ready(bool unlock_if_locked)
++{
++	BOOL locked;
++
++	if (!s7_wanted()) {
++		say("hakios: ready: s7=1 is not among the boot-args; nothing done\n");
++		return;
++	}
++	say("hakios: ready: begin\n");
++	locked = lock_state();
++	dismiss_alerts();
++	dismiss_switcher();
++	if (locked && unlock_if_locked) {
++		say("hakios: ready: the UI is still locked: asking SBLockScreenManager again\n");
++		ask_unlock();
++		locked = lock_state();
++	}
++	/*
++	 * The cover sheet is the lock screen itself. While the UI is locked, the unlock is the one
++	 * that takes it away; asking the presentation manager then would only race it. After the
++	 * unlock (and whenever a ready arrives later), it is checked and, if it is still up,
++	 * presented as gone through its own setter.
++	 */
++	if (!locked) {
++		coversheet();
++	}
++	lock_state();
++	say("hakios: ready: end\n");
++}
++
++static void
++unlock(void)
++{
++	ask_unlock();
++	if (s7_wanted()) {
++		dismiss_alerts();
++		dismiss_switcher();
++		if (!lock_state()) {
++			coversheet();
+ 		}
+ 	}
+-	if (class_getInstanceMethod(cls, dismiss) == NULL) {
+-		say("hakios: coversheet: no -dismissCoverSheetAnimated:completion: to call\n");
++}
++
++/*
++ * -[SBTelephonyManager _setCurrentActivationAlertItem:] (0x1c4b29e50 in 20F66): with nil it
++ * deactivates whatever item is up and keeps none; that is the one hook that stops the activation
++ * alert of the fake SIM from ever reaching SBAlertItemsController.
++ */
++static void (*original_current_activation_alert)(id self, SEL selector, id item);
++
++static void
++current_activation_alert(id self, SEL selector, id item)
++{
++	if (item != NULL && s7_wanted()) {
++		say("hakios: alerts: SBTelephonyManager would present %s; dropped (s7=1)\n", object_getClassName(item));
++		if (original_current_activation_alert != NULL) {
++			original_current_activation_alert(self, selector, nil);
++		}
+ 		return;
+ 	}
+-	((void (*)(id, SEL, BOOL, id))objc_msgSend)(manager, dismiss, NO, NULL);
+-	say("hakios: coversheet: dismissed (not animated); the window stack is printed by com.hakios.layers\n");
++	if (original_current_activation_alert != NULL) {
++		original_current_activation_alert(self, selector, item);
++	}
+ }
+ 
+ /*
+@@ -1649,6 +2025,12 @@
+ 	    0x18928d310UL, (IMP)battery_view_set_charge_percent);
+ 	original_ring_charging_level = (double (*)(id, SEL))replace_method("CSBatteryChargingRingView", "batteryChargingLevel",
+ 	    0x1c48c2cf4UL, (IMP)ring_charging_level);
++	if (s7_wanted()) {
++		original_current_activation_alert = (void (*)(id, SEL, id))replace_method("SBTelephonyManager",
++		    "_setCurrentActivationAlertItem:", 0x1c4b29e50UL, (IMP)current_activation_alert);
++		say("hakios: s7=1: -[SBTelephonyManager _setCurrentActivationAlertItem:] %s\n",
++		    original_current_activation_alert ? "replaced (activation alerts are dropped)" : "NOT replaced");
++	}
+ 	battery_lvl = (IMP)original_battery_level;
+ 	battery_st  = (IMP)original_battery_state;
+ 	say("hakios: SpringBoard: activation %s, setup assistant %s, application snapshots %s, the side button's long press %s, "
+@@ -1747,6 +2129,21 @@
+ 	notify_register_dispatch("com.hakios.switcher", &token, dispatch_get_main_queue(), ^(__unused int t) {
+ 		switcher();
+ 	});
++	notify_register_dispatch("com.hakios.ready", &token, dispatch_get_main_queue(), ^(__unused int t) {
++		s7_ready(true);
++	});
++	notify_register_dispatch("com.hakios.activate", &token, dispatch_get_main_queue(), ^(__unused int t) {
++		activate_preferences();
++	});
++	if (s7_wanted()) {
++		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++			s7_ready(false);
++		});
++		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++			s7_ready(true);
++		});
++		say("hakios: s7=1: com.hakios.ready will also be run at +6 s and +12 s\n");
++	}
+ 	/*
+ 	 * Belt-and-suspenders unlock. The user can always swipe up to open the home screen -- that
+ 	 * works fine when the touch driver is doing its job. But if touch is still probing, has

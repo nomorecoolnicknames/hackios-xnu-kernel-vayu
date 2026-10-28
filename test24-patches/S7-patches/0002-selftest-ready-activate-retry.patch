@@ -1,0 +1,64 @@
+--- a/devices/poco-x3-pro/userland/src/selftest.m
++++ b/devices/poco-x3-pro/userland/src/selftest.m
+@@ -2364,7 +2364,21 @@
+ 	 * window stack is printed (com.hakios.layers) so the log names every window that is left and
+ 	 * whether the user counts as authenticated. Without the boot-arg nothing is posted.
+ 	 */
+-	if (g_have_bootargs && st_boot_arg_is(g_bootargs, "s6_coversheet", "1")) {
++	if (g_have_bootargs && st_boot_arg_is(g_bootargs, "s7", "1")) {
++		/*
++		 * S7: the thief is not the cover sheet (TEST22B/E: no SBCoverSheetWindow in the stack at
++		 * all) but SBAlertItemWindow level 2000 with SBActivationFailedAlertItem, and the prefs:
++		 * launch leaves an SBSwitcherWindow level 5 behind it. com.hakios.ready drops all three
++		 * in SpringBoard and prints the lock state, the alert controller and the switcher; the
++		 * stack afterwards is printed by com.hakios.layers.
++		 */
++		stage_say("S7: dropping modal alerts, the switcher and the cover sheet before Settings is "
++		    "opened (s7=1), then printing the window stack");
++		notify_post("com.hakios.ready");
++		sleep_seconds(1.0);
++		notify_post("com.hakios.layers");
++		sleep_seconds(0.5);
++	} else if (g_have_bootargs && st_boot_arg_is(g_bootargs, "s6_coversheet", "1")) {
+ 		stage_say("coversheet: asking SpringBoard to dismiss the cover sheet (s6_coversheet=1) and printing "
+ 		    "the window stack it leaves");
+ 		notify_post("com.hakios.coversheet");
+@@ -2401,12 +2415,38 @@
+ 				continue;
+ 			}
+ 			sleep_seconds(2.0);
++			if (g_have_bootargs && st_boot_arg_is(g_bootargs, "s7", "1")) {
++				/*
++				 * S7: the launch itself can raise the switcher (SBSwitcherViewController,
++				 * unbalanced) or re-present the activation alert after the first ready. Drop
++				 * them now that the application is up, then probe; if the tap still does not
++				 * arrive, one more ready and one more probe before the next way in.
++				 */
++				stage_say("S7: the application is up: dropping whatever the launch left (alerts, "
++				    "switcher, cover sheet) and probing");
++				notify_post("com.hakios.ready");
++				sleep_seconds(0.8);
++			}
+ 			if (s5_probe(fd, mark, sizeof(mark))) {
+ 				stage_say("PROBE: the application got the tap (%s): the touches reach it, the swipes below are "
+ 				    "its scroll", mark);
+ 				reached = 1;
+ 				break;
+ 			}
++			if (g_have_bootargs && st_boot_arg_is(g_bootargs, "s7", "1")) {
++				stage_say("S7: the first tap did not arrive: one more ready+probe after %s %s, "
++				    "and an activation request if the application is still not in front", ways[i].command,
++				    ways[i].what);
++				notify_post("com.hakios.ready");
++				notify_post("com.hakios.activate");
++				sleep_seconds(0.7);
++				if (s5_probe(fd, mark, sizeof(mark))) {
++					stage_say("PROBE: the application got the tap after the second ready (%s): the "
++					    "touches reach it, the swipes below are its scroll", mark);
++					reached = 1;
++					break;
++				}
++			}
+ 			stage_say("PROBE: the application did NOT get a tap after battery_test %s %s: the touch delivery "
+ 			    "does not go to it (backboardd's [TouchEvents] touchstats names the destination). The next way "
+ 			    "in is tried", ways[i].command, ways[i].what);

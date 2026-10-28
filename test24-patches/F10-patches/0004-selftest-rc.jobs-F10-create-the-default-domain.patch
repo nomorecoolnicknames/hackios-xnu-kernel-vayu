@@ -1,0 +1,37 @@
+--- a/devices/poco-x3-pro/userland/src/selftest.m
++++ b/devices/poco-x3-pro/userland/src/selftest.m
+@@ -898,7 +898,8 @@
+ 	if (access("/redwood/bin/fp_enable", X_OK) == 0) {
+ 		enable[0] = '\0';
+ 		enable_exit = run_capture((char *const[]){ (char *)"/redwood/bin/fp_enable", (char *)"--wait=20",
+-		    (char *)"--retry=60", (char *)"--restart=20", NULL }, enable, sizeof(enable), 200);
++		    (char *)"--retry=60", (char *)"--restart=20", (char *)"--create", NULL }, enable,
++		    sizeof(enable), 200);
+ 		stage_say("fp_enable (fileprovider domain enable, as mobile): exit %d", enable_exit);
+ 		detail_text(enable);
+ 		summary[0] = '\0';
+@@ -1044,7 +1045,8 @@
+ 	if ((!listed || !enabled) && access("/redwood/bin/fp_enable", X_OK) == 0) {
+ 		again[0] = '\0';
+ 		again_exit = run_capture((char *const[]){ (char *)"/redwood/bin/fp_enable", (char *)"--wait=10",
+-		    (char *)"--retry=30", (char *)"--restart=20", NULL }, again, sizeof(again), 120);
++		    (char *)"--retry=30", (char *)"--restart=20", (char *)"--create", NULL }, again,
++		    sizeof(again), 120);
+ 		stage_say("fp_enable again, later (the domain was %s after the first pass): exit %d",
+ 		    enabled ? "enabled" : "not enabled", again_exit);
+ 		detail_text(again);
+--- a/userland/rc.jobs.test3
++++ b/userland/rc.jobs.test3
+@@ -81,7 +81,11 @@
+ # serving the enable has a provider list older than the registry (R14); one restart gives it the completed
+ # one before anything creates a domain.
+ /var/jb/bin/sh /redwood/etc/fp-dirs.sh
+-/redwood/bin/fp_enable --trace --wait=30 --restart=20 --retry=45
++# F10: --create is the daemon's _recreateDefaultDomainIfNeeded path (removeAllDomains). It was held back
++# while pkd=no; the appex now carries NSExtension.NSExtensionAttributes, which is the dictionary
++# -[FPDProviderDescriptor initWithExtension:] reads (0x1c3c6551c), so pkd/appex=yes, mcm=yes and the
++# domain can be created with a real documentStorageURL instead of nil (TEST14's abort).
++/redwood/bin/fp_enable --trace --wait=30 --restart=20 --retry=45 --create
+ /usr/bin/fileproviderctl domain list
+ # fileproviderd's log onto the console (it is in a file on the phone; owner15 had no ssh to fetch it)
+ /var/jb/bin/sh /redwood/etc/fp-log.sh

@@ -1,0 +1,66 @@
+--- a/devices/poco-x3-pro/userland/src/fp_enable.m
++++ b/devices/poco-x3-pro/userland/src/fp_enable.m
+@@ -1533,6 +1533,12 @@
+ 	NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+ 	    [appex stringByAppendingPathComponent:@"Info.plist"]];
+ 	NSString *identifier = [info objectForKey:@"CFBundleIdentifier"];
++	NSDictionary *extension_info = [info objectForKey:@"NSExtension"];
++	NSDictionary *appex_attributes = [extension_info isKindOfClass:[NSDictionary class]] ?
++	    [extension_info objectForKey:@"NSExtensionAttributes"] : nil;
++	NSString *appex_value = [appex_attributes isKindOfClass:[NSDictionary class]] ?
++	    [appex_attributes objectForKey:@"NSExtensionFileProviderDocumentGroup"] : nil;
++	const char *value_source = "NSExtension.attributes";
+ 	NSError *error = nil;
+ 	id extension, attributes, value;
+ 
+@@ -1554,8 +1560,26 @@
+ 	    ((id (*)(id, SEL))objc_msgSend)(extension, @selector(attributes)) : nil;
+ 	value = [attributes isKindOfClass:[NSDictionary class]] ?
+ 	    [attributes objectForKey:@"NSExtensionFileProviderDocumentGroup"] : nil;
+-	fprintf(stderr, "fp_enable: pkd: NSExtension %s: found; NSExtensionFileProviderDocumentGroup = %s%s\n",
+-	    [identifier UTF8String], value != nil ? [[value description] UTF8String] : "(absent)",
++	/*
++	 * F10: the shim's -attributes is the NSExtensionAttributes dictionary (plus the three point keys
++	 * ExtensionFoundation synthesizes), but the daemon's descriptor reads the nested NSExtensionAttributes
++	 * from the appex's Info.plist: -[FPDProviderDescriptor initWithExtension:] (0x1c3c6551c) does
++	 * [bundle infoDictionary][NSExtension][NSExtensionAttributes] and takes every NSExtensionFileProvider*
++	 * key from it (0x1c3c65c14-0x1c3c66038). A record whose attributes come out short, while the Info.plist
++	 * has the nested key, is therefore usable by the daemon -- do not hold the domain-creating call back on
++	 * the shim's answer alone. The appex copy is read from disk, exactly as the daemon reads it.
++	 */
++	if ((value == nil || ![group isEqual:value]) && appex_value != nil) {
++		value = appex_value;
++		value_source = [appex_attributes isKindOfClass:[NSDictionary class]] ?
++		    "appex NSExtension.NSExtensionAttributes" : "appex NSExtension";
++		fprintf(stderr, "fp_enable: pkd: NSExtension.attributes has no usable group, but the appex's "
++		    "%s does (F10: the daemon reads this Info.plist; FileProviderDaemon 0x1c3c6551c)\n",
++		    value_source);
++	}
++	fprintf(stderr, "fp_enable: pkd: NSExtension %s: found; NSExtensionFileProviderDocumentGroup = %s "
++	    "(from %s)%s\n", [identifier UTF8String],
++	    value != nil ? [[value description] UTF8String] : "(absent)", value_source,
+ 	    value != nil && [group isEqual:value] ? "" : "  <- the daemon's descriptor has no usable group");
+ 	return [group isEqual:value] ? 1 : 0;
+ }
+@@ -1837,6 +1861,21 @@
+ 		}
+ 		fprintf(stderr, "fp_enable: record: the appex's Info.plist names %s\n",
+ 		    group != nil ? [group UTF8String] : "(no document group at all)");
++		{
++			/* F10: the dictionary the daemon's descriptor actually reads. */
++			NSDictionary *appex_info = [NSDictionary dictionaryWithContentsOfFile:
++			    [appex stringByAppendingPathComponent:@"Info.plist"]];
++			NSDictionary *appex_ext = [appex_info objectForKey:@"NSExtension"];
++			NSDictionary *appex_attrs = [appex_ext isKindOfClass:[NSDictionary class]] ?
++			    [appex_ext objectForKey:@"NSExtensionAttributes"] : nil;
++			if ([appex_attrs isKindOfClass:[NSDictionary class]]) {
++				dump_record("record: appex NSExtension.NSExtensionAttributes", appex_attrs);
++			} else {
++				fprintf(stderr, "fp_enable: record: appex Info.plist has no "
++				    "NSExtension.NSExtensionAttributes (F10: the daemon's descriptor reads that "
++				    "dictionary; the keys at the NSExtension level are not seen there)\n");
++			}
++		}
+ 		fprintf(stderr, "fp_enable: record: the extension record %s\n",
+ 		    carries ? "carries NSExtensionFileProviderDocumentGroup" :
+ 		    "does NOT carry NSExtensionFileProviderDocumentGroup");

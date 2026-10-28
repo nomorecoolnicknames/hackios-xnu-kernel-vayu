@@ -1,0 +1,73 @@
+--- a/userland/src/init.c
++++ b/userland/src/init.c
+@@ -101,6 +101,8 @@
+ 	return ok;
+ }
+ 
++static void bind_fp_appex(const char *root);
++
+ /* An empty directory that is not on the volume, for a mount point (sysctl kern.apfs_synthetic). */
+ static int
+ synthetic_dir(const char *path)
+@@ -287,6 +289,7 @@
+ 	    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not iOS's");
+ 	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
+ 	    "our audio device, not Apple's plug-ins");
++	bind_fp_appex("/flash");
+ 	bind_applications("/flash/Applications");
+ 	if (stat("/fw", &fw_st) == 0) {
+ 		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */
+@@ -1531,6 +1534,41 @@
+ 	    "our audio device, not the system image's plug-ins");
+ }
+ 
++/*
++ * F10: the LocalStorage file provider's Info.plist. FileProviderDaemon builds its provider descriptor
++ * from the appex bundle itself: -[FPDProviderDescriptor initWithExtension:] (FileProviderDaemon 16.5,
++ * 0x1c3c6551c) makes an NSBundle from the extension's _extensionBundle.bundleURL, takes
++ * [bundle infoDictionary], then [NSExtension][@"NSExtensionAttributes"], and reads every
++ * NSExtensionFileProvider* key from that nested dictionary (0x1c3c65c14-0x1c3c66038). The appex in the
++ * system image has the keys only directly under NSExtension, so NSExtensionAttributes is nil: the
++ * descriptor has no document group, -[FPDExtension initWithExtension:] logs
++ *   [INFO] "NSExtensionFileProviderDocumentGroup" key not found in Info.plist of <appex>.
++ *   The documentStorageURL property on NSFileProviderManager will not be available.
++ * (__oslogstring 0x1c3d172fb, logger call 0x1c3c76378) and storage stays nil. The copy in this image
++ * carries the nested dictionary; put it in place before launchd reads the appex.
++ */
++static void
++bind_fp_appex(const char *root)
++{
++	struct stat st;
++	char target[400];
++	const char *from = in_image("/share/fp-localstorage/LocalStorageFileProvider.appex");
++
++	strcpy(target, root);
++	strcpy(target + strlen(target),
++	    "/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex");
++	if (stat(target, &st) != 0) {
++		printf("  no %s for the LocalStorage appex: %s\n", target, strerror(errno));
++		return;
++	}
++	if (stat(join(from, "/Info.plist", ""), &st) != 0) {
++		printf("  no %s/Info.plist for the LocalStorage appex: %s\n", from, strerror(errno));
++		return;
++	}
++	check(bind_dir(from, target),
++	    "the LocalStorage appex with NSExtension.NSExtensionAttributes");
++}
++
+ int
+ main(int argc, char **argv, char **envp)
+ {
+@@ -1563,8 +1601,10 @@
+ 			flash_root(dev);
+ 		} else {
+ 			/* the root is the system image; its plug-in directory is as old as the image (see
+-			 * bind_audio_plugins) and so are its applications (see bind_applications) */
++			 * bind_audio_plugins) and so are its applications (see bind_applications); the
++			 * LocalStorage appex's Info.plist is patched the same way (see bind_fp_appex) */
+ 			bind_audio_plugins();
++			bind_fp_appex("");
+ 			bind_applications("/Applications");
+ 		}
+ 	}

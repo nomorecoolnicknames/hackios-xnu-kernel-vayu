@@ -1,0 +1,88 @@
+--- /dev/null
++++ b/docs/s7-alert-item-touch-delivery.md
+@@ -0,0 +1,85 @@
++# S7: the touches of TEST22 went to `SBAlertItemWindow`, not to a cover sheet
++
++TEST22B/E (`artifacts/vayu/test22-lead2-20261028`) had Preferences in the foreground but
++`inactive`, and every synthetic touch went to one SpringBoard context. The S6 run read that as a
++cover sheet and looked for `-dismissCoverSheetAnimated:completion:`, which does not exist in
++SpringBoard 16.5. The window stack that S6 0006 added answers it:
++
++```
++hakios: layers: 13 windows
++hakios: layers: window SBAlertItemWindow level 2000, context 0x5c18e2a6 (secure, ...)
++hakios: layers:   ... "VC:SBAlertItemRootViewController" ...
++hakios: layers:       ... "VC:_SBAlertController" ... 270x210.333
++hakios: layers:         _UILabelLayer ... 238x42.3333      (title)
++hakios: layers:         _UILabelLayer ... 238x95.6667      (body)
++hakios: layers:         ... _UIAlertControllerActionView ... 134.667x44
++hakios: layers:         ... _UIAlertControllerActionView ... 135x44
++```
++
++and backboardd:
++
++```
++[TouchEvents] touchstats ... destinations: {
++    SpringBoard.10 contextID 5C18E2A6: { touchIDs: 1-6; };
++}
++```
++
++`5C18E2A6` is exactly that window. There is no `SBCoverSheetWindow` in the stack at all.
++
++## What the alert is
++
++`SBActivationFailedAlertItem`, built by the telephony layer:
++
++- `-[SBTelephonyManager _provisioningUpdateWithStatus:slot:]` (`0x1c4b29ef4`) makes it with
++  `-initWithFailureCount:slot:`; the classref loaded at `0x1c4b2a0c0` (`0x1de7c9498`) is
++  `SBActivationFailedAlertItem`;
++- `-[SBTelephonyManager _setCurrentActivationAlertItem:]` (`0x1c4b29e50`) deactivates the old
++  item and calls `-[SBAlertItemsController activateAlertItem:]` for the new one.
++
++The fake SIM of `vayu_cell` never reports "activated", so the item is presented at boot and stays:
++the application's scene is foreground, but the modal alert makes SpringBoard's scene the active
++one, so the app is `inactive`, gets no touches and has nothing to redraw. That is the "1 frame a
++second" of TEST20B/S6.
++
++## The real cover-sheet API (for the record)
++
++- `-_dismissCoverSheetAnimated:withCompletion:` belongs to
++  `SBCoverSheetSlidingViewController` (`0x1c4a7e378`), not to the presentation manager.
++- `SBCoverSheetPresentationManager` (`+sharedInstance` `0x1c4a1300c`) has
++  `-setCoverSheetPresented:animated:withCompletion:` (`0x1c4a937f4`) and
++  `-setCoverSheetPresented:animated:options:withCompletion:` (`0x1c4a7e2c0`);
++  `-isPresented` is `0x1c4a39aec`.
++
++## What S7 does
++
++Boot-arg `s7=1`:
++
++1. replaces `-[SBTelephonyManager _setCurrentActivationAlertItem:]`; an item is logged and dropped
++   (the original is called with nil, which deactivates anything already up);
++2. `com.hakios.ready` dismisses an alert that was presented before the hook
++   (`SBAlertItemsController`: `visibleAlertItem`, `hasVisibleAlert`,
++   `canDeactivateAlertForMenuClickOrSystemGesture`,
++   `deactivateAlertItemsOfClass:reason:animated:`, `deactivateAlertItem:`,
++   `_clearAllQueuedAlertItems`), then the application switcher
++   (`SBMainSwitcherControllerCoordinator`: `isMainSwitcherVisible`/`isAnySwitcherVisible`,
++   `dismissMainSwitcherNoninteractivelyAnimated:NO`,
++   `dismissAllSwitchersNoninteractivelyAnimated:NO`), then the cover sheet if it is up
++   (`setCoverSheetPresented:NO animated:NO withCompletion:nil`);
++3. `com.hakios.activate` is the last resort: `SBUIController
++   activateApplication:fromIcon:nil location:0 activationSettings:nil actions:nil` for
++   `com.apple.Preferences` from `SBApplicationController`;
++4. the self-test (`s7=1`) posts `com.hakios.ready` before opening Settings and again after the
++   application is up; it probes a tap after each, and on failure posts ready+activate and probes
++   once more.
++
++The run without `s7=1` behaves exactly as before; `s6_coversheet=1` still works as the old path.
++
++## What to read in the next log
++
++- `hakios: s7=1: -[SBTelephonyManager _setCurrentActivationAlertItem:] replaced`
++- `hakios: alerts: ... hasVisibleAlert ...` / `dropped ... SBActivationFailedAlertItem`
++- `hakios: switcher: ...` / `hakios: coversheet: ...`
++- `hakios: layers: window SBAlertItemWindow ...` must be absent; touchstats must name
++  `Preferences.<pid> contextID ...`
++- `PROBE: the application got the tap ...`, `the application is active`, `S5: N events`,
++  `S5FPS ... 60+ frames (... a second)`.
