@@ -101,6 +101,35 @@ report(const char *when, NSString *plugin)
 }
 
 /*
+ * F5: the camera stage's question, for an *application* rather than a plug-in. selftest asks SpringBoard
+ * to open hakiostest://camera and SBSOpenSensitiveURLAndUnlock answers NO (battery_test's "it REFUSES",
+ * TEST13B :71928); that is either "no bundle in LaunchServices claims the scheme" (this prints the
+ * record, or its absence) or "the bundle is there and SpringBoard still refused" -- two different faults
+ * that the old stage could not tell apart. com.hakios.selftest.camera is SelftestCamera.app's id.
+ */
+static void
+report_app(const char *bundle_id)
+{
+	Class app_class = NSClassFromString(@"LSApplicationProxy");
+	NSString *identifier = [NSString stringWithUTF8String:bundle_id];
+	id app = nil;
+	NSString *path = nil;
+
+	if ([app_class respondsToSelector:@selector(applicationProxyForIdentifier:)]) {
+		app = [app_class performSelector:@selector(applicationProxyForIdentifier:) withObject:identifier];
+	}
+	if (app == nil) {
+		fprintf(stderr, "ls_rebuild: app %s: not registered (no handler for its URL schemes)\n", bundle_id);
+		return;
+	}
+	if ([app respondsToSelector:@selector(bundleURL)]) {
+		path = [[app performSelector:@selector(bundleURL)] path];
+	}
+	fprintf(stderr, "ls_rebuild: app %s: registered, bundle %s\n", bundle_id,
+	    path != nil ? [path UTF8String] : "(no bundle URL)");
+}
+
+/*
  * GPU-B (14:31): LS holds 506 plug-ins and the LocalStorage one among them, fileproviderd lists it among its 8
  * providers, yet NSExtension finds no such extension (nil, no error) and fileproviderctl ls says -2001. That
  * lookup goes through pkd. So: what pkd finds for a few extension points, matched asynchronously (which
@@ -179,10 +208,12 @@ main(int argc, char **argv)
 		id workspace;
 		SEL rebuild = NSSelectorFromString(@"_LSPrivateRebuildApplicationDatabasesForSystemApps:internal:user:");
 
-		const char *register_path = NULL;
+		const char *register_path = NULL, *app_id = NULL;
 
 		if (index < argc && strcmp(argv[index], "--check") == 0) { check = YES; index++; }
 		else if (index + 1 < argc && strcmp(argv[index], "--register") == 0) { register_path = argv[index + 1]; index += 2; }
+		else if (index + 1 < argc && strcmp(argv[index], "--app") == 0) { app_id = argv[index + 1]; index += 2; }
+		else if (index < argc && strncmp(argv[index], "--app=", 6) == 0) { app_id = argv[index] + 6; index++; }
 		if (index < argc) plugin = [NSString stringWithUTF8String:argv[index++]];
 		/* the database that apps and fileproviderd read is mobile's */
 		if (getuid() == 0) {
@@ -194,6 +225,10 @@ main(int argc, char **argv)
 			setenv("CFFIXED_USER_HOME", "/var/mobile", 1);
 		}
 		load_launchservices();
+		if (app_id != NULL) {
+			report_app(app_id);
+			return 0;
+		}
 		report("before", plugin);
 		probe_points();
 		if (check) return 0;
