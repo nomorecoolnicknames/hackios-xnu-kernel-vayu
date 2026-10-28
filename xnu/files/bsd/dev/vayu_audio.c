@@ -824,6 +824,7 @@ static LCK_GRP_DECLARE(vayu_audio_lock_group, "vayu-audio");
 static LCK_MTX_DECLARE(apr_lock, &vayu_audio_lock_group);       /* one APR command and its answer at a time */
 static LCK_MTX_DECLARE(mic_lock, &vayu_audio_lock_group);       /* the capture path's state, for the node and quiesce */
 
+
 #define APR_SVC_AFE             4
 #define APR_SVC_ASM             7
 #define APR_SVC_ADM             8
@@ -1599,6 +1600,7 @@ space_ensure(void)
 #define MIC_READDONE_SIZE                       4
 #define MIC_READ_TIMEOUT_MS                     150             /* (7.5 periods: a read the DSP never answers) */
 #define MIC_ZERO_REBUILD_PERIODS                50              /* ~1 s of exact zeros after the codec's re-arm */
+#define MIC_EMPTY_PERIODS_MAX                   250             /* 5 s of periods the DSP answers with no bytes at all */
 
 static bool mapped, copp_open, stream_open;
 static uint32_t map_handle, copp;
@@ -1614,7 +1616,7 @@ static volatile uint32_t mic_read_short;        /* periods the DSP filled with l
 static volatile uint32_t mic_size_order_said;   /* the other READ_DONE word order was seen, and said */
 
 /*
- * R17. What test12 proved about the second capture of a boot: every layer of the codec's path is
+ * R18. What test12 proved about the second capture of a boot: every layer of the codec's path is
  * brought up again (M1-M9 write the same values, the TX ports go 0 -> 1, CONNECT_SRC/DEF_ACT_CHAN/
  * RECONFIG_NOW are acked), and yet the DSP reads exact zeros. The codec's own TX port status at M-off
  * says why: after the working first capture TX7 is found closed with an underflow latched (it was in
@@ -1623,16 +1625,22 @@ static volatile uint32_t mic_size_order_said;   /* the other READ_DONE word orde
  * AFE_PORT_CMD_DEVICE_START of 0x4001 therefore does not re-arm the framer's TX channel map; only the
  * first start after boot does.
  *
- * Two consequences, both here:
- *   - the capture's path is kept up between the node's opens (vayu_mic_keep_ms), so the path that
- *     works is the one that stays and a re-open never asks for a second start of the port;
- *   - a cold bring-up (the first one after boot, or one after the keep window) asks the AFE for a
- *     stop, a wait, the configuration and a start, and gives the port time to join the frame.
+ * R17 answered that by keeping the whole capture up between the node's opens (vayu_mic_keep_ms, 30
+ * minutes of ASM reads nobody asked for, with the port and session 2 live next to every playback) --
+ * and the two runs that had it (test13) hung the kernel within 13 and 37 s, no panic, no log
+ * (R18-report.md). R18 does the opposite and stays bounded: the path is ALWAYS taken down when the
+ * node closes, and a capture that follows another one is re-initialised from scratch when it opens:
+ *   - the channels 135/136 are removed from the framer while nothing runs (vayu_jack_mic_chan_clear),
+ *     so M7's CONNECT_SRC/DEF_ACT_CHAN are a definition and not a re-activation;
+ *   - a port that is still on is stopped, waited for, configured and started again (vayu_mic_cold=0
+ *     turns this off for an A/B);
+ *   - every wait is a bounded command timeout (apr_ask's 1000 ms) or a fixed delay, and nothing loops
+ *     without a bound: the feed ends when the node closes, on 150 ms without a READ_DONE, or on the
+ *     re-arm/rebuild limits.
  */
 static uint16_t mic_port_id = MIC_AFE_PORT;     /* vayu_mic_port: the AFE SLIMbus TX port (0x4001..0x400f) */
-static uint32_t mic_keep_ms = 1800000;          /* vayu_mic_keep_ms: how long the path stays up after the node closes (0: at once) */
-static bool mic_port_ever_started;              /* a capture started mic_port_id in this boot: the next one is a restart */
-static uint32_t mic_reuses;                     /* node opens that found the capture's path up: no bring-up at all */
+static bool mic_cold_start = true;              /* vayu_mic_cold: stop/param/start a port that is still on */
+static uint32_t mic_captures;                   /* captures brought up in this boot (>1: a re-initialisation) */
 
 /*
  * The size word of an ASM_DATA_EVENT_READ_DONE_V2 (see MIC_READDONE_*): the bytes the DSP actually wrote.
@@ -3309,18 +3317,17 @@ mic_afe_on(void)
 	uint16_t start[2] = { mic_port_id, 0 };
 
 	/*
-	 * R17: a port that was started before is stopped, waited for, configured and started again. That is
-	 * the coldest sequence this interface offers, and it is what the first start after boot is: there is
-	 * no port instance in the DSP at all. If the DSP keeps the stopped port's channel map (test12's
-	 * reading: no underflow from a port that is enabled and joined, but not in any frame), then nothing
-	 * on this side can re-arm it -- which is why the path is also kept up between the node's opens.
+	 * R18: the re-initialised capture starts the port from nothing. mic_off() has already stopped it,
+	 * so this only fires when one is still on (a bring-up that failed half way, or a caller that did
+	 * not take the path down): stop it, give the DSP a moment, and let the configure/start below make a
+	 * fresh instance. The stop is one command with apr_ask's 1000 ms bound; nothing here waits on a
+	 * loop. vayu_mic_cold=0 restores the TEST12 behaviour (no stop before the start) for an A/B.
 	 */
-	if (mic_port_ever_started) {
-		mic_say("the port %#x was started before: stopped, configured and started again (a cold start)\n",
-		    mic_port_id);
+	if (mic_cold_start && mic_port_on) {
+		mic_say("the port %#x is still on: stopped, waited for, configured and started again\n", mic_port_id);
 		if (!mic_step_command("the port, stopped before it is started again", APR_SVC_AFE, 0,
 		    AFE_PORT_CMD_DEVICE_STOP, start, sizeof(start), 0)) {
-			mic_say("the stop before the cold start did not take: the start is tried anyway\n");
+			mic_say("the stop before the restart did not take: the start is tried anyway\n");
 		}
 		mic_port_on = false;
 		delay_for_interval(5, NSEC_PER_MSEC);
@@ -3335,7 +3342,6 @@ mic_afe_on(void)
 	if (!mic_port_on) {
 		return false;
 	}
-	mic_port_ever_started = true;
 	/*
 	 * The command answers when the port's own DMA/FIFO is up; the SLIMbus RX block behind it joins the
 	 * frame a moment later. Nothing consumes the port before the ASM stream is opened below, but a fixed
@@ -3406,7 +3412,7 @@ mic_route(void)
 	           ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &route, sizeof(route), 0);
 }
 
-/* ADM: a live-recording device path from 0x4001, routed to session 2 on the AUDIO_TX matrix. */
+/* ADM: a live-recording device path from the capture's port, routed to session 2 on the AUDIO_TX matrix. */
 static bool
 mic_adm_on(void)
 {
@@ -3420,8 +3426,12 @@ mic_adm_on(void)
 		                           { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
 	uint32_t status = 0, copp = 0;
 
+	/*
+	 * (R18: the APR port of the open is the capture's port as well; R17 changed the endpoint in the
+	 * payload but left the header at 0x4001, which would confound a vayu_mic_port=0x4002 run.)
+	 */
 	if (!mic_step_command_words("a device path from the port: live recording, no processing, 2 channels of 16 bits at 48 kHz",
-	    APR_SVC_ADM, MIC_AFE_PORT, ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5, &status, &copp)) {
+	    APR_SVC_ADM, mic_port_id, ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5, &status, &copp)) {
 		return false;
 	}
 	if (status != 0) {
@@ -3944,6 +3954,8 @@ mic_rearm(const char *why)
 static bool
 mic_path_up(void)
 {
+	unsigned previous;                      /* captures that came up before this one (0: the first) */
+
 	mic_ios_mode = true;
 	mic_path_live = false;
 	/*
@@ -3951,10 +3963,17 @@ mic_path_up(void)
 	 * carries the old generation is ignored (see MIC_READ_TOKEN).
 	 */
 	mic_generation = (mic_generation + 1) & MIC_READ_GEN_MASK;
+	/*
+	 * R18: `previous' is the number of captures that CAME UP before this one. A bring-up that fails half
+	 * way does not count (its port is taken down again by fail:), so the count and the
+	 * "a re-initialisation" label always describe what really happened.
+	 */
+	previous = mic_captures;
 	__atomic_store_n(&ios_ring_read, __atomic_load_n(&ios_ring_written, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
 	ios_ring_primed = false;
 	ios_ring_skipped = ios_ring_dry = 0;
-	mic_say("the path up: codec TX7/TX8, AFE 0x4001, ASM session 2, ADM live recording\n");
+	mic_say("the path up: codec TX7/TX8, AFE %#x, ASM session 2, ADM live recording (capture %u%s)\n", mic_port_id,
+	    previous + 1, previous != 0 ? ", a re-initialisation" : "");
 	if (!vayu_jack_ready()) {
 		mic_say("not vayu_jack>=2 (the codec): the path cannot come up\n");
 		mic_ios_mode = false;
@@ -3969,6 +3988,23 @@ mic_path_up(void)
 	    space.passed ? " (the stream 0x1b21 is bypassed)" : " (the second region of the stream 0x1b21 mapping)");
 	if (mic_stopping) {
 		goto fail;                      /* (no DSP command after the way out has begun: see mic_path_down()) */
+	}
+	/*
+	 * R18: a capture that is not the boot's first one is re-initialised, and the re-initialisation starts
+	 * here -- with nothing running at all. The channels 135/136 are taken off the framer (one SLIMbus
+	 * message, 1000 ms at most) so that M7's CONNECT_SRC/DEF_ACT_CHAN below are a definition and not a
+	 * re-activation of what the framer kept (or dropped) when the previous port was stopped. This is the
+	 * one place the remove is safe: in both vayu_mic_order settings it is before mic_afe_on(), i.e.
+	 * before any port exists; R17 did it in the kick, with the port running and reads in flight.
+	 * vayu_mic_cold=0 leaves the channels alone, for an A/B against the old behaviour.
+	 */
+	if (previous != 0 && mic_cold_start) {
+		mic_say("the capture is re-initialised: the channels 135/136 off the framer first (nothing is "
+		    "running), so the codec's M7 defines them again\n");
+		if (!vayu_jack_mic_chan_clear("the capture is re-initialised")) {
+			mic_say("the channels could not be taken off the framer (the codec's state is what it is); "
+			    "the bring-up goes on and M7 defines them anyway\n");
+		}
 	}
 	/*
 	 * Android's order (MIC_TX.md 2.1, 4): the codec's TX path first -- its widgets are powered at
@@ -4043,6 +4079,7 @@ mic_path_up(void)
 	 * 40 + 300 ms) plus the ~20 SLIMbus messages around them.
 	 */
 	vayu_jack_mic_kick("the session is running");
+	mic_captures = previous + 1;
 	return true;
 
 fail:
@@ -4070,12 +4107,12 @@ enum mic_feed_result {
  * down and built again by the caller (MIC_FEED_REBUILD), which is the only safe way to drop the reads that
  * are in flight (test10: a port stop made the DSP answer no READ at all).
  *
- * R17: the feed does not end when iOS closes the node. The whole path (codec's TX, port 0x4001, ADM device
- * path, ASM session 2) stays exactly as it was -- including the DSP's read queue, which must keep being
- * served or it is gone -- for vayu_mic_keep_ms (default 30 minutes). The periods are read and dropped while
- * nobody holds the node; a re-open inside the window continues the same capture, so no second
- * AFE_PORT_CMD_DEVICE_START is ever asked for (test12: only the first start after boot puts channels 135/136
- * into the framer's frame; every later one gives full-size periods of exact zeros).
+ * R18: the feed ends when iOS closes the node, as it did before R17. There is no keep window: the two runs
+ * that had one (test13) hung the kernel 13 and 37 s in, with the ASM session and the AFE port live next to
+ * a playback path, and no panic or log to say why (R18-report.md). The capture that follows is built again
+ * from scratch by the thread (mic_path_down() then mic_path_up(), which re-initialises it), and that path
+ * has bounds everywhere: a READ_DONE that does not come in MIC_READ_TIMEOUT_MS, the re-arm and rebuild
+ * limits, and MIC_EMPTY_PERIODS_MAX periods the DSP answers with no bytes at all.
  */
 static enum mic_feed_result
 mic_feed(void)
@@ -4084,8 +4121,6 @@ mic_feed(void)
 	uint64_t frames = 0, posted = 0, window_frames = 0, sums[2] = { 0, 0 };
 	uint32_t next = 0, seconds = 0, periods = 0, peaks[2] = { 0, 0 }, all_peaks[2] = { 0, 0 };
 	uint32_t zero_periods = 0, zero_runs = 0, rearms = 0, short_before = 0;
-	uint32_t reuses_before = mic_reuses;
-	uint64_t closed_at = 0;                 /* mach_absolute_time when iOS closed the node (0: it holds it) */
 	bool ok = true, rebuild = false, short_said = false;
 	int16_t mono[MIC_PERIOD_FRAMES];
 
@@ -4117,59 +4152,17 @@ mic_feed(void)
 		uint64_t now;
 		uint32_t size, got;
 
-		if (mic_stopping) {
+		/*
+		 * R18: iOS closing the node ends the feed here and now (the caller takes the path down and the
+		 * next open re-initialises it). R17 kept it up for 30 minutes on this check alone.
+		 */
+		if (!ios_wants || mic_stopping) {
 			break;
-		}
-		if (!ios_wants) {
-			/*
-			 * iOS closed the node. The reads keep being posted and reaped (that is what keeps the DSP's
-			 * read queue for session 2 alive), the periods are dropped, and only the keep window running
-			 * out takes the path down. mic_keep_ms=0 restores the old behaviour: down at once.
-			 */
-			if (mic_keep_ms == 0) {
-				break;
-			}
-			if (closed_at == 0) {
-				closed_at = mach_absolute_time();
-				mic_say("iOS closed the node: the capture's path stays up for %u ms (vayu_mic_keep_ms) "
-				    "and the reads keep going, so the next open is this capture and not a second start "
-				    "of the port\n", mic_keep_ms);
-			}
-			absolutetime_to_nanoseconds(mach_absolute_time() - closed_at, &ns);
-			if (ns >= (uint64_t)mic_keep_ms * NSEC_PER_MSEC) {
-				mic_say("the node has been closed for %u ms: the capture's path goes down (the next open "
-				    "is a cold bring-up)\n", mic_keep_ms);
-				break;
-			}
-		} else if (closed_at != 0) {
-			uint64_t away = mach_absolute_time() - closed_at;
-
-			closed_at = 0;
-			mic_reuses++;
-			/*
-			 * The reader starts where the DSP is now: the periods read while the node was closed were
-			 * dropped from the ring's point of view, and what is in it now is newer than the reader.
-			 */
-			__atomic_store_n(&ios_ring_read, __atomic_load_n(&ios_ring_written, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
-			ios_ring_primed = false;
-			ios_ring_skipped = ios_ring_dry = 0;
-			absolutetime_to_nanoseconds(away, &ns);
-			mic_say("iOS opened the node again after %llu ms: the capture that was kept up continues (no "
-			    "bring-up, no rebuild, no second start of the port)\n", ns / NSEC_PER_MSEC);
 		}
 		if (!(mic_read_ready & (1u << next))) {
 			now = mach_absolute_time();
 			absolutetime_to_nanoseconds(now - last_next, &ns);
 			if (ns >= MIC_READ_TIMEOUT_MS * NSEC_PER_MSEC) {
-				if (closed_at != 0) {
-					/*
-					 * Nobody holds the node and the DSP has stopped answering this session: there is
-					 * nothing to rebuild for. Let the path go down (ok stays true: no capture failed).
-					 */
-					mic_say("the DSP has not answered the read of period %u for %llu ms while the node was "
-					    "closed: its read queue is gone; the path goes down\n", next, ns / NSEC_PER_MSEC);
-					break;
-				}
 				/*
 				 * Not "no data so far": a whole period late, with seven more reads posted behind it.
 				 * The DSP's read queue for session 2 is gone (a stopped AFE port, a closed path), and
@@ -4198,13 +4191,19 @@ mic_feed(void)
 				mic_say("the DSP's read of period %u came back with %u bytes: nothing to copy (%llu reads "
 				    "posted)\n", next, size, posted);
 			}
-		} else if (closed_at != 0) {
 			/*
-			 * The node is closed: the period is taken from the DSP (the read queue must stay served) and
-			 * dropped. Nothing is invalidated or copied, and the codec's re-arm/rebuild decisions are not
-			 * taken on samples nobody asked for.
+			 * R18: a bound on a DSP that answers but carries nothing. A capture that is merely silent
+			 * returns a full period of zeros (test13b: 49 periods of 3840 bytes, peak 0); a period with
+			 * no bytes at all is the read queue answering without the port. If that goes on for
+			 * MIC_EMPTY_PERIODS_MAX periods (5 s), the capture is over instead of the feed posting
+			 * reads at 50 Hz for as long as iOS keeps the node open.
 			 */
-			frames += got;
+			if (mic_empty_periods > MIC_EMPTY_PERIODS_MAX) {
+				mic_say("the DSP has answered %u periods in a row with no bytes at all: the capture is over\n",
+				    mic_empty_periods);
+				ok = false;
+				break;
+			}
 		} else {
 			int16_t *samples = (int16_t *)(mic_memory() + 4096 * next);
 			bool silent = true;
@@ -4283,9 +4282,6 @@ mic_feed(void)
 		periods++;
 		last_next = mach_absolute_time();
 		now = mach_absolute_time();
-		if (closed_at != 0) {
-			continue;                       /* (the node is closed: no level lines for samples nobody reads) */
-		}
 		absolutetime_to_nanoseconds(now - last_level, &ns);
 		if (ns >= 10 * NSEC_PER_SEC) {
 			uint32_t rms0 = window_frames != 0 ? isqrt64(sums[0] / window_frames) : 0;
@@ -4318,10 +4314,6 @@ mic_feed(void)
 	    rearms, zero_runs, (unsigned long long)__atomic_load_n(&ios_ring_skipped, __ATOMIC_RELAXED),
 	    (unsigned long long)__atomic_load_n(&ios_ring_dry, __ATOMIC_RELAXED), ok ? "" : rebuild ? " (the capture is rebuilt)" :
 	    " (the capture failed)");
-	if (mic_reuses != reuses_before) {
-		mic_say("the node was closed and opened again %u time(s) while this capture ran: the path was kept up, "
-		    "no second start of the port\n", mic_reuses - reuses_before);
-	}
 	if (all_peaks[0] == 0 && all_peaks[1] == 0) {
 		mic_state_say("the whole capture was exactly zero, the codec at its end");
 	}
@@ -4371,9 +4363,9 @@ ios_mic_thread(__unused void *parameter, __unused wait_result_t result)
 		/*
 		 * The feed runs until a failure, a capture that has to be built again (its reads are not
 		 * answered, or it stays exactly zero after the codec's side was said again), the end of the run,
-		 * or -- R17 -- until the node has been closed for vayu_mic_keep_ms. iOS closing the node alone no
-		 * longer ends it: the path and the DSP's read queue stay up between the node's opens, because a
-		 * second start of the AFE port reads zeros (see mic_feed()).
+		 * or iOS closing the node (R18: no keep window -- the path goes down there and then, and the next
+		 * open is a re-initialisation; R17 kept the session, the port and 50 ASM reads a second alive
+		 * between the node's opens and the two runs that had it hung, see R18-report.md).
 		 * A rebuild is the only way to drop reads that are in flight; it is safe here because no read is
 		 * in flight while the stream is closed.
 		 */
@@ -4402,8 +4394,7 @@ ios_mic_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		lck_mtx_lock(&mic_lock);
 		mic_active = false;
-		mic_say("iOS's recording %u ended (the keep window is over)%s; the path down\n", mic_recordings,
-		    ok ? "" : " (the capture failed)");
+		mic_say("iOS's recording %u ended%s; the path down\n", mic_recordings, ok ? "" : " (the capture failed)");
 		mic_path_down();
 		lck_mtx_unlock(&mic_lock);
 		if (!ok) {
@@ -4886,22 +4877,24 @@ vayu_audio_quiesce(void)
 void
 vayu_audio_init(void)
 {
-	uint32_t cx = 0, pause = 2200, ear = 0, keep = 0, mic_port_arg = 0;
+	uint32_t cx = 0, pause = 2200, ear = 0, cold = 1, mic_port_arg = 0;
 	thread_t thread;
 
 	PE_parse_boot_argn("vayu_mic", &mic_ios, sizeof(mic_ios));
 	PE_parse_boot_argn("vayu_mic_order", &mic_order, sizeof(mic_order));
 	mic_order = mic_order != 0;     /* anything else is the codec-first order */
 	/*
-	 * R17: the capture's path is kept up after the node closes, and the port is a boot arg so that the
-	 * next run can A/B "the DSP's port instance, not the codec" (vayu_mic_port=0x4002, ...).
+	 * R18: no keep window any more (R17's vayu_mic_keep_ms is gone). What is a boot arg is the port, so
+	 * that a run can A/B "the DSP's port instance, not the codec" (vayu_mic_port=0x4002, ...), and
+	 * whether a capture that follows another one is re-initialised (vayu_mic_cold=0: the old
+	 * teardown/bring-up only, no channel remove and no stop before the start).
 	 */
-	if (PE_parse_boot_argn("vayu_mic_keep_ms", &keep, sizeof(keep))) {
-		mic_keep_ms = keep > 86400000u ? 86400000u : keep;
-	}
 	if (PE_parse_boot_argn("vayu_mic_port", &mic_port_arg, sizeof(mic_port_arg)) &&
 	    mic_port_arg >= 0x4001u && mic_port_arg <= 0x400fu) {
 		mic_port_id = (uint16_t)mic_port_arg;
+	}
+	if (PE_parse_boot_argn("vayu_mic_cold", &cold, sizeof(cold))) {
+		mic_cold_start = cold != 0;
 	}
 	if (!PE_parse_boot_argn("vayu_audio", &level, sizeof(level)) || level == 0) {
 		if (mic_ios) {
@@ -4942,8 +4935,8 @@ vayu_audio_init(void)
 	if (mic_ios) {
 		say("vayu-audio: mic: vayu_mic=1: /dev/hakios-mic will be made once vayu_jack>=2 has the codec up; "
 		    "it implies vayu_audio_keep=1\n");
-		say("vayu-audio: mic: the path is kept up for %u ms after the node closes (vayu_mic_keep_ms), AFE port "
-		    "%#x (vayu_mic_port)\n", mic_keep_ms, mic_port_id);
+		say("vayu-audio: mic: the path goes down when the node closes and the next capture is re-initialised "
+		    "(vayu_mic_cold=%u); AFE port %#x (vayu_mic_port)\n", mic_cold_start ? 1 : 0, mic_port_id);
 	}
 	if (amp_ear_enabled) {
 		say("vayu-audio: vayu_audio_ear=1: the earpiece's TAS2564 at 0x4d, DVC index %u (%d dB)\n", ear_dvc_index,
