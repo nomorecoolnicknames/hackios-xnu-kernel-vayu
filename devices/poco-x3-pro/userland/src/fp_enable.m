@@ -218,7 +218,23 @@
  *    container manager refuses: TEST14 shows the daemon spawning the extension and then aborting on a nil
  *    URL, i.e. the record is the input that abort comes from (crashed=1).
  *
- * usage: fp_enable [--wait[=SECONDS]] [--retry[=SECONDS]] [--trace] [--check] [--create] [--reset] [PROVIDER_ID]
+ * F8 (TEST18): pkd's plug-in database is not a file -- it has no load/save at all. PKDatabase builds its
+ * records from LaunchServices in memory (LSPlugInKitProxy -> pluginKitDictionary, an NSCache in front of
+ * it); the only persisted store in pkd is PKDAnnotationStore's annotation file, whose
+ * +[PKDAnnotationStore defaultDatabaseURL] (IMP 0x100012ca0) is the "com.apple.pkd" data container
+ * (+[PKDAnnotationStore containerURL], IMP 0x100012f74, container_create_or_lookup_path_for_current_user)
+ * plus "com.apple.pluginkit/Annotations", with "/var/db/PlugInKit-Annotations" as the fallback
+ * (+[PKDAnnotationStore globalURL], IMP 0x100012f60). There is nothing under /var/mobile/Library to
+ * delete and no /private/var/db pkd database: a pkd that was started before
+ * the LaunchServices record was complete keeps the old record until the process is replaced. TEST18 FACT:
+ * pkd[95] started at 13:14:15.9, ls_rebuild --plugins found the 14-key record with the group at 13:14:27,
+ * and NSExtension still answered "found; NSExtensionFileProviderDocumentGroup = (absent)" at +131 s.
+ * F8 therefore adds the missing step: after the boot's ls_rebuild --plugins, stop pkd as root so the next
+ * NSExtension lookup (ls_rebuild --check, then fp_enable) starts a process that reads the completed
+ * registry. The same stop is done by --restart-pkd and, for a mobile run that can not signal pkd, through
+ * launchctl kickstart -k user/501/com.apple.pluginkit.pkd when that tool is present.
+ *
+ * usage: fp_enable [--wait[=SECONDS]] [--retry[=SECONDS]] [--trace] [--check] [--create] [--reset] [--restart-pkd] [PROVIDER_ID]
  *        --wait    wait up to SECONDS (default 30) for fileproviderd to answer before doing anything: the
  *                  unattended self-test calls this at +45 s and launchd may be starting the daemon on this
  *                  very first connection (the call itself makes the daemon run), so "no connection yet" is
@@ -240,6 +256,11 @@
  *                  one, then repeat the pass: a daemon that started before LaunchServices/pkd held the
  *                  appex keeps a provider list that answers -2001 for it (R14, TEST9) and only a new
  *                  process reads the completed registry
+ *        --restart-pkd  (alone) stop pkd and return: the boot runs this as root between ls_rebuild --plugins and
+ *                  the next NSExtension lookup, because pkd keeps its plug-in records in memory and a
+ *                  process that started before the LaunchServices rebuild never sees the new record
+ *                  (F8; TEST18: pkd[95] at 13:14:15.9, the 14-key record at 13:14:27, pkd=no at +131 s).
+ *                  As mobile the same stop is attempted with launchctl kickstart -k user/501/...
  *        as mobile, from root too; signed with fileproviderctl's entitlements
  *
  * exit: 0 the provider object answers isEnabled=YES and isHidden=NO (the readback is the verdict; calls
@@ -254,11 +275,14 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <grp.h>
+#include <spawn.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define MOBILE_ID	501
@@ -1749,6 +1773,60 @@ say_extension_record(NSString *appex, NSString *identifier, NSString *group)
  * NSExtension lookup -- which this function makes. That is the cheap way to make pkd re-read the record
  * and it creates nothing either.
  */
+extern char **environ;
+
+/*
+ * F8: a mobile process cannot signal pkd (TEST16 :104034), but the per-user launchd can replace the job
+ * through launchctl. Procursus' launchctl is at /var/jb/bin/launchctl on this image; /bin/launchctl is
+ * not there (rc.jobs' nfcd line says so). "kickstart -k" stops the job and starts a new instance, which
+ * is exactly the restart pkd needs to drop the in-memory PKDatabase. Returns YES only when the tool
+ * answered 0; the caller still verifies the pid.
+ */
+static BOOL
+kickstart_pkd(void)
+{
+	static const char *const paths[] = {
+		"/var/jb/bin/launchctl",
+		"/bin/launchctl",
+		"/usr/bin/launchctl",
+	};
+	char job[96];
+	unsigned i;
+
+	snprintf(job, sizeof(job), "user/%d/com.apple.pluginkit.pkd", MOBILE_ID);
+	for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		char *const argv[] = { (char *)paths[i], (char *)"kickstart", (char *)"-k", job, NULL };
+		pid_t child, waited;
+		int spawn_error, status = 0;
+
+		if (access(paths[i], X_OK) != 0) {
+			continue;
+		}
+		fprintf(stderr, "fp_enable: repair: trying %s kickstart -k %s\n", paths[i], job);
+		spawn_error = posix_spawn(&child, paths[i], NULL, NULL, argv, environ);
+		if (spawn_error != 0) {
+			fprintf(stderr, "fp_enable: repair: posix_spawn %s: %s\n", paths[i],
+			    strerror(spawn_error));
+			continue;
+		}
+		do {
+			waited = waitpid(child, &status, 0);
+		} while (waited < 0 && errno == EINTR);
+		if (waited != child) {
+			fprintf(stderr, "fp_enable: repair: waitpid %s: %s\n", paths[i], strerror(errno));
+			continue;
+		}
+		fprintf(stderr, "fp_enable: repair: %s exited %d\n", paths[i],
+		    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+		if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+			return YES;
+		}
+	}
+	fprintf(stderr, "fp_enable: repair: no launchctl could kickstart pkd (looked at /var/jb/bin, "
+	    "/bin, /usr/bin)\n");
+	return NO;
+}
+
 /*
  * F6: stop pkd so that the next NSExtension lookup makes launchd start a process with no cached
  * record. Returns YES when the old pid is gone (or pkd was not running), NO when it survived SIGKILL.
@@ -2416,6 +2494,13 @@ enable_pass(id daemon, NSString *provider, BOOL reset, BOOL check, BOOL create, 
 int
 main(int argc, char **argv)
 {
+	/* F8: the boot's one-shot pkd restart. This runs before the setuid below, so rc.jobs' root
+	 * invocation really can signal pkd; a mobile invocation falls back to launchctl kickstart. */
+	if (argc == 2 && strcmp(argv[1], "--restart-pkd") == 0) {
+		fprintf(stderr, "fp_enable: --restart-pkd: uid %d: %s\n", (int)getuid(),
+		    getuid() == 0 ? "root, kill(2) is available" : "mobile, launchctl is the only door");
+		return restart_pkd(5.0) ? 0 : 1;
+	}
 	@autoreleasepool {
 		int index = 1;
 		BOOL check = NO, reset = NO, wait = NO, restart = NO, restarted = NO, create = NO;
