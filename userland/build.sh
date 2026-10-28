@@ -220,6 +220,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# the console (docs/oslog.md).  LoggingSupport is dlopen'd, not linked: it is a private
 		# framework, and a boot without it must leave this program saying so, not failing to start
 		$DYN -fobjc-arc -framework Foundation -lobjc -o obj/oslogfwd src/oslogfwd.m
+		${LDID:-ldid} -S obj/oslogfwd 2>/dev/null || echo "build.sh: no ldid: oslogfwd is unsigned"
 		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface -o obj/surf_test src/surf_test.c
 		$DYN -o obj/rwtouch src/rwtouch.c
 		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/sound_test.c
