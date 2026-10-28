@@ -38,14 +38,16 @@
 # exist on this system image ("/bin/launchctl: No such file or directory", exit 127), so the first kickstart never ran.
 /var/jb/bin/launchctl kickstart -p system/com.apple.nfcd
 # Files' On My iPhone: the directories fileproviderd needs, the app groups, and the enable the toggle asks for.
-# R17 (TEST11): fp_enable now waits for the daemon and does NOT create a domain by default -- the
-# removeAllDomains that created one on a provider with no document storage URL is what aborted
-# fileproviderd ("-[NSFileManager createDirectoryAtURL:...]: URL is nil", SIGABRT, 12 times between
-# 00:58:57 and 01:02:27), and every extension it spawned was killed with it. The pass enables what the
-# daemon lists, prints the storage chain (document group / appex signature / group container) and says
-# storage=nil instead of killing the daemon; --create is the deliberate experiment.
+# F5 (TEST13B): storage=nil before the enable is the normal state -- TEST10's first provider object said
+# url:(null) and the same enable brought <GroupContainers>/.../File Provider Storage back, so R17's "do
+# not ask" is what kept files=FAIL in TEST12/13. The pass enables, prints pkd=/mcm= (the two inputs of the
+# daemon's storage URL, asked from this side) and recovers fileproviderd if the domain-creating call still
+# aborts it. --restart=20 because that daemon was spawned at 04:07:42 and the appex reached
+# LaunchServices/pkd at 04:07:47-51 (media_import at 04:07:44 still answered "NOT FOUND"), so the process
+# serving the enable has a provider list older than the registry (R14); one restart gives it the completed
+# one before anything creates a domain.
 /var/jb/bin/sh /redwood/etc/fp-dirs.sh
-/redwood/bin/fp_enable --trace --wait=30
+/redwood/bin/fp_enable --trace --wait=30 --restart=20 --retry=45
 /usr/bin/fileproviderctl domain list
 # fileproviderd's log onto the console (it is in a file on the phone; owner15 had no ssh to fetch it)
 /var/jb/bin/sh /redwood/etc/fp-log.sh
