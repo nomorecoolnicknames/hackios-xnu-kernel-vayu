@@ -17,6 +17,12 @@ if [ -d BUILD/obj ] && [ "$(cat $STAMP 2>/dev/null)" != "$now" ]; then
 	rm -f BUILD/obj/*/mach.*.unstripped
 	echo "$now" > $STAMP
 fi
+# MIGCC: make's MakeInc.cmd exports MIGCC := $(CC), and the cctools mig script
+# runs it as one executable.  CC above is a wrapper plus a flag, which mig cannot
+# execute; the preprocessor only needs the wrapper.
 exec make HAKIOS_OBJECTS="$LX" SDKROOT=iphoneos ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=${MACHINE:-BCM2837} KERNEL_CONFIGS=DEVELOPMENT \
   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 BUILD_WERROR=0 BUILD_LTO=0 DO_CTFMERGE=0 \
-  HOST_CC="$HOSTCC" HOST_FLEX=flex HOST_BISON=bison HOST_GM4=m4 CC=xnu-clang CXX=xnu-clang++ LOGCOLORS=n "$@"
+  HOST_CC="$HOSTCC" HOST_FLEX=flex HOST_BISON=bison HOST_GM4=m4 \
+  MIGCC=xnu-clang \
+  CC="xnu-clang -enable-trivial-auto-var-init-zero-knowing-it-will-be-removed-from-clang" \
+  CXX="xnu-clang++ -enable-trivial-auto-var-init-zero-knowing-it-will-be-removed-from-clang" LOGCOLORS=n "$@"
