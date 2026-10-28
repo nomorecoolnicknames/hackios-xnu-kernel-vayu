@@ -492,6 +492,28 @@ filter(const uint8_t * packet, unsigned length)
 			return;
 		}
 		/*
+		 * 2F 19 = "get FW interface version" (builder phNciNfc_GetFwInterfaceVersionCmd
+		 * 0x1f454ed38: GID 0x0F, OID 0x19, len 0). It is step 5 of the init sequence
+		 * (phLibNfc_MwFwCompatibilityChk 0x1f455049c -> phNciNfc_GetFwInterfaceVersion
+		 * 0x1f45ed110), before 2F 06 and 2F 00, so it must be answered locally whatever
+		 * vayu_nfc_propinit says. Refusing it is fatal: phNciNfc_GetFwInterfaceVersionRsp
+		 * 0x1f4580f34 takes payload[0] == 1 (REJECTED) or 5 (SYNTAX_ERROR) as "Hence this is
+		 * OLD FW" and returns 0x80 (0x1f4580fa8); _NFDriverLoadMW 0x1f13e5570 turns 0x80/0x81
+		 * into its status 2 ("Incompatible firmware !", 0x1f13e5778), and NFDriverLoadStack:441
+		 * prints "Stack load failed with 0x2" -> "_openDriver: Failed to start stack : 2".
+		 * The answer needs three payload bytes [status 0][version high][version low]; the
+		 * response handler requires length 3 and phLibNfc_MwFwCompatibilityChkProcess
+		 * 0x1f458f1ec compares rev16(the two bytes) with 21 for hw 0x42 (phLibNfc_GetNfccFeatures
+		 * 0x1f4592b14 sets ctx[2811]=1 for hw 66; 0x1f458f274 expects 21). Hence 0x00 0x15.
+		 */
+		if (oid == 0x19) {
+			static const uint8_t fw_interface_ok[] = { 0x4f, 0x19, 0x03, 0x00, 0x00, 0x15 };
+
+			filterLog(packet, length, "answer 4f 19 03 00 00 15");
+			answerNfcd(fw_interface_ok, sizeof(fw_interface_ok));
+			return;
+		}
+		/*
 		 * The rest of the 2F family stays refused; vayu_nfc_propinit=1 additionally answers the
 		 * two proprietary init steps that come after the HSU one, locally and never to the chip:
 		 * 2F 06 GET_FW_TYPE - phLibNfc_GetFwTypeProc 0x1f45e37a0 (pInfo at 0x1f45e3860) passes the
