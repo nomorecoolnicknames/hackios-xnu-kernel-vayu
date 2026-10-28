@@ -140,6 +140,7 @@
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
 #include <sys/vayu_pas.h>
+#include <sys/vayu_scm.h>
 #include <sys/vayu_venus.h>
 #include <sys/vayu_venus_hfi.h>
 #include <vm/memory_types.h>
@@ -1742,7 +1743,6 @@ venus_run(void)
 /* ---- TrustZone: the one PAS step vayu_pas.c does not export --------------------------------------- */
 
 #define SCM_64                  (1ull << 30)
-#define SCM_INTERRUPTED         1ull
 #define SCM_SIP                 (2ull << 24)
 #define SCM_CALL(service, command) ((uint64_t)(service) << 8 | (command))
 #define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)          /* vayu_pas.c:1132 */
@@ -1751,34 +1751,19 @@ venus_run(void)
 
 static uint64_t g_scm_convention = SCM_64;
 
-/* 100 bounded retries for an interrupted call, no sleep: usable on the panic path as well. */
+/* The retry rule and the one shared lock are vayu_scm.c's; on the panic path the lock is not taken. */
 static int32_t
 venus_scm(uint64_t convention, uint64_t command, uint64_t arguments, uint64_t first, uint64_t second,
     uint64_t third, uint64_t *answer)
 {
-	uint64_t function = convention | SCM_SIP | command, session = 0;
+	uint64_t function = convention | SCM_SIP | command;
 
-	/* vayu_pas.c's retry rule: an SMC may come back "interrupted"; keep the session and ask again. */
-	for (unsigned i = 0; i < 100; i++) {
-		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
-		register uint64_t x1 __asm__("x1") = arguments;
-		register uint64_t x2 __asm__("x2") = first;
-		register uint64_t x3 __asm__("x3") = second;
-		register uint64_t x4 __asm__("x4") = third;
-		register uint64_t x5 __asm__("x5") = 0;
-		register uint64_t x6 __asm__("x6") = session;
-		register uint64_t x7 __asm__("x7") = 0;
-
-		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4),
-		    "+r" (x5), "+r" (x6), "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14",
-		    "x15", "x16", "x17", "memory");
-		session = x6;
-		*answer = x1;
-		if (x0 != SCM_INTERRUPTED) {
-			return (int32_t)x0;
-		}
-	}
-	return (int32_t)SCM_INTERRUPTED;
+	/*
+	 * vayu_pas.c's retry rule lives in vayu_scm.c now, with the one lock every TrustZone call
+	 * takes.  On the panic path (vayu_venus_quiesce() -> vayu_scm_quiescing()) the call is made
+	 * without that lock: this is the one place that must not sleep or wait.
+	 */
+	return vayu_scm_call(function, arguments, first, second, third, 0, answer);
 }
 
 /*
@@ -1940,6 +1925,7 @@ vayu_venus_quiesce(void)
 		return;
 	}
 	g_leaving = true;
+	vayu_scm_quiescing();           /* the shutdown below is asked without the shared lock (vayu_scm.c) */
 	loader_log_line("vayu-venus: quiesce: the kernel is on its way back to the loader");
 	if (g_power_up && venus_va != 0) {
 		wr(venus_va + WRAPPER_BASE + WRAPPER_INTR_MASK, 0);

@@ -100,6 +100,7 @@
 #include <sys/hakios.input.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
+#include <sys/vayu_scm.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -1520,33 +1521,20 @@ static int32_t
 scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
     uint64_t *answer)
 {
-	uint64_t session = 0;
+	int32_t result;
 
 	printf("adreno: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx\n", step, what, function, first,
 	    second, third);
 	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
 	hold(true);
-	for (int i = 0; i < 100; i++) {
-		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
-		register uint64_t x1 __asm__("x1") = arguments;
-		register uint64_t x2 __asm__("x2") = first;
-		register uint64_t x3 __asm__("x3") = second;
-		register uint64_t x4 __asm__("x4") = third;
-		register uint64_t x5 __asm__("x5") = 0;
-		register uint64_t x6 __asm__("x6") = session;
-		register uint64_t x7 __asm__("x7") = 0;
-
-		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
-		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-		session = x6;
-		if (x0 != SCM_INTERRUPTED) {
-			printf("adreno: %u: TrustZone returns %d, answer %#llx\n", step, (int32_t)x0, x1);
-			*answer = x1;
-			return (int32_t)x0;
-		}
+	/* One TrustZone call at a time, with every other driver of this kernel (vayu_scm.c). */
+	result = vayu_scm_call(function, arguments, first, second, third, 0, answer);
+	if (result == SCM_INTERRUPTED) {
+		printf("adreno: %u: TrustZone keeps saying the call was interrupted\n", step);
+		return -1;
 	}
-	printf("adreno: %u: TrustZone keeps saying the call was interrupted\n", step);
-	return -1;
+	printf("adreno: %u: TrustZone returns %d, answer %#llx\n", step, result, *answer);
+	return result;
 }
 
 static bool

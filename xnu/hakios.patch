@@ -65,7 +65,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 44274016a4cf..ef4e0d1eedd2 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,68 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,69 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -110,6 +110,7 @@ index 44274016a4cf..ef4e0d1eedd2 100644
 +bsd/dev/hakios.sta.c		standard
 +bsd/dev/vayu_audio.c		standard
 +bsd/dev/vayu_pas.c		standard
++bsd/dev/vayu_scm.c		standard
 +bsd/dev/vayu_haptic.c		standard
 +bsd/dev/vayu_vsync.c		standard
 +bsd/dev/vayu_modem.c		standard

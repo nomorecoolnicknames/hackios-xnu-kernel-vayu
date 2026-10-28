@@ -40,6 +40,7 @@
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
 #include <sys/vayu_pas.h>
+#include <sys/vayu_scm.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
 
@@ -1541,32 +1542,19 @@ static int32_t
 scm(const char *who, const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
     uint64_t *answer)
 {
-	uint64_t session = 0;
+	int32_t result;
 
 	function |= scm_convention | SCM_SIP;
 	say("%s: about to ask TrustZone %s: smc %#llx (%#llx, %#llx, %#llx)\n", who, what, function, first, second, third);
 	hold();
-	for (int i = 0; i < 100; i++) {
-		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
-		register uint64_t x1 __asm__("x1") = arguments;
-		register uint64_t x2 __asm__("x2") = first;
-		register uint64_t x3 __asm__("x3") = second;
-		register uint64_t x4 __asm__("x4") = third;
-		register uint64_t x5 __asm__("x5") = 0;
-		register uint64_t x6 __asm__("x6") = session;
-		register uint64_t x7 __asm__("x7") = 0;
-
-		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
-		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-		session = x6;
-		if (x0 != SCM_INTERRUPTED) {
-			say("%s: TrustZone returns %d, answer %#llx\n", who, (int32_t)x0, x1);
-			*answer = x1;
-			return (int32_t)x0;
-		}
+	/* One TrustZone call at a time (vayu_scm.c); no lock on the way back to the loader, where leaving is set. */
+	result = vayu_scm_call(function, arguments, first, second, third, 0, answer);
+	if (result == SCM_INTERRUPTED) {
+		say("%s: TrustZone keeps saying the call was interrupted\n", who);
+		return -1;
 	}
-	say("%s: TrustZone keeps saying the call was interrupted\n", who);
-	return -1;
+	say("%s: TrustZone returns %d, answer %#llx\n", who, result, *answer);
+	return result;
 }
 
 /*
@@ -1606,7 +1594,8 @@ vayu_scm_assign_shared(uint64_t physical, uint64_t size, uint32_t vmid)
 	struct scm_mem_map *map;
 	struct scm_dest_perm *dest;
 	uint64_t *ext;
-	uint64_t session = 0, answer = ~0ull, function;
+	uint64_t answer = ~0ull, function;
+	int32_t result;
 
 	if (page == NULL) {
 		page = kalloc_data(PAGE_SIZE, Z_WAITOK | Z_ZERO);
@@ -1635,27 +1624,18 @@ vayu_scm_assign_shared(uint64_t physical, uint64_t size, uint32_t vmid)
 	say("scm: about to ask TrustZone to give %#llx..%#llx to VMIDs 3 and 15 read/write: smc %#llx\n",
 	    physical, physical + size - 1, function);
 	hold();
-	for (int i = 0; i < 100; i++) {
-		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
-		register uint64_t x1 __asm__("x1") = SCM_SEVEN_ARGS;
-		register uint64_t x2 __asm__("x2") = kvtophys((vm_offset_t)(page + 64));
-		register uint64_t x3 __asm__("x3") = sizeof(struct scm_mem_map);
-		register uint64_t x4 __asm__("x4") = kvtophys((vm_offset_t)page);
-		register uint64_t x5 __asm__("x5") = kvtophys((vm_offset_t)(page + 512));
-		register uint64_t x6 __asm__("x6") = session;
-		register uint64_t x7 __asm__("x7") = 0;
-
-		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
-		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-		session = x6;
-		if (x0 != SCM_INTERRUPTED) {
-			answer = x1;
-			say("scm: TrustZone returns %d, answer %#llx\n", (int32_t)x0, answer);
-			return (int32_t)x0 != 0 ? (int32_t)x0 : (int32_t)answer;
-		}
+	/*
+	 * One TrustZone call at a time (vayu_scm.c): the page above is one static buffer, so two
+	 * assign calls at once would also write over each other's lists.
+	 */
+	result = vayu_scm_call(function, SCM_SEVEN_ARGS, kvtophys((vm_offset_t)(page + 64)),
+	    sizeof(struct scm_mem_map), kvtophys((vm_offset_t)page), kvtophys((vm_offset_t)(page + 512)), &answer);
+	if (result == SCM_INTERRUPTED) {
+		say("scm: TrustZone keeps saying the assign call was interrupted\n");
+		return -1;
 	}
-	say("scm: TrustZone keeps saying the assign call was interrupted\n");
-	return -1;
+	say("scm: TrustZone returns %d, answer %#llx\n", result, answer);
+	return result != 0 ? result : (int32_t)answer;
 }
 
 /*
@@ -1673,7 +1653,8 @@ vayu_scm_assign_msa(uint64_t physical, uint64_t size, bool secure)
 	struct scm_mem_map *map;
 	struct scm_dest_perm *dest;
 	uint64_t *ext;
-	uint64_t session = 0, answer = ~0ull, function;
+	uint64_t answer = ~0ull, function;
+	int32_t result;
 	uint32_t count = secure ? 2 : 3;
 
 	if (page == NULL) {
@@ -1705,27 +1686,14 @@ vayu_scm_assign_msa(uint64_t physical, uint64_t size, bool secure)
 	say("scm: MSA %#llx..%#llx -> MSS 15, WLAN 0x18%s (source HLOS 3, %u entries)\n",
 	    physical, physical + size - 1, secure ? "" : ", WLAN_CE 0x19", count);
 	hold();
-	for (int i = 0; i < 100; i++) {
-		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
-		register uint64_t x1 __asm__("x1") = SCM_SEVEN_ARGS;
-		register uint64_t x2 __asm__("x2") = kvtophys((vm_offset_t)(page + 64));
-		register uint64_t x3 __asm__("x3") = sizeof(struct scm_mem_map);
-		register uint64_t x4 __asm__("x4") = kvtophys((vm_offset_t)page);
-		register uint64_t x5 __asm__("x5") = kvtophys((vm_offset_t)(page + 512));
-		register uint64_t x6 __asm__("x6") = session;
-		register uint64_t x7 __asm__("x7") = 0;
-
-		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
-		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-		session = x6;
-		if (x0 != SCM_INTERRUPTED) {
-			answer = x1;
-			say("scm: MSA TrustZone returns %d, answer %#llx\n", (int32_t)x0, answer);
-			return (int32_t)x0 != 0 ? (int32_t)x0 : (int32_t)answer;
-		}
+	result = vayu_scm_call(function, SCM_SEVEN_ARGS, kvtophys((vm_offset_t)(page + 64)),
+	    sizeof(struct scm_mem_map), kvtophys((vm_offset_t)page), kvtophys((vm_offset_t)(page + 512)), &answer);
+	if (result == SCM_INTERRUPTED) {
+		say("scm: MSA TrustZone keeps saying the call was interrupted\n");
+		return -1;
 	}
-	say("scm: MSA TrustZone keeps saying the call was interrupted\n");
-	return -1;
+	say("scm: MSA TrustZone returns %d, answer %#llx\n", result, answer);
+	return result != 0 ? result : (int32_t)answer;
 }
 
 /*
@@ -2352,6 +2320,7 @@ vayu_pas_quiesce(struct vayu_rproc *rp)
 		return;
 	}
 	leaving = true;
+	vayu_scm_quiescing();           /* no waiting for the shared TrustZone lock: a stopped processor may hold it */
 	rproc_shutdown(rp, "the kernel is on its way back to the loader");
 }
 

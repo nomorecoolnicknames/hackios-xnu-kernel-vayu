@@ -73,6 +73,7 @@
 #include <sys/kauth.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
+#include <sys/vayu_scm.h>
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
 #include <vm/vm_kern.h>
@@ -1298,33 +1299,20 @@ static int32_t
 scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third, uint64_t fourth,
     uint64_t *answer)
 {
-	uint64_t session = 0;
+	int32_t result;
 
 	function |= SCM_64 | SCM_SIP;
 	printf("mpss: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx\n", step, what, function, first,
 	    second, third);
 	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
-	for (int i = 0; i < 100; i++) {
-		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
-		register uint64_t x1 __asm__("x1") = arguments;
-		register uint64_t x2 __asm__("x2") = first;
-		register uint64_t x3 __asm__("x3") = second;
-		register uint64_t x4 __asm__("x4") = third;
-		register uint64_t x5 __asm__("x5") = fourth;
-		register uint64_t x6 __asm__("x6") = session;
-		register uint64_t x7 __asm__("x7") = 0;
-
-		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
-		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-		session = x6;
-		if (x0 != SCM_INTERRUPTED) {
-			printf("mpss: %u: TrustZone returns %d, answer %#llx\n", step, (int32_t)x0, x1);
-			*answer = x1;
-			return (int32_t)x0;
-		}
+	/* One TrustZone call at a time, with every other driver of this kernel (vayu_scm.c). */
+	result = vayu_scm_call(function, arguments, first, second, third, fourth, answer);
+	if (result == SCM_INTERRUPTED) {
+		printf("mpss: %u: TrustZone keeps saying the call was interrupted\n", step);
+		return -1;
 	}
-	printf("mpss: %u: TrustZone keeps saying the call was interrupted\n", step);
-	return -1;
+	printf("mpss: %u: TrustZone returns %d, answer %#llx\n", step, result, *answer);
+	return result;
 }
 
 static uint32_t
@@ -6230,6 +6218,7 @@ hakios_mpss_quiesce(void)
 		return;
 	}
 	leaving = true;
+	vayu_scm_quiescing();           /* the shutdown below is asked without the shared lock */
 	new_from = ~0u;
 	dsp_shutdown("the kernel is on its way back to the loader");
 }
