@@ -96,6 +96,78 @@ matched nothing":
 /redwood/bin/oslogfwd --probe 20
 ```
 
+## TEST13B: the stream opened and delivered nothing (X2)
+
+`oslogfwd` ran, printed `streaming, backend OSLogEventLiveStream/initWithLiveSource`, and
+five minutes later `alive, the stream has delivered nothing (0 seen)`. The reason was not
+the filter and not the framework: the job was loaded into the **user/501 launchd domain**
+and ran as uid 501 gid 501 (the plists in `/redwood/LaunchDaemons` say nothing about the
+session, and launchd's daemon default is that domain), while `diagnosticd` answers a stream
+request only when
+
+* `__os_trace_peer_is_admin()` says yes (euid 0), **or**
+* the client carries `com.apple.private.logging.stream`, **or**
+* `com.apple.private.logging.stream.darwinos` on a darwinOS variant.
+
+Anything else gets a reply `{error: 1}` and `xpc_connection_cancel()` — the code is at
+`diagnosticd + 0x938c..0x95d8` (`__os_trace_peer_is_admin`, the entitlement lookup, the
+`denying stream client (insufficient access)` message, the reply and the cancel). The binary
+that ran had **no entitlements at all** (`ldid -S` with no plist: the signature's superblob
+holds a CodeDirectory and requirements, no entitlements blob), so both halves of the check
+said no. launchd did spawn `diagnosticd` on the stream's Mach lookup
+(`Successfully spawned diagnosticd[185] because ipc (mach)`, 14 s after the backend line),
+so the connection was made and then refused; libtrace invalidates the stream, but the old
+code installed no invalidation handler and `-invalidated` is not a method of every stream
+class, so it sat on it and the heartbeat kept saying zero.
+
+The fix is in two places and both are wanted:
+
+* `com.hakios.oslogfwd.plist` carries `LimitLoadToSessionType=System` (as
+  `com.apple.logd.plist` and `com.apple.diagnosticd.plist` do), so the job is spawned by the
+  system domain as uid 0; and
+* `src/oslogfwd.entitlements` (`com.apple.private.logging.stream`,
+  `com.apple.private.logging.diagnostic`) is now what `ldid` signs, so the job is served
+  even where only the entitlement is checked.
+
+`oslogfwd` also stopped taking chances with the rest of it:
+
+* the subsystem predicate is still sent to `diagnosticd` first, because that is what keeps
+  the XPC cheap (only the named subsystems cross it), but a minute without a single event
+  drops it and reconnects without it: a predicate the framework's mapper inside the daemon
+  cannot translate leaves a connected stream that delivers nothing, which cannot be told
+  from a refusal. The filter in the daemon always decides what is printed; `oslog_pred=0`
+  starts without the server-side predicate at all.
+* the handler counts every call it is given (`n_events`), not only the events that have a
+  subsystem, and every heartbeat says the count: `0 handler calls` is a dead channel,
+  `N calls, 0 seen` is a channel that carries something that is not `os_log`.
+* `setInvalidationHandler:` is installed, so a refusal now says
+  `the stream was invalidated: ...` instead of nothing.
+* the first line says `uid ... euid ... gid ...`, so the next log answers the access
+  question by itself.
+* a console line is written in a loop now; the one write with `O_NONBLOCK` is how
+  `streaming, backend ...` was lost from `run.log` in TEST13B while the heartbeat survived.
+
+### The archive, when the live pipe still says nothing
+
+`logd` writes `.tracev3` files into `/private/var/db/diagnostics` (var_store leaves that
+directory out of the saved volume on purpose: "tens of MB a boot, and remade"), so the same
+`os_log` records are on disk whether or not a live client is served. `oslogfwd` now
+
+* prints `archive ...: N .tracev3, M bytes, newest K s old` 20 s after it starts and every
+  five minutes — if that grows, `os_log` itself is alive and only the reader is at fault;
+  if it stays empty, the firehose is the fault and no reader can help;
+* when the live stream has delivered **nothing** for `oslog_store_secs` (default 120), it
+  reads the store from the last boot through `LoggingSupport` (`OSLogEventStore/localStore`
+  then a store-to-stream shape, `activateStreamFromLastBoot`) and prints the matching
+  entries with the tag `oslog-ar` instead of `oslog`. Timestamps dedup the reads, so the
+  repeats every `oslog_store_secs` only print what is new.
+
+Boot-args for that: `oslog_store=0` turns it off, `oslog_store_secs=N` moves the first read,
+`oslog_store_wait=N` (default 20) bounds one read. `--store` reads the archive at once and
+`--no-store` never does. The read needs root (or `com.apple.private.logging.diagnostic`,
+which the entitlements carry); if the store or the shape is missing, the line says which
+step failed (`no local store (...)`, `cannot stream the store (...)`).
+
 The daemon starts by itself (`com.hakios.oslogfwd`, `RunAtLoad`); `OSLOGFWD=0` in the build
 leaves it out.
 
@@ -110,8 +182,20 @@ liveStreamWithFilterPredicate:error:]`, `-[OSLogEventLiveStream initWithLiveSour
 `-[OSLogEventLiveStream initWithSource:]`, `-[OSLogEventLiveStream init]` — and prints the
 one that worked in its first line (`backend ...`). A wrong guess is caught, not fatal.
 
+TEST13B settled that part: `initWithLiveSource:` is the shape that reaches
+`diagnosticd` (its spawn appears right after the backend line), so the creation and the
+activation are right and only the authorisation was missing.
+
+The archive-to-stream shape (which selector of `OSLogEventStore` hands out an
+`OSLogEventStream`) is the remaining unknown: the code tries
+`streamWithFilterPredicate:error:`, `streamWithPredicate:error:`, `-stream`, then
+`-[OSLogEventStream initWithPredicate:]`, and says which one answered. `--selftest` prints
+the class/selector matrix and runs one read, so the first phone-side run that is not a full
+test settles it in one line.
+
 If none of them can be created on the phone, the line to look for is
-`oslogfwd: no live stream (...); retry in N s`, and the next thing to try is the in-process
+`oslogfwd: no live stream (...); retry in N s` (or, for the archive,
+`oslogfwd: archive: no local store (...)`), and the next thing to try is the in-process
 hook, which needs no stream at all: libsystem_trace exports `_os_log_set_hook` and
 `_os_trace_set_mode`, so a library of ours inside the process (the `INJECT` mechanism
 already puts one into backboardd, SpringBoard and mediaserverd) can take the messages as

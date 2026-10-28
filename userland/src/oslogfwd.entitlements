@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	X2: what diagnosticd checks before it streams to a client (its own strings and the
+	code at +0x938c: __os_trace_peer_is_admin(conn) or
+	com.apple.private.logging.stream, else reply {error:1} + xpc_connection_cancel).
+
+	com.apple.private.logging.stream      the live stream itself
+	com.apple.private.logging.diagnostic  the read side of logd's store (OSLogEventStore),
+	                                      i.e. what OSLog.framework's XPC service carries
+	com.apple.private.logging.admin       logd's admin side (com.apple.logd.admin); not
+	                                      needed for either path, kept out on purpose.
+
+	The job also runs as root (LimitLoadToSessionType System), so the first check passes
+	on its own; the entitlements are the belt to that suspenders, because a build that
+	loses the plist key would still be served.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.private.logging.stream</key>
+	<true/>
+	<key>com.apple.private.logging.diagnostic</key>
+	<true/>
+</dict>
+</plist>

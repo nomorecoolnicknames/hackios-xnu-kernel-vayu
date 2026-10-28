@@ -53,6 +53,9 @@
 
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <time.h>
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <signal.h>
@@ -101,8 +104,24 @@ static double global_rate;       /* derived from rate, see load_config() */
 static int    global_burst;
 static double global_tokens;
 static double global_last;
-static unsigned long long n_printed, n_dropped, n_seen;
+/* n_events counts what the stream handler was called with, before anything is looked at;
+ * n_seen is the part of it that had a subsystem, i.e. was an os_log entry and not an
+ * activity or a signpost.  The two together are what tells a silent diagnosticd (both 0)
+ * from a channel that works (n_events grows) and a filter that matches nothing. */
+static unsigned long long n_printed, n_dropped, n_seen, n_events;
+static unsigned long long live_events;   /* the live handler only, so that the archive
+                                          * reads below cannot look like a live stream */
 static int probe_left = -1;   /* --probe N: stop after N printed lines */
+
+/* X2: a stream that diagnosticd refuses is invalidated, and the old code had no handler
+ * for that, no counter of the events it was handed, and did not say which uid it ran as
+ * -- the "alive, 0 seen" heartbeat was therefore compatible with three different faults. */
+static volatile sig_atomic_t stream_invalidated;
+static volatile sig_atomic_t store_done;
+static int send_predicate = 1;   /* oslog_pred=0: filter here only, not in diagnosticd */
+static int store_fallback = 1;   /* oslog_store=0: never read the tracev3 archive */
+static int store_secs = 120;     /* first archive read after N s, and every N s after */
+static int store_wait = 20;      /* seconds to let one archive read run */
 
 static int console_fd = -1;
 static pthread_mutex_t out_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -112,15 +131,43 @@ static void
 out_line(const char *line)
 {
 	size_t len = strlen(line);
+	size_t done = 0;
+	int tries;
 
 	pthread_mutex_lock(&out_lock);
 	if (console_fd >= 0) {
-		ssize_t n = write(console_fd, line, len);
-		/* A console that cannot take the line is not a reason to spin; the
-		 * loader drains it at its own pace, so say nothing and move on. */
-		(void)n;
+		/* X2: the old write was a single non-blocking write and threw the rest of the
+		 * line away on EAGAIN.  In TEST13B that is how "streaming, backend ..." was
+		 * lost from run.log while the heartbeat four minutes later survived, which
+		 * cost the reader the one line that named the backend.  Keep the bytes. */
+		for (tries = 0; done < len && tries < 400; tries++) {
+			ssize_t n = write(console_fd, line + done, len - done);
+			if (n > 0) {
+				done += (size_t)n;
+				continue;
+			}
+			if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+				usleep(500);
+				continue;
+			}
+			if (n < 0 && errno == EINTR) {
+				continue;
+			}
+			break;
+		}
+		/* a line that could not be finished is still terminated, so that it does not
+		 * swallow the one after it */
+		if (done > 0 && done < len) {
+			(void)write(console_fd, "\n", 1);
+		}
 	} else {
-		(void)write(STDERR_FILENO, line, len);
+		while (done < len) {
+			ssize_t n = write(STDERR_FILENO, line + done, len - done);
+			if (n <= 0) {
+				break;
+			}
+			done += (size_t)n;
+		}
 	}
 	pthread_mutex_unlock(&out_lock);
 }
@@ -333,6 +380,18 @@ load_config(int argc, char **argv)
 		if (bootarg_value(cmdline, "oslog_burst", value, sizeof(value))) {
 			burst = atoi(value);
 		}
+		if (bootarg_value(cmdline, "oslog_pred", value, sizeof(value))) {
+			send_predicate = atoi(value) != 0;
+		}
+		if (bootarg_value(cmdline, "oslog_store", value, sizeof(value))) {
+			store_fallback = atoi(value) != 0;
+		}
+		if (bootarg_value(cmdline, "oslog_store_secs", value, sizeof(value))) {
+			store_secs = atoi(value);
+		}
+		if (bootarg_value(cmdline, "oslog_store_wait", value, sizeof(value))) {
+			store_wait = atoi(value);
+		}
 	}
 
 	for (i = 1; i < argc; i++) {
@@ -370,6 +429,15 @@ load_config(int argc, char **argv)
 				close(console_fd);
 			}
 			console_fd = open(argv[++i], O_WRONLY | O_NONBLOCK | O_NOCTTY);
+		} else if (strcmp(argv[i], "--pred") == 0) {
+			send_predicate = 1;
+		} else if (strcmp(argv[i], "--no-store") == 0) {
+			store_fallback = 0;
+		} else if (strcmp(argv[i], "--store-secs") == 0 && i + 1 < argc) {
+			store_secs = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--store") == 0) {
+			store_fallback = 1;
+			store_secs = 0;         /* read the archive now, not after a silence */
 		}
 	}
 	if (!have_subsystems) {
@@ -528,7 +596,7 @@ escape(const char *in, char *out, size_t outlen)
 }
 
 static void
-handle_event(id ev)
+handle_event(id ev, const char *tag)
 {
 	static const char *type_names[] = { "default", "info", "debug", "error", "fault" };
 	NSString *subsystem, *category, *process, *message;
@@ -539,6 +607,7 @@ handle_event(id ev)
 	char line[LINE_LEN];
 	int n;
 
+	n_events++;
 	if (![ev respondsToSelector:@selector(subsystem)]) {
 		return;
 	}
@@ -577,12 +646,12 @@ handle_event(id ev)
 	pid = (long)(int)ev_uint(ev, "processIdentifier");
 	stamp(clock, sizeof(clock));
 	if (type < sizeof(type_names) / sizeof(type_names[0])) {
-		n = snprintf(line, sizeof(line), "oslog %s %s[%ld] %s%s%s %s: %s\n",
-		    clock, proc, pid, sub, cat[0] ? ":" : "", cat,
+		n = snprintf(line, sizeof(line), "%s %s %s[%ld] %s%s%s %s: %s\n",
+		    tag, clock, proc, pid, sub, cat[0] ? ":" : "", cat,
 		    type_names[type], msg);
 	} else {
-		n = snprintf(line, sizeof(line), "oslog %s %s[%ld] %s%s%s t=%lu: %s\n",
-		    clock, proc, pid, sub, cat[0] ? ":" : "", cat, (unsigned long)type, msg);
+		n = snprintf(line, sizeof(line), "%s %s %s[%ld] %s%s%s t=%lu: %s\n",
+		    tag, clock, proc, pid, sub, cat[0] ? ":" : "", cat, (unsigned long)type, msg);
 	}
 	if (n > 0) {
 		rule->printed++;
@@ -698,6 +767,22 @@ make_stream_with_predicate(NSPredicate *predicate, NSString **why)
 	return nil;
 }
 
+static void
+on_stream_invalidated(id stream)
+{
+	id why = nil;
+
+	stream_invalidated = 1;
+	@try {
+		why = ev_get(stream, "error", nil);
+	} @catch (NSException *e) {
+		why = nil;
+	}
+	say("oslogfwd: the stream was invalidated%s%s",
+	    why ? ": " : " with no error object",
+	    why ? [[why description] UTF8String] : "");
+}
+
 static BOOL
 attach_and_activate(id stream, NSPredicate *predicate, NSString **why)
 {
@@ -705,15 +790,33 @@ attach_and_activate(id stream, NSPredicate *predicate, NSString **why)
 	SEL set_event_handler = sel_getUid("setEventHandler:");
 	void (^handler)(id) = ^(id event) {
 		@autoreleasepool {
-			handle_event(event);
+			live_events++;
+			handle_event(event, "oslog");
 		}
 	};
 
 	if (!stream) {
 		return NO;
 	}
+	stream_invalidated = 0;
 	@try {
-		if ([stream respondsToSelector:@selector(setFilterPredicate:)] && predicate) {
+		if ([stream respondsToSelector:@selector(setInvalidationHandler:)]) {
+			void (^invalid)(id) = ^(id s) {
+				@autoreleasepool {
+					on_stream_invalidated(s);
+				}
+			};
+			((void (*)(id, SEL, id))objc_msgSend)(stream,
+			    @selector(setInvalidationHandler:), invalid);
+		}
+		/* The predicate is translated by the framework's own mapper inside
+		 * diagnosticd: cheap (only the named subsystems cross the XPC) but a shape
+		 * the mapper does not understand can leave a stream that is perfectly
+		 * connected and delivers nothing, which is indistinguishable from the refusal
+		 * of TEST13B.  The main loop therefore drops it and reconnects when the
+		 * stream has said nothing for a minute; the filter here (find_rule) is always
+		 * the one that decides what is printed. */
+		if (send_predicate && [stream respondsToSelector:@selector(setFilterPredicate:)] && predicate) {
 			((void (*)(id, SEL, id))objc_msgSend)(stream, @selector(setFilterPredicate:), predicate);
 		}
 		if ([stream respondsToSelector:set_stream_handler]) {
@@ -772,6 +875,331 @@ make_predicate(void)
 	}
 }
 
+/* ------------------------------------------------------------------ */
+/* the archive logd writes, for when the live stream says nothing      */
+
+/* logd writes .tracev3 files into /private/var/db/diagnostics; var_store leaves that
+ * directory out of the saved volume on purpose ("tens of MB a boot, and remade"), which
+ * is also the evidence that it fills up.  Its size answers the one question that has to
+ * be answered before anything else in the next log: is os_log itself alive in this boot
+ * (files growing) or not (no files)?  Without that, "0 seen" is unattributable. */
+static void
+archive_stats(void)
+{
+	static const char *const dirs[] = { "/private/var/db/diagnostics", "/var/db/diagnostics" };
+	static const char *const uuid_dirs[] = { "/private/var/db/uuidtext", "/var/db/uuidtext" };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		DIR *d = opendir(dirs[i]);
+		struct dirent *e;
+		unsigned long long files = 0, bytes = 0;
+		unsigned long long ufiles = 0, ubytes = 0;
+		long newest_age = -1;
+		time_t now = time(NULL);
+
+		if (!d) {
+			continue;
+		}
+		while ((e = readdir(d)) != NULL) {
+			char path[512];
+			struct stat st;
+
+			if (e->d_name[0] == '.') {
+				continue;
+			}
+			snprintf(path, sizeof(path), "%s/%s", dirs[i], e->d_name);
+			if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+				continue;
+			}
+			if (strstr(e->d_name, ".tracev3") == NULL) {
+				continue;
+			}
+			files++;
+			bytes += (unsigned long long)st.st_size;
+			if (newest_age < 0 || st.st_mtime > now - newest_age) {
+				newest_age = (long)(now - st.st_mtime);
+			}
+		}
+		closedir(d);
+		if ((d = opendir(uuid_dirs[i])) != NULL) {
+			while ((e = readdir(d)) != NULL) {
+				char path[512];
+				struct stat st;
+
+				if (e->d_name[0] == '.') {
+					continue;
+				}
+				snprintf(path, sizeof(path), "%s/%s", uuid_dirs[i], e->d_name);
+				if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+					ufiles++;
+					ubytes += (unsigned long long)st.st_size;
+				}
+			}
+			closedir(d);
+		}
+		say("oslogfwd: archive %s: %llu .tracev3, %llu bytes, newest %ld s old; uuidtext %llu files, %llu bytes",
+		    dirs[i], files, bytes, newest_age, ufiles, ubytes);
+		return;
+	}
+	say("oslogfwd: archive: neither %s nor %s can be opened", dirs[0], dirs[1]);
+}
+
+static id store_obj;            /* OSLogEventStore: the local (this boot's) store */
+static id store_stream;         /* one OSLogEventStream over it */
+static NSString *store_how;     /* the shape that worked, for the log */
+static unsigned long long store_last_ts;   /* dedup between polls */
+static unsigned long long store_events, store_printed;   /* cumulative */
+static unsigned long long store_poll_printed;
+
+static id
+make_local_store(NSString **why)
+{
+	Class st = NSClassFromString(@"OSLogEventStore");
+
+	if (!st) {
+		*why = @"no OSLogEventStore in LoggingSupport";
+		return nil;
+	}
+	if ([st respondsToSelector:@selector(localStore)]) {
+		id s = ((id (*)(id, SEL))objc_msgSend)(st, @selector(localStore));
+		if (s) {
+			store_how = @"OSLogEventStore/localStore";
+			return s;
+		}
+		*why = @"+localStore returned nil";
+		return nil;
+	}
+	if ([st respondsToSelector:@selector(localStoreWithError:)]) {
+		NSError *error = nil;
+		id s = ((id (*)(id, SEL, NSError **))objc_msgSend)(st, @selector(localStoreWithError:), &error);
+		if (s) {
+			store_how = @"OSLogEventStore/localStoreWithError:";
+			return s;
+		}
+		*why = error ? [error description] : @"+localStoreWithError: returned nil";
+		return nil;
+	}
+	*why = @"OSLogEventStore has no +localStore";
+	return nil;
+}
+
+/* The store-to-stream step is the one shape nobody has documented for iOS 16.5 and the
+ * class's method list in the dyld cache does not decode, so try what the selector names
+ * allow, in order, and say which one produced a stream. */
+static id
+make_store_stream(id store, NSPredicate *predicate, NSString **why)
+{
+	static const char *const with_pred[] = {
+		"streamWithFilterPredicate:error:", "streamWithPredicate:error:",
+		"streamWithFilterPredicate:", "streamWithPredicate:", NULL
+	};
+	Class stream_class = NSClassFromString(@"OSLogEventStream");
+	int i;
+
+	for (i = 0; with_pred[i]; i++) {
+		SEL sel = sel_getUid(with_pred[i]);
+		id s;
+
+		if (![store respondsToSelector:sel]) {
+			continue;
+		}
+		if (strstr(with_pred[i], "error:") != NULL) {
+			NSError *error = nil;
+			s = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(store, sel, predicate, &error);
+			if (!s && error) {
+				*why = [error description];
+			}
+		} else {
+			s = ((id (*)(id, SEL, id))objc_msgSend)(store, sel, predicate);
+		}
+		if (s) {
+			store_how = [NSString stringWithFormat:@"OSLogEventStore/%s", with_pred[i]];
+			return s;
+		}
+	}
+	if ([store respondsToSelector:@selector(stream)]) {
+		id s = ((id (*)(id, SEL))objc_msgSend)(store, @selector(stream));
+		if (s) {
+			store_how = @"OSLogEventStore/stream";
+			return s;
+		}
+	}
+	if (stream_class && [stream_class instancesRespondToSelector:@selector(initWithPredicate:)]) {
+		id s = ((id (*)(id, SEL, id))objc_msgSend)(
+		    ((id (*)(id, SEL))objc_msgSend)(stream_class, @selector(alloc)),
+		    @selector(initWithPredicate:), predicate);
+		if (s) {
+			store_how = @"OSLogEventStream/initWithPredicate:";
+			return s;
+		}
+	}
+	if (stream_class) {
+		@try {
+			id s = ((id (*)(id, SEL))objc_msgSend)(
+			    ((id (*)(id, SEL))objc_msgSend)(stream_class, @selector(alloc)),
+			    @selector(init));
+			if (s && [s respondsToSelector:@selector(activateStreamFromLastBoot)]) {
+				store_how = @"OSLogEventStream/init";
+				return s;
+			}
+		} @catch (NSException *e) {
+			(void)e;
+		}
+	}
+	if (why && *why == nil) {
+		*why = @"no store-to-stream selector answered";
+	}
+	return nil;
+}
+
+static void
+handle_store_event(id ev)
+{
+	SEL sel = sel_getUid("timestamp");
+	unsigned long long ts = 0;
+
+	if ([ev respondsToSelector:sel]) {
+		unsigned long long (*fn)(id, SEL) = (unsigned long long (*)(id, SEL))(void *)
+		    [ev methodForSelector:sel];
+		ts = fn(ev, sel);
+	}
+	store_events++;
+	if (ts && ts <= store_last_ts) {
+		return;                 /* printed by an earlier poll */
+	}
+	if (ts) {
+		store_last_ts = ts;
+	}
+	{
+		unsigned long long before = n_printed;
+
+		handle_event(ev, "oslog-ar");
+		if (n_printed != before) {
+			store_printed++;
+			store_poll_printed++;
+		}
+	}
+}
+
+static void
+store_stop(void)
+{
+	if (store_stream && [store_stream respondsToSelector:@selector(invalidate)]) {
+		@try {
+			((void (*)(id, SEL))objc_msgSend)(store_stream, @selector(invalidate));
+		} @catch (NSException *e) {
+			(void)e;
+		}
+	}
+	store_stream = nil;
+}
+
+static int
+store_activate(NSPredicate *predicate, NSString **why)
+{
+	void (^handler)(id) = ^(id event) {
+		@autoreleasepool {
+			handle_store_event(event);
+		}
+	};
+
+	store_stream = make_store_stream(store_obj, predicate, why);
+	if (!store_stream) {
+		return 0;
+	}
+	@try {
+		if ([store_stream respondsToSelector:@selector(setInvalidationHandler:)]) {
+			void (^invalid)(id) = ^(id s) {
+				(void)s;
+				store_done = 1;
+			};
+			((void (*)(id, SEL, id))objc_msgSend)(store_stream,
+			    @selector(setInvalidationHandler:), invalid);
+		}
+		if ([store_stream respondsToSelector:@selector(setEventHandler:)]) {
+			((void (*)(id, SEL, id))objc_msgSend)(store_stream,
+			    @selector(setEventHandler:), handler);
+		} else if ([store_stream respondsToSelector:@selector(setStreamHandler:)]) {
+			((void (*)(id, SEL, id))objc_msgSend)(store_stream,
+			    @selector(setStreamHandler:), handler);
+		} else {
+			*why = @"the store stream takes neither setEventHandler: nor setStreamHandler:";
+			return 0;
+		}
+		if (send_predicate && predicate &&
+		    [store_stream respondsToSelector:@selector(setFilterPredicate:)]) {
+			((void (*)(id, SEL, id))objc_msgSend)(store_stream,
+			    @selector(setFilterPredicate:), predicate);
+		}
+		if ([store_stream respondsToSelector:@selector(activateStreamFromLastBoot)]) {
+			((void (*)(id, SEL))objc_msgSend)(store_stream,
+			    @selector(activateStreamFromLastBoot));
+		} else if ([store_stream respondsToSelector:@selector(activate)]) {
+			((void (*)(id, SEL))objc_msgSend)(store_stream, @selector(activate));
+		} else {
+			*why = @"the store stream has no -activateStreamFromLastBoot";
+			return 0;
+		}
+	} @catch (NSException *e) {
+		*why = [NSString stringWithFormat:@"%@: %@", [e name], [e reason]];
+		return 0;
+	}
+	return 1;
+}
+
+/* One read of the archive from the last boot; entries already printed by an earlier read
+ * are skipped by their timestamp.  Returns 0 when the path works. */
+static int
+store_poll(void)
+{
+	NSPredicate *predicate = make_predicate();
+	NSString *why = nil;
+	double until;
+	int attempt;
+
+	if (!store_obj) {
+		store_obj = make_local_store(&why);
+		if (!store_obj) {
+			say("oslogfwd: archive: no local store (%s)", why ? [why UTF8String] : "unknown");
+			return -1;
+		}
+		say("oslogfwd: archive: local store, %s", [store_how UTF8String]);
+	}
+	/* the predicate keeps the read cheap; if the mapper will not have it, read the boot
+	 * without one rather than lose the fallback to the same shape question as the live
+	 * stream (the filter here decides what is printed either way) */
+	for (attempt = 0; attempt < 2; attempt++) {
+		store_stop();
+		store_done = 0;
+		store_events = 0;
+		store_poll_printed = 0;
+		why = nil;
+		if (!store_activate(predicate, &why)) {
+			say("oslogfwd: archive: cannot stream the store (%s); %s",
+			    why ? [why UTF8String] : "unknown",
+			    store_how ? [store_how UTF8String] : "no shape tried");
+			if (!predicate) {
+				return -1;
+			}
+			say("oslogfwd: archive: retrying without the predicate");
+			predicate = nil;
+			continue;
+		}
+		say("oslogfwd: archive: reading from the last boot through %s", [store_how UTF8String]);
+		until = now_sec() + (double)store_wait;
+		while (!stop_now && !store_done && now_sec() < until) {
+			[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.5]];
+		}
+		say("oslogfwd: archive: %llu entries offered, %llu printed, last timestamp %llu%s",
+		    store_events, store_poll_printed, store_last_ts,
+		    store_done ? "" : " (timed out)");
+		store_stop();
+		return 0;
+	}
+	return -1;
+}
+
 static void
 print_rules(void)
 {
@@ -815,7 +1243,8 @@ selftest(void)
 	id stream;
 	int i, j;
 
-	say("oslogfwd: selftest (%s), pid %d uid %d", OSLFWD_VERSION, getpid(), getuid());
+	say("oslogfwd: selftest (%s), pid %d uid %d euid %d gid %d", OSLFWD_VERSION, getpid(),
+	    getuid(), geteuid(), getgid());
 	cmdline = read_bootargs();
 	say("oslogfwd: kern.bootargs \"%s\"", cmdline ? cmdline : "(unreadable)");
 	free(cmdline);
@@ -871,6 +1300,43 @@ selftest(void)
 		say("oslogfwd: attach and activate: %s%s%s",
 		    attach_and_activate(stream, predicate, &why) ? "ok" : "failed",
 		    why ? " - " : "", why ? [why UTF8String] : "");
+		/* X2: activation that returns is not the same as a stream that delivers;
+		 * what the next log needs is the count of handler calls, not just "ok". */
+		if (store_secs < 5) {
+			store_secs = 5;
+		}
+		{
+			double until = now_sec() + 5.0;
+			while (!stop_now && now_sec() < until) {
+				[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.5]];
+			}
+		}
+		say("oslogfwd: selftest: %llu events, %llu with a subsystem, %llu printed, %llu dropped%s",
+		    n_events, n_seen, n_printed, n_dropped,
+		    stream_invalidated ? ", the stream was invalidated" : "");
+	}
+	archive_stats();
+	{
+		Class store_class = NSClassFromString(@"OSLogEventStore");
+		static const char *const store_sels[] = {
+			"localStore", "localStoreWithError:", "stream", "streamWithPredicate:",
+			"streamWithFilterPredicate:error:", "storeWithArchiveURL:", NULL
+		};
+		char yes[400] = "";
+
+		if (!store_class) {
+			say("oslogfwd: store class OSLogEventStore NO");
+		} else {
+			for (j = 0; store_sels[j]; j++) {
+				SEL sel = sel_getUid(store_sels[j]);
+				if ([store_class respondsToSelector:sel]) {
+					size_t used = strlen(yes);
+					snprintf(yes + used, sizeof(yes) - used, " +%s", store_sels[j]);
+				}
+			}
+			say("oslogfwd: store class OSLogEventStore%s", yes[0] ? yes : " (no class methods of interest)");
+		}
+		say("oslogfwd: archive probe: %s", store_poll() == 0 ? "ran" : "failed");
 	}
 	say("oslogfwd: selftest done");
 	return stream ? 0 : 1;
@@ -890,7 +1356,9 @@ usage(void)
 {
 	say("usage: oslogfwd [--selftest] [--all] [--subsystem SPEC]... [--process NAME]...");
 	say("                [--rate N] [--burst N] [--console PATH] [--probe N]");
+	say("                [--pred] [--store] [--no-store] [--store-secs N]");
 	say("boot-args: oslog=sub[,sub:category]... oslog_proc=a,b oslog_rate=N oslog_burst=N");
+	say("           oslog_pred=1 oslog_store=0|1 oslog_store_secs=N oslog_store_wait=N");
 }
 
 int
@@ -924,8 +1392,16 @@ main(int argc, char **argv)
 		return selftest();
 	}
 
-	say("oslogfwd: started (%s), pid %d, console %s", OSLFWD_VERSION, getpid(),
+	say("oslogfwd: started (%s), pid %d, uid %d euid %d gid %d, console %s", OSLFWD_VERSION,
+	    getpid(), getuid(), geteuid(), getgid(),
 	    console_fd >= 0 ? "/dev/console" : "stderr");
+	/* X2: diagnosticd lets a client read the stream if it is root ("admin status") or
+	 * carries com.apple.private.logging.stream; a job in the user/501 launchd domain is
+	 * neither, and the run log has to say which one this boot is. */
+	say("oslogfwd: filter %s; live stream enabled; archive fallback %s (%d s)",
+	    send_predicate ? "subsystem predicate sent first, dropped after 60 s without an event"
+	                   : "checked here only, the predicate is not sent to diagnosticd",
+	    store_fallback ? "enabled" : "off", store_secs);
 	print_rules();
 	if (nprocs) {
 		char buf[256] = "";
@@ -946,8 +1422,11 @@ main(int argc, char **argv)
 			NSString *why = nil;
 			id stream = make_stream_with_predicate(predicate, &why);
 			unsigned long long last_dropped = n_dropped;
-			unsigned long long last_printed = n_printed;
-			unsigned long long seen_at_start = n_seen;
+			unsigned long long live_at_start = live_events;
+			unsigned long long store_at_start = store_printed;
+			double stream_start;
+			double next_archive = 20.0;    /* the archive exists only once logd is up */
+			double next_store = (double)store_secs;
 			int heartbeat = 0;
 
 			if (!stream || !attach_and_activate(stream, predicate, &why)) {
@@ -961,27 +1440,66 @@ main(int argc, char **argv)
 				continue;
 			}
 			backoff = 10;
+			stream_start = now_sec();
 			say("oslogfwd: streaming, backend %s", [backend_name UTF8String]);
 			while (!stop_now) {
-				[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:60.0]];
-				heartbeat++;
-				if (n_dropped != last_dropped) {
+				double elapsed;
+				unsigned long long live_before = live_events;
+
+				[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:10.0]];
+				elapsed = now_sec() - stream_start;
+				if (elapsed >= next_archive) {
+					archive_stats();
+					next_archive = elapsed + 300.0;
+				}
+				/* X2: the handler's call count, not the printed count, is what
+				 * says whether diagnosticd is feeding us at all. */
+				if (live_events != live_at_start || store_printed != store_at_start) {
+					say("oslogfwd: %llu events, %llu with a subsystem, %llu printed, %llu dropped by the rate limit",
+					    live_events - live_at_start, n_seen, n_printed, n_dropped);
+					live_at_start = live_events;
+					store_at_start = store_printed;
+					heartbeat = 0;
+				} else if (n_dropped != last_dropped) {
 					say("oslogfwd: %llu dropped by the rate limit so far", n_dropped);
 					last_dropped = n_dropped;
 				}
-				if (heartbeat >= 5 && n_printed == last_printed) {
-					if (n_seen == seen_at_start) {
-						say("oslogfwd: alive, the stream has delivered nothing (%llu seen)", n_seen);
+				heartbeat++;
+				if (heartbeat >= 6) {          /* a minute of ten-second slices */
+					if (live_events == live_at_start) {
+						say("oslogfwd: alive, the live stream has delivered nothing in %d min (%llu handler calls since the start)",
+						    heartbeat / 6, live_events);
 					} else {
-						say("oslogfwd: alive, nothing matched in %d min (%llu seen)",
-						    heartbeat, n_seen);
+						say("oslogfwd: alive, nothing matched in %d min (%llu handler calls, %llu seen)",
+						    heartbeat / 6, live_events - live_at_start, n_seen);
 					}
 					heartbeat = 0;
 				}
-				last_printed = n_printed;
-				if (ev_uint(stream, "invalidated")) {
+				if (stream_invalidated || ev_uint(stream, "invalidated")) {
 					say("oslogfwd: stream invalidated, restarting");
 					break;
+				}
+				/* X2: a predicate diagnosticd cannot translate looks exactly like a
+				 * refusal -- a live stream that delivers nothing.  Give it a minute,
+				 * then reconnect without it (and say so once). */
+				if (send_predicate && live_events == 0 && elapsed >= 60.0) {
+					send_predicate = 0;
+					say("oslogfwd: nothing through the subsystem predicate in 60 s; reconnecting without it");
+					break;
+				}
+				/* the fallback: the live stream has said nothing for store_secs
+				 * and logd's archive is the only other reader of the same data;
+				 * keep reading it, so entries written after the first read are
+				 * printed too (the timestamps in handle_store_event dedup). */
+				if (store_fallback && elapsed >= next_store && live_before == 0 &&
+				    live_events == 0) {
+					say("oslogfwd: the live stream has been silent for %.0f s; reading logd's archive",
+					    elapsed);
+					store_poll();
+					next_store = elapsed + (double)store_secs;
+					if (store_secs <= 0) {
+						next_store = elapsed + 60.0;
+					}
 				}
 			}
 		}

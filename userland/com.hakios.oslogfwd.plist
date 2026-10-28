@@ -17,6 +17,16 @@
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<!-- X2: the job used to land in the user/501 launchd domain, i.e. uid 501 gid 501,
+	     and diagnosticd serves a live stream only to a client with admin status (root)
+	     or with com.apple.private.logging.stream: it answers {error:1} and cancels the
+	     connection for anyone else, which is what "0 seen" was.  The Apple daemons that
+	     must be root say the same thing (com.apple.logd.plist, com.apple.diagnosticd.plist:
+	     LimitLoadToSessionType System); with it and no UserName this job is spawned by
+	     the system domain as uid 0.  The entitlements are in src/oslogfwd.entitlements,
+	     so the job is served even where the check wants an entitlement, not euid 0. -->
+	<key>LimitLoadToSessionType</key>
+	<string>System</string>
 	<!-- a restart loop would be six console lines a minute; the program backs off by
 	     itself, and launchd is asked not to add to it -->
 	<key>ThrottleInterval</key>
