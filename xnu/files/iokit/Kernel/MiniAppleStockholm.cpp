@@ -273,7 +273,10 @@ static uint8_t  gSpmiTermios[72];       /* TIOCSETA-shaped, zeros until nfcd set
 static uint32_t gIosLevel;
 static uint32_t gHwSpoof;               /* vayu_nfc_hwspoof=1: CORE_INIT_RSP hardware byte 0x41 shown to nfcd as 0x42 */
 static uint32_t gPropInit;              /* vayu_nfc_propinit=1: also answer the 2F 06 and 2F 00 init steps (filter()) */
-static uint32_t gNfceeForward;          /* vayu_nfc_nfcee=1: forward NFCEE_DISCOVER instead of answering 0 NFCEEs */
+static uint32_t gNfceeMode;             /* vayu_nfc_nfcee=2: answer 0 NFCEEs locally; otherwise forward 22 00/22 01 */
+static uint32_t gNfceeNtfFilter = 1;    /* vayu_nfc_nfcee_ntf=0: pass every 62 00, do not cut after the RSP count */
+static int32_t  gNfceeAnnounced = -1;   /* NFCEE count from the forwarded 42 00 RSP; -1 = no RSP seen yet */
+static uint32_t gNfceeNtfSeen;          /* 62 00 notifications passed since that RSP */
 static uint8_t  gCtlReassembly[1024];
 static size_t   gCtlReassemblyLength;
 static uint32_t gFilterDecisions, gBridgeRxErrors, gForwardErrors, gAnswerErrors;
@@ -479,36 +482,51 @@ filterGetConfig(const uint8_t * packet, unsigned length)
 
 /*
  * NFCEE management (GID 2). iOS 16.5's init asks NFCEE_DISCOVER (22 00) right after the
- * CORE_SET_CONFIG/GET_CONFIG block. The board is a PN553, not a PN80T (vendor
- * libnfc-nxp.conf NXP_NFC_CHIP=0x07; CORE_INIT_RSP hw 0x41), so there is no eSE inside the
- * controller, and this port does not use a UICC NFCEE either. Answer "0 NFCEEs" locally;
- * there is then nothing to route, power or open.
+ * CORE_SET_CONFIG/GET_CONFIG block. Two facts decide what the bridge must do with it.
  *
- * The accepted shape is [status][number of NFCEEs] = 00 00, payload length 2:
- * phNciNfc_ProcessNfceeDiscoverRsp 0x1f45a3aa0 reads the response at ctx+3360/3368
- *   0x1f45a3ae0  ldr  w9, [x19, #3368]    ; payload length
- *   0x1f45a3ae4  cmp  w9, #2
- *   0x1f45a3ae8  b.hi 0x1f45a3b58         ; > 2 -> w20=255
- *   0x1f45a3aec  ldrb w8, [x8]            ; status
- *   0x1f45a3af0  cmp  w8, #0xf1           ; discovery already started -> w20=81
- *   0x1f45a3af8  cbnz w8, 0x1f45a3b58     ; any other status -> w20=255
- *   0x1f45a3b24  ldrb w5, [x8, #1]        ; number of NFCEEs
- *   0x1f45a3b28  strb w5, [x19, #3545]
- * The answer the bridge used to give, 42 00 01 01, has status 1 and therefore takes the
- * 0x1f45a3af8 branch; that 255 is the "LibNfc Init/Re-init Failed" of TEST14.
+ * 1. The response shape is [status][number of NFCEEs], payload length 2;
+ *    phNciNfc_ProcessNfceeDiscoverRsp 0x1f45a3aa0 reads it at ctx+3360/3368:
+ *      0x1f45a3ae0  ldr  w9, [x19, #3368]    ; payload length; >2 -> 255
+ *      0x1f45a3aec  ldrb w8, [x8]            ; status
+ *      0x1f45a3af0  cmp  w8, #0xf1           ; already started -> 81
+ *      0x1f45a3af8  cbnz w8, 0x1f45a3b58     ; any other status -> 255
+ *      0x1f45a3b24  ldrb w5, [x8, #1]        ; number of NFCEEs
+ *      0x1f45a3b28  strb w5, [x19, #3545]
+ *    TEST14's 42 00 01 01 (status 1) takes the 255 branch: "LibNfc Init/Re-init Failed"
+ *    in 16 ms. TEST15's local 42 00 02 00 00 (status 0, count 0) passes this parser.
  *
- * No NTF is owed for an empty list. phNciNfc_CompleteNfceeDiscoverSequence 0x1f4555290
- * registers the 62 00 handler (0x1f4555310 "Registering for Nfcee Discover Notification",
- * handler phNciNfc_NfceeDiscNtfHandler 0x1f45a41a0) and calls phNciNfc_Notify 0x1f45d552c
- * with the count straight away; it does not wait for a 62 00. NCI sends one
- * NFCEE_DISCOVER_NTF per discovered NFCEE and none for zero. phLibNfc_ProcessNfceeDiscRsp
- * 0x1f455a500 checks only the status (0x1f455a540 cbz w20) and sets ctx+480=1; it never
- * looks at the count, so the init proceeds to phLibNfc_InitializeComplete 0x1f4552e50.
+ * 2. Count 0 nevertheless does not finish the init. phNciNfc_CompleteNfceeDiscoverSequence
+ *    0x1f4555290 does register the 62 00 handler (0x1f4555310, handler
+ *    phNciNfc_NfceeDiscNtfHandler 0x1f45a41a0) and calls phNciNfc_Notify 0x1f45d552c at
+ *    0x1f45553cc at once - the branch at 0x1f4555380 is only the "DeRegistering for Nfcee
+ *    Discover Notification" / stop-discovery path (ctx+4088 = 1 is set in
+ *    phNciNfc_Nfcee_StartDiscovery 0x1f45ed4ec), it is not a timer. What then runs out is
+ *    phLibNfc_InitCompleteWdTimer 0x1f4559874, armed by phLibNfc_InitializeComplete
+ *    0x1f45533dc with 1000 ms and ctx+2752 = 8 retries (0x1f4559a2c); its callback
+ *    phLibNfc_InitCompleteWdTimerCb 0x1f45d4674 restarts it at 0x1f45d477c (1000 ms) until
+ *    the count is 0, then 0x1f45d48c0-0x1f45d48c8 calls phLibNfc_ReleaseLibNfcContext
+ *    with 255 -> "LibNfc Init/Re-init Failed" 0x1f4593e20. 1 + 8 s = the 9.118 s silence of
+ *    TEST15. The only thing that stops that timer is phLibNfc_staticFeatureCfgComplete
+ *    0x1f4558880, which is reached from phLibNfc_NfceeInitializeComplete 0x1f459474c after
+ *    the per-SE (HCI child device) init - i.e. iOS expects the discovery result to agree
+ *    with its own SE map (A0EC=1/A0ED=0 -> ctx+325 = 3 at phLibNfc_GetNfceeIntfCfgProc
+ *    0x1f45903fc, so the empty "no SE" path at 0x1f45533e0..0x1f455340c is not taken).
  *
- * Forwarding 22 00 (vayu_nfc_nfcee=1, for a hardware comparison only) is safe in itself -
- * discover reads - but the chip's config on this board (A0EC=1/A0ED=0 as read by
- * phLibNfc_GetNfceeIntfCfgProc 0x1f4590324) may make its firmware report an NFCEE that is
- * not there; iOS would then try NFCEE_MODE_SET/pipe opens against a phantom eSE.
+ * So an empty list is only consistent when the controller itself says it has no NFCEE.
+ * The PN553 keeps A0EC=1 because filterSetConfig() strips iOS's "A0EC=0/A0ED=1" write, and
+ * its firmware is the only authority on what it really reports. Forward 22 00 (discover is
+ * read only) and the 22 01 that follows when the chip reports an NFCEE; a local "0 NFCEE"
+ * answer stays available for comparison, where 22 01 is refused as before.
+ *
+ * TEST15B (forward, job 0766) proved the point: the chip answered 42 00 02 00 01 and sent
+ * 62 00 05 01 00 01 01 00 (id 0x01, status DISABLED, one protocol, no TLV); nfcd then sent
+ * 20 04 06 03 01 01 02 01 01 CORE_CONN_CREATE. But the chip also sent two more 62 00 (ids
+ * 0x81 and 0x02) for one announced NFCEE, iOS keeps one SE entry per NTF, and the init ended
+ * in "NCI RSP: Timer expired". bridgeRx() therefore passes only the first "count" 62 00 of
+ * the current discovery (vayu_nfc_nfcee_ntf=0 disables that cut).
+ *
+ * vayu_nfc_nfcee=0 (default) or 1: forward (1 keeps the old spelling used by TEST15)
+ * vayu_nfc_nfcee=2: answer 42 00 02 00 00 locally, refuse 22 01 (N6/TEST15 behaviour)
  */
 static void
 filterNfcee(const uint8_t * packet, unsigned length)
@@ -518,15 +536,30 @@ filterNfcee(const uint8_t * packet, unsigned length)
 	if (oid == 0x00) {                      /* NFCEE_DISCOVER */
 		static const uint8_t no_nfcee[] = { 0x42, 0x00, 0x02, 0x00, 0x00 };
 
-		if (gNfceeForward != 0) {
-			forwardPacket(packet, length, packet, length, "forward (NFCEE_DISCOVER)");
+		if (gNfceeMode == 2) {
+			filterLog(packet, length, "answer 42 00 02 00 00 (0 NFCEEs, local)");
+			answerNfcd(no_nfcee, sizeof(no_nfcee));
 			return;
 		}
-		filterLog(packet, length, "answer 42 00 02 00 00 (0 NFCEEs)");
-		answerNfcd(no_nfcee, sizeof(no_nfcee));
+		/*
+		 * A new discovery: forget the previous list. The 62 00 count filter in bridgeRx() is
+		 * re-armed by the 42 00 that the chip answers this command with.
+		 */
+		gNfceeAnnounced = -1;
+		gNfceeNtfSeen = 0;
+		forwardPacket(packet, length, packet, length, "forward (NFCEE_DISCOVER)");
 		return;
 	}
-	/* 22 01 NFCEE_MODE_SET and the rest: there is no such NFCEE on this phone. */
+	if (oid == 0x01) {                      /* NFCEE_MODE_SET */
+		if (gNfceeMode == 2) {
+			/* No NFCEE was reported, so there is nothing to switch on. */
+			answerRejected(packet, length, 0x42, oid);
+			return;
+		}
+		forwardPacket(packet, length, packet, length, "forward (NFCEE_MODE_SET)");
+		return;
+	}
+	/* The rest of GID 2 (22 02..22 3f) has no meaning for this board. */
 	answerRejected(packet, length, 0x42, oid);
 }
 
@@ -745,6 +778,36 @@ bridgeRx(const uint8_t * packet, unsigned length)
 			packet = spoofed;
 		}
 	}
+	/*
+	 * NFCEE discovery: TEST15B showed the PN553 answering 42 00 02 00 01 (one NFCEE) and then
+	 * sending three 62 00 notifications (ids 01, 81, 02). iOS keeps one SE entry per NTF and
+	 * then tries to connect to each of them; the extras describe NFCEEs its own configuration
+	 * does not have (A0ED=0 -> no UICC), and the init ends in "NCI RSP: Timer expired". Keep
+	 * the list to the count the RSP announced: the first N notifications pass, the rest are
+	 * dropped here. vayu_nfc_nfcee_ntf=0 passes every NTF instead.
+	 */
+	if (length >= 5 && packet[0] == 0x42 && packet[1] == 0x00 && packet[2] == 0x02) {
+		gNfceeAnnounced = packet[4];
+		gNfceeNtfSeen = 0;
+		stockholmLog("MiniAppleStockholm: nfcee rsp: status %02x, %u NFCEE(s)\n",
+		    packet[3], packet[4]);
+	} else if (length >= 4 && packet[0] == 0x62 && packet[1] == 0x00) {
+		/* payload: [0] id, [1] status, [2] number of supported protocols (filterNfcee()) */
+		uint8_t nfcee_id = packet[3];
+		uint8_t nfcee_status = length > 4 ? packet[4] : 0;
+		uint8_t nfcee_protocols = length > 5 ? packet[5] : 0;
+
+		if (gNfceeNtfFilter != 0 && gNfceeAnnounced >= 0 &&
+		    gNfceeNtfSeen >= (uint32_t)gNfceeAnnounced) {
+			stockholmLog("MiniAppleStockholm: nfcee ntf: id %02x status %02x dropped "
+			    "(RSP announced %d NFCEE(s), %u already passed)\n",
+			    nfcee_id, nfcee_status, gNfceeAnnounced, gNfceeNtfSeen);
+			return;
+		}
+		gNfceeNtfSeen++;
+		stockholmLog("MiniAppleStockholm: nfcee ntf: %u bytes: id %02x status %02x protocols %u\n",
+		    length, nfcee_id, nfcee_status, nfcee_protocols);
+	}
 	error = ctl_enqueuedata(ref, unit, (void *)(uintptr_t)packet, length, 0);
 	if (error != 0) {
 		gBridgeRxErrors++;
@@ -787,6 +850,8 @@ ctlDisconnect(kern_ctl_ref kctlref, u_int32_t unit, void * unitinfo)
 		vayu_nfc_bridge_stop();
 	}
 	gCtlReassemblyLength = 0;
+	gNfceeAnnounced = -1;
+	gNfceeNtfSeen = 0;
 	gKctlRef = NULL;
 	gKctlUnit = 0;
 	return 0;
@@ -940,13 +1005,28 @@ MiniAppleStockholmStart(void)
 		    "status 0; the rest of the 2F family stays refused)\n");
 	}
 	/*
-	 * Default off: NFCEE_DISCOVER is answered locally with 0 NFCEEs (see filterNfcee()).
-	 * vayu_nfc_nfcee=1 forwards 22 00 to the PN553 for one hardware comparison run; it is
-	 * not the intended mode because the chip's table describes an NFCEE this board lacks.
+	 * NFCEE (see filterNfcee()). Default is forward: the PN553's own discovery answer and its
+	 * 62 00 notifications are the only pair that agrees with the A0EC=1 its EEPROM keeps, so
+	 * forward both 22 00 and 22 01. vayu_nfc_nfcee=2 answers 42 00 02 00 00 locally and
+	 * refuses 22 01 (the N6/TEST15 behaviour, kept for A/B runs). =1 is the old spelling of
+	 * "forward" and still means that.
 	 */
-	(void)PE_parse_boot_argn("vayu_nfc_nfcee", &gNfceeForward, sizeof(gNfceeForward));
-	if (gNfceeForward != 0) {
-		stockholmLog("MiniAppleStockholm: nfcee: forwarding NFCEE_DISCOVER (22 00) to the chip\n");
+	(void)PE_parse_boot_argn("vayu_nfc_nfcee", &gNfceeMode, sizeof(gNfceeMode));
+	if (gNfceeMode == 2) {
+		stockholmLog("MiniAppleStockholm: nfcee: answering NFCEE_DISCOVER (22 00) locally with "
+		    "0 NFCEEs; 22 01 refused\n");
+	} else {
+		stockholmLog("MiniAppleStockholm: nfcee: forwarding NFCEE_DISCOVER (22 00) and "
+		    "NFCEE_MODE_SET (22 01) to the chip\n");
+	}
+	/*
+	 * TEST15B: the chip announced one NFCEE but sent three 62 00. The count filter in
+	 * bridgeRx() keeps the notifications equal to the announced number. vayu_nfc_nfcee_ntf=0
+	 * turns it off (pure forward, the TEST15B behaviour).
+	 */
+	(void)PE_parse_boot_argn("vayu_nfc_nfcee_ntf", &gNfceeNtfFilter, sizeof(gNfceeNtfFilter));
+	if (gNfceeNtfFilter == 0) {
+		stockholmLog("MiniAppleStockholm: nfcee: 62 00 count filter off (every NTF passed)\n");
 	}
 	resources = IOService::getResourceService();
 	if (resources == NULL) return;
