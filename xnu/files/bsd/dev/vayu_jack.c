@@ -235,6 +235,7 @@ static volatile bool proof_done;                /* J2-B: the proof thread has le
 static bool proof_running;                      /* J2-B: the proof thread was started and not yet waited for */
 static uint64_t proof_began;                    /* J2-B: millisecond clock at P11, for "proof +N ms" */
 static bool mic_live;                           /* M1-M9: the handset microphones' path is up */
+static bool mic_ever_live;                      /* R17: a capture brought it up in this boot: M7 re-defines the channels */
 static volatile bool mbhc_live;                 /* J11/J12: the MBHC poll thread runs while true */
 static volatile bool mbhc_done;                 /* J11/J12: the MBHC poll thread has left */
 static bool mbhc_running;                       /* J11/J12: the poll thread was started and not yet waited for */
@@ -2672,21 +2673,21 @@ mic_bias_wanted(void)
 }
 
 /*
- * vayu_mic_chan_keep=0: the channels 135/136 are removed from the bus at the end of every capture,
- * as this driver did until R12. The default keeps them: the vendor adds a channel once, when the
- * stream is opened (wcd9xxx-slimslave.c: the channel map of a codec port is a bus resource that
- * outlives the stream, slim_ch_alloc/slim_ch_free around the ASoC stream), and removes it only when
- * the codec goes away. Removing them while the TX ports stayed enabled (M-off leaves IFD 0x1F7/0x1F8
- * at 0x02) made every capture depend on the one before it: an iOS boot has four captures (the kernel's
- * 3 s test, the music stage's two streams, the self-test's recorder) and the fourth one read exact
- * zeros in every boot of test8 (run 121732).
+ * vayu_mic_chan_keep=1: the channels 135/136 stay defined on the bus at the end of every capture (the
+ * R12 default, and what the vendor's channel map does: a bus resource that outlives the stream).
+ * R17 flips the default to remove them at M-off: test12 showed that a channel that is left defined is
+ * not re-defined by the next bring-up (the codec's DEF_ACT_CHAN is acked either way), and that a codec
+ * TX port with nothing latched at M-off was never in the framer's frame -- i.e. the second capture's
+ * port enable joins a channel the framer no longer carries. Removing the channels and defining them
+ * again makes every bring-up start from the same state as the first one after boot.
+ * vayu_mic_chan_keep=1 restores the old behaviour for an A/B.
  */
 static bool
 mic_chan_keep_wanted(void)
 {
 	uint32_t keep;
 
-	return !PE_parse_boot_argn("vayu_mic_chan_keep", &keep, sizeof(keep)) || keep != 0;
+	return PE_parse_boot_argn("vayu_mic_chan_keep", &keep, sizeof(keep)) && keep != 0;
 }
 
 /* AMIC_3_4/AMIC_1_2 PWR MODE, bits [6:5] (wcd934x.c:119-124), as the vendor names it. */
@@ -2866,6 +2867,30 @@ mic_slim_ports(bool on)
 	return true;
 }
 
+/*
+ * R17: the channels 135/136 taken off the framer again, so that the CONNECT_SRC/DEF_ACT_CHAN that
+ * follow define them from scratch instead of re-activating a definition the framer may have dropped
+ * when the AFE port was stopped. The vendor's channel map is created per stream
+ * (wcd9xxx_cfg_slim_sch_tx() runs inside the DAPM power-up of the TX widgets), not once per boot;
+ * test12's second capture is exactly the case where re-activating was not enough.
+ */
+static bool
+mic_slim_chan_remove(const char *why)
+{
+	uint8_t chan_remove[7] = { 0x47, 0x23, 0xff, 0, 0, 0x87, 0x88 };       /* CHAN_CTRL, tid 4 */
+	uint8_t reconfig[5] = { 0x45, 0x24, 0xff, 0, 0 };                       /* RECONFIG_NOW, tid 3 */
+	bool ok;
+
+	chan_remove[3] = (uint8_t)(0x80 | (codec_pgd_la & 0x1f));
+	ok = user_msg(chan_remove, sizeof(chan_remove), 4);
+	say("vayu-jack: M7: CHAN_CTRL remove for channels 135/136 (%s): %s\n", why, ok ? "acked" : "not acked");
+	reconfig[4] = codec_pgd_la;
+	if (!user_msg(reconfig, sizeof(reconfig), 3)) {
+		say("vayu-jack: M7: RECONFIG_NOW after the remove (%s): not acked\n", why);
+	}
+	return ok;
+}
+
 /* M7: the SLIM TX ports and channels (wcd9xxx-slimslave.c:349-456, wcd934x.c:1486-1528). */
 static bool
 mic_slim_tx(void)
@@ -3023,6 +3048,14 @@ vayu_jack_mic_kick(const char *why)
 	}
 	vayu_jack_mic_clear_status("before the re-join");
 	spin_us(1000);
+	/*
+	 * R17: the same remove-then-define as a bring-up: the kick is the one moment the DSP's frame is
+	 * known to exist, so the channel definition made here is the one that counts.
+	 */
+	if (mic_ever_live) {
+		(void)mic_slim_chan_remove("before the re-join defines them again");
+		spin_us(1000);
+	}
 	if (!mic_slim_ports(true)) {
 		say("vayu-jack: M-kick (%s): the TX ports did not go on again\n", why);
 		return false;
@@ -3202,6 +3235,16 @@ vayu_jack_mic_on(void)
 		return mic_failed(6, "the decimator POST_PMU");
 	}
 	m6_ms = now_ms();
+	/*
+	 * R17: a capture that follows another one does not inherit its channel definition: the channels are
+	 * taken off the framer first, so M7's CONNECT_SRC/DEF_ACT_CHAN below are a definition and not a
+	 * re-activation (test12: the second capture's enable bit toggled and every message was acked, and
+	 * the codec's port still never joined the frame).
+	 */
+	if (mic_ever_live) {
+		(void)mic_slim_chan_remove("before this bring-up defines them again");
+		spin_us(1000);
+	}
 	if (!mic_slim_tx()) {
 		return mic_failed(7, "the SLIM TX ports and channels");
 	}
@@ -3212,6 +3255,7 @@ vayu_jack_mic_on(void)
 		return mic_failed(9, "the proof readback");
 	}
 	mic_live = true;
+	mic_ever_live = true;
 	return true;
 }
 
@@ -3259,12 +3303,50 @@ vayu_jack_mic_off(void)
 	 * the port stays enabled against a silent decimator and underflows during the whole idle time
 	 * (test10: 0x36=0x80, source 0x02 at the next capture's start); with them removed it sees the
 	 * channel close (test8: source 0x06). Either way the next capture must not inherit it.
+	 *
+	 * R17: before that is read and cleared, the same registers answer the question a capture that read
+	 * zeros needs: was this capture's TX port in the framer's frame at all? The decimators above are
+	 * stopped, so a port that is enabled *and joined* runs out of data and underflows within a
+	 * superframe (test12's working first capture: 0x36=80, 0x77=02, and the port then closed itself,
+	 * 0x11C bit 7 = 0). A port that is enabled and *not* joined is not clocked, cannot underflow and
+	 * shows nothing latched -- which is every zero capture of test12. This line is the codec-side proof
+	 * for the next run, independent of anything the DSP says.
 	 */
+	{
+		uint8_t f36 = 0, f37 = 0, f77 = 0, f78 = 0;
+
+		spin_us(2000);                  /* (a SLIMbus superframe: an underflow of a joined port latches in it) */
+		(void)ifd_read(0x36, &f36);
+		(void)ifd_read(0x37, &f37);
+		(void)ifd_read(0x77, &f77);
+		(void)ifd_read(0x78, &f78);
+		/* (a bring-up that failed never had the TX path on, so its registers say nothing about a frame) */
+		if (mic_live) {
+			if (f36 != 0 || f37 != 0 || f77 != 0 || f78 != 0) {
+				say("vayu-jack: M-off: the codec's TX ports WERE in the framer's frame (an interrupt latched "
+				    "when the decimators stopped: 0x36=%02x 0x37=%02x 0x77=%02x 0x78=%02x)\n", f36, f37, f77, f78);
+			} else {
+				say("vayu-jack: M-off: the codec's TX ports were NOT in the framer's frame (nothing latched "
+				    "while the decimators stopped: 0x36=%02x 0x37=%02x 0x77=%02x 0x78=%02x): the AFE port's "
+				    "start did not carry channels 135/136\n", f36, f37, f77, f78);
+			}
+		}
+	}
 	vayu_jack_mic_clear_status("at M-off");
+	/*
+	 * The enable bit goes to 0 on every capture: the next M-on must be a 0 -> 1 transition (a real port
+	 * start against the master's frame), not a write of the value that is already there. It goes first,
+	 * before the channels are removed or kept below -- the vendor's stream stop is trigger STOP (the
+	 * port) before hw_free (the channel map), and removing a channel under a running port is the other
+	 * order.
+	 */
+	if (!mic_slim_ports(false)) {
+		say("vayu-jack: M-off: the TX ports' enable bit did not go to 0\n");
+	}
 	chan_remove[3] = (uint8_t)(0x80 | (codec_pgd_la & 0x1f));
 	if (!mic_chan_keep_wanted()) {
 		if (user_msg(chan_remove, sizeof(chan_remove), 4)) {
-			say("vayu-jack: M-off: CHAN_CTRL remove for channels 135/136 acked (vayu_mic_chan_keep=0)\n");
+			say("vayu-jack: M-off: CHAN_CTRL remove for channels 135/136 acked (vayu_mic_chan_keep=0, the default)\n");
 		} else {
 			say("vayu-jack: M-off: CHAN_CTRL remove for channels 135/136 was not acked\n");
 		}
@@ -3276,20 +3358,12 @@ vayu_jack_mic_off(void)
 		}
 	} else {
 		/*
-		 * The ports stay enabled and the channels stay defined, muted: the next capture re-sends
-		 * CONNECT_SRC/DEF_ACT_CHAN/RECONFIG (M7) and unmutes 40 ms later. This is what a stream stop
-		 * leaves behind in Android, and it is what keeps the channel map the same at the fourth
-		 * capture of a boot as at the first.
+		 * vayu_mic_chan_keep=1 (the A/B): the channels stay defined, muted, and the next capture re-sends
+		 * CONNECT_SRC/DEF_ACT_CHAN/RECONFIG (M7). R17's default removes them instead, because a definition
+		 * that is left behind is not re-defined by the next bring-up, and test12's second capture's port
+		 * never joined the frame.
 		 */
 		say("vayu-jack: M-off: channels 135/136 stay defined (vayu_mic_chan_keep=1)\n");
-	}
-	/*
-	 * The enable bit itself goes to 0 in both cases: the next M-on must be a 0 -> 1 transition (a real
-	 * port start against the master's frame), not a write of the value that is already there. The
-	 * channels, when they are kept, stay defined, so the port rejoins the same 135/136.
-	 */
-	if (!mic_slim_ports(false)) {
-		say("vayu-jack: M-off: the TX ports' enable bit did not go to 0\n");
 	}
 	mic_live = false;
 	say("vayu-jack: M-off: the microphone path is down\n");
