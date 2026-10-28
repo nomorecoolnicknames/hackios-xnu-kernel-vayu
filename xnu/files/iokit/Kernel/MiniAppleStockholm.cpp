@@ -277,6 +277,24 @@ static uint32_t gNfceeMode;             /* vayu_nfc_nfcee=2: answer 0 NFCEEs loc
 static uint32_t gNfceeNtfFilter = 1;    /* vayu_nfc_nfcee_ntf=0: pass every 62 00, do not cut after the RSP count */
 static int32_t  gNfceeAnnounced = -1;   /* NFCEE count from the forwarded 42 00 RSP; -1 = no RSP seen yet */
 static uint32_t gNfceeNtfSeen;          /* 62 00 notifications passed since that RSP */
+
+/*
+ * N8 (TEST17): after 40 04 CORE_CONN_CREATE_RSP (status 0, conn id 3) nfcd waits 2.02 s and then
+ * tears the session down. phLibNfc_OpenLogConnProcess 0x1f4593588 immediately calls
+ * phHciNfc_CoreInit 0x1f45433a4; the first HCI command goes through phHciNfc_CoreSend
+ * 0x1f45465fc -> phNciNfc_SeSendData 0x1f45670b8 -> the mux ->
+ * phNciMuxNfc_BuildHciNciPkt 0x1f4541cb4. That function asks phNciNfc_GetConnCredits
+ * 0x1f457a0c0 for credits; with none it calls phNciNfc_RegForConnCredits 0x1f457a1e8 and returns
+ * "pending" (0x1f4541f44: strb w20,[x25,#841]; mov w22,#13), so no data packet is ever written.
+ * The HCI command-response timer armed by phHciNfc_CoreSend is 2000 ms (0x1f45466e4), which is
+ * exactly the observed 2.02 s. A synthetic CORE_CONN_CREDITS_NTF (60 06) for that conn id lets
+ * the HCI CORE_RESET travel. The PN553 never sends 60 06 by itself for this connection.
+ */
+static uint32_t gNfcCredits;            /* vayu_nfc_credits=N: after a successful CORE_CONN_CREATE_RSP send 60 06 with N credits; 0 = off */
+static uint32_t gNfcA0bf;               /* vayu_nfc_a0bf=1: keep 0xA0BF in CORE_SET_CONFIG and forward it instead of stripping it */
+static uint32_t gNfcData;               /* vayu_nfc_data=1: forward data packets on the logical connections learnt from 40 04 */
+static int32_t  gLogConns[4] = { -1, -1, -1, -1 };      /* logical conn ids created by a successful CORE_CONN_CREATE_RSP */
+static uint32_t gCreditsInjected, gCreditsErrors;
 static uint8_t  gCtlReassembly[1024];
 static size_t   gCtlReassemblyLength;
 static uint32_t gFilterDecisions, gBridgeRxErrors, gForwardErrors, gAnswerErrors;
@@ -347,6 +365,68 @@ answerRejected(const uint8_t * packet, unsigned length, uint8_t first, uint8_t o
 }
 
 /*
+ * The conn id in a successful 40 04 CORE_CONN_CREATE_RSP (payload: status, max data packet
+ * payload size, number of connections, conn id...) is what phNciNfc_LogConnResp stores at
+ * ctx+3392 (0x1f45432fc..0x1f4543320) and what HCI data packets then carry in byte 1.
+ */
+static void
+rememberLogConn(uint8_t id)
+{
+	for (unsigned i = 0; i < sizeof(gLogConns) / sizeof(gLogConns[0]); i++) {
+		if (gLogConns[i] == (int32_t)id) return;
+	}
+	for (unsigned i = 0; i < sizeof(gLogConns) / sizeof(gLogConns[0]); i++) {
+		if (gLogConns[i] < 0) {
+			gLogConns[i] = id;
+			stockholmLog("MiniAppleStockholm: data: conn %u known (CORE_CONN_CREATE_RSP)\n", id);
+			return;
+		}
+	}
+	stockholmLog("MiniAppleStockholm: data: conn %u not remembered (table full)\n", id);
+}
+
+static bool
+isLogConn(uint8_t id)
+{
+	for (unsigned i = 0; i < sizeof(gLogConns) / sizeof(gLogConns[0]); i++) {
+		if (gLogConns[i] == (int32_t)id) return true;
+	}
+	return false;
+}
+
+/*
+ * vayu_nfc_credits=N. A CORE_CONN_CREDITS_NTF is [60 06][03][count=1][conn id][credits]
+ * (phNciNfc_LogConnNotifCB: payload[0] count, payload[1] conn id, payload[2] credits; the
+ * credits are added to the per-connection entry at ctx+3393 and clamp at 254). The delay lets
+ * nfcd process the 40 04 first: the registration for credits happens in
+ * phNciNfc_RegForConnCredits, called from the HCI send that runs *after* the connect callback.
+ */
+static void
+injectConnCredits(kern_ctl_ref ref, uint32_t unit, uint8_t conn)
+{
+	uint8_t ntf[6] = { 0x60, 0x06, 0x03, 0x01, conn, (uint8_t)gNfcCredits };
+	errno_t error;
+
+	IOSleep(20);
+	if (gKctlRef != ref) return;
+	error = ctl_enqueuedata(ref, unit, ntf, sizeof(ntf), 0);
+	if (error == 0) {
+		gCreditsInjected++;
+		if (gCreditsInjected <= 8 || (gCreditsInjected % 20) == 0) {
+			stockholmLog("MiniAppleStockholm: credits: synthetic 60 06 03 01 %02x %02x "
+			    "(conn %u, %u credits, #%u)\n", conn, (uint8_t)gNfcCredits, conn,
+			    gNfcCredits, gCreditsInjected);
+		}
+	} else {
+		gCreditsErrors++;
+		if (gCreditsErrors <= 8 || (gCreditsErrors % 100) == 0) {
+			stockholmLog("MiniAppleStockholm: credits: 60 06 for conn %u not delivered: %d%s\n",
+			    conn, error, error == ENOBUFS ? " (ENOBUFS)" : "");
+		}
+	}
+}
+
+/*
  * CORE_SET_CONFIG_CMD: payload = [count][params], a param = [id][len][value]. NXP's extended
  * ids take two id bytes, the first 0xA0; the PN553 answers those, the firmware here does not
  * know them, so they are stripped and the count and the length are rebuilt.
@@ -357,9 +437,9 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 	uint8_t rebuilt[260];
 	unsigned payload = packet[2];
 	unsigned end = 3 + payload;
-	unsigned input = 4, written = 0, kept = 0, stripped = 0;
+	unsigned input = 4, written = 0, kept = 0, stripped = 0, kept_extended = 0;
 	unsigned count;
-	char decision[32];
+	char decision[48];
 
 	if (payload < 1 || length < 4 || length != end) {
 		answerRejected(packet, length, 0x40, 0x02);
@@ -371,7 +451,7 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 	for (unsigned i = 0; i < count; i++) {
 		unsigned start = input;
 		unsigned parameter_length, parameter_bytes;
-		bool extended;
+		bool extended, keep_extended = false;
 
 		if (input >= end) {
 			answerRejected(packet, length, 0x40, 0x02);
@@ -383,6 +463,12 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 				answerRejected(packet, length, 0x40, 0x02);
 				return;
 			}
+			/*
+			 * N8: 0xA0BF is the one NXP RF parameter the teardown path sets
+			 * (20 02 05 01 a0 bf 01 01). Keep it only when vayu_nfc_a0bf=1;
+			 * every other 0xA0xx stays stripped as before.
+			 */
+			keep_extended = gNfcA0bf != 0 && packet[input + 1] == 0xbf;
 			input += 2;
 		} else {
 			input++;
@@ -397,7 +483,7 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 			return;
 		}
 		parameter_bytes = input - start + parameter_length;
-		if (extended) {
+		if (extended && !keep_extended) {
 			stripped++;
 		} else {
 			if (4 + written + parameter_bytes > sizeof(rebuilt)) {
@@ -407,6 +493,7 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 			memcpy(rebuilt + 4 + written, packet + start, parameter_bytes);
 			written += parameter_bytes;
 			kept++;
+			if (keep_extended) kept_extended++;
 		}
 		input += parameter_length;
 	}
@@ -423,7 +510,9 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 		answerNfcd(ok, sizeof(ok));
 		return;
 	}
-	if (stripped != 0) {
+	if (kept_extended != 0) {
+		snprintf(decision, sizeof(decision), "forward (keep A0BF, strip %u)", stripped);
+	} else if (stripped != 0) {
 		snprintf(decision, sizeof(decision), "strip %u", stripped);
 	} else {
 		snprintf(decision, sizeof(decision), "forward");
@@ -569,13 +658,30 @@ filter(const uint8_t * packet, unsigned length)
 	uint8_t mt = packet[0] >> 5;
 	uint8_t gid = packet[0] & 0x0f;
 	uint8_t oid = packet[1] & 0x3f;
+	char decision[64];
 
 	if (mt == 0) {                          /* data packet: straight to the chip */
-		if (packet[1] != 0) {
-			filterLog(packet, length, "drop");
+		/*
+		 * N8: the HCI CORE_RESET/INIT traffic for the NFCEE runs on the logical connection
+		 * created by 20 04 (conn id 3 in TEST15B/17), so it is a data packet 00 03 ... .
+		 * Until vayu_nfc_data=1 these were dropped and HCI could never start. The whitelist
+		 * is the conn id from a successful 40 04; conn 0 (static RF) is always passed.
+		 */
+		if (packet[1] == 0) {
+			forwardPacket(packet, length, packet, length, "forward");
 			return;
 		}
-		forwardPacket(packet, length, packet, length, "forward");
+		if (gNfcData != 0 && isLogConn(packet[1])) {
+			snprintf(decision, sizeof(decision), "forward (data, conn %u)", packet[1]);
+			forwardPacket(packet, length, packet, length, decision);
+			return;
+		}
+		if (gNfcData == 0) {
+			snprintf(decision, sizeof(decision), "drop (data on conn %u; vayu_nfc_data=0)", packet[1]);
+		} else {
+			snprintf(decision, sizeof(decision), "drop (data on unknown conn %u)", packet[1]);
+		}
+		filterLog(packet, length, decision);
 		return;
 	}
 	if (mt != 1) {
@@ -585,6 +691,18 @@ filter(const uint8_t * packet, unsigned length)
 	if (gid == 0) {                         /* CORE */
 		switch (oid) {
 		case 0x00:                      /* CORE_RESET */
+			/*
+			 * N8: only NCI's two defined payloads go through: 0x00 keep configuration,
+			 * 0x01 reset configuration. Anything else (download/PN553 test modes) is
+			 * refused with CORE_RESET_RSP status 1.
+			 */
+			if (length >= 4 && packet[3] > 0x01) {
+				filterLog(packet, length, "refuse 40 00 01 01 (bad CORE_RESET payload)");
+				answerRejected(packet, length, 0x40, 0x00);
+				return;
+			}
+			forwardPacket(packet, length, packet, length, "forward");
+			return;
 		case 0x01:                      /* CORE_INIT */
 		case 0x04:                      /* CORE_CONN_CREATE */
 		case 0x05:                      /* CORE_CONN_CLOSE */
@@ -619,6 +737,18 @@ filter(const uint8_t * packet, unsigned length)
 		return;
 	}
 	if (gid == 0x0f) {                      /* NXP proprietary */
+		/*
+		 * N8: 2F 2C, phNciNfc_SetConfigSigned 0x1f45e64d8 ("phLibNfc_Ioctl_PropSetConfigSigned"
+		 * 0x1f4575c18), is the signed firmware/RF blob write. It is never needed for bring-up,
+		 * and it is the one 2F command that can touch persistent controller data. Refuse it
+		 * explicitly (0x4F 0x2C 01 01) before the generic 2F handling; every other 0x2F OID
+		 * outside the whitelist below also ends in answerRejected(), never in a forward.
+		 */
+		if (oid == 0x2c) {
+			filterLog(packet, length, "refuse 4f 2c 01 01 (SET_CONFIG_SIGNED/download)");
+			answerRejected(packet, length, 0x4f, oid);
+			return;
+		}
 		/*
 		 * 2F 03 = "configure the HSU baud rate" (builder phNciNfc_PropConfigHsuBr 0x1f4546f9c,
 		 * label "phLibNfc_ConfigHsuBrCmd" 0x1f4548a20). On an iPhone the controller sits behind
@@ -684,6 +814,16 @@ filter(const uint8_t * packet, unsigned length)
 			return;
 		}
 		if (oid == 0x02) {
+			/*
+			 * N8: 2F 02 is the zero-length "enable NXP extensions" command
+			 * (phNciNfc_EnableExtnCmd 0x1f45e5300, payload length 0). A 2F 02 with a
+			 * payload is not that command and has no known safe meaning here; refuse it.
+			 */
+			if (length != 3) {
+				filterLog(packet, length, "refuse 4f 02 01 01 (2F 02 with payload)");
+				answerRejected(packet, length, 0x4f, oid);
+				return;
+			}
 			forwardPacket(packet, length, packet, length, "forward");
 		} else {
 			answerRejected(packet, length, 0x4f, oid);
@@ -815,6 +955,21 @@ bridgeRx(const uint8_t * packet, unsigned length)
 			stockholmLog("MiniAppleStockholm: bridge rx: %u bytes not delivered: %d%s (error %u)\n",
 			    length, error, error == ENOBUFS ? " (ENOBUFS)" : "", gBridgeRxErrors);
 		}
+		return;
+	}
+	/*
+	 * N8: 40 04 CORE_CONN_CREATE_RSP, payload [status][max pld][count][conn id...]. Remember the
+	 * conn id for data forwarding and, with vayu_nfc_credits=N, answer the credit wait that
+	 * phNciNfc_RegForConnCredits started. The NTF goes after the RSP on the same socket, 20 ms
+	 * later (injectConnCredits), so nfcd has already run phLibNfc_OpenLogConnProcess.
+	 */
+	if (length >= 7 && packet[0] == 0x40 && packet[1] == 0x04 && packet[2] >= 4 && packet[3] == 0x00) {
+		uint8_t conn = packet[6];
+
+		rememberLogConn(conn);
+		if (gNfcCredits != 0) {
+			injectConnCredits(ref, unit, conn);
+		}
 	}
 }
 
@@ -852,6 +1007,9 @@ ctlDisconnect(kern_ctl_ref kctlref, u_int32_t unit, void * unitinfo)
 	gCtlReassemblyLength = 0;
 	gNfceeAnnounced = -1;
 	gNfceeNtfSeen = 0;
+	for (unsigned i = 0; i < sizeof(gLogConns) / sizeof(gLogConns[0]); i++) {
+		gLogConns[i] = -1;
+	}
 	gKctlRef = NULL;
 	gKctlUnit = 0;
 	return 0;
@@ -1027,6 +1185,34 @@ MiniAppleStockholmStart(void)
 	(void)PE_parse_boot_argn("vayu_nfc_nfcee_ntf", &gNfceeNtfFilter, sizeof(gNfceeNtfFilter));
 	if (gNfceeNtfFilter == 0) {
 		stockholmLog("MiniAppleStockholm: nfcee: 62 00 count filter off (every NTF passed)\n");
+	}
+	/*
+	 * N8 (TEST17). Three independent switches, all off by default so an A/B run changes one
+	 * variable at a time:
+	 *   vayu_nfc_credits=N  after 40 04 status 0 send 60 06 03 01 <conn> N; this answers the
+	 *                       credit wait that otherwise holds the first HCI packet for 2000 ms.
+	 *   vayu_nfc_a0bf=1     keep 0xA0BF in a CORE_SET_CONFIG and forward it to the PN553.
+	 *   vayu_nfc_data=1     forward data packets (00 <conn> ...) on the conn id from 40 04.
+	 */
+	(void)PE_parse_boot_argn("vayu_nfc_credits", &gNfcCredits, sizeof(gNfcCredits));
+	if (gNfcCredits > 254) gNfcCredits = 254;
+	if (gNfcCredits != 0) {
+		stockholmLog("MiniAppleStockholm: credits: on (synthetic 60 06 with %u credits after a "
+		    "successful CORE_CONN_CREATE_RSP)\n", gNfcCredits);
+	}
+	(void)PE_parse_boot_argn("vayu_nfc_a0bf", &gNfcA0bf, sizeof(gNfcA0bf));
+	if (gNfcA0bf != 0) {
+		stockholmLog("MiniAppleStockholm: a0bf: on (0xA0BF kept in CORE_SET_CONFIG and forwarded "
+		    "to the chip; every other 0xA0xx still stripped)\n");
+	}
+	(void)PE_parse_boot_argn("vayu_nfc_data", &gNfcData, sizeof(gNfcData));
+	if (gNfcData != 0) {
+		stockholmLog("MiniAppleStockholm: data: on (data packets on conn ids from "
+		    "CORE_CONN_CREATE_RSP are forwarded; 2F 2C stays refused)\n");
+	}
+	if (gNfcCredits != 0 && gNfcData == 0) {
+		stockholmLog("MiniAppleStockholm: credits: on but vayu_nfc_data=0: the HCI packet the "
+		    "credits unblock would still be dropped\n");
 	}
 	resources = IOService::getResourceService();
 	if (resources == NULL) return;

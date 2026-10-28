@@ -39,9 +39,11 @@
  * 4's) is the IMX582's res3 1920x1080 at 60.08 fps or the S5K3T2's res2 1280x720 at 120.41 fps;
  * mode 1 is the vendor's full 4:3 stills mode, res1 4000x3000 at 30.03 fps or res1 2592x1940 at
  * 30.13 fps. HAKIOS_CAMERA_SENSOR's a is the sensor and b the mode: 0 or ~0 is mode 0, 1 is mode
- * 1, anything else is EINVAL. Every SENSOR command is a switch, as before: the session ends and
- * the next read starts the requested sensor and mode (one line per switch, "sensor N mode M asked
- * (WxH)").
+ * 1, anything else is EINVAL, and so is a mode whose block (res1) is not in the image's vendor
+ * table -- that check happens before the switch, so the running session is not touched (the
+ * userland then takes the photograph from the preview's frames). Every other SENSOR command is a
+ * switch, as before: the session ends and the next read starts the requested sensor and mode (one
+ * line per switch, "sensor N mode M asked (WxH)").
  *
  * A session is step 4's whole bring-up (vendor tables, rails, GDSC, PLL0, clocks, ldoc3, TLMM,
  * I2C, chip ID, init and one mode, CSIPHY, CSID-lite 0's RDI 0, IFE-lite 0, stream-on). Mode 0
@@ -59,7 +61,10 @@
  * and its readers woken. The session ends
  * after 1 s without reads, the last close, a sensor command, an SMMU fault or three consecutive
  * frame timeouts, always with the module's off block and step 4's teardown. A failure makes that
- * session's reads EIO; one later session may retry, the second failed session ends the node.
+ * session's reads EIO; one later session may retry, the second failed session ends the node. A
+ * stills mode (mode 1) is the exception: its failed bring-up falls back to mode 0 for the next
+ * read and is not counted as a node fault, so the preview survives a photograph the sensor or the
+ * table cannot do.
  * Step 1 is not run (only GCC and camcc are mapped, from camera_ahb as step 1 does), and
  * vayu_camera_xnu_tlmm=1 is required. EXPOSURE commands go to the session thread between frames
  * (only 0x0202 and 0x0204; mode 1's frame length stays the vendor's), FOCUS to the rear DW9800

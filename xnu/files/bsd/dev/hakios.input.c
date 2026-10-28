@@ -117,6 +117,26 @@ count_fingers(uint32_t type, uint32_t finger)
 	}
 }
 
+/*
+ * The samples a program posted (the write() side, `from_driver` false: userland/src/rwtouch.c, and
+ * the self-test's swipe stage) and the fingers it has down. The display driver's per-window line
+ * (iokit/Kernel/MiniIOMobileFramebuffer.cpp, boot-arg s5_fps) reads them: a window of frames with
+ * synthetic samples in it is a window a swipe produced, and one with none is the idle cadence.
+ */
+static volatile uint32_t synthetic_samples;
+static volatile uint32_t synthetic_down;
+
+/*
+ * Samples posted by a program since the last call, and whether such a finger is down now. For the
+ * display driver's s5_fps line only (iokit/Kernel/MiniIOMobileFramebuffer.cpp).
+ */
+void
+hakios_touch_synthetic(uint32_t *samples, uint32_t *down)
+{
+	*samples = os_atomic_xchg(&synthetic_samples, 0, relaxed);
+	*down = os_atomic_load(&synthetic_down, relaxed) != 0;
+}
+
 static void
 touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time, bool from_driver)
 {
@@ -140,6 +160,13 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time
 	t->y = y > 65535 ? 65535 : y;
 	if (from_driver) {
 		count_fingers(type, finger);
+	} else if (finger < 32 && (type == HAKIOS_TOUCH_DOWN || type == HAKIOS_TOUCH_MOVE || type == HAKIOS_TOUCH_UP)) {
+		os_atomic_inc(&synthetic_samples, relaxed);
+		if (type == HAKIOS_TOUCH_DOWN) {
+			os_atomic_or(&synthetic_down, 1u << finger, relaxed);
+		} else if (type == HAKIOS_TOUCH_UP) {
+			os_atomic_andnot(&synthetic_down, 1u << finger, relaxed);
+		}
 	}
 	lck_mtx_unlock(&touch_lock);
 	wakeup(&touch_queue);

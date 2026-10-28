@@ -92,9 +92,11 @@
  * 0 (the usual one, step 4's) is the IMX582's res3 1920x1080 at 60.08 fps or the S5K3T2's res2
  * 1280x720 at 120.41 fps; mode 1 is the vendor's full 4:3 stills mode, its res1 4000x3000 at
  * 30.03 fps or its res1 2592x1940 at 30.13 fps. HAKIOS_CAMERA_SENSOR's a is the sensor and b the
- * mode: 0 or ~0 is mode 0, 1 is mode 1, anything else is EINVAL. Every SENSOR command is a switch,
- * as before: the session ends and the next read starts the requested sensor and mode (one line per
- * switch, "sensor N mode M asked (WxH)").
+ * mode: 0 or ~0 is mode 0, 1 is mode 1, anything else is EINVAL. A mode whose block is not in the
+ * image's table is EINVAL too, and that check is made before the switch, so the running session
+ * (the preview) is left alone. Every other SENSOR command is a switch, as before: the session ends
+ * and the next read starts the requested sensor and mode (one line per switch, "sensor N mode M
+ * asked (WxH)"). A mode 1 bring-up that does fail falls back to mode 0 for the next read.
  *
  * A session is step 4's bring-up -- the tab load, the rails, the GDSC, PLL0, the clocks, ldoc3,
  * the pins, the module's power-up, the chip ID (MATCH required), the vendor init and the mode's
@@ -3230,6 +3232,56 @@ cam_tab_load(const char *file, const char *mode_block, const char *step)
 }
 
 /*
+ * Whether the table in the image carries a block by this name, before any register is written.
+ * The SENSOR write asks this about the mode it is asked for: an image whose fw/camera-*.tab is an
+ * older one (TEST18's had init, res3, on and off, but no res1) must answer EINVAL and leave the
+ * running session -- the preview -- alone, instead of stopping it for a bring-up that cannot work.
+ * The block's entry count goes to *entries when it is there.
+ */
+static bool
+cam_tab_has_block(const char *camera, const char *file, const char *want, uint32_t *entries)
+{
+	const uint8_t *data;
+	uint64_t size = 0, at;
+	uint32_t blocks;
+	bool found = false;
+
+	data = hakios_image_file("fw", file, &size, NULL);
+	if (data == NULL || size < CAM_TAB_BLOCK_BYTES || memcmp(data, CAM_TAB_MAGIC, 8) != 0) {
+		printf("vayu-camera: %s tab: no fw/%s (VYCTAB01): the mode cannot be checked\n", camera, file);
+		return false;
+	}
+	blocks = cam_le32(data + 8);
+	if ((uint64_t)blocks > (size - CAM_TAB_BLOCK_BYTES) / CAM_TAB_BLOCK_BYTES) {
+		printf("vayu-camera: %s tab: fw/%s: %u blocks do not fit %llu bytes: the mode cannot be checked\n",
+		    camera, file, blocks, (unsigned long long)size);
+		return false;
+	}
+	at = CAM_TAB_BLOCK_BYTES;
+	for (uint32_t b = 0; b < blocks; b++) {
+		struct cam_tab_block block = { 0 };
+
+		if (!cam_tab_block_at(data, size, &at, &block)) {
+			printf("vayu-camera: %s tab: fw/%s: block %u is past the file: the mode cannot be checked\n",
+			    camera, file, b);
+			return false;
+		}
+		if (strcmp(block.name, want) == 0) {
+			found = true;
+			if (entries != NULL) {
+				*entries = block.count;
+			}
+			break;
+		}
+	}
+	if (!found) {
+		printf("vayu-camera: %s tab: no \"%s\" block: that mode is not in this image's fw/%s\n",
+		    camera, want, file);
+	}
+	return found;
+}
+
+/*
  * One block: every byte acknowledged, the entry's delay after it. A NACK ends the block. TLMM
  * exception 3's amendment (maintainers, 2026-10-25; amendment 2 for the S5K3T2) allows these four blocks
  * of the selected module and nothing else.
@@ -4324,22 +4376,31 @@ cam_fake_ring_alloc(const struct cam_abi_sensor *rows, unsigned count, const cha
 
 /* the sensor+mode selection, its first exposure: a room's, until the program asks for its own */
 static bool
-cam_fake_select(uint32_t sensor, uint32_t mode)
+cam_fake_select_locked(uint32_t sensor, uint32_t mode)
 {
 	const struct cam_abi_sensor *s = cam_fake_source->find(sensor, mode);
 
 	if (s == NULL) {
 		return false;
 	}
-	lck_mtx_lock(&cam_fake_lock);
 	cam_fake_now = s;
 	/* (mode 1's frame length is the vendor block's, known only once its session has loaded it) */
 	cam_fake_ask.lines = s->frame_lines_min > s->margin ? s->frame_lines_min - s->margin : 0;
 	cam_fake_ask.gain = s->gain_unity;
 	cam_fake_ask.frame_lines = 0;
 	cam_fake_ask.pending = false;
-	lck_mtx_unlock(&cam_fake_lock);
 	return true;
+}
+
+static bool
+cam_fake_select(uint32_t sensor, uint32_t mode)
+{
+	bool ok;
+
+	lck_mtx_lock(&cam_fake_lock);
+	ok = cam_fake_select_locked(sensor, mode);
+	lck_mtx_unlock(&cam_fake_lock);
+	return ok;
 }
 
 /* one line of the chart, RAW10: `ramp' the grey ramp's, else the bars'; `odd' the second line of the cells */
@@ -4461,6 +4522,23 @@ cam_real_find(uint32_t sensor, uint32_t mode)
 		}
 	}
 	return NULL;
+}
+
+/*
+ * Whether the image's vendor table can bring this sensor and mode up: the mode's block must be
+ * there. The SENSOR write asks before it sets a switch, so a mode the table does not carry never
+ * stops the session that is running (the preview); it becomes EINVAL and the userland takes the
+ * photograph from the preview's frames, as it did before the stills mode existed.
+ */
+static bool
+cam_real_mode_available(const struct cam_abi_sensor *want, uint32_t *entries)
+{
+	const struct cam_stream_cfg *cfg = want->stream;
+
+	if (cfg == NULL || want->mode >= cfg->mode_count) {
+		return false;
+	}
+	return cam_tab_has_block(cfg->name, cfg->tab, cfg->modes[want->mode].block, entries);
 }
 
 /*
@@ -4888,7 +4966,7 @@ cam_session(const struct cam_abi_sensor *s, const struct cam_source *src)
 	uint32_t lines, gain, frame_lines, failures;
 	const char *why;
 	uint64_t made, given, reads;
-	bool failed = false, broken_now;
+	bool failed = false, broken_now, fell_back = false;
 
 	lck_mtx_lock(&cam_fake_lock);
 	cam_fake_frame_bytes = RAW10_STRIDE(s->width) * s->height;
@@ -5025,9 +5103,23 @@ cam_session(const struct cam_abi_sensor *s, const struct cam_source *src)
 	reads = cam_fake_reads;
 	if (failed) {
 		cam_fake_failed = true;
-		cam_fake_failures++;
-		if (cam_fake_failures >= 2) {
-			cam_fake_broken = true;
+		/*
+		 * A stills mode (mode 1) is entered for one photograph, and the session it replaces is the
+		 * preview's (mode 0). If its bring-up fails -- a table that is there but does not match the
+		 * sensor, a sensor that will not take the mode -- do not let the second failed session end
+		 * the node: select mode 0 now, so the read after the EIO brings the preview up again. The
+		 * EIO still reaches the userland, whose stills-session fallback takes the photograph from the
+		 * preview's frames; the failed stills attempt is not counted as a node fault.
+		 */
+		if (src->fixed_exposure && s->mode != 0 && !cam_fake_broken &&
+		    cam_fake_select_locked(s->sensor, 0)) {
+			fell_back = true;
+			cam_fake_failures = 0;
+		} else {
+			cam_fake_failures++;
+			if (cam_fake_failures >= 2) {
+				cam_fake_broken = true;
+			}
 		}
 	} else {
 		/* a session that ended normally proves the source works: the next failure may retry */
@@ -5042,7 +5134,10 @@ cam_session(const struct cam_abi_sensor *s, const struct cam_source *src)
 	printf("vayu-camera: %s: session stopped (%s) on sensor %u (%s): %llu frames made, %llu frames given, "
 	    "%llu reads\n", src->step, why, s->sensor, s->name, (unsigned long long)made,
 	    (unsigned long long)given, (unsigned long long)reads);
-	if (failed) {
+	if (fell_back) {
+		printf("vayu-camera: %s: sensor %u mode %u failed at bring-up: the session falls back to mode 0; "
+		    "the preview goes on, the photograph comes from its frames\n", src->step, s->sensor, s->mode);
+	} else if (failed) {
 		printf("vayu-camera: %s: the failed session is %u of 2; its reads get EIO; %s\n", src->step,
 		    failures, broken_now ? "the node ends" : "one more session may try");
 	}
@@ -5247,6 +5342,29 @@ cam_fake_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		want = cam_fake_source->find(c.a, mode);
 		if (want == NULL) {
 			return EINVAL;
+		}
+		/*
+		 * Before the switch: the mode's block must be in the image's table. Asking for one that is
+		 * not (an older fw/camera-*.tab, as TEST18's lacked res1) is EINVAL at once -- the session
+		 * thread never sees a switch, so the preview keeps running, and camera_device.c's EINVAL
+		 * branch takes the photograph from its frames. The session loop's own fallback below covers
+		 * a block that is there but whose bring-up still fails.
+		 */
+		if (cam_fake_source->fixed_exposure) {
+			uint32_t entries = 0;
+
+			if (!cam_real_mode_available(want, &entries)) {
+				printf("vayu-camera: %s: sensor %u mode %u (%ux%u) is not in fw/%s: "
+				    "the mode is refused, the session stays as it is\n", cam_fake_source->step,
+				    c.a, mode, want->width, want->height,
+				    want->stream != NULL ? want->stream->tab : "(no table)");
+				return EINVAL;
+			}
+			if (mode != 0) {
+				printf("vayu-camera: %s: sensor %u mode %u (%ux%u): fw/%s has \"%s\", %u entries\n",
+				    cam_fake_source->step, c.a, mode, want->width, want->height,
+				    want->stream->tab, want->stream->modes[mode].block, entries);
+			}
 		}
 		lck_mtx_lock(&cam_fake_lock);
 		/* (every sensor command is a switch, as before: the latest one wins) */

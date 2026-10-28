@@ -45,6 +45,10 @@ void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 void hakios_touch_post_at(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time);
 /* mach_absolute_time units since the last touch or button event; 0 while a finger is down; UINT64_MAX if never */
 uint64_t hakios_touch_idle_abs(void);
+/* the touch samples a program posted (write() to /dev/hakios-touch) since the last call, and whether such
+ * a finger is down now: for the display driver's s5_fps line, which tells a window a synthetic swipe
+ * produced from an idle one (iokit/Kernel/MiniIOMobileFramebuffer.cpp) */
+void hakios_touch_synthetic(uint32_t *samples, uint32_t *down);
 void hakios_input_init(void);
 void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */

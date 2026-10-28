@@ -304,6 +304,7 @@ static TUNABLE(uint32_t, gFb120IdleMs, "fb_120_idle_ms", 1000);
 static bool gFb120Slow;                         /* the refreshes are now every 2nd panel frame (fb_120_idle) */
 static uint32_t gFb120Changes;                  /* ... and how often that changed, for the log */
 extern "C" uint64_t hakios_touch_idle_abs(void);       /* bsd/dev/hakios.input.c */
+extern "C" void hakios_touch_synthetic(uint32_t *samples, uint32_t *down);     /* ... and what a program posted */
 static uint32_t gModeHz;                        /* the refresh the display is said to run at (fb_120: 120) */
 static bool gPictureFit;                        /* rows copied, not scaled: fb_fit, or a 120 Hz frame's cost */
 static uint32_t gVSyncsTold;                    /* refreshes told to user space since the last 5 s line (atomic) */
@@ -344,6 +345,18 @@ static TUNABLE(uint32_t, gEarly, "fb_early", 0);
  * touch takes to show (tools/latency.py; the touch's own lines: bsd/dev/hakios.input.c).
  */
 static TUNABLE(uint32_t, gTouchLat, "touch_lat", 0);
+/*
+ * Boot-arg s5_fps=MS (default 0, off): the self-test's frame-rate window. The five-second line below
+ * is printed every MS milliseconds instead (100 to 5000), preceded by one compact line that has what a
+ * scroll's frame rate is read from: frames a second, refreshes told to user space a second, the mode
+ * iOS is told in Hz (beside fb_hz, fb_120 and the divisor it comes from), how many of the touch
+ * samples in the window came from a program -- the self-test's synthetic swipe -- and whether such a
+ * finger is down. During a swipe: "frames" is the answer, "refreshes told" the ceiling this driver
+ * offers, "synthetic samples" whether the swipe reached the queue at all. A window of 240 samples a
+ * second and 60 frames is the window server's own policy, not this driver: the budget line beside it
+ * says how many of the late frames waited for neither the GPU's fence nor the copy.
+ */
+static TUNABLE(uint32_t, gS5Fps, "s5_fps", 0);
 
 static inline uint64_t
 micros(uint64_t absolute)
@@ -1568,9 +1581,16 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 		fStatSince = began;
 	}
 	absolutetime_to_nanoseconds(mach_absolute_time() - fStatSince, &nanos);
-	if (nanos >= 5 * NSEC_PER_SEC) {
+	if (nanos >= (gS5Fps >= 100 && gS5Fps <= 5000 ? (uint64_t)gS5Fps * NSEC_PER_MSEC : 5 * NSEC_PER_SEC)) {
 		uint64_t drawing, waiting, beat;
 		unsigned different;
+		const bool s5 = gS5Fps >= 100 && gS5Fps <= 5000;
+		uint32_t told = (s5 || gFb120 != 0) ? os_atomic_xchg(&gVSyncsTold, 0, relaxed) : 0;
+		uint32_t synthesized = 0, synth_down = 0;
+
+		if (s5) {
+			hakios_touch_synthetic(&synthesized, &synth_down);
+		}
 
 		absolutetime_to_nanoseconds(fStatDrawing, &drawing);
 		absolutetime_to_nanoseconds(fStatWaiting, &waiting);
@@ -1581,6 +1601,21 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate);
+		/*
+		 * The self-test's window (boot-arg s5_fps): one line with the answer, right after the line
+		 * it is made of. `finger` is 1 while a synthetic finger is down, and `synthetic samples` is
+		 * what the swipe posted in this window: 0 there with a finger down means the swipe's writer
+		 * is not being read (nothing in backboardd's input thread), not that the window is idle.
+		 */
+		if (s5) {
+			IOLog("MiniIOMobileFramebuffer: S5FPS: %llu ms: %u frames (%llu a second), %u refreshes told (%u a second), "
+			    "mode %u Hz (fb_hz %u, fb_120 %u, every %u panel frame), %u synthetic touch samples, finger %u; "
+			    "%u waited for the frame before, %u came a refresh late, %u of %u late waited for neither the GPU's "
+			    "fence nor the copy\n", nanos / NSEC_PER_MSEC, fStatFrames, fStatFrames * NSEC_PER_SEC / nanos, told,
+			    (uint32_t)((uint64_t)told * NSEC_PER_SEC / nanos), refreshHz(), gRefreshHz, gFb120,
+			    gFb120 != 0 ? 1u : (gVsyncDivisor != 0 ? gVsyncDivisor : gFBDivisor), synthesized, synth_down,
+			    fStatHeld, fStatSwapsLate, fBudgetLateNeither, fBudgetFrames);
+		}
 		/*
 		 * The fences of the frames: how many swaps came with a GPU submission to wait for at all (0: the
 		 * GPU is not in the drawing of what is on the screen, and neither the idle vote nor a fence can
@@ -1605,8 +1640,6 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 			 * A window server that takes them asks every panel frame (120 a second); one on its own
 			 * timer never does, and this reads 0.
 			 */
-			uint32_t told = os_atomic_xchg(&gVSyncsTold, 0, relaxed);
-
 			IOLog("MiniIOMobileFramebuffer: fb_120: %u refreshes told to user space in %llu ms (%u a second)%s\n",
 			    told, nanos / NSEC_PER_MSEC, (uint32_t) ((uint64_t) told * NSEC_PER_SEC / nanos),
 			    told == 0 ? ": nobody is listening, the compositor is on its own clock" : "");
