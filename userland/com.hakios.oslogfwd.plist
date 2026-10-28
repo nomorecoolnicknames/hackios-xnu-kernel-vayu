@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.hakios.oslogfwd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/oslogfwd</string>
+	</array>
+	<!-- The unified log is already there (/dev/oslog and /dev/oslog_stream, logd,
+	     diagnosticd) but nothing copies it to the console, which is where the run log
+	     comes from. This job does that, for the subsystems named in the boot-arg
+	     oslog=... (see docs/oslog.md). It starts on its own so that a boot with no
+	     oslog= argument still says, in one line, that it is alive. -->
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<!-- a restart loop would be six console lines a minute; the program backs off by
+	     itself, and launchd is asked not to add to it -->
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

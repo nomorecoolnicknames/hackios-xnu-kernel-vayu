@@ -13,6 +13,10 @@
 #                      WIFID=0      without wifid, iOS's Wi-Fi daemon, which is in by default (see below)
 #                      OSLOG="..."  labels of the jobs whose os_log output goes to the console ("all": every
 #                                   one of JOBS; default: only the window server, which says little)
+#                      OSLOGFWD=0   without com.hakios.oslogfwd: the program that carries the os_log of the
+#                                   subsystems named in the boot-arg oslog=... to the console (docs/oslog.md).
+#                                   It is the only thing that shows an application's os_log -- OSLOG above
+#                                   reaches the jobs of ours it names, and no application is one of them.
 #                      INJECT="..." the programs started with a library of ours, "LIBRARY NAME..." per line
 #                                   (default: src/inject.c in backboardd, src/inject_sb.c in SpringBoard,
 #                                   src/inject_media.c in mediaserverd);
@@ -212,6 +216,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# ordinary dynamically linked programs of our own, built against the iOS SDK
 		$DYN -o obj/hello_dyn src/hello_dyn.c
 		$DYN -framework CoreFoundation -o obj/svc_test src/svc_test.c
+		# the reader of the unified log: the live stream of the subsystems the boot-arg names, onto
+		# the console (docs/oslog.md).  LoggingSupport is dlopen'd, not linked: it is a private
+		# framework, and a boot without it must leave this program saying so, not failing to start
+		$DYN -fobjc-arc -framework Foundation -lobjc -o obj/oslogfwd src/oslogfwd.m
 		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface -o obj/surf_test src/surf_test.c
 		$DYN -o obj/rwtouch src/rwtouch.c
 		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/sound_test.c
@@ -340,6 +348,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		fi
 	fi
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
+	[ -f obj/oslogfwd ] && cp obj/oslogfwd root/bin/
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
@@ -468,6 +477,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# and not by what select-system.py extracted here (--root-volume; seven jobs turn on the difference,
 	# fairplayd among them).
 	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
+	[ "${OSLOGFWD-1}" != 0 ] && cp com.hakios.oslogfwd.plist root/LaunchDaemons/
 	# the unattended self-test's own job (src/selftest.m, devices/<name>/userland), which reads
 	# kern.bootargs and exits at once unless selftest=1 is there. Only when the device build made
 	# the program; with SELFTEST=1 the rc.jobs list above carries the same stages, so this job is
