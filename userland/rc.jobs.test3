@@ -33,6 +33,15 @@
 /redwood/bin/ls_rebuild --check
 /redwood/bin/run_migrator 00LaunchServicesMigrator SystemAppMigrator MediaLibrary
 /redwood/bin/ls_rebuild --check
+# F6: the database rebuild alone left LocalStorage's plug-in record without
+# NSExtensionFileProviderDocumentGroup (TEST14: the appex's Info.plist has it, NSExtension.attributes
+# says "(absent)", pkd=no). registerPlugin: is the per-bundle call that reads that Info.plist and
+# stores the record; it is idempotent and creates nothing, and it runs before fileproviderd is asked.
+/redwood/bin/ls_rebuild --plugins
+# F6, next step if the record is still missing the group (repair=0 in the summary): the stores are a
+# cache of the plists on disk, so a record that stays wrong survives every rebuild of it. --fresh moves
+# them aside (renames, never deletes, .f6-backup) and the rebuild below reads the bundles again.
+#/redwood/bin/ls_rebuild --fresh
 /var/jb/bin/sh /var/jb/prep.sh
 # nfcd for the NFC bridge (vayu_nfc_ios=2), once the prefix is there. TEST4 FACT: /bin/launchctl does not
 # exist on this system image ("/bin/launchctl: No such file or directory", exit 127), so the first kickstart never ran.

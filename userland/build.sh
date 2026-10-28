@@ -376,6 +376,13 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/camera_avtest ] && cp obj/camera_avtest root/bin/
 	[ -f obj/record_test ] && cp obj/record_test root/bin/
 	for f in $DEVICE_BIN; do [ -f obj/$f ] && cp obj/$f root/bin/; done      # (devices/$DEVICE/userland/build.sh)
+	# ... and the applications in this image too, not only in the system image's /Applications below.
+	# The system images this phone boots (system-ru10.apfs) are prebuilt without them, and the root
+	# is read only; init gives each bundle here a synthetic entry in the root's /Applications and
+	# mounts it there (src/init.c, bind_applications). They are two small bundles, not the 2.7 GB
+	# of the system image.
+	[ -n "$DEVICE_APPS" ] && mkdir -p root/Applications
+	for f in $DEVICE_APPS; do [ -d obj/$f ] && cp -a obj/$f root/Applications/; done
 	for f in $EXTRA; do cp "$f" root/bin/; done
 	# /dev and /private/var exist so that this image can also be the root on its own:
 	# devfs is mounted on /dev, and init puts a ramfs on /private/var

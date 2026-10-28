@@ -1885,6 +1885,39 @@ stage_camera(double at, int app_timeout)
 	snprintf(url, sizeof(url), "hakiostest://camera?run=%llu", g_run_id);
 	result[0] = '\0';
 
+	/*
+	 * The bundle has to be in LaunchServices before SpringBoard can be asked for its URL: "registered,
+	 * bundle (no bundle URL)" is a proxy with no bundle, and the 90 s that follow are spent waiting
+	 * for an application that was never started. init puts the bundle into /Applications at boot
+	 * (userland/src/init.c, bind_applications) and lsd walks the directory then; the files stage's
+	 * rebuild (stage_files) is the second chance. If neither has, say what the database holds and
+	 * rebuild it once here -- a boot whose /Applications changed after lsd's scan is the case this
+	 * covers, and a rebuild that cannot help is worth seeing in the log before the wait.
+	 */
+	if (access("/redwood/bin/ls_rebuild", X_OK) == 0) {
+		static char entry[8192];
+
+		memset(entry, 0, sizeof(entry));
+		(void)run_capture((char *const[]){ (char *)"/redwood/bin/ls_rebuild", (char *)"--app",
+		    (char *)"com.hakios.selftest.camera", NULL }, entry, sizeof(entry), 30);
+		if (strstr(entry, "bundle /") == NULL) {
+			stage_say("the application is not in LaunchServices yet; rebuilding the database:");
+			detail_text(entry);
+			memset(entry, 0, sizeof(entry));
+			(void)run_capture((char *const[]){ (char *)"/redwood/bin/ls_rebuild", NULL },
+			    entry, sizeof(entry), 60);
+			detail_text(entry);
+			memset(entry, 0, sizeof(entry));
+			(void)run_capture((char *const[]){ (char *)"/redwood/bin/ls_rebuild", (char *)"--app",
+			    (char *)"com.hakios.selftest.camera", NULL }, entry, sizeof(entry), 30);
+			stage_say("and after the rebuild:");
+			detail_text(entry);
+		} else {
+			stage_say("LaunchServices has the application:");
+			detail_text(entry);
+		}
+	}
+
 	stage_say("the foreground application is the one that can be given frames (userland/src/camera_avtest.m: "
 	    "\"a program like this one is not given any\"); asking SpringBoard to open %s", url);
 	exit_code = run_capture((char *const[]){ (char *)"/redwood/bin/battery_test", (char *)"open", url, NULL },

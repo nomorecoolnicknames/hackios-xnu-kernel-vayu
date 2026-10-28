@@ -114,6 +114,81 @@ synthetic_dir(const char *path)
 }
 
 /*
+ * The applications that travel in this image, in the root's /Applications.
+ *
+ * The root is the resident system image (rd=md0, 2.7 GB) and is read only; the image we boot
+ * (system-ru10.apfs and its neighbours) was built by somebody else and has none of our
+ * applications -- no SelftestCamera.app, so LaunchServices has no bundle for
+ * com.hakios.selftest.camera and SpringBoard refuses hakiostest://camera (TEST14/14R:
+ * "registered, bundle (no bundle URL)": a nil bundleURL, no launchable bundle, not a bundle
+ * whose URL was lost). DEVICE_APPS go into the system image when it is remade, which this host cannot do
+ * (the cryptex and the dyld shared cache are not here), but they also travel in this small
+ * image, and the volume cannot be written.
+ *
+ * So each bundle gets a synthetic directory in /Applications -- an entry the APFS volume does
+ * not have, seen by lookup and by readdir of its parent, which is what the flash root already
+ * uses for /redwood and /fw (kern.apfs_synthetic) -- and the bundle from this image is mounted
+ * on it. LaunchServices walks /Applications at every boot and finds it at the path the
+ * application's own bundle identity names.
+ *
+ * Not a union mount of this image's /Applications over the root's: this kernel's
+ * getattrlistbulk has no union merge (bsd/vfs/vfs_attrlist.c), and APFS has no native bulk
+ * read, so the kernel's readdir fallback would walk the covering bindfs alone and the volume's
+ * own 166 applications would vanish from LaunchServices.
+ */
+static void
+bind_applications(const char *to)
+{
+	char buf[8192], name[256], from[1200], at[400];
+	struct stat st;
+	off_t pos = 0;
+	ssize_t n;
+	int fd, apps = 0, bound = 0, there = 0;
+
+	if (stat(in_image("/Applications"), &st) != 0 || (st.st_mode & S_IFMT) != S_IFDIR) {
+		return;         /* an image that carries no applications of its own */
+	}
+	fd = open(in_image("/Applications"), O_RDONLY | O_DIRECTORY, 0);
+	while (fd >= 0 && (n = getdirentries(fd, buf, sizeof(buf), &pos)) > 0) {
+		for (char *p = buf; p < buf + n;) {
+			struct dirent *de = (struct dirent *)(void *)p;
+			size_t len = de->d_namlen;
+
+			if (de->d_reclen == 0) {
+				break;
+			}
+			p += de->d_reclen;
+			if (len < 5 || len >= sizeof(name) || strncmp(de->d_name + len - 4, ".app", 4) != 0) {
+				continue;
+			}
+			memcpy(name, de->d_name, len);
+			name[len] = 0;
+			apps++;
+			strcpy(at, join(to, "/", name));
+			if (stat(at, &st) == 0) {
+				there++;        /* a system image that has this one already */
+				continue;
+			}
+			strcpy(from, join(in_image("/Applications/"), name, ""));
+			/* the bundle through the mount, as LaunchServices will read it: a mount that
+			 * does not show its Info.plist is no application, whatever the mount said */
+			if (synthetic_dir(at) && bind_dir(from, at) &&
+			    stat(join(at, "/Info.plist", ""), &st) == 0) {
+				bound++;
+			}
+		}
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
+	printf("  our applications: %d in %s, %d on the root already, %d mounted there\n",
+	    apps, in_image("/Applications"), there, bound);
+	if (apps > 0) {
+		check(bound + there == apps, "our applications in /Applications");
+	}
+}
+
+/*
  * root_apfs=DEV: the root is to be the iOS root volume on /dev/DEV -- the phone's flash, read
  * only.  The kernel has started off the boot volume of flashboot.apfs (the resident image, md0,
  * its first container: stage0, firmware, mount points; the OS cryptex with the dyld shared cache
@@ -198,6 +273,7 @@ flash_root(const char *dev)
 	    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not iOS's");
 	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
 	    "our audio device, not Apple's plug-ins");
+	bind_applications("/flash/Applications");
 	if (stat("/fw", &fw_st) == 0) {
 		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */
 		check(synthetic_dir("/flash/fw") && bind_dir("/fw", "/flash/fw"), "the firmware on /fw (adsp=1, sound=N)");
@@ -1473,8 +1549,9 @@ main(int argc, char **argv, char **envp)
 			flash_root(dev);
 		} else {
 			/* the root is the system image; its plug-in directory is as old as the image (see
-			 * bind_audio_plugins) */
+			 * bind_audio_plugins) and so are its applications (see bind_applications) */
 			bind_audio_plugins();
+			bind_applications("/Applications");
 		}
 	}
 

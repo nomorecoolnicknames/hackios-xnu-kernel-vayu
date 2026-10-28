@@ -54,6 +54,7 @@
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
 #include <dirent.h>
 #include <time.h>
 #include <fcntl.h>
@@ -65,14 +66,22 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
+
+/* libproc, for the name/path of a pid when the event's catalog entry is missing (X3:
+ * -process was one of the fields the decoder could not fill when it had no catalog). */
+extern int proc_name(int pid, void *buffer, uint32_t size);
+extern int proc_pidpath(int pid, void *buffer, uint32_t size);
 
 #define MAX_RULES       32
 #define MAX_PROCS       8
+#define MAX_APPS        8
 #define SUBSYS_LEN      160
 #define CATEGORY_LEN    96
 #define LINE_LEN        768
+#define DUMP_LEN        1400
 #define MSG_LEN         420
-#define OSLFWD_VERSION  "x1"
+#define OSLFWD_VERSION  "x3"
 
 /* The subsystems a Music/Files/scroll investigation needs, unless the boot-arg says
  * otherwise.  com.apple.UIKit:Scrolling is a subsystem and a category, the rest are
@@ -112,6 +121,32 @@ static unsigned long long n_printed, n_dropped, n_seen, n_events;
 static unsigned long long live_events;   /* the live handler only, so that the archive
                                           * reads below cannot look like a live stream */
 static int probe_left = -1;   /* --probe N: stop after N printed lines */
+
+/* X3: the raw dump.  The X2 reader required a non-empty -subsystem before it looked at
+ * anything else; TEST14 showed 1136 handler calls and not one event with a subsystem, so
+ * every application line was thrown away before -composedMessage was ever asked for.
+ * The dump path prints the fields that exist (and says which are absent) without a
+ * process/category/subsystem filter, and stops on a byte/line budget instead of on a
+ * filter that cannot match.  The budgets are split: app/error lines may spend the last
+ * reserve, everything else stops before it, so a chatty daemon cannot use up the space
+ * an application error would have needed. */
+static int dump_mode;                 /* 0 off, 1 every log event, 2 error/fault only */
+static int dump_activity;             /* oslog_dump_activity=1: activities/signposts too */
+static int classes_mode;              /* oslog_classes=1: list the private classes' methods */
+static unsigned long long dump_bytes_limit = 64 * 1024;
+static unsigned long long dump_lines_limit = 400;
+static unsigned long long dump_bytes_used, dump_lines_used;
+static unsigned long long dump_events, dump_with_msg, dump_no_msg, dump_dropped_events;
+static unsigned long long dump_bare_shown, dump_bare_limit = 40;
+static int dump_exhausted_said;
+static double dump_rate = 20.0;       /* dump lines a second, app/error exempt */
+static int dump_burst = 40;
+static double dump_tokens, dump_last;
+static char app_names[MAX_APPS][64];
+static int napps;
+static const char *const default_app_names[] = {
+	"Music", "Files", "selftest", "camera", "MediaPlayer", "fileprovider", NULL
+};
 
 /* X2: a stream that diagnosticd refuses is invalidated, and the old code had no handler
  * for that, no counter of the events it was handed, and did not say which uid it ran as
@@ -293,6 +328,71 @@ add_proc(const char *name)
 	}
 }
 
+/* X3: the processes whose lines are kept in the last reserve of the dump budget.  A
+ * substring, because the camera selftest can be com.hakios.selftest.camera, and the
+ * decoder may hand us "Music" or the executable's basename depending on the catalog. */
+static void
+add_app(const char *name)
+{
+	int i;
+
+	for (i = 0; i < napps; i++) {
+		if (strcmp(app_names[i], name) == 0) {
+			return;
+		}
+	}
+	if (napps < MAX_APPS) {
+		snprintf(app_names[napps], sizeof(app_names[0]), "%s", name);
+		napps++;
+	}
+}
+
+static int
+contains_nocase(const char *haystack, const char *needle)
+{
+	size_t nlen = strlen(needle);
+	const char *p;
+
+	if (!haystack || !nlen) {
+		return 0;
+	}
+	for (p = haystack; *p; p++) {
+		size_t i;
+
+		for (i = 0; i < nlen; i++) {
+			unsigned char a = (unsigned char)p[i];
+			unsigned char b = (unsigned char)needle[i];
+
+			if (a >= 'A' && a <= 'Z') {
+				a = (unsigned char)(a - 'A' + 'a');
+			}
+			if (b >= 'A' && b <= 'Z') {
+				b = (unsigned char)(b - 'A' + 'a');
+			}
+			if (a != b) {
+				break;
+			}
+		}
+		if (i == nlen) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int
+app_match(const char *name)
+{
+	int i;
+
+	for (i = 0; i < napps; i++) {
+		if (contains_nocase(name, app_names[i])) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static char *
 read_bootargs(void)
 {
@@ -392,6 +492,58 @@ load_config(int argc, char **argv)
 		if (bootarg_value(cmdline, "oslog_store_wait", value, sizeof(value))) {
 			store_wait = atoi(value);
 		}
+		if (bootarg_value(cmdline, "oslog_dump", value, sizeof(value))) {
+			if (strcmp(value, "0") == 0) {
+				dump_mode = 0;
+			} else if (strcmp(value, "errors") == 0 || strcmp(value, "2") == 0) {
+				dump_mode = 2;
+			} else {
+				dump_mode = 1;
+			}
+		}
+		if (bootarg_value(cmdline, "oslog_dump_bytes", value, sizeof(value))) {
+			dump_bytes_limit = strtoull(value, NULL, 0);
+		}
+		if (bootarg_value(cmdline, "oslog_dump_lines", value, sizeof(value))) {
+			dump_lines_limit = strtoull(value, NULL, 0);
+		}
+		if (bootarg_value(cmdline, "oslog_dump_rate", value, sizeof(value))) {
+			dump_rate = atof(value);
+		}
+		if (bootarg_value(cmdline, "oslog_dump_burst", value, sizeof(value))) {
+			dump_burst = atoi(value);
+		}
+		if (bootarg_value(cmdline, "oslog_dump_bare", value, sizeof(value))) {
+			dump_bare_limit = strtoull(value, NULL, 0);
+		}
+		if (bootarg_value(cmdline, "oslog_dump_activity", value, sizeof(value))) {
+			dump_activity = atoi(value) != 0;
+		}
+		if (bootarg_value(cmdline, "oslog_classes", value, sizeof(value))) {
+			classes_mode = atoi(value) != 0;
+		}
+		if (bootarg_value(cmdline, "oslog_app", value, sizeof(value))) {
+			const char *p = value;
+
+			while (*p) {
+				const char *comma = strchr(p, ',');
+				size_t len = comma ? (size_t)(comma - p) : strlen(p);
+				char name[64];
+
+				if (len >= sizeof(name)) {
+					len = sizeof(name) - 1;
+				}
+				memcpy(name, p, len);
+				name[len] = 0;
+				if (len) {
+					add_app(name);
+				}
+				if (!comma) {
+					break;
+				}
+				p = comma + 1;
+			}
+		}
 	}
 
 	for (i = 1; i < argc; i++) {
@@ -438,11 +590,57 @@ load_config(int argc, char **argv)
 		} else if (strcmp(argv[i], "--store") == 0) {
 			store_fallback = 1;
 			store_secs = 0;         /* read the archive now, not after a silence */
+		} else if (strcmp(argv[i], "--dump") == 0) {
+			dump_mode = 1;
+		} else if (strcmp(argv[i], "--dump-errors") == 0) {
+			dump_mode = 2;
+		} else if (strcmp(argv[i], "--no-dump") == 0) {
+			dump_mode = 0;
+		} else if (strcmp(argv[i], "--dump-bytes") == 0 && i + 1 < argc) {
+			dump_bytes_limit = strtoull(argv[++i], NULL, 0);
+		} else if (strcmp(argv[i], "--dump-lines") == 0 && i + 1 < argc) {
+			dump_lines_limit = strtoull(argv[++i], NULL, 0);
+		} else if (strcmp(argv[i], "--dump-activity") == 0) {
+			dump_activity = 1;
+		} else if (strcmp(argv[i], "--classes") == 0) {
+			classes_mode = 1;
+		} else if (strcmp(argv[i], "--app") == 0 && i + 1 < argc) {
+			add_app(argv[++i]);
 		}
 	}
 	if (!have_subsystems) {
 		parse_spec_list(default_spec);
 	}
+	if (napps == 0) {
+		int i;
+
+		for (i = 0; default_app_names[i]; i++) {
+			add_app(default_app_names[i]);
+		}
+	}
+	/* X3: a dump is the default.  TEST14's live stream had 1136 handler calls and not
+	 * one event with a subsystem; a reader that waits for a matching subsystem prints
+	 * nothing at all there.  The budget keeps the console safe; oslog_dump=0 gives the
+	 * old subsystem-filtered behaviour back. */
+	/* the predicate and the dump are mutually exclusive: a server-side subsystem
+	 * filter in dump mode is the X3 fault again, one layer down */
+	if (dump_mode) {
+		send_predicate = 0;
+	}
+	if (dump_bytes_limit == 0) {
+		dump_bytes_limit = 64 * 1024;
+	}
+	if (dump_lines_limit == 0) {
+		dump_lines_limit = 400;
+	}
+	if (dump_rate < 0.0) {
+		dump_rate = 0.0;
+	}
+	if (dump_burst <= 0) {
+		dump_burst = 1;
+	}
+	dump_tokens = (double)dump_burst;
+	dump_last = now_sec();
 	if (burst <= 0) {
 		burst = 1;
 	}
@@ -595,37 +793,397 @@ escape(const char *in, char *out, size_t outlen)
 	out[o] = 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* X3: the unfiltered dump                                             */
+
+static const char *
+type_name(unsigned long type)
+{
+	switch (type) {
+	case 0:  return "default";
+	case 1:  return "info";
+	case 2:  return "debug";
+	case 16: return "error";
+	case 17: return "fault";
+	default: return "?";
+	}
+}
+
+static void
+append(char *buf, size_t len, int *used, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (*used < 0 || (size_t)*used >= len) {
+		return;
+	}
+	va_start(ap, fmt);
+	n = vsnprintf(buf + *used, len - (size_t)*used, fmt, ap);
+	va_end(ap);
+	if (n < 0) {
+		return;
+	}
+	if ((size_t)n >= len - (size_t)*used) {
+		*used = (int)len - 1;
+	} else {
+		*used += n;
+	}
+}
+
+static void
+append_quoted(char *buf, size_t len, int *used, const char *key, NSString *s)
+{
+	char tmp[MSG_LEN];
+
+	if (![s isKindOfClass:[NSString class]]) {
+		return;
+	}
+	escape([s UTF8String], tmp, sizeof(tmp));
+	append(buf, len, used, " %s=\"%s\"", key, tmp);
+}
+
+/* The raw value of one decomposed argument.  -rawValue is a small struct (the raw
+ * placeholder's value, not its formatted representation); NSInvocation copies it by
+ * the method's own type encoding, so no guess about the layout is needed here. */
+static void
+raw_value_hex(id arg, char *out, size_t outlen)
+{
+	SEL sel = sel_getUid("rawValue");
+	NSMethodSignature *sig;
+	NSInvocation *inv;
+	NSUInteger n, i;
+	unsigned char bytes[32];
+
+	out[0] = 0;
+	if (![arg respondsToSelector:sel]) {
+		return;
+	}
+	@try {
+		sig = [arg methodSignatureForSelector:sel];
+		if (!sig) {
+			return;
+		}
+		n = [sig methodReturnLength];
+		if (n == 0 || n > sizeof(bytes)) {
+			n = (n > sizeof(bytes)) ? sizeof(bytes) : 0;
+		}
+		if (n == 0) {
+			return;
+		}
+		inv = [NSInvocation invocationWithMethodSignature:sig];
+		[inv setTarget:arg];
+		[inv setSelector:sel];
+		[inv invoke];
+		[inv getReturnValue:bytes];
+		for (i = 0; i < n && i * 2 + 2 < outlen; i++) {
+			snprintf(out + i * 2, outlen - i * 2, "%02x", bytes[i]);
+		}
+	} @catch (NSException *e) {
+		out[0] = 0;
+	}
+}
+
+/* Walk OSLogEventDecomposedMessage/OSLogEventMessageArgument without assuming a
+ * particular selector set: the class lists in the dyld cache do not decode, and the
+ * next iOS may move a method.  Every step is optional. */
+static void
+append_args(char *buf, size_t len, int *used, id ev)
+{
+	id dm = ev_get(ev, "decomposedMessage", nil);
+	unsigned long count, i, shown = 0;
+
+	if (!dm) {
+		return;
+	}
+	count = ev_uint(dm, "placeholderCount");
+	if (count > 16) {
+		count = 16;
+	}
+	for (i = 0; i < count; i++) {
+		id arg = nil;
+		id rep;
+		char repr[160], raw[80];
+
+		if ([dm respondsToSelector:sel_getUid("argumentAtIndex:")]) {
+			arg = ((id (*)(id, SEL, unsigned long))objc_msgSend)(dm,
+			    sel_getUid("argumentAtIndex:"), i);
+		}
+		if (!arg && [dm respondsToSelector:@selector(segments)]) {
+			id segs = ev_get(dm, "segments", nil);
+			if ([segs isKindOfClass:[NSArray class]] && i < [segs count]) {
+				id seg = [segs objectAtIndex:i];
+				id ph = ev_get(seg, "placeholder", nil);
+				arg = ev_get(ph, "argument", nil);
+			}
+		}
+		if (!arg) {
+			continue;
+		}
+		rep = ev_get(arg, "objectRepresentation", nil);
+		escape([rep isKindOfClass:[NSString class]] ? [rep UTF8String] :
+		    (rep ? [[rep description] UTF8String] : ""), repr, sizeof(repr));
+		raw_value_hex(arg, raw, sizeof(raw));
+		append(buf, len, used, " a%lu={t=%lu p=%lu v=\"%s\"%s%s}",
+		    i, ev_uint(arg, "scalarType"), ev_uint(arg, "privacy"), repr,
+		    raw[0] ? " raw=" : "", raw);
+		shown++;
+	}
+	if (count && !shown) {
+		append(buf, len, used, " args=%lu(unreadable)", count);
+	}
+}
+
+static void
+append_raw_bytes(char *buf, size_t len, int *used, id ev)
+{
+	id data = ev_get(ev, "rawBytes", nil);
+	NSUInteger n, i;
+
+	if (![data isKindOfClass:[NSData class]]) {
+		return;
+	}
+	n = [data length];
+	if (n == 0) {
+		return;
+	}
+	if (n > 32) {
+		n = 32;
+	}
+	append(buf, len, used, " bytes=");
+	for (i = 0; i < n; i++) {
+		append(buf, len, used, "%02x", ((const unsigned char *)[data bytes])[i]);
+	}
+	if ([data length] > n) {
+		append(buf, len, used, "..");
+	}
+}
+
+static int
+dump_take(size_t bytes, int priority)
+{
+	double t = now_sec();
+	unsigned long long line_reserve = priority ? 0 : 100;
+	unsigned long long byte_reserve = priority ? 0 : 16 * 1024;
+
+	if (dump_lines_used + line_reserve >= dump_lines_limit ||
+	    dump_bytes_used + byte_reserve + bytes > dump_bytes_limit) {
+		dump_dropped_events++;
+		if (!dump_exhausted_said) {
+			dump_exhausted_said = 1;
+			say("oslogfwd: dump budget exhausted (%llu lines, %llu bytes): "
+			    "the rest is counted, not printed",
+			    dump_lines_used, dump_bytes_used);
+		}
+		return 0;
+	}
+	if (!priority && dump_rate > 0.0) {
+		double elapsed = t - dump_last;
+
+		if (elapsed > 0.0) {
+			dump_tokens += elapsed * dump_rate;
+			if (dump_tokens > (double)dump_burst) {
+				dump_tokens = (double)dump_burst;
+			}
+			dump_last = t;
+		}
+		if (dump_tokens < 1.0) {
+			dump_dropped_events++;
+			return 0;
+		}
+		dump_tokens -= 1.0;
+	}
+	dump_lines_used++;
+	dump_bytes_used += bytes;
+	return 1;
+}
+
+/* X3: the uuid of a sender image, and its path, are what a line needs to be decoded
+ * offline.  On a system without uuidtext the format string is not in the event; it is in
+ * the sender's own __TEXT,__oslogstring, and the image is what names it. */
+static void
+append_uuid(char *buf, size_t len, int *used, const char *key, id uuid)
+{
+	char tmp[64];
+
+	tmp[0] = 0;
+	if ([uuid isKindOfClass:[NSUUID class]]) {
+		snprintf(tmp, sizeof(tmp), "%s", [[uuid UUIDString] UTF8String]);
+	} else if ([uuid isKindOfClass:[NSString class]]) {
+		snprintf(tmp, sizeof(tmp), "%s", [uuid UTF8String]);
+	}
+	if (tmp[0]) {
+		append(buf, len, used, " %s=%s", key, tmp);
+	}
+}
+
+static int
+dump_event(id ev, const char *proc, long pid, const char *sub, const char *cat,
+    unsigned long type, int priority)
+{
+	char line[DUMP_LEN], clock[32];
+	NSString *message, *format, *raw;
+	int used = 0, bare;
+
+	message = ev_get(ev, "composedMessage", nil);
+	format = ev_get(ev, "formatString", nil);
+	raw = ev_get(ev, "rawString", nil);
+
+	/* One handler call is only a log line if it has something to say.  An activity or
+	 * a signpost has neither a format string nor a composed message; printing its
+	 * proxy would spend the budget the application's error needs.  An app line and an
+	 * error/fault are always kept, with whatever fields they have. */
+	bare = 0;
+	if (![message isKindOfClass:[NSString class]] &&
+	    ![format isKindOfClass:[NSString class]] &&
+	    ![raw isKindOfClass:[NSString class]]) {
+		dump_no_msg++;
+		if (dump_activity) {
+			bare = 0;
+		} else if (dump_bare_shown < dump_bare_limit) {
+			dump_bare_shown++;
+			bare = 1;
+		} else if (!priority) {
+			return 0;
+		}
+	}
+	dump_events++;
+	if (!bare && ([message isKindOfClass:[NSString class]] ||
+	    [format isKindOfClass:[NSString class]] || [raw isKindOfClass:[NSString class]])) {
+		dump_with_msg++;
+	}
+
+	stamp(clock, sizeof(clock));
+	append(line, sizeof(line), &used, "oslog-dump %s %s[%ld] t=%lu/%s sub=%s cat=%s",
+	    clock, proc, pid, type, type_name(type), sub[0] ? sub : "-", cat[0] ? cat : "-");
+	append_quoted(line, sizeof(line), &used, "msg", message);
+	append_quoted(line, sizeof(line), &used, "fmt", format);
+	append_quoted(line, sizeof(line), &used, "raw", raw);
+	append_args(line, sizeof(line), &used, ev);
+	append_raw_bytes(line, sizeof(line), &used, ev);
+	append_quoted(line, sizeof(line), &used, "img", ev_get(ev, "senderImagePath", nil));
+	append_uuid(line, sizeof(line), &used, "uuid", ev_get(ev, "senderImageUUID", nil));
+	if (bare) {
+		append(line, sizeof(line), &used, " bare=1");
+	}
+	append(line, sizeof(line), &used, " at=%llu thr=%llu",
+	    (unsigned long long)ev_uint(ev, "senderImageOffset"),
+	    (unsigned long long)ev_uint(ev, "threadIdentifier"));
+	if (used <= 0) {
+		dump_dropped_events++;
+		return 0;
+	}
+	if (!dump_take((size_t)used + 1, priority)) {
+		return 0;
+	}
+	append(line, sizeof(line), &used, "\n");
+	out_line(line);
+	n_printed++;
+	return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* X3: what the private classes actually offer on this system          */
+
+static void
+dump_class(const char *name)
+{
+	Class cls = NSClassFromString([NSString stringWithUTF8String:name]);
+	unsigned int i, n;
+	Method *methods;
+	Ivar *ivars;
+
+	if (!cls) {
+		say("oslogfwd: class %s: NO", name);
+		return;
+	}
+	methods = class_copyMethodList(cls, &n);
+	say("oslogfwd: class %s: %u methods", name, n);
+	for (i = 0; i < n && i < 96; i++) {
+		const char *types = method_getTypeEncoding(methods[i]);
+
+		say("oslogfwd:   -%s %s", sel_getName(method_getName(methods[i])),
+		    types ? types : "");
+	}
+	free(methods);
+	ivars = class_copyIvarList(cls, &n);
+	say("oslogfwd: class %s: %u ivars", name, n);
+	for (i = 0; i < n && i < 64; i++) {
+		const char *iname = ivar_getName(ivars[i]);
+		const char *itypes = ivar_getTypeEncoding(ivars[i]);
+
+		say("oslogfwd:   %s %s", iname ? iname : "?", itypes ? itypes : "");
+	}
+	free(ivars);
+}
+
 static void
 handle_event(id ev, const char *tag)
 {
 	static const char *type_names[] = { "default", "info", "debug", "error", "fault" };
 	NSString *subsystem, *category, *process, *message;
 	char sub[SUBSYS_LEN], cat[CATEGORY_LEN], proc[96], msg[MSG_LEN], clock[32];
+	char path[512];
 	rule_t *rule;
 	NSUInteger type = 0;
 	long pid = 0;
 	char line[LINE_LEN];
-	int n;
+	int n, app, priority, printed;
 
 	n_events++;
-	if (![ev respondsToSelector:@selector(subsystem)]) {
-		return;
-	}
 	subsystem = ev_get(ev, "subsystem", nil);
-	if (![subsystem isKindOfClass:[NSString class]] || [subsystem length] == 0) {
-		return;         /* an activity or a signpost, not an os_log entry */
-	}
 	category = ev_get(ev, "category", nil);
 	process = ev_get(ev, "process", nil);
-	if (![process isKindOfClass:[NSString class]]) {
+	type = (NSUInteger)ev_uint(ev, "type");
+	pid = (long)(int)ev_uint(ev, "processIdentifier");
+
+	/* X3: the catalog entry that carries -process is one of the things that is missing
+	 * when the stream has no subsystem.  The pid is in every tracepoint, so ask libproc
+	 * rather than print "?" and lose the one field that identifies the application. */
+	if (![process isKindOfClass:[NSString class]] || [process length] == 0) {
+		char pname[64];
+
+		if (pid > 0 && proc_name((int)pid, pname, sizeof(pname)) > 0) {
+			process = [NSString stringWithUTF8String:pname];
+		}
+	}
+	if (![process isKindOfClass:[NSString class]] || [process length] == 0) {
 		process = @"?";
 	}
 
-	escape([subsystem UTF8String], sub, sizeof(sub));
-	escape([category isKindOfClass:[NSString class]] ? [category UTF8String] : "", cat, sizeof(cat));
+	escape([subsystem isKindOfClass:[NSString class]] ? [subsystem UTF8String] : "",
+	    sub, sizeof(sub));
+	escape([category isKindOfClass:[NSString class]] ? [category UTF8String] : "",
+	    cat, sizeof(cat));
 	escape([process UTF8String], proc, sizeof(proc));
 
-	n_seen++;
+	if (sub[0]) {
+		n_seen++;
+	}
+
+	app = app_match(proc);
+	if (!app && pid > 0 && proc_pidpath((int)pid, path, sizeof(path)) > 0) {
+		path[sizeof(path) - 1] = 0;
+		app = app_match(path);
+	}
+	priority = app || type == 16 || type == 17;
+
+	/* X3: the dump is before every filter.  It has its own byte/line budget and its
+	 * own rate limit; app and error/fault lines have the last reserve of that budget. */
+	if (dump_mode) {
+		if (dump_mode == 2 && type != 16 && type != 17) {
+			return;
+		}
+		printed = dump_event(ev, proc, pid, sub, cat, (unsigned long)type, priority);
+		if (printed && probe_left > 0 && --probe_left == 0) {
+			stop_now = 1;
+		}
+		return;
+	}
+
+	if (!sub[0]) {
+		return;         /* the old, subsystem-only path */
+	}
 	rule = find_rule(sub, cat);
 	if (!rule || !proc_allowed(proc)) {
 		return;
@@ -642,8 +1200,6 @@ handle_event(id ev, const char *tag)
 		message = ev_get(ev, "formatString", nil);
 	}
 	escape([message isKindOfClass:[NSString class]] ? [message UTF8String] : "", msg, sizeof(msg));
-	type = (NSUInteger)ev_uint(ev, "type");
-	pid = (long)(int)ev_uint(ev, "processIdentifier");
 	stamp(clock, sizeof(clock));
 	if (type < sizeof(type_names) / sizeof(type_names[0])) {
 		n = snprintf(line, sizeof(line), "%s %s %s[%ld] %s%s%s %s: %s\n",
@@ -854,6 +1410,11 @@ make_predicate(void)
 	NSMutableArray *parts = [NSMutableArray array];
 	int i;
 
+	/* the dump wants every event, not just the named subsystems: a server-side
+	 * predicate here would hide exactly the events that have no subsystem */
+	if (dump_mode) {
+		return nil;
+	}
 	for (i = 0; i < nrules; i++) {
 		if (rules[i].prefix) {
 			continue;
@@ -883,63 +1444,147 @@ make_predicate(void)
  * is also the evidence that it fills up.  Its size answers the one question that has to
  * be answered before anything else in the next log: is os_log itself alive in this boot
  * (files growing) or not (no files)?  Without that, "0 seen" is unattributable. */
+typedef struct {
+	unsigned long long files;
+	unsigned long long bytes;
+	long newest_age;
+} tree_count_t;
+
+/* X3: logd does not write tracev3 files at the top of /private/var/db/diagnostics.  Its
+ * book is Persist/logdata.Persistent.<uuid>.tracev3 (strings "Persist" and
+ * "logdata.Persistent." in logd), and uuidtext is /private/var/db/uuidtext/<XX>/<uuid>
+ * and .../dsc/... ("%02X" in logd).  The X2 statistic counted the top level only, so
+ * "0 .tracev3, 0 uuidtext" in TEST14 was not evidence that logd wrote nothing. */
+static void
+count_tree(const char *path, int depth, const char *suffix, tree_count_t *tc, time_t now)
+{
+	DIR *d = opendir(path);
+	struct dirent *e;
+
+	if (!d) {
+		return;
+	}
+	while ((e = readdir(d)) != NULL) {
+		char child[512];
+		struct stat st;
+
+		if (e->d_name[0] == '.') {
+			continue;
+		}
+		snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+		if (lstat(child, &st) != 0) {
+			continue;
+		}
+		if (S_ISDIR(st.st_mode)) {
+			if (depth > 0) {
+				count_tree(child, depth - 1, suffix, tc, now);
+			}
+			continue;
+		}
+		if (!S_ISREG(st.st_mode)) {
+			continue;
+		}
+		if (suffix && strstr(e->d_name, suffix) == NULL) {
+			continue;
+		}
+		tc->files++;
+		tc->bytes += (unsigned long long)st.st_size;
+		if (tc->newest_age < 0 || st.st_mtime > now - tc->newest_age) {
+			tc->newest_age = (long)(now - st.st_mtime);
+		}
+	}
+	closedir(d);
+}
+
+static void
+keybag_state(void)
+{
+	static void *handle;
+	static int tried;
+	int (*unlocked)(void) = NULL;
+	int (*formatted)(void) = NULL;
+
+	if (!tried) {
+		tried = 1;
+		handle = dlopen("/System/Library/PrivateFrameworks/MobileKeyBag.framework/MobileKeyBag",
+		    RTLD_LAZY);
+	}
+	if (!handle) {
+		say("oslogfwd: keybag: MobileKeyBag is not loadable (%s)", dlerror());
+		return;
+	}
+	unlocked = (int (*)(void))dlsym(handle, "MKBDeviceUnlockedSinceBoot");
+	formatted = (int (*)(void))dlsym(handle, "MKBDeviceFormattedForContentProtection");
+	say("oslogfwd: keybag: MKBDeviceUnlockedSinceBoot=%s MKBDeviceFormattedForContentProtection=%s",
+	    unlocked ? (unlocked() ? "1" : "0") : "?",
+	    formatted ? (formatted() ? "1" : "0") : "?");
+}
+
 static void
 archive_stats(void)
 {
 	static const char *const dirs[] = { "/private/var/db/diagnostics", "/var/db/diagnostics" };
 	static const char *const uuid_dirs[] = { "/private/var/db/uuidtext", "/var/db/uuidtext" };
-	int i;
+	static const char *const books[] = { "Persist", "Special", "Signpost", "HighVolume", "Subsystems" };
+	int i, b;
 
 	for (i = 0; i < 2; i++) {
-		DIR *d = opendir(dirs[i]);
-		struct dirent *e;
-		unsigned long long files = 0, bytes = 0;
-		unsigned long long ufiles = 0, ubytes = 0;
-		long newest_age = -1;
+		struct stat dst;
+		struct statfs sf;
+		tree_count_t all = { 0, 0, -1 }, us = { 0, 0, -1 };
+		char sub[512];
 		time_t now = time(NULL);
+		int writable;
 
-		if (!d) {
+		if (stat(dirs[i], &dst) != 0) {
 			continue;
 		}
-		while ((e = readdir(d)) != NULL) {
-			char path[512];
-			struct stat st;
+		count_tree(dirs[i], 4, ".tracev3", &all, now);
+		count_tree(uuid_dirs[i], 4, NULL, &us, now);
+		writable = access(dirs[i], W_OK) == 0;
+		memset(&sf, 0, sizeof(sf));
+		(void)statfs(dirs[i], &sf);
+		say("oslogfwd: archive %s: %llu .tracev3 in the tree, %llu bytes, newest %ld s old; "
+		    "uuidtext %llu files, %llu bytes; mode %o uid %d gid %d writable=%d free=%llu",
+		    dirs[i], all.files, all.bytes, all.newest_age, us.files, us.bytes,
+		    dst.st_mode & 07777, dst.st_uid, dst.st_gid, writable,
+		    (unsigned long long)sf.f_bavail * (unsigned long long)sf.f_bsize);
+		for (b = 0; b < (int)(sizeof(books) / sizeof(books[0])); b++) {
+			tree_count_t one = { 0, 0, -1 };
+			struct stat bs;
 
-			if (e->d_name[0] == '.') {
-				continue;
-			}
-			snprintf(path, sizeof(path), "%s/%s", dirs[i], e->d_name);
-			if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
-				continue;
-			}
-			if (strstr(e->d_name, ".tracev3") == NULL) {
-				continue;
-			}
-			files++;
-			bytes += (unsigned long long)st.st_size;
-			if (newest_age < 0 || st.st_mtime > now - newest_age) {
-				newest_age = (long)(now - st.st_mtime);
+			snprintf(sub, sizeof(sub), "%s/%s", dirs[i], books[b]);
+			count_tree(sub, 2, ".tracev3", &one, now);
+			/* X3: printed even when the book is absent.  "the book does not exist" and
+			 * "the book exists and is empty" are different faults -- logd creates its
+			 * books when it starts persisting -- and the old statistic could say
+			 * neither. */
+			if (stat(sub, &bs) != 0) {
+				say("oslogfwd: archive %s/%s: absent", dirs[i], books[b]);
+			} else {
+				say("oslogfwd: archive %s/%s: %llu files, %llu bytes, newest %ld s old, "
+				    "mode %o uid %d gid %d",
+				    dirs[i], books[b], one.files, one.bytes, one.newest_age,
+				    bs.st_mode & 07777, bs.st_uid, bs.st_gid);
 			}
 		}
-		closedir(d);
-		if ((d = opendir(uuid_dirs[i])) != NULL) {
-			while ((e = readdir(d)) != NULL) {
-				char path[512];
-				struct stat st;
+		/* logd refuses to persist without a usable timesync file (the timestamps of
+		 * a record are stored against it), and mkvarskel.py makes it a directory. */
+		snprintf(sub, sizeof(sub), "%s/timesync", dirs[i]);
+		{
+			struct stat ts;
 
-				if (e->d_name[0] == '.') {
-					continue;
-				}
-				snprintf(path, sizeof(path), "%s/%s", uuid_dirs[i], e->d_name);
-				if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
-					ufiles++;
-					ubytes += (unsigned long long)st.st_size;
-				}
+			if (stat(sub, &ts) == 0) {
+				say("oslogfwd: archive %s: timesync %s, %llu bytes, %ld s old, mode %o",
+				    sub, S_ISDIR(ts.st_mode) ? "a directory" :
+				    (S_ISREG(ts.st_mode) ? "a file" : "neither"),
+				    (unsigned long long)ts.st_size, (long)(now - ts.st_mtime),
+				    ts.st_mode & 07777);
+			} else {
+				say("oslogfwd: archive %s: absent", sub);
 			}
-			closedir(d);
 		}
-		say("oslogfwd: archive %s: %llu .tracev3, %llu bytes, newest %ld s old; uuidtext %llu files, %llu bytes",
-		    dirs[i], files, bytes, newest_age, ufiles, ubytes);
+		keybag_state();
 		return;
 	}
 	say("oslogfwd: archive: neither %s nor %s can be opened", dirs[0], dirs[1]);
@@ -1290,6 +1935,21 @@ selftest(void)
 		}
 	}
 
+	if (classes_mode) {
+		static const char *const dump_names[] = {
+			"OSLogEventProxy", "OSLogEventDecomposedMessage",
+			"OSLogEventMessageArgument", "OSLogEventSegment",
+			"OSLogEventStream", NULL
+		};
+
+		/* X3: the public field list says nothing about how to get a format string
+		 * when the catalog is missing.  What this system's own classes offer is the
+		 * only honest answer, and it is a method list, not a guess. */
+		for (i = 0; dump_names[i]; i++) {
+			dump_class(dump_names[i]);
+		}
+	}
+
 	predicate = make_predicate();
 	stream = make_stream_with_predicate(predicate, &why);
 	say("oslogfwd: create stream: %s%s%s", stream ? "ok, " : "failed",
@@ -1399,8 +2059,9 @@ main(int argc, char **argv)
 	 * carries com.apple.private.logging.stream; a job in the user/501 launchd domain is
 	 * neither, and the run log has to say which one this boot is. */
 	say("oslogfwd: filter %s; live stream enabled; archive fallback %s (%d s)",
-	    send_predicate ? "subsystem predicate sent first, dropped after 60 s without an event"
-	                   : "checked here only, the predicate is not sent to diagnosticd",
+	    dump_mode ? "none, the dump takes every event"
+	              : (send_predicate ? "subsystem predicate sent first, dropped after 60 s without an event"
+	                                : "checked here only, the predicate is not sent to diagnosticd"),
 	    store_fallback ? "enabled" : "off", store_secs);
 	print_rules();
 	if (nprocs) {
@@ -1410,6 +2071,22 @@ main(int argc, char **argv)
 			n += snprintf(buf + n, sizeof(buf) - n, "%s%s", i ? "," : "", procs[i]);
 		}
 		say("oslogfwd: processes %s", buf);
+	}
+	/* X3: the mode is a boot-arg and the log has to say which one ran, or the next
+	 * "0 printed" cannot be attributed to the reader or to the stream. */
+	if (dump_mode) {
+		char apps[320] = "";
+		int n = 0;
+
+		for (i = 0; i < napps && n < (int)sizeof(apps) - 32; i++) {
+			n += snprintf(apps + n, sizeof(apps) - n, "%s%s", i ? "," : "", app_names[i]);
+		}
+		say("oslogfwd: dump %s: %llu lines / %llu bytes, %.1f lines a second (burst %d), "
+		    "app/error reserve 100 lines/16 KB, bare sample %llu, apps %s",
+		    dump_mode == 2 ? "errors only" : "every event", dump_lines_limit,
+		    dump_bytes_limit, dump_rate, dump_burst, dump_bare_limit, apps);
+	} else {
+		say("oslogfwd: dump off: only the subsystems above are printed");
 	}
 	if (dlopen("/System/Library/PrivateFrameworks/LoggingSupport.framework/LoggingSupport", RTLD_NOW) == NULL) {
 		say("oslogfwd: no LoggingSupport: %s", dlerror());
@@ -1424,6 +2101,7 @@ main(int argc, char **argv)
 			unsigned long long last_dropped = n_dropped;
 			unsigned long long live_at_start = live_events;
 			unsigned long long store_at_start = store_printed;
+			unsigned long long printed_at_start = n_printed;
 			double stream_start;
 			double next_archive = 20.0;    /* the archive exists only once logd is up */
 			double next_store = (double)store_secs;
@@ -1444,7 +2122,6 @@ main(int argc, char **argv)
 			say("oslogfwd: streaming, backend %s", [backend_name UTF8String]);
 			while (!stop_now) {
 				double elapsed;
-				unsigned long long live_before = live_events;
 
 				[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:10.0]];
 				elapsed = now_sec() - stream_start;
@@ -1455,8 +2132,12 @@ main(int argc, char **argv)
 				/* X2: the handler's call count, not the printed count, is what
 				 * says whether diagnosticd is feeding us at all. */
 				if (live_events != live_at_start || store_printed != store_at_start) {
-					say("oslogfwd: %llu events, %llu with a subsystem, %llu printed, %llu dropped by the rate limit",
-					    live_events - live_at_start, n_seen, n_printed, n_dropped);
+					say("oslogfwd: %llu events, %llu with a subsystem, %llu printed, %llu dropped by the rate limit; "
+					    "dump %llu lines/%llu bytes, %llu with a message, %llu without (%llu shown bare), "
+					    "%llu not printed",
+					    live_events - live_at_start, n_seen, n_printed, n_dropped,
+					    dump_lines_used, dump_bytes_used, dump_with_msg, dump_no_msg,
+					    dump_bare_shown, dump_dropped_events);
 					live_at_start = live_events;
 					store_at_start = store_printed;
 					heartbeat = 0;
@@ -1490,10 +2171,15 @@ main(int argc, char **argv)
 				/* the fallback: the live stream has said nothing for store_secs
 				 * and logd's archive is the only other reader of the same data;
 				 * keep reading it, so entries written after the first read are
-				 * printed too (the timestamps in handle_store_event dedup). */
-				if (store_fallback && elapsed >= next_store && live_before == 0 &&
-				    live_events == 0) {
-					say("oslogfwd: the live stream has been silent for %.0f s; reading logd's archive",
+				 * printed too (the timestamps in handle_store_event dedup).
+				 * X3: "live_events == 0" was the wrong trigger.  TEST14's stream
+				 * delivered 1136 handler calls (so live_events was never 0) but not
+				 * one event with a subsystem, and the archive was never read.  A
+				 * stream that carries events but no subsystem is exactly the case
+				 * the archive is for. */
+				if (store_fallback && elapsed >= next_store &&
+				    (n_seen == 0 || n_printed == printed_at_start)) {
+					say("oslogfwd: the live stream has no subsystem (or nothing printed) after %.0f s; reading logd's archive",
 					    elapsed);
 					store_poll();
 					next_store = elapsed + (double)store_secs;

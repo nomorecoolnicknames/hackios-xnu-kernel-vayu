@@ -171,6 +171,95 @@ step failed (`no local store (...)`, `cannot stream the store (...)`).
 The daemon starts by itself (`com.hakios.oslogfwd`, `RunAtLoad`); `OSLOGFWD=0` in the build
 leaves it out.
 
+### X3: TEST14, 1136 handler calls and not one subsystem
+
+TEST14 and TEST14R (`receipts/2026-10-23-vayu-backup-fw-hwruns.md` §TEST14) show the same
+line: `603 events, 0 with a subsystem, 0 printed` (`run/061845-merged-dedup.log:235791`;
+TEST14R `601` at `072836-...:240672`), and `alive, the live stream has delivered nothing in
+1 min (1136 handler calls since the start)` (`:21950`). The events arrive; the reader threw
+them away.
+
+Three faults, all in the reader:
+
+* `handle_event` rejected the event before it asked for anything else
+  (`userland/src/oslogfwd.m:611-617` before this change): no `-subsystem` or an empty one
+  was a `return`. Applications on this system emit events whose catalog entry is missing,
+  and an empty `-subsystem` was therefore not a property of the event but of the reader.
+  `n_seen` was incremented after that test (`:628`), so "0 with a subsystem, 0 printed" was
+  one filter, counted twice.
+* the archive fallback only fired when `live_events == 0`
+  (`:1494-1495`). In TEST14 `live_events` was never 0 — 1136 handler calls — so a stream
+  that carried events and no subsystem never fell back to the archive, which is exactly the
+  case the archive exists for.
+* `archive_stats` counted the **top level** of `/private/var/db/diagnostics` only
+  (`:890-941`), and skipped every directory entry that was not a regular file. logd writes
+  `Persist/logdata.Persistent.<uuid>.tracev3` and `uuidtext/<XX>/<uuid>` (X2 read
+  `logdata.Persistent.` and `uuidtextdir_fd` out of `/usr/libexec/logd`), so `0 .tracev3,
+  uuidtext 0 files` in TEST14 was a measurement that could not have said anything else.
+
+What the reader does now:
+
+* nothing is filtered in `handle_event` before the line exists. `-subsystem`, `-category`,
+  `-process`, `-composedMessage`, `-formatString`, `-rawString` are each optional; a missing
+  `-process` is filled in through libproc (`proc_name`, `proc_pidpath`) from the pid, which
+  is in every tracepoint even when the catalog entry is not.
+* a dump line is
+  `oslog-dump <time> <process>[<pid>] t=<type>/<name> sub=<...> cat=<...> msg="..." fmt="..."
+  raw="..." a<i>={t= p= v="..." raw=...} bytes=... img=... uuid=... at=... thr=...`
+  — the fields that exist, and the arguments of a decomposed message with their scalar type,
+  privacy and raw value.
+* the volume is bounded twice: `oslog_dump_lines` (400) and `oslog_dump_bytes` (64 KiB)
+  over the whole run, and a token bucket of `oslog_dump_rate` lines a second (20, burst 40).
+  Application lines (`oslog_app`, default `Music,Files,selftest,camera,MediaPlayer,
+  fileprovider`) and `error`/`fault` may spend the last 100 lines and 16 KiB; nothing else
+  may. The first refusal prints `dump budget exhausted (...)`, the rest are only counted.
+* an event with no message at all (an activity or a signpost) is not printed in full, but
+  the first `oslog_dump_bare` of them (40) are, marked `bare=1`. TEST14's stream may have
+  been nothing but activities; a dump that prints none of them would repeat the fault it is
+  meant to diagnose, and the heartbeat's `N without (M shown bare)` says which it was.
+* in dump mode the subsystem predicate is not sent to diagnosticd at all: a server-side
+  filter would hide every event that has no subsystem, which is the one class of event this
+  mode exists for.
+* the archive is read when nothing was printed or nothing had a subsystem for
+  `oslog_store_secs`, not only when the stream was silent; `archive_stats` walks the tree
+  four levels down, prints each book (`Persist`, `Special`, `Signpost`, `HighVolume`,
+  `Subsystems`) and the directory's `mode/uid/gid/writable/free`, and
+  `MKBDeviceUnlockedSinceBoot` (`keybag_state`) — a logd that withholds persistence until
+  the volume is unlocked looks exactly like a logd that writes nothing.
+* `oslog_classes=1` (`--classes`) prints the method and ivar lists of `OSLogEventProxy`,
+  `OSLogEventDecomposedMessage`, `OSLogEventMessageArgument`, `OSLogEventSegment` and
+  `OSLogEventStream`: the one honest answer to "which field is the format string" on a
+  system whose dyld-cache class lists do not decode.
+
+Boot-args: `oslog_dump=0|1|errors` (default 1), `oslog_dump_lines=N`, `oslog_dump_bytes=N`,
+`oslog_dump_rate=N`, `oslog_dump_burst=N`, `oslog_dump_bare=N` (40),
+`oslog_dump_activity=0|1`, `oslog_app=a,b,c`, `oslog_classes=0|1`; CLI `--dump`,
+`--dump-errors`, `--no-dump`, `--dump-lines N`, `--dump-bytes N`, `--dump-activity`,
+`--app NAME`, `--classes`.
+
+A run with this build should say, in this order: `dump every event: 400 lines / 65536 bytes,
+20.0 lines a second (burst 40), app/error reserve 100 lines/16 KB, apps Music,Files,...`,
+then `oslog-dump ...` lines, then `archive /private/var/db/diagnostics: N .tracev3 in the
+tree`, one line per book (`archive .../Persist: ...`, `absent` included), `timesync` and
+`keybag: MKBDeviceUnlockedSinceBoot=...`. If `oslog-dump` lines appear with `msg="..."` and
+`sub=-`, the format string was resolvable and the subsystem was not; if both are empty, the
+catalog entry is missing for that event, and `pid`, `img`, `uuid`, `at` and the raw arguments
+are what is left — the string is in the sender's own `__TEXT,__oslogstring`, taken from
+`img`, with or without uuidtext.
+
+### Does the string need uuidtext?
+
+`uuidtext` is the on-disk copy of a sender's catalog: it maps the `(uuid, offset)` in a
+record to the format string, the subsystem and the category. `logd` writes it while it
+persists a message whose catalog it does not have yet, so an empty `uuidtext` is a
+consequence of an empty tracev3 archive, not a cause of a missing subsystem — and on a live
+stream neither file is read at all: `diagnosticd` asks the sending process, whose
+libsystem_trace publishes the same strings (`__TEXT,__oslogstring`) when the process first
+logs. Two ways to get the format string without uuidtext: the sender is still alive and
+answers the stream (the common case — then `msg=` is filled even though the files are
+empty), or the sender is gone and the string is in its image, which is what `img` names.
+The variant that needs neither is the in-process `_os_log_set_hook` (below).
+
 ## What is not certain yet
 
 The private API's exact creation selector cannot be read out of the cache: the class method

@@ -207,6 +207,17 @@
  *    04:07:42, the appex reached LaunchServices/pkd at 04:07:47-51, and the daemon serves every later
  *    request from the provider list it built at startup (R14).
  *
+ * F6 adds the record itself to that list and one repair:
+ *  - prints the extension record whole (NSExtension.attributes, _extensionBundle, and LaunchServices'
+ *    pluginKitDictionary for the same plug-in) next to the appex's Info.plist, so "the file has the key"
+ *    and "the record has the key" are two separate lines in one log;
+ *  - when the file has the group and the record does not, re-registers the bundle with LaunchServices'
+ *    registerPlugin: -- the call that reads that Info.plist and stores the plug-in record -- and prints
+ *    the record again. That is the only userland lever on pkd's answer; it creates nothing.
+ *  - holds the domain-CREATING call back when the record itself has no group (pkd=no), not only when the
+ *    container manager refuses: TEST14 shows the daemon spawning the extension and then aborting on a nil
+ *    URL, i.e. the record is the input that abort comes from (crashed=1).
+ *
  * usage: fp_enable [--wait[=SECONDS]] [--retry[=SECONDS]] [--trace] [--check] [--create] [--reset] [PROVIDER_ID]
  *        --wait    wait up to SECONDS (default 30) for fileproviderd to answer before doing anything: the
  *                  unattended self-test calls this at +45 s and launchd may be starting the daemon on this
@@ -251,6 +262,12 @@
 #include <unistd.h>
 
 #define MOBILE_ID	501
+
+/* F6: the provider this tool was written for, in one place. The appex path is the one LaunchServices
+ * returns for it (ls_rebuild's "before" line) and the one the daemon's descriptor is built from. */
+#define LOCAL_STORAGE_APPEX	"/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex"
+#define LOCAL_STORAGE_ID	"com.apple.FileProvider.LocalStorage"
+#define LOCAL_STORAGE_GROUP	"group.com.apple.FileProvider.LocalStorage"
 
 /*
  * libxpc, declared here instead of #include <xpc/xpc.h>: the theos SDK this tree cross-builds against
@@ -1549,9 +1566,342 @@ say_mcm_group_path(NSString *group)
 	return 0;
 }
 
+/* ---- F6: the extension record in full, and the one repair a userland process can make ---- */
+
+/*
+ * F6. TEST14 (pkd=no mcm=yes) leaves two questions the F5 probes could not answer: *which* of the two
+ * things NSExtension.attributes could be -- the appex's Info.plist, or the plug-in record LaunchServices
+ * keeps -- is missing the document group, and whether the record can be put right from userland.
+ *
+ * FACT (TEST14, run/061845:158962 and :158974): the appex's Info.plist carries
+ * NSExtensionFileProviderDocumentGroup = group.com.apple.FileProvider.LocalStorage, and the same process
+ * one second later reads NSExtension.attributes for the same identifier and finds no such key. The plist
+ * is therefore not the source of the attribute: ExtensionFoundation hands NSExtension out as a shim over
+ * an EXConcreteExtension (strings "EXConcreteExtension.m", "_EXNSExtensionShimExtension",
+ * "NSExtension", "self.infoDictionary != nil", "Unable to resolve bundle URL: %@" in
+ * ExtensionFoundation 16.5), whose infoDictionary/attributes come from the plug-in record the extension
+ * service returns -- the LaunchServices record, mirrored by pkd. That record is what pkd=no names.
+ *
+ * These three functions print that record whole and, when the plist has the group but the record does
+ * not, re-register the bundle through LaunchServices' own registerPlugin: -- the call that reads the
+ * appex's Info.plist and stores the plug-in record (ls_rebuild --register uses the same one). They are
+ * diagnostics plus one bounded repair attempt; nothing here creates a domain or starts the daemon.
+ */
+
+/* LaunchServices lives in MobileCoreServices (CoreServices is its umbrella on iOS 16); a process that
+ * links only Foundation has no LSApplicationWorkspace and no LSPlugInKitProxy, and every call below
+ * would answer nil (ls_rebuild's TEST7 note: "LSApplicationWorkspace MISSING ... 0 plug-ins"). */
+static void
+load_mobilecoreservices(void)
+{
+	static const char *const paths[] = {
+		"/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices",
+		"/System/Library/Frameworks/CoreServices.framework/CoreServices",
+	};
+	unsigned i;
+
+	if (NSClassFromString(@"LSApplicationWorkspace") != Nil) {
+		return;
+	}
+	for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		if (dlopen(paths[i], RTLD_NOW | RTLD_GLOBAL) != NULL) {
+			fprintf(stderr, "fp_enable: record: loaded %s\n", paths[i]);
+			return;
+		}
+	}
+	fprintf(stderr, "fp_enable: record: MobileCoreServices did not load: LaunchServices is not in this "
+	    "process, the LS record below cannot be read\n");
+}
+
+/* One dictionary, key by key, bounded: a record with a nested array (LocalStorage's
+ * NSFileProviderDecorations) is otherwise one unreadable line. */
+static void
+dump_record(const char *label, NSDictionary *dictionary)
+{
+	NSArray *keys;
+	NSUInteger shown = 0;
+
+	if (dictionary == nil) {
+		fprintf(stderr, "fp_enable: %s: (no dictionary at all)\n", label);
+		return;
+	}
+	keys = [[dictionary allKeys] sortedArrayUsingSelector:@selector(compare:)];
+	fprintf(stderr, "fp_enable: %s: %lu key(s)\n", label, (unsigned long)[keys count]);
+	for (NSString *key in keys) {
+		id value = [dictionary objectForKey:key];
+		NSString *text = [value isKindOfClass:[NSString class]] ? value : [value description];
+
+		fprintf(stderr, "fp_enable:   %s = %s\n", [key UTF8String],
+		    [[text substringToIndex:MIN((NSUInteger)200, [text length])] UTF8String]);
+		if (++shown >= 40) {
+			fprintf(stderr, "fp_enable:   ... (%lu more key(s))\n",
+			    (unsigned long)([keys count] - shown));
+			break;
+		}
+	}
+}
+
+/* The appex's own Info.plist, read the same way say_appex_storage does: the document group the file
+ * names, or nil. This is the reference the record is compared against. */
+static NSString *
+appex_document_group(NSString *appex)
+{
+	NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+	    [appex stringByAppendingPathComponent:@"Info.plist"]];
+	NSDictionary *extension = [info[@"NSExtension"] isKindOfClass:[NSDictionary class]]
+	    ? info[@"NSExtension"] : nil;
+	id group = extension[@"NSExtensionFileProviderDocumentGroup"];
+
+	return [group isKindOfClass:[NSString class]] ? group : nil;
+}
+
+/*
+ * Everything the extension record says, from this side: the NSExtension object (what fp_enable's pkd=
+ * probe reads one key of), its bundle, and the LaunchServices plug-in proxy with the pluginKitDictionary
+ * the record is built from. The three lines that matter for F6 are the attributes dictionary, the
+ * bundle URL (a record whose bundle cannot be resolved has no Info.plist to read -- TEST14's camera
+ * record printed "(no bundle URL)") and the pluginKitDictionary.
+ *
+ * 1 = the record carries the group, 0 = it does not, -1 = NSExtension is not in this process.
+ */
+static int
+say_extension_record(NSString *appex, NSString *identifier, NSString *group)
+{
+	Class extension_class = NSClassFromString(@"NSExtension");
+	Class proxy_class = NSClassFromString(@"LSPlugInKitProxy");
+	NSError *error = nil;
+	id extension = nil, attributes = nil, dictionary = nil, proxy = nil, bundle;
+	int carries;
+
+	fprintf(stderr, "fp_enable: record: appex %s\n", [appex UTF8String]);
+	if (extension_class == Nil) {
+		fprintf(stderr, "fp_enable: record: NSExtension is not in this process (FileProvider.framework "
+		    "not linked?), the record cannot be read here\n");
+		return -1;
+	}
+	if ([extension_class respondsToSelector:@selector(extensionWithIdentifier:error:)]) {
+		extension = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(extension_class,
+		    @selector(extensionWithIdentifier:error:), identifier, &error);
+	}
+	if (extension == nil) {
+		fprintf(stderr, "fp_enable: record: NSExtension %s: not found (%s)\n", [identifier UTF8String],
+		    error != nil ? [[error description] UTF8String] : "no error");
+		return 0;
+	}
+	attributes = [extension respondsToSelector:@selector(attributes)] ?
+	    ((id (*)(id, SEL))objc_msgSend)(extension, @selector(attributes)) : nil;
+	if ([attributes isKindOfClass:[NSDictionary class]]) {
+		carries = [attributes objectForKey:@"NSExtensionFileProviderDocumentGroup"] != nil;
+	} else {
+		carries = 0;
+	}
+	fprintf(stderr, "fp_enable: record: the appex's Info.plist names %s\n",
+	    group != nil ? [group UTF8String] : "(no document group at all)");
+	fprintf(stderr, "fp_enable: record: the extension record %s\n",
+	    carries ? "carries NSExtensionFileProviderDocumentGroup" :
+	    "does NOT carry NSExtensionFileProviderDocumentGroup");
+	dump_record("record: NSExtension.attributes",
+	    [attributes isKindOfClass:[NSDictionary class]] ? attributes : nil);
+	if ([extension respondsToSelector:@selector(_extensionBundle)]) {
+		bundle = ((id (*)(id, SEL))objc_msgSend)(extension, @selector(_extensionBundle));
+		fprintf(stderr, "fp_enable: record: _extensionBundle %s\n", bundle != nil ?
+		    [[[bundle bundleURL] path] UTF8String] ?: "(no bundle URL)" : "(nil)");
+	}
+	/* the same record as LaunchServices holds it: pluginKitDictionary is the NSExtension dictionary the
+	 * plug-in was registered with, and it is the one input a re-registration can change */
+	if (proxy_class != Nil) {
+		if ([proxy_class respondsToSelector:@selector(pluginKitProxyForIdentifier:)]) {
+			proxy = ((id (*)(id, SEL, id))objc_msgSend)(proxy_class,
+			    @selector(pluginKitProxyForIdentifier:), identifier);
+		}
+		if (proxy == nil) {
+			fprintf(stderr, "fp_enable: record: LS: %s is not a registered plug-in\n",
+			    [identifier UTF8String]);
+		} else {
+			fprintf(stderr, "fp_enable: record: LS: bundle %s\n",
+			    [[[proxy performSelector:@selector(bundleURL)] path] UTF8String] ?:
+			    "(no bundle URL)");
+			if ([proxy respondsToSelector:@selector(pluginKitDictionary)]) {
+				dictionary = ((id (*)(id, SEL))objc_msgSend)(proxy,
+				    @selector(pluginKitDictionary));
+			}
+			dump_record("record: LS pluginKitDictionary",
+			    [dictionary isKindOfClass:[NSDictionary class]] ? dictionary : nil);
+		}
+	} else {
+		fprintf(stderr, "fp_enable: record: LSPlugInKitProxy is not in this process\n");
+	}
+	return carries;
+}
+
+/*
+ * F6, the repair. FACT: the file has the key, the record does not (TEST14). registerPlugin: is
+ * LaunchServices' own "read this bundle's Info.plist and store its plug-in record" call; a record built
+ * by the database rebuild alone need not carry the point-specific NSExtension keys, and this is the only
+ * userland call that asks for them again. It is idempotent and it creates nothing, so it runs once per
+ * fp_enable process and only when the record is actually missing the group.
+ *
+ * The second half is pkd itself. pkd is started at boot (TEST14: pkd[94] at 06:18:55, before the
+ * migrators and every ls_rebuild) and keeps the records it read from LaunchServices in PKDatabase and an
+ * NSCache (strings "PKDatabase", "NSCache", "cacheHits"/"cacheMisses" in /usr/libexec/pkd); a
+ * registerPlugin: after that start changes the store, not the daemon's copy. pkd runs as mobile in the
+ * user domain, so a process of the same uid may stop it, and launchd starts it again on the next
+ * NSExtension lookup -- which this function makes. That is the cheap way to make pkd re-read the record
+ * and it creates nothing either.
+ */
+/*
+ * F6: stop pkd so that the next NSExtension lookup makes launchd start a process with no cached
+ * record. Returns YES when the old pid is gone (or pkd was not running), NO when it survived SIGKILL.
+ */
+static BOOL
+restart_pkd(double seconds)
+{
+	pid_t pid = 0, old_pid;
+	int tries;
+
+	if (named_processes("pkd", &pid) <= 0 || pid <= 0) {
+		fprintf(stderr, "fp_enable: repair: pkd is not running; the next NSExtension lookup starts it "
+		    "against the record registerPlugin: just wrote\n");
+		return YES;
+	}
+	old_pid = pid;
+	fprintf(stderr, "fp_enable: repair: stopping pkd pid %d so that it reads the LaunchServices record "
+	    "again (it was started at boot, before the rebuild)\n", (int)old_pid);
+	if (kill(old_pid, SIGTERM) != 0) {
+		fprintf(stderr, "fp_enable: repair: kill(%d, SIGTERM): %s\n", (int)old_pid, strerror(errno));
+	}
+	for (tries = 0; tries < (int)(seconds * 10.0); tries++) {
+		pid = 0;
+		if (named_processes("pkd", &pid) <= 0 || pid != old_pid) {
+			break;
+		}
+		usleep(100000);
+	}
+	if (pid == old_pid) {
+		fprintf(stderr, "fp_enable: repair: pkd pid %d is still there after %.0f s, SIGKILL\n",
+		    (int)old_pid, seconds);
+		(void)kill(old_pid, SIGKILL);
+		for (tries = 0; tries < 50; tries++) {
+			pid = 0;
+			if (named_processes("pkd", &pid) <= 0 || pid != old_pid) {
+				break;
+			}
+			usleep(100000);
+		}
+	}
+	if (pid == old_pid) {
+		fprintf(stderr, "fp_enable: repair: pkd pid %d did not go away\n", (int)old_pid);
+		return NO;
+	}
+	return YES;
+}
+
+/*
+ * F6: the answer that matters is pkd's, not the one LaunchServices' proxy in this process gives: a
+ * registerPlugin: can change the store and leave pkd's cached copy alone. Ask pkd; when it still says
+ * no, stop it and ask again (launchd starts a fresh one on the lookup).
+ */
+static int
+repair_pkd_answer(NSString *appex, NSString *group)
+{
+	int answer = say_pkd_document_group(appex, group);
+	int tries;
+
+	if (answer == 1) {
+		return 1;
+	}
+	if (answer < 0) {
+		return answer;		/* no NSExtension in this process: pkd is not the question */
+	}
+	if (!restart_pkd(5.0)) {
+		return answer;
+	}
+	for (tries = 0; tries < 3; tries++) {
+		if (tries > 0) {
+			usleep(500000);
+		}
+		answer = say_pkd_document_group(appex, group);
+		if (answer == 1) {
+			break;
+		}
+	}
+	fprintf(stderr, "fp_enable: repair: after the pkd restart the record %s the document group\n",
+	    answer == 1 ? "carries" : "still does not carry");
+	return answer;
+}
+
+static int
+repair_extension_record(NSString *appex, NSString *identifier, NSString *group)
+{
+	Class workspace_class = NSClassFromString(@"LSApplicationWorkspace");
+	id workspace = nil;
+	BOOL registered = NO;
+	int after;
+
+	if (workspace_class == Nil) {
+		return -1;
+	}
+	if ([workspace_class respondsToSelector:@selector(defaultWorkspace)]) {
+		workspace = ((id (*)(id, SEL))objc_msgSend)(workspace_class, @selector(defaultWorkspace));
+	}
+	if (workspace == nil || ![workspace respondsToSelector:@selector(registerPlugin:)]) {
+		fprintf(stderr, "fp_enable: repair: this LaunchServices has no registerPlugin:; the record can "
+		    "not be re-registered from here\n");
+		return -1;
+	}
+	fprintf(stderr, "fp_enable: repair: the record has no document group but the appex's Info.plist does; "
+	    "registering %s again (LSApplicationWorkspace registerPlugin:)\n", [appex UTF8String]);
+	registered = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, @selector(registerPlugin:),
+	    [NSURL fileURLWithPath:appex]);
+	fprintf(stderr, "fp_enable: repair: registerPlugin: says %d\n", (int)registered);
+	after = say_extension_record(appex, identifier, group);
+	fprintf(stderr, "fp_enable: repair: after registerPlugin: the record %s the document group\n",
+	    after == 1 ? "carries" : after == 0 ? "still does not carry" : "could not be read");
+	if (after == 1) {
+		return repair_pkd_answer(appex, group);
+	}
+	/*
+	 * A record that is already in the store need not be rewritten by registerPlugin: -- that call can
+	 * answer YES and keep the dictionary it has. unregisterPlugin: drops it, so the next registerPlugin:
+	 * has to read the appex's Info.plist again. Both calls exist on this LaunchServices (pkd's own
+	 * strings name them); the pair is only reached when the record is already wrong, and a system appex
+	 * whose re-registration failed is what the next boot's rebuild puts back.
+	 */
+	if ([workspace respondsToSelector:@selector(unregisterPlugin:)]) {
+		BOOL dropped;
+
+		fprintf(stderr, "fp_enable: repair: registerPlugin: alone left the record unchanged; dropping the "
+		    "record first (LSApplicationWorkspace unregisterPlugin:) so that the next call reads the "
+		    "Info.plist again\n");
+		dropped = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, @selector(unregisterPlugin:),
+		    [NSURL fileURLWithPath:appex]);
+		fprintf(stderr, "fp_enable: repair: unregisterPlugin: says %d\n", (int)dropped);
+		if (dropped) {
+			registered = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace,
+			    @selector(registerPlugin:), [NSURL fileURLWithPath:appex]);
+			fprintf(stderr, "fp_enable: repair: registerPlugin: after the drop says %d\n",
+			    (int)registered);
+			after = say_extension_record(appex, identifier, group);
+			fprintf(stderr, "fp_enable: repair: after unregister/register the record %s the document "
+			    "group\n", after == 1 ? "carries" : after == 0 ? "still does not carry" :
+			    "could not be read");
+			if (after == 1) {
+				return repair_pkd_answer(appex, group);
+			}
+		}
+	} else {
+		fprintf(stderr, "fp_enable: repair: this LaunchServices has no unregisterPlugin:; the record is "
+		    "left as it is\n");
+	}
+	/* H-B: pkd started at boot and holds the old record; make it read the store again. */
+	return repair_pkd_answer(appex, group);
+}
+
 /* F5: the two answers above, kept for the pass and for the summary line (1 yes, 0 no, -1 unknown). */
 static int	g_pkd_document_group = -1;
 static int	g_mcm_group_path = -1;
+/* F6: the repair's answer (1 the record carries the group after it, 0 it still does not, -1 not tried). */
+static int	g_record_repaired = -1;
 /* F5: the domain-creating call is the one that can abort the daemon (TEST11). It is made at most
  * once per process unless --create asks again -- a retry loop must not turn one abort into ten. */
 static int	g_create_calls = 0;
@@ -1823,6 +2173,18 @@ enable_pass(id daemon, NSString *provider, BOOL reset, BOOL check, BOOL create, 
 		may_create = NO;
 	}
 	/*
+	 * F6: and the record's own answer is the second half of the same proof. TEST14 FACT: with
+	 * pkd=no mcm=yes the fallback removeAllDomains went out, the daemon created the default domain,
+	 * spawned LocalStorageFileProvider[246] and then aborted one second later in
+	 * -[NSFileManager createDirectoryAtURL:withIntermediateDirectories:attributes:error:] with
+	 * "URL is nil" (run/061845:159225-159238, :159938) -- crashed=1 in the summary. The container is
+	 * not what the daemon builds that URL from; the document group in the extension record is, and
+	 * when the record has no group the call can only end in that abort. --create still runs it.
+	 */
+	if (g_pkd_document_group == 0 && !force_create) {
+		may_create = NO;
+	}
+	/*
 	 * F5: storage=nil here is the state *before* the domain exists, not a reason to stop: TEST10 printed
 	 * the same url:(null) at its first read and then got <GroupContainers>/8128A991-.../File Provider
 	 * Storage back from the same setEnabled below, because the URL is resolved when the daemon creates or
@@ -1851,6 +2213,14 @@ enable_pass(id daemon, NSString *provider, BOOL reset, BOOL check, BOOL create, 
 		fprintf(stderr, "fp_enable: the container manager does not answer for the document group (mcm=no), "
 		    "so the domain-creating call is held back; the enable below still goes out and can land on a "
 		    "domain that already exists (its URL is stored, not derived). --create runs the create anyway.\n");
+	}
+	if (g_pkd_document_group == 0 && !may_create && result.provider_url != 1) {
+		fprintf(stderr, "fp_enable: the extension record does not carry the document group (pkd=no), so the "
+		    "domain-creating call is held back: the daemon builds the domain's documentStorageURL from that "
+		    "key and aborts on a nil URL when it is missing (TEST14: removeAllDomains -> "
+		    "LocalStorageFileProvider[246] spawned -> fileproviderd '-[NSFileManager createDirectoryAtURL:]"
+		    ": URL is nil', crashed=1). --create runs it anyway; the repair line above says whether "
+		    "registerPlugin: put the key back.\n");
 	}
 	pid_before = daemon_pid_now();
 	if (reset) {
@@ -2029,10 +2399,10 @@ enable_pass(id daemon, NSString *provider, BOOL reset, BOOL check, BOOL create, 
 		    "same object\n");
 	}
 	fprintf(stderr, "fp_enable: summary: provider=%s known=%d enabled=%d hidden=%d domains=%lu errors=%d "
-	    "pkd=%s mcm=%s storage=%s crashed=%d result=%s reason=%s\n", [provider UTF8String],
+	    "pkd=%s mcm=%s repair=%s storage=%s crashed=%d result=%s reason=%s\n", [provider UTF8String],
 	    result.provider_known ? 1 : 0, result.provider_enabled, result.provider_hidden,
 	    (unsigned long)result.domains, result.failures, tri_state(g_pkd_document_group),
-	    tri_state(g_mcm_group_path),
+	    tri_state(g_mcm_group_path), tri_state(g_record_repaired),
 	    result.provider_url == 1 ? "yes" : result.provider_url == 0 ? "nil" : "unknown", died ? 1 : 0,
 	    (result.provider_known && result.provider_enabled == 1 && result.provider_hidden == 0) ?
 	    "PASS" : "FAIL",
@@ -2121,22 +2491,53 @@ main(int argc, char **argv)
 		    getuid() == MOBILE_ID ? "mobile" : "NOT mobile");
 		say_daemon_state("start");
 		if ([provider isEqualToString:@"com.apple.FileProvider.LocalStorage"]) {
-			say_registration_state(
-			    "/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex");
+			NSString *appex = @LOCAL_STORAGE_APPEX;
+			NSString *group = @LOCAL_STORAGE_GROUP;
+
+			say_registration_state(LOCAL_STORAGE_APPEX);
 			/* R17: the storage chain, in the order the daemon walks it: the appex's Info.plist names the
 			 * document group, the appex's signature says whether the extension may use it, and the
 			 * container manager's metadata is what its resolution is answered from. */
-			say_appex_storage(
-			    @"/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex");
-			say_group_metadata(@"group.com.apple.FileProvider.LocalStorage");
+			say_appex_storage(appex);
+			say_group_metadata(group);
 			/* F5: the two answers the daemon builds its document storage URL from, asked here:
 			 * what PlugInKit hands out as the extension record (pkd=) and what the container
 			 * manager answers for the document group (mcm=). They are the summary's pkd= and
 			 * mcm= fields, and they say which link is missing when the daemon has no URL. */
-			g_pkd_document_group = say_pkd_document_group(
-			    @"/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex",
-			    @"group.com.apple.FileProvider.LocalStorage");
-			g_mcm_group_path = say_mcm_group_path(@"group.com.apple.FileProvider.LocalStorage");
+			g_pkd_document_group = say_pkd_document_group(appex, group);
+			/* F6: the record whole (the LS proxy needs MobileCoreServices), then the one repair: the
+			 * plist names the group and the record does not (TEST14's exact state) -> registerPlugin:. */
+			load_mobilecoreservices();
+			(void)say_extension_record(appex, provider, group);
+			if (g_pkd_document_group == 0) {
+				if (appex_document_group(appex) != nil) {
+					g_record_repaired = repair_extension_record(appex, provider, group);
+					if (g_record_repaired == 1) {
+						g_pkd_document_group = 1;
+					}
+				} else {
+					fprintf(stderr, "fp_enable: repair: not attempted: the appex's Info.plist does not "
+					    "name a document group either, so there is nothing to put back into the "
+					    "record\n");
+					g_record_repaired = 0;
+				}
+			}
+			/*
+			 * F6: the running daemon built its provider list (and the nil storage URL that goes with it)
+			 * before the repair; the group is only in the record now. Stop it here so that the process
+			 * this pass talks to is one born after the repair -- otherwise the repaired record changes
+			 * nothing until the next boot.
+			 */
+			if (g_record_repaired == 1) {
+				NSString *label = nil;
+				NSArray *names = mach_service_names(&label);
+				NSString *job = [names count] > 0 ? [names objectAtIndex:0] : label;
+
+				fprintf(stderr, "fp_enable: repair: the record carries the document group now; restarting "
+				    "fileproviderd so that its provider list is built from it\n");
+				(void)restart_daemon(job, 20.0);
+			}
+			g_mcm_group_path = say_mcm_group_path(group);
 		}
 		ensure_storage(provider);
 		load_fileprovider();

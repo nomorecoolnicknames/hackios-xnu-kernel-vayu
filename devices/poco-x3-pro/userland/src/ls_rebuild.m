@@ -198,6 +198,147 @@ register_plugin(const char *path)
 	    (int)((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, @selector(registerPlugin:), url));
 }
 
+/*
+ * F6: one plug-in's record, as LaunchServices holds it. pluginKitDictionary is the NSExtension dictionary
+ * the plug-in was registered with -- the same dictionary NSExtension.attributes answers with, and the one
+ * fileproviderd builds FPDProviderDescriptor from. TEST14's LocalStorage record did not carry
+ * NSExtensionFileProviderDocumentGroup while the appex's Info.plist did, so this is the line that says
+ * whether a re-registration changed anything.
+ */
+static void
+say_plugin_record(NSString *identifier)
+{
+	Class proxy_class = NSClassFromString(@"LSPlugInKitProxy");
+	id proxy = nil, dictionary = nil;
+	NSArray *keys;
+
+	if (proxy_class == Nil) { fprintf(stderr, "ls_rebuild: record: LSPlugInKitProxy is MISSING\n"); return; }
+	if ([proxy_class respondsToSelector:@selector(pluginKitProxyForIdentifier:)]) {
+		proxy = ((id (*)(id, SEL, id))objc_msgSend)(proxy_class,
+		    @selector(pluginKitProxyForIdentifier:), identifier);
+	}
+	if (proxy == nil) {
+		fprintf(stderr, "ls_rebuild: record: %s: not registered\n", [identifier UTF8String]);
+		return;
+	}
+	fprintf(stderr, "ls_rebuild: record: %s: bundle %s\n", [identifier UTF8String],
+	    [[[proxy performSelector:@selector(bundleURL)] path] ?: @"(no bundle URL)" UTF8String]);
+	if ([proxy respondsToSelector:@selector(pluginKitDictionary)]) {
+		dictionary = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(pluginKitDictionary));
+	}
+	if (![dictionary isKindOfClass:[NSDictionary class]]) {
+		fprintf(stderr, "ls_rebuild: record: %s: no pluginKitDictionary (%s)\n", [identifier UTF8String],
+		    dictionary != nil ? "not a dictionary" : "nil");
+		return;
+	}
+	keys = [[dictionary allKeys] sortedArrayUsingSelector:@selector(compare:)];
+	fprintf(stderr, "ls_rebuild: record: %s: %lu key(s)%s\n", [identifier UTF8String],
+	    (unsigned long)[keys count],
+	    [dictionary objectForKey:@"NSExtensionFileProviderDocumentGroup"] != nil ?
+	    ", NSExtensionFileProviderDocumentGroup = " : ", NO NSExtensionFileProviderDocumentGroup");
+	for (NSString *key in keys) {
+		id value = [dictionary objectForKey:key];
+		NSString *text = [value isKindOfClass:[NSString class]] ? value : [value description];
+
+		fprintf(stderr, "ls_rebuild:   %s = %s\n", [key UTF8String],
+		    [[text substringToIndex:MIN((NSUInteger)160, [text length])] UTF8String]);
+	}
+}
+
+/*
+ * F6: --plugins. Every file provider LaunchServices already knows (the com.apple.fileprovider-nonui
+ * point) is registered again by its own bundle. registerPlugin: is the per-bundle call that reads the
+ * bundle's Info.plist and stores its plug-in record; the bulk database rebuild need not carry the
+ * point-specific NSExtension keys, and TEST14 is exactly that state -- the plist has
+ * NSExtensionFileProviderDocumentGroup, the record NSExtension.attributes answers with does not. It is
+ * idempotent and creates nothing, so it runs before fileproviderd is asked anything.
+ *
+ * Returns the number of bundles that were offered to registerPlugin:.
+ */
+static unsigned
+reregister_file_providers(NSString *plugin)
+{
+	id workspace = [NSClassFromString(@"LSApplicationWorkspace") performSelector:@selector(defaultWorkspace)];
+	NSArray *plugins = nil;
+	unsigned offered = 0, accepted = 0;
+
+	if ([workspace respondsToSelector:@selector(installedPlugins)]) {
+		plugins = [workspace performSelector:@selector(installedPlugins)];
+	}
+	fprintf(stderr, "ls_rebuild: --plugins: %lu plug-in(s) to look at\n", (unsigned long)[plugins count]);
+	for (id proxy in plugins) {
+		NSDictionary *dictionary = nil;
+		NSString *point = nil;
+		NSURL *url = nil;
+
+		if (![proxy respondsToSelector:@selector(pluginKitDictionary)]) { continue; }
+		dictionary = ((id (*)(id, SEL))objc_msgSend)(proxy, @selector(pluginKitDictionary));
+		if (![dictionary isKindOfClass:[NSDictionary class]]) { continue; }
+		point = [dictionary objectForKey:@"NSExtensionPointIdentifier"];
+		if (![point isKindOfClass:[NSString class]] ||
+		    ![point isEqualToString:@"com.apple.fileprovider-nonui"]) { continue; }
+		if ([proxy respondsToSelector:@selector(bundleURL)]) {
+			url = [proxy performSelector:@selector(bundleURL)];
+		}
+		if (url == nil) {
+			fprintf(stderr, "ls_rebuild: --plugins: %s: no bundle URL, cannot re-register\n",
+			    [[[proxy performSelector:@selector(identifier)] description] UTF8String]);
+			continue;
+		}
+		offered++;
+		if ([workspace respondsToSelector:@selector(registerPlugin:)]) {
+			BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace,
+			    @selector(registerPlugin:), url);
+			accepted += ok ? 1 : 0;
+			fprintf(stderr, "ls_rebuild: --plugins: registerPlugin %s says %d\n",
+			    [[url path] UTF8String], (int)ok);
+		}
+	}
+	fprintf(stderr, "ls_rebuild: --plugins: %u file provider bundle(s) offered, %u accepted\n",
+	    offered, accepted);
+	say_plugin_record(plugin);
+	return offered;
+}
+
+/*
+ * F6: --fresh. The LaunchServices database is a cache of the plists on disk; when the record itself is
+ * wrong, rebuilding it from the same stale store keeps the wrong record. This moves the stores aside
+ * (renames, never deletes: the suffix is .f6-backup) so the next lsd reads the bundles into fresh
+ * records. It is a boot-time experiment, not something the self-test does on its own: the UI reads this
+ * database, and a failed rebuild leaves it empty until the next one.
+ */
+static void
+move_launchservices_stores(void)
+{
+	static const char *const directories[] = {
+		"/var/mobile/Library/Caches",
+		"/var/mobile/Library/Preferences",
+	};
+	NSFileManager *files = [NSFileManager defaultManager];
+
+	for (size_t i = 0; i < sizeof(directories) / sizeof(directories[0]); i++) {
+		NSString *directory = [NSString stringWithUTF8String:directories[i]];
+		NSArray *names = [files contentsOfDirectoryAtPath:directory error:NULL];
+
+		for (NSString *name in names) {
+			BOOL wanted = [name hasPrefix:@"com.apple.LaunchServices-"] ||
+			    [name hasPrefix:@"com.apple.LaunchServices."];
+
+			if (!wanted) { continue; }
+			NSString *from = [directory stringByAppendingPathComponent:name];
+			NSString *to = [from stringByAppendingString:@".f6-backup"];
+			if ([files moveItemAtPath:from toPath:to error:NULL]) {
+				fprintf(stderr, "ls_rebuild: --fresh: moved %s aside\n", [name UTF8String]);
+			} else {
+				fprintf(stderr, "ls_rebuild: --fresh: could not move %s aside\n",
+				    [name UTF8String]);
+			}
+		}
+	}
+	fprintf(stderr, "ls_rebuild: --fresh: the stores are gone; the rebuild below, or the next lsd "
+	    "start, reads the bundles again\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -209,8 +350,11 @@ main(int argc, char **argv)
 		SEL rebuild = NSSelectorFromString(@"_LSPrivateRebuildApplicationDatabasesForSystemApps:internal:user:");
 
 		const char *register_path = NULL, *app_id = NULL;
+		BOOL plugins = NO, fresh = NO;
 
 		if (index < argc && strcmp(argv[index], "--check") == 0) { check = YES; index++; }
+		else if (index < argc && strcmp(argv[index], "--plugins") == 0) { plugins = YES; index++; }
+		else if (index < argc && strcmp(argv[index], "--fresh") == 0) { fresh = YES; index++; }
 		else if (index + 1 < argc && strcmp(argv[index], "--register") == 0) { register_path = argv[index + 1]; index += 2; }
 		else if (index + 1 < argc && strcmp(argv[index], "--app") == 0) { app_id = argv[index + 1]; index += 2; }
 		else if (index < argc && strncmp(argv[index], "--app=", 6) == 0) { app_id = argv[index] + 6; index++; }
@@ -231,11 +375,25 @@ main(int argc, char **argv)
 		}
 		report("before", plugin);
 		probe_points();
-		if (check) return 0;
+		if (check) {
+			say_plugin_record(plugin);
+			return 0;
+		}
 		if (register_path != NULL) {
 			register_plugin(register_path);
 			report("after", plugin);
+			say_plugin_record(plugin);
 			return 0;
+		}
+		/* F6: --plugins re-registers each known file provider by its bundle and prints the record; it does
+		 * not rebuild the database (that is the default path below, which still runs after it). */
+		if (plugins) {
+			reregister_file_providers(plugin);
+			report("after --plugins", plugin);
+			return 0;
+		}
+		if (fresh) {
+			move_launchservices_stores();
 		}
 		workspace = [NSClassFromString(@"LSApplicationWorkspace") performSelector:@selector(defaultWorkspace)];
 		/* as 00LaunchServicesMigrator does it: say a migrator runs, then rebuild */
@@ -250,6 +408,7 @@ main(int argc, char **argv)
 		BOOL ok = ((BOOL (*)(id, SEL, BOOL, BOOL, BOOL))objc_msgSend)(workspace, rebuild, YES, YES, YES);
 		fprintf(stderr, "ls_rebuild: rebuild says %d\n", (int)ok);
 		report("after", plugin);
+		say_plugin_record(plugin);
 	}
 	return 0;
 }
