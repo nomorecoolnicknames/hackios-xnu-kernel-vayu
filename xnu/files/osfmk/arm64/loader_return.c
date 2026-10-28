@@ -360,6 +360,46 @@ loader_log_append_msgbuf(void)
 	}
 }
 
+/*
+ * What the end of the run does when the user asked for it (osfmk/kern/machine.c, host_reboot():
+ * a reboot(2) from the system -- "slide to power off" is one, with HOST_REBOOT_HALT). The ways out
+ * this kernel had before are the loader's: it takes the log and the phone stays in its hands. The
+ * two from the firmware (PSCI SYSTEM_OFF and SYSTEM_RESET) are what the user expects the buttons
+ * to do; the boot arguments choose, and a firmware that refuses them puts the loader's way back:
+ *
+ *   halt_psci=0       neither -- both ends are the loader's, exactly as before;
+ *   restart_loader=1  a restart is the loader's (its log is what a run being studied is for),
+ *                     a power-off is still the firmware's.
+ *
+ * A panic, a timed return (loader_return_after) or "xl stop" never asks, so nothing of this
+ * touches their way out.
+ */
+#define LOADER_END_RETURN       0       /* back to the boot loader (what everything else does) */
+#define LOADER_END_POWER_OFF    1       /* PSCI SYSTEM_OFF */
+#define LOADER_END_RESTART      2       /* PSCI SYSTEM_RESET */
+
+#if defined(GENERIC_PSCI_SMP)
+static int loader_end_action = LOADER_END_RETURN;
+#endif
+
+void
+loader_end_request(boolean_t restart)
+{
+#if defined(GENERIC_PSCI_SMP)
+	uint32_t psci = 1, to_loader = 0;
+
+	if (PE_parse_boot_argn("halt_psci", &psci, sizeof(psci)) && psci == 0) {
+		return;
+	}
+	if (restart && PE_parse_boot_argn("restart_loader", &to_loader, sizeof(to_loader)) && to_loader) {
+		return;
+	}
+	loader_end_action = restart ? LOADER_END_RESTART : LOADER_END_POWER_OFF;
+#else
+	(void)restart;
+#endif
+}
+
 void
 loader_return(void)
 {
@@ -397,6 +437,26 @@ loader_return(void)
 			loader_log_putc(*c);
 		}
 	}
+#if defined(GENERIC_PSCI_SMP)
+	/*
+	 * The user's own way out: everything above is quiet and the other processors are off, so the
+	 * firmware is asked to end the system itself. The call does not come back when it is taken
+	 * (and then this log, with the memory it is in, goes with the system); when it is refused --
+	 * a hypervisor with only the CPU_* calls -- the status says so and the loader takes the run as
+	 * it always did. A panic that happened on the way here (the shutdown timed out, a driver
+	 * faulted) is not this: its log is what the loader is for, so it always goes back.
+	 */
+	if (loader_end_action != LOADER_END_RETURN && !panic_active()) {
+		bool power_off = loader_end_action == LOADER_END_POWER_OFF;
+		int64_t status;
+
+		printf("\n--- PSCI SYSTEM_%s ---\n", power_off ? "OFF" : "RESET");
+		status = power_off ? psci_system_off() : psci_system_reset();
+		printf("--- PSCI SYSTEM_%s refused (%d): back to the loader ---\n",
+		    power_off ? "OFF" : "RESET", (int)status);
+		loader_end_action = LOADER_END_RETURN;  /* once is enough if the loader is the way out again */
+	}
+#endif /* defined(GENERIC_PSCI_SMP) */
 	loader_jump(0, 0);
 }
 

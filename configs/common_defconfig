@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 341 symbols in 18 groups; 34 are set, 25 of them drivers built in.
+# 343 symbols in 18 groups; 34 are set, 25 of them drivers built in.
 #
 
 #
@@ -98,7 +98,7 @@ CONFIG_HAKIOS_VIRTIO_BLK=y
 CONFIG_HAKIOS_WIFI=y
 
 #
-# CPU, memory and boot (21)
+# CPU, memory and boot (23)
 #
 
 # CPU cores the kernel uses, 1 to 8; one if not set
@@ -128,6 +128,9 @@ CONFIG_HAKIOS_WIFI=y
 # read by hakios.cpufreq.c (kernel)
 # CONFIG_DDR_VOTE is not set
 
+# neither -- both ends are the loader's, exactly as before
+# CONFIG_HALT_PSCI is not set
+
 # read by GenericARMPE.cpp (kernel)
 # CONFIG_MACHINE_NAME is not set
 
@@ -139,6 +142,9 @@ CONFIG_HAKIOS_WIFI=y
 
 # read by the patch to Apple's files (kernel)
 # CONFIG_REGTRACE is not set
+
+# a restart is the loader's (its log is what a run being studied is for), a power-off is still the firmware's
+# CONFIG_RESTART_LOADER is not set
 
 # read by loader_return.c (kernel)
 # CONFIG_RETURN_CPU is not set

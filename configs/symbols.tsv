@@ -127,6 +127,7 @@ GPU_CACHED	arg	gpu_cached	GPU and display	k	hakios.gpu.cpp
 GPU_EXACT	arg	gpu_exact	GPU and display	k	hakios.adreno.c	
 GPU_KEEP	arg	gpu_keep	GPU and display	k	hakios.gpu.cpp	
 GPU_LOG	arg	gpu_log	GPU and display	k	hakios.adreno.c	
+HALT_PSCI	arg	halt_psci	CPU, memory and boot	k	loader_return.c	neither -- both ends are the loader's, exactly as before
 HAPTIC_EFFECT	arg	haptic_effect	Haptics and torch	k	hakios.haptic.c	
 MACHINE_NAME	arg	machine_name	CPU, memory and boot	k	GenericARMPE.cpp	
 MEMBENCH	arg	membench	CPU, memory and boot	k	hakios.cpufreq.c	
@@ -188,6 +189,7 @@ REC_SOUND_MIC	arg	rec_sound_mic	Audio and battery	k	hakios.audio.c
 REC_START	arg	rec_start	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 REC_STEP	arg	rec_step	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 REGTRACE	arg	regtrace	CPU, memory and boot	k	(patch)	
+RESTART_LOADER	arg	restart_loader	CPU, memory and boot	k	loader_return.c	a restart is the loader's (its log is what a run being studied is for), a power-off is still the firmware's
 RETURN_CPU	arg	return_cpu	CPU, memory and boot	k	loader_return.c	
 RETURN_PANIC	arg	return_panic	CPU, memory and boot	k	loader_return.c	
 ROOT_APFS	arg	root_apfs	User space	u	init.c	the root is to be the iOS root volume on /dev/DEV -- the phone's flash, read only

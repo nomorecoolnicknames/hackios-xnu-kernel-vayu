@@ -889,6 +889,36 @@ index 88adf2dda936..e29e09fc0f0b 100644
  	/*
  	 * We first evaluate policies that may deny the granting of
  	 * privilege unilaterally.
+diff --git a/bsd/kern/kern_shutdown.c b/bsd/kern/kern_shutdown.c
+index 20d9d475e0b9..5b84b7a4a77a 100644
+--- a/bsd/kern/kern_shutdown.c
++++ b/bsd/kern/kern_shutdown.c
+@@ -87,6 +87,7 @@ static void sd_log(vfs_context_t, const char *, ...);
+ static void proc_shutdown(int only_non_dext);
+ static void zprint_panic_info(void);
+ extern void halt_log_enter(const char * what, const void * pc, uint64_t time);
++extern void hakios_var_save_on_return(void);   /* bsd/dev/hakios.ufs.c: the data volume into the flash */
+ 
+ #if DEVELOPMENT || DEBUG
+ extern boolean_t kdp_has_polled_corefile(void);
+@@ -208,6 +209,17 @@ reboot_kernel(int howto, char *message)
+ 
+ 	lck_mtx_unlock(&vm_swap_data_lock);
+ 
++	/*
++	 * The data volume first (bsd/dev/hakios.ufs.c, var_store=1): its saver is a program, and the
++	 * programs are gone before the platform expert halts (proc_shutdown() below), so it is asked
++	 * here, while the run is still whole. It answers in its own time, 20 s at most (var_save_ms),
++	 * and only if it registered -- with no saver nothing is asked and nothing is waited for. A
++	 * quick reboot (RB_QUICK) is the one way out that does not wait for anything.
++	 */
++	if ((howto & RB_QUICK) == 0) {
++		hakios_var_save_on_return();
++	}
++
+ 	/*
+ 	 * Notify the power management root domain that the system will shut down.
+ 	 */
 diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
 index ae4a5f33df1e..986b517dfd18 100644
 --- a/bsd/kern/kern_sig.c
@@ -2974,6 +3004,38 @@ index dfa89c7b0d29..07e0ba5bf44c 100644
  
  #define KALLOC_TYPE_ASSERT_COMPATIBLE_POINTER(ptr, type) \
  	_Static_assert(KALLOC_TYPE_IS_COMPATIBLE_PTR(ptr, type), \
+diff --git a/osfmk/kern/machine.c b/osfmk/kern/machine.c
+index 7a279b06ab1c..4cda5f2df7f3 100644
+--- a/osfmk/kern/machine.c
++++ b/osfmk/kern/machine.c
+@@ -216,6 +216,8 @@ processor_up(
+ }
+ #include <atm/atm_internal.h>
+ 
++extern void loader_end_request(boolean_t restart);      /* osfmk/arm64/loader_return.c */
++
+ kern_return_t
+ host_reboot(
+ 	host_priv_t             host_priv,
+@@ -236,7 +238,17 @@ host_reboot(
+ 		// UPS power cutoff path
+ 		PEHaltRestart( kPEUPSDelayHaltCPU );
+ 	} else {
+-		halt_all_cpus(!(options & HOST_REBOOT_HALT));
++		boolean_t restart = !(options & HOST_REBOOT_HALT);
++
++		/*
++		 * The user's own way out -- reboot(2), and "slide to power off" is one with
++		 * HOST_REBOOT_HALT. No driver of this platform expert halts the machine
++		 * (PE_halt_restart is never set), so the run ends in loader_return(); say first what
++		 * that end is meant to be, and it asks the firmware for it (osfmk/arm64/loader_return.c:
++		 * PSCI SYSTEM_OFF or SYSTEM_RESET, halt_psci=0/restart_loader=1 for the loader's way).
++		 */
++		loader_end_request(restart);
++		halt_all_cpus(restart);
+ 	}
+ 
+ 	return KERN_SUCCESS;
 diff --git a/osfmk/kern/percpu.h b/osfmk/kern/percpu.h
 index 4fb223ee9788..df563bc04910 100644
 --- a/osfmk/kern/percpu.h

@@ -54,6 +54,13 @@
 #define PSCI_CPU_ON             0xC4000003u
 #define PSCI_AFFINITY_INFO      0xC4000004u
 #define PSCI_AFFINITY_OFF       1
+/*
+ * SYSTEM_OFF and SYSTEM_RESET (PSCI 1.0 sections 5.6 and 5.7) are 32-bit calls even in the 64-bit
+ * convention. They end the whole system, not just the calling core, and are made from the boot
+ * processor only, after the others have gone (loader_return() has done that by the time it asks).
+ */
+#define PSCI_SYSTEM_OFF         0x84000008u
+#define PSCI_SYSTEM_RESET       0x84000009u
 
 #define PSCI_SMP_START_SECONDS  5       /* how long a started core is waited for */
 #define PSCI_SMP_STOP_SECONDS   3       /* ... and the cores that were told to stop */
@@ -382,6 +389,38 @@ psci_smp_stop_here(void)
 			__builtin_arm_wfi();
 		}
 	}
+}
+
+/*
+ * The system itself goes off or resets (PSCI SYSTEM_OFF / SYSTEM_RESET), not merely the kernel:
+ * what "slide to power off" and a reboot from the system are supposed to do. Called from
+ * loader_return() with the other processors already off, so the calling one -- the boot
+ * processor -- is the only one left, which is what the specification asks for. The call does not
+ * return when the firmware takes it; a negative status is its refusal (PSCI_ERROR_NOT_SUPPORTED
+ * when the hypervisor implements only the CPU_* calls, as Qualcomm's may), and then the loader is
+ * still there to take the run and its log.
+ */
+static int64_t
+psci_system_end(uint64_t function)
+{
+	int64_t status;
+
+	__builtin_arm_wsr("DAIFSet", DAIFSC_ALL);       /* nothing between the last quiesce and this */
+	status = psci_call(function, 0, 0, 0);
+	__builtin_arm_wsr("DAIFClr", DAIFSC_ALL);       /* only reached when the firmware refused */
+	return status;
+}
+
+int64_t
+psci_system_off(void)
+{
+	return psci_system_end(PSCI_SYSTEM_OFF);
+}
+
+int64_t
+psci_system_reset(void)
+{
+	return psci_system_end(PSCI_SYSTEM_RESET);
 }
 
 #endif /* defined(GENERIC_PSCI_SMP) */

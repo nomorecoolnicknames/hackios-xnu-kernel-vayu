@@ -138,6 +138,7 @@ gpu_exact	k
 gpu_keep	k
 gpu_log	k
 hakios_kver	k
+halt_psci	k
 haptic	k
 haptic_effect	k
 hv_wdt_pet	k
@@ -209,6 +210,7 @@ rec_sound_mic	k
 rec_start	k
 rec_step	k
 regtrace	k
+restart_loader	k
 return_cpu	k
 return_panic	k
 root_apfs	u
