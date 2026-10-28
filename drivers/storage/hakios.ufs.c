@@ -200,6 +200,7 @@ static LCK_MTX_DECLARE(ufs_write_mtx, &ufs_lck_grp);
 #define VAR_SAVE_MS        20000        /* at most this long on the way out (var_save_ms=N) */
 
 static volatile int ufs_var_save = VAR_SAVE_NONE;
+static volatile bool ufs_var_save_early;           /* hakios_var_save_early() has asked already */
 static int ufs_var_busy_pid;
 
 /* ufs_write=1 and the one partition it is for: everything else answers EROFS as it always did */
@@ -914,18 +915,41 @@ static const struct cdevsw ufs_cdevsw = {
  * so twenty seconds here is well inside both. Nothing else of the way out has happened yet: the
  * GPU, the DSPs and this kernel's transfer list are still as the run had them.
  */
+/*
+ * The first moment of an orderly shutdown, from OSKext::setLoadEnabled(false) (libkern/c++/OSKext.cpp): launchd
+ * disables kext loading when SpringBoard starts "slide to power off" -- once per run, about 3 s before it calls
+ * reboot(2).
+ * By reboot(2) the saver is long dead (launchd tears the services down first), so the data volume is asked for
+ * here, while the saver still lives: nothing is waited for, the saver (which now ignores SIGTERM until it has
+ * saved) answers in its own time, and hakios_var_save_on_return() later only waits for that answer.
+ */
+void
+hakios_var_save_early(void)
+{
+	if (!ufs_ready || ufs_write_part < 0 || ufs_var_save != VAR_SAVE_IDLE) {
+		return;
+	}
+	printf("var_store: the system is shutting down: the data volume is asked for now, while the saver is alive\n");
+	ufs_var_save_early = true;
+	ufs_var_save = VAR_SAVE_WANTED;
+}
+
 void
 hakios_var_save_on_return(void)
 {
 	uint32_t ms = VAR_SAVE_MS;
 	uint64_t waited = 0;
 
-	if (!ufs_ready || ufs_write_part < 0 || ufs_var_save != VAR_SAVE_IDLE) {
+	if (!ufs_ready || ufs_write_part < 0 || (ufs_var_save != VAR_SAVE_IDLE && !ufs_var_save_early)) {
 		return;
 	}
 	PE_parse_boot_argn("var_save_ms", &ms, sizeof(ms));
-	printf("var_store: the run is ending: the data volume is asked for\n");
-	ufs_var_save = VAR_SAVE_WANTED;
+	if (ufs_var_save_early) {
+		printf("var_store: the run is ending: the data volume was asked for at the start of the shutdown; waiting for the saver\n");
+	} else {
+		printf("var_store: the run is ending: the data volume is asked for\n");
+		ufs_var_save = VAR_SAVE_WANTED;
+	}
 	while (ufs_var_save != VAR_SAVE_DONE && waited < ms) {
 		IOSleep(20);
 		waited += 20;

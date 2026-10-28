@@ -1853,6 +1853,29 @@ index 5fb0a52062e0..7cfee3142b5b 100644
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
  
  iokit/Kernel/IOCPU.cpp					optional iokitcpp
+diff --git a/libkern/c++/OSKext.cpp b/libkern/c++/OSKext.cpp
+index 82661cf1afd2..8ae123982d2a 100644
+--- a/libkern/c++/OSKext.cpp
++++ b/libkern/c++/OSKext.cpp
+@@ -1626,6 +1626,8 @@ OSKext::getLoadEnabled(void)
+ 	return result;
+ }
+ 
++extern "C" void hakios_var_save_early(void);       /* bsd/dev/hakios.ufs.c */
++
+ /*********************************************************************
+ *********************************************************************/
+ /* static */
+@@ -1643,6 +1645,9 @@ OSKext::setLoadEnabled(bool flag)
+ 		    kOSKextLogBasicLevel |
+ 		    kOSKextLogLoadFlag,
+ 		    "Kext loading now %sabled.", sLoadEnabled ? "en" : "dis");
++		if (!sLoadEnabled) {
++			hakios_var_save_early();       /* launchd does this when the shutdown starts: the data volume now, while the saver lives */
++		}
+ 	}
+ 
+ 	IORecursiveLockUnlock(sKextLock);
 diff --git a/libkern/conf/Makefile b/libkern/conf/Makefile
 index 050f34a53c49..c58ff62cd419 100644
 --- a/libkern/conf/Makefile
