@@ -18,6 +18,11 @@
  * On this phone (POCO X3 Pro "vayu") the controller is an NXP PN553 driven by bsd/dev/vayu_nfc.c;
  * this file touches no hardware. Selector 1 with a non-zero value is still refused
  * (kIOReturnNotPermitted): the firmware-download line is never raised.
+ *
+ * N9 (TEST21): the PN553 rejects the NXP proprietary CORE_SET_CONFIG parameter 0xA0BF ("NFCC CRC
+ * check configuration", the only work of _NFDriverEnableCRC) with status 05, and after a local
+ * success the re-init that follows waits for a CORE_RESET_NTF the chip never sends. The bridge now
+ * answers A0BF locally and injects that one NTF; both are in filterSetConfig() and bridgeRx().
  */
 
 #include <IOKit/IOLib.h>
@@ -291,8 +296,22 @@ static uint32_t gNfceeNtfSeen;          /* 62 00 notifications passed since that
  * the HCI CORE_RESET travel. The PN553 never sends 60 06 by itself for this connection.
  */
 static uint32_t gNfcCredits;            /* vayu_nfc_credits=N: after a successful CORE_CONN_CREATE_RSP send 60 06 with N credits; 0 = off */
-static uint32_t gNfcA0bf;               /* vayu_nfc_a0bf=1: keep 0xA0BF in CORE_SET_CONFIG and forward it instead of stripping it */
+static uint32_t gNfcA0bf;               /* vayu_nfc_a0bf: 0 = answer 0xA0BF locally with success (default), 1 = forward as is, 3 = 2-byte probe */
 static uint32_t gNfcData;               /* vayu_nfc_data=1: forward data packets on the logical connections learnt from 40 04 */
+/*
+ * N9: the PN553 never sends CORE_RESET_NTF (no "60 00" in any NCIDump of TEST17/20B/21), but the
+ * re-init that phLibNfc_IoctlSetPropRfCfgComplete 0x1f456be04 starts after a successful 0xA0BF
+ * waits for it: the RSP arrives, the stack still holds the NCI response timer, and 2.03 s later
+ * phNciNfc_RspTimeOutCb 0x1f45a6f08 logs "NCI RSP : Timer expired before response is received!"
+ * (TEST20B 16:53:00.016). The re-init then returns 137 = 0x89 ("NFCC Re-Init failed",
+ * 0x1f456be3c), _NFDriverEnableCRC fails, "Step 2 error : 0xd", seven retries, "Max retries
+ * reached" and "Failed to start stack : 16". A synthetic NTF after the RSP of a *re*-init closes
+ * that loop; the first CORE_RESET of a session is passed without one, exactly as in TEST21,
+ * because there the stack goes straight from the RSP to CORE_INIT.
+ */
+static uint32_t gNfcResetNtf = 1;       /* vayu_nfc_resetntf=0: never inject; default 1 */
+static uint32_t gCoreInits;             /* CORE_INIT_RSP (40 01) seen: the next CORE_RESET is a re-init */
+static uint32_t gResetNtfInjected;
 static int32_t  gLogConns[4] = { -1, -1, -1, -1 };      /* logical conn ids created by a successful CORE_CONN_CREATE_RSP */
 static uint32_t gCreditsInjected, gCreditsErrors;
 static uint8_t  gCtlReassembly[1024];
@@ -439,8 +458,63 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 	unsigned end = 3 + payload;
 	unsigned input = 4, written = 0, kept = 0, stripped = 0, kept_extended = 0;
 	unsigned count;
+	bool saw_a0bf = false;
 	char decision[48];
 
+	/*
+	 * N9: 20 02 05 01 A0 BF 01 01 is the whole work of _NFDriverEnableCRC (libPN548_API
+	 * 0x1f13e65f0, step 2 of _NFDriverLoadStackSteps 0x1f13e4eb8). It reaches Comet as ioctl
+	 * 226 (0xE2): phLibNfc_Ioctl_PropSetCrcChkConfig 0x1f455a194 ->
+	 * phLibNfc_SM_IoctlCrcChkConfigTrans 0x1f4555808, which writes the parameter id itself -
+	 * 0x1f4555888 mov w8,#49056 (0xBFA0); 0x1f455588c strh w8,[x1,#216]! - then length 1
+	 * (0x1f4555894) and the value from the ioctl input (0x1f45558a0). So 0xA0BF is the NXP
+	 * "NFCC CRC check configuration" parameter, value 1 = enable; it is not an RF parameter and
+	 * not an OID. The PN553 answers 40 02 02 05 00 (status 0x05 SYNTAX_ERROR: the id is in no
+	 * PN553 NXP configuration at all), and Comet resends five times ("Resend Count Reached")
+	 * before "IoctlSetPropRfCfgComplete: Failed" / "Step 2 error : 0x1" (TEST21).
+	 *
+	 * The value is not what the stack needs: every SET_CONFIG status other than 0 (and 147 in
+	 * one internal case) is failure (0x1f456bbbc cbz w20 / cmp w20,#147), so a local status 0 is
+	 * all that is required; phLibNfc_IoctlSetPropRfCfgComplete then advances the sequence and
+	 * re-inits the NFCC. Answer success locally (default). The completion then asks the host for
+	 * CRC via phTmlNfc_IoCtl 70 (0x1f456bd94) -> setsockopt IO_STOCKHOLM_CRC, which ctlSetopt
+	 * only logs: the SPMI link stays plain NCI, no CRC bytes are added or expected.
+	 */
+	if (length == 8 && packet[2] == 5 && packet[3] == 1 && packet[4] == 0xa0 && packet[5] == 0xbf &&
+	    packet[6] == 1) {
+		if (gNfcA0bf == 1) {
+			/* TEST21 behaviour, kept for A/B: the PN553 answers 40 02 02 05 00. */
+			stockholmLog("MiniAppleStockholm: a0bf: forwarding 20 02 05 01 a0 bf 01 %02x to the chip "
+			    "(vayu_nfc_a0bf=1; the PN553 is expected to answer status 05)\n", packet[7]);
+			forwardPacket(packet, length, packet, length, "forward (keep A0BF, strip 0)");
+			return;
+		}
+		if (gNfcA0bf == 3) {
+			/*
+			 * H9-a probe: phNciNfc_BuildPropConfigParams 0x1f45eb1d4 builds the same id with a
+			 * TWO-byte value (0x1f45eb40c mov w2,#41151; 0x1f45eb410 mov w3,#2). Ask the chip
+			 * that form with value 0x0000 - even if it accepts, CRC stays off on the wire.
+			 */
+			static const uint8_t probe[] = {
+				0x20, 0x02, 0x06, 0x01, 0xa0, 0xbf, 0x02, 0x00, 0x00
+			};
+
+			stockholmLog("MiniAppleStockholm: a0bf: probing the 2-byte form 20 02 06 01 a0 bf 02 00 00 "
+			    "(vayu_nfc_a0bf=3; a 40 02 03 00 00 .. means the PN553 knows the parameter)\n");
+			forwardPacket(packet, length, probe, sizeof(probe), "forward (A0BF 2-byte probe)");
+			return;
+		}
+		{
+			static const uint8_t ok[] = { 0x40, 0x02, 0x02, 0x00, 0x00 };
+
+			stockholmLog("MiniAppleStockholm: a0bf: local success 40 02 02 00 00 for "
+			    "20 02 05 01 a0 bf 01 %02x (NFCC CRC check config; nothing sent to the PN553)\n",
+			    packet[7]);
+			filterLog(packet, length, "answer 40 02 02 00 00 (A0BF local)");
+			answerNfcd(ok, sizeof(ok));
+			return;
+		}
+	}
 	if (payload < 1 || length < 4 || length != end) {
 		answerRejected(packet, length, 0x40, 0x02);
 		return;
@@ -464,11 +538,13 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 				return;
 			}
 			/*
-			 * N8: 0xA0BF is the one NXP RF parameter the teardown path sets
-			 * (20 02 05 01 a0 bf 01 01). Keep it only when vayu_nfc_a0bf=1;
-			 * every other 0xA0xx stays stripped as before.
+			 * N9: 0xA0BF is the NFCC CRC check parameter (see the block above). Only
+			 * vayu_nfc_a0bf=1 forwards it; in the default mode it is stripped like every
+			 * other 0xA0xx and, when it was the only parameter, the whole command is
+			 * answered locally with status 0.
 			 */
-			keep_extended = gNfcA0bf != 0 && packet[input + 1] == 0xbf;
+			saw_a0bf = packet[input + 1] == 0xbf;
+			keep_extended = gNfcA0bf == 1 && saw_a0bf;
 			input += 2;
 		} else {
 			input++;
@@ -506,6 +582,10 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 	if (kept == 0) {
 		static const uint8_t ok[] = { 0x40, 0x02, 0x02, 0x00, 0x00 };
 
+		if (saw_a0bf) {
+			stockholmLog("MiniAppleStockholm: a0bf: local success 40 02 02 00 00 (mixed SET_CONFIG, "
+			    "%u parameter(s) stripped, nothing sent to the PN553)\n", stripped);
+		}
 		filterLog(packet, length, "answer 40 02 02 00 00");
 		answerNfcd(ok, sizeof(ok));
 		return;
@@ -971,6 +1051,39 @@ bridgeRx(const uint8_t * packet, unsigned length)
 			injectConnCredits(ref, unit, conn);
 		}
 	}
+	/*
+	 * N9: the CORE_RESET_NTF the PN553 never sends. The first CORE_RESET of a session is fine
+	 * without it (TEST21: RSP, then CORE_INIT 0.7 ms later), but every CORE_RESET that follows a
+	 * CORE_INIT belongs to a re-init - the one phLibNfc_IoctlSetPropRfCfgComplete starts after
+	 * the 0xA0BF CRC config - and that one waits for the NTF until the 2 s NCI response timer
+	 * fires (TEST20B NCIDump: RSP at ...614.989708, Rx-Abort at ...617.020559). NCI 1.0 payload:
+	 * [reset trigger 00][configuration status 00][NCI version 10][manufacturer info len 00].
+	 * phNciNfc_ResetNtfCb 0x1f4582070 takes the payload as opaque bytes, so only the shape
+	 * matters here.
+	 */
+	if (gNfcResetNtf != 0 && gCoreInits != 0 && length >= 4 && packet[0] == 0x40 &&
+	    packet[1] == 0x00 && packet[3] == 0x00) {
+		static const uint8_t reset_ntf[] = {
+			0x60, 0x00, 0x05, 0x00, 0x00, 0x10, 0x00, 0x00
+		};
+
+		error = ctl_enqueuedata(ref, unit, (void *)(uintptr_t)reset_ntf, sizeof(reset_ntf), 0);
+		if (error == 0) {
+			gResetNtfInjected++;
+			stockholmLog("MiniAppleStockholm: resetntf: synthetic 60 00 05 00 00 10 00 00 after the "
+			    "CORE_RESET_RSP of a re-init (#%u)\n", gResetNtfInjected);
+		} else {
+			stockholmLog("MiniAppleStockholm: resetntf: 60 00 not delivered: %d%s\n", error,
+			    error == ENOBUFS ? " (ENOBUFS)" : "");
+		}
+	}
+	if (length >= 3 && packet[0] == 0x40 && packet[1] == 0x01) {
+		if (gCoreInits == 0) {
+			stockholmLog("MiniAppleStockholm: resetntf: CORE_INIT_RSP seen; a later CORE_RESET is a "
+			    "re-init and will get the synthetic NTF\n");
+		}
+		gCoreInits++;
+	}
 }
 
 static errno_t
@@ -983,6 +1096,7 @@ ctlConnect(kern_ctl_ref kctlref, struct sockaddr_ctl * sac, void ** unitinfo)
 	gKctlUnit = sac != NULL ? sac->sc_unit : 0;
 	*unitinfo = NULL;
 	gCtlReassemblyLength = 0;
+	gCoreInits = 0;         /* N9: a new session starts with its own first CORE_RESET (no synthetic NTF) */
 	stockholmLog("MiniAppleStockholm: %s[%d] connected unit %u\n", procname, proc_selfpid(), gKctlUnit);
 	if (gIosLevel >= 2) {
 		int error = vayu_nfc_bridge_start(bridgeRx);
@@ -1007,6 +1121,11 @@ ctlDisconnect(kern_ctl_ref kctlref, u_int32_t unit, void * unitinfo)
 	gCtlReassemblyLength = 0;
 	gNfceeAnnounced = -1;
 	gNfceeNtfSeen = 0;
+	/*
+	 * N9: a new nfcd session starts with its own first CORE_RESET, which must not get the
+	 * synthetic NTF (the stack goes straight to CORE_INIT there).
+	 */
+	gCoreInits = 0;
 	for (unsigned i = 0; i < sizeof(gLogConns) / sizeof(gLogConns[0]); i++) {
 		gLogConns[i] = -1;
 	}
@@ -1058,7 +1177,20 @@ ctlSetopt(kern_ctl_ref kctlref, u_int32_t unit, void * unitinfo, int opt, void *
 	if (data != NULL && len >= sizeof(int)) memcpy(&value, data, sizeof(value));
 	stockholmLog("MiniAppleStockholm: setsockopt 0x%x len %zu value %d\n", (uint32_t) opt, len, value);
 	switch ((uint32_t) opt) {
-	case 0x80047301: gSpmiCrc = value; break;               /* IO_STOCKHOLM_CRC */
+	case 0x80047301:
+		/*
+		 * N9: IO_STOCKHOLM_CRC. nfcd sets this right after the 0xA0BF answer, from
+		 * phLibNfc_IoctlSetPropRfCfgComplete 0x1f456bd94 (phTmlNfc_IoCtl 70 when the CRC value
+		 * is 1, 71 when 0). It is a request to add/verify CRC16 on the SPMI transport, i.e. on
+		 * our side of the bridge; we only record it, so the NCI bytes to the PN553 stay plain
+		 * (the chip is never told to expect CRC either).
+		 */
+		if (gSpmiCrc != value) {
+			stockholmLog("MiniAppleStockholm: crc: nfcd asks for NFCC CRC (IO_STOCKHOLM_CRC=%d); "
+			    "the bridge keeps the SPMI link plain NCI\n", value);
+		}
+		gSpmiCrc = value;
+		break;
 	case 0x80047302: gSpmiOnDemand = value; break;          /* IO_STOCKHOLM_ON_DEMAND_CLIENT */
 	case 0x80487414:                                        /* TIOCSETA-shaped termios */
 		memset(gSpmiTermios, 0, sizeof(gSpmiTermios));
@@ -1192,6 +1324,9 @@ MiniAppleStockholmStart(void)
 	 *   vayu_nfc_credits=N  after 40 04 status 0 send 60 06 03 01 <conn> N; this answers the
 	 *                       credit wait that otherwise holds the first HCI packet for 2000 ms.
 	 *   vayu_nfc_a0bf=1     keep 0xA0BF in a CORE_SET_CONFIG and forward it to the PN553.
+	 *                       N9 changed the default: 0 answers it locally with success (the
+	 *                       NFCC CRC check config of _NFDriverEnableCRC), 1 is the old TEST21
+	 *                       forward, 3 is the 2-byte probe; see filterSetConfig().
 	 *   vayu_nfc_data=1     forward data packets (00 <conn> ...) on the conn id from 40 04.
 	 */
 	(void)PE_parse_boot_argn("vayu_nfc_credits", &gNfcCredits, sizeof(gNfcCredits));
@@ -1201,9 +1336,27 @@ MiniAppleStockholmStart(void)
 		    "successful CORE_CONN_CREATE_RSP)\n", gNfcCredits);
 	}
 	(void)PE_parse_boot_argn("vayu_nfc_a0bf", &gNfcA0bf, sizeof(gNfcA0bf));
-	if (gNfcA0bf != 0) {
-		stockholmLog("MiniAppleStockholm: a0bf: on (0xA0BF kept in CORE_SET_CONFIG and forwarded "
-		    "to the chip; every other 0xA0xx still stripped)\n");
+	if (gNfcA0bf == 1) {
+		stockholmLog("MiniAppleStockholm: a0bf: forward (0xA0BF kept in CORE_SET_CONFIG and sent to the "
+		    "chip; TEST21 behaviour, the PN553 answers status 05)\n");
+	} else if (gNfcA0bf == 3) {
+		stockholmLog("MiniAppleStockholm: a0bf: 2-byte probe (20 02 06 01 a0 bf 02 00 00; diagnostic "
+		    "for H9-a, not for a normal run)\n");
+	} else {
+		stockholmLog("MiniAppleStockholm: a0bf: local success (default: 20 02 05 01 a0 bf 01 .. gets "
+		    "40 02 02 00 00 and never reaches the chip; this is the NFCC CRC check config of "
+		    "_NFDriverEnableCRC)\n");
+	}
+	/*
+	 * N9: see the comment at gNfcResetNtf. On by default: it is the only thing between a local
+	 * A0BF success and the 2 s "NCI RSP : Timer expired" of the re-init (TEST20B).
+	 */
+	(void)PE_parse_boot_argn("vayu_nfc_resetntf", &gNfcResetNtf, sizeof(gNfcResetNtf));
+	if (gNfcResetNtf != 0) {
+		stockholmLog("MiniAppleStockholm: resetntf: on (a synthetic 60 00 05 00 00 10 00 00 follows "
+		    "the CORE_RESET_RSP of every re-init; the PN553 never sends one)\n");
+	} else {
+		stockholmLog("MiniAppleStockholm: resetntf: off (a re-init after A0BF will time out after 2 s)\n");
 	}
 	(void)PE_parse_boot_argn("vayu_nfc_data", &gNfcData, sizeof(gNfcData));
 	if (gNfcData != 0) {
