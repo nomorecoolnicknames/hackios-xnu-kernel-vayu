@@ -273,6 +273,7 @@ static uint8_t  gSpmiTermios[72];       /* TIOCSETA-shaped, zeros until nfcd set
 static uint32_t gIosLevel;
 static uint32_t gHwSpoof;               /* vayu_nfc_hwspoof=1: CORE_INIT_RSP hardware byte 0x41 shown to nfcd as 0x42 */
 static uint32_t gPropInit;              /* vayu_nfc_propinit=1: also answer the 2F 06 and 2F 00 init steps (filter()) */
+static uint32_t gNfceeForward;          /* vayu_nfc_nfcee=1: forward NFCEE_DISCOVER instead of answering 0 NFCEEs */
 static uint8_t  gCtlReassembly[1024];
 static size_t   gCtlReassemblyLength;
 static uint32_t gFilterDecisions, gBridgeRxErrors, gForwardErrors, gAnswerErrors;
@@ -476,6 +477,59 @@ filterGetConfig(const uint8_t * packet, unsigned length)
 	forwardPacket(packet, length, packet, length, "forward");
 }
 
+/*
+ * NFCEE management (GID 2). iOS 16.5's init asks NFCEE_DISCOVER (22 00) right after the
+ * CORE_SET_CONFIG/GET_CONFIG block. The board is a PN553, not a PN80T (vendor
+ * libnfc-nxp.conf NXP_NFC_CHIP=0x07; CORE_INIT_RSP hw 0x41), so there is no eSE inside the
+ * controller, and this port does not use a UICC NFCEE either. Answer "0 NFCEEs" locally;
+ * there is then nothing to route, power or open.
+ *
+ * The accepted shape is [status][number of NFCEEs] = 00 00, payload length 2:
+ * phNciNfc_ProcessNfceeDiscoverRsp 0x1f45a3aa0 reads the response at ctx+3360/3368
+ *   0x1f45a3ae0  ldr  w9, [x19, #3368]    ; payload length
+ *   0x1f45a3ae4  cmp  w9, #2
+ *   0x1f45a3ae8  b.hi 0x1f45a3b58         ; > 2 -> w20=255
+ *   0x1f45a3aec  ldrb w8, [x8]            ; status
+ *   0x1f45a3af0  cmp  w8, #0xf1           ; discovery already started -> w20=81
+ *   0x1f45a3af8  cbnz w8, 0x1f45a3b58     ; any other status -> w20=255
+ *   0x1f45a3b24  ldrb w5, [x8, #1]        ; number of NFCEEs
+ *   0x1f45a3b28  strb w5, [x19, #3545]
+ * The answer the bridge used to give, 42 00 01 01, has status 1 and therefore takes the
+ * 0x1f45a3af8 branch; that 255 is the "LibNfc Init/Re-init Failed" of TEST14.
+ *
+ * No NTF is owed for an empty list. phNciNfc_CompleteNfceeDiscoverSequence 0x1f4555290
+ * registers the 62 00 handler (0x1f4555310 "Registering for Nfcee Discover Notification",
+ * handler phNciNfc_NfceeDiscNtfHandler 0x1f45a41a0) and calls phNciNfc_Notify 0x1f45d552c
+ * with the count straight away; it does not wait for a 62 00. NCI sends one
+ * NFCEE_DISCOVER_NTF per discovered NFCEE and none for zero. phLibNfc_ProcessNfceeDiscRsp
+ * 0x1f455a500 checks only the status (0x1f455a540 cbz w20) and sets ctx+480=1; it never
+ * looks at the count, so the init proceeds to phLibNfc_InitializeComplete 0x1f4552e50.
+ *
+ * Forwarding 22 00 (vayu_nfc_nfcee=1, for a hardware comparison only) is safe in itself -
+ * discover reads - but the chip's config on this board (A0EC=1/A0ED=0 as read by
+ * phLibNfc_GetNfceeIntfCfgProc 0x1f4590324) may make its firmware report an NFCEE that is
+ * not there; iOS would then try NFCEE_MODE_SET/pipe opens against a phantom eSE.
+ */
+static void
+filterNfcee(const uint8_t * packet, unsigned length)
+{
+	uint8_t oid = packet[1] & 0x3f;
+
+	if (oid == 0x00) {                      /* NFCEE_DISCOVER */
+		static const uint8_t no_nfcee[] = { 0x42, 0x00, 0x02, 0x00, 0x00 };
+
+		if (gNfceeForward != 0) {
+			forwardPacket(packet, length, packet, length, "forward (NFCEE_DISCOVER)");
+			return;
+		}
+		filterLog(packet, length, "answer 42 00 02 00 00 (0 NFCEEs)");
+		answerNfcd(no_nfcee, sizeof(no_nfcee));
+		return;
+	}
+	/* 22 01 NFCEE_MODE_SET and the rest: there is no such NFCEE on this phone. */
+	answerRejected(packet, length, 0x42, oid);
+}
+
 static void
 filter(const uint8_t * packet, unsigned length)
 {
@@ -515,11 +569,20 @@ filter(const uint8_t * packet, unsigned length)
 		}
 	}
 	if (gid == 1) {                         /* RF management */
+		/*
+		 * Forward. RF_DISCOVER_MAP (21 00) only fills the protocol-to-interface table and
+		 * RF_DISCOVER (21 03) starts polling; the same two commands bsd/dev/vayu_nfc.c sends
+		 * to this PN553 in its own discovery step (build_discover, vayu_nfc.c:1354 and :1398),
+		 * so the chip is known to answer them. RF_DISCOVER_SELECT (21 04) and RF_DEACTIVATE
+		 * (21 06) are the rest of that conversation. None of them is a firmware/download
+		 * operation. CORE_SET_CONFIG (20 02) is the one that is filtered, above: 0xA0xx
+		 * parameters are stripped, the standard ones still go to the chip.
+		 */
 		forwardPacket(packet, length, packet, length, "forward");
 		return;
 	}
 	if (gid == 2) {                         /* NFCEE: no eSE and no UICC on this phone */
-		answerRejected(packet, length, 0x42, oid);
+		filterNfcee(packet, length);
 		return;
 	}
 	if (gid == 0x0f) {                      /* NXP proprietary */
@@ -875,6 +938,15 @@ MiniAppleStockholmStart(void)
 	if (gPropInit != 0) {
 		stockholmLog("MiniAppleStockholm: propinit: on (2F 06 GET_FW_TYPE and 2F 00 standby get a local "
 		    "status 0; the rest of the 2F family stays refused)\n");
+	}
+	/*
+	 * Default off: NFCEE_DISCOVER is answered locally with 0 NFCEEs (see filterNfcee()).
+	 * vayu_nfc_nfcee=1 forwards 22 00 to the PN553 for one hardware comparison run; it is
+	 * not the intended mode because the chip's table describes an NFCEE this board lacks.
+	 */
+	(void)PE_parse_boot_argn("vayu_nfc_nfcee", &gNfceeForward, sizeof(gNfceeForward));
+	if (gNfceeForward != 0) {
+		stockholmLog("MiniAppleStockholm: nfcee: forwarding NFCEE_DISCOVER (22 00) to the chip\n");
 	}
 	resources = IOService::getResourceService();
 	if (resources == NULL) return;
