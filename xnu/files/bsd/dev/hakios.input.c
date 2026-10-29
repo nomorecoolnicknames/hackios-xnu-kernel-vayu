@@ -137,6 +137,23 @@ hakios_touch_synthetic(uint32_t *samples, uint32_t *down)
 	*down = os_atomic_load(&synthetic_down, relaxed) != 0;
 }
 
+/*
+ * S8: the same two numbers for the screen's own driver (bsd/dev/vayu_nvt.c, from_driver true), so
+ * that a scroll driven by a real finger reads in the display driver's window the way the self-test's
+ * synthetic swipe did: "N screen touch samples, screen finger 1" with "M frames (F a second)" beside
+ * it is the answer to "what does the panel do when the owner scrolls?". Kept apart from the
+ * synthetic counters so the self-test's PASS line cannot be mistaken for a real touch.
+ */
+static volatile uint32_t driver_samples;
+static volatile uint32_t driver_down;
+
+void
+hakios_touch_driver(uint32_t *samples, uint32_t *down)
+{
+	*samples = os_atomic_xchg(&driver_samples, 0, relaxed);
+	*down = os_atomic_load(&driver_down, relaxed) != 0;
+}
+
 static void
 touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time, bool from_driver)
 {
@@ -174,6 +191,14 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time
 	t->y = y > 65535 ? 65535 : y;
 	if (from_driver) {
 		count_fingers(type, finger);
+		if (finger < 32 && (type == HAKIOS_TOUCH_DOWN || type == HAKIOS_TOUCH_MOVE || type == HAKIOS_TOUCH_UP)) {
+			os_atomic_inc(&driver_samples, relaxed);
+			if (type == HAKIOS_TOUCH_DOWN) {
+				os_atomic_or(&driver_down, 1u << finger, relaxed);
+			} else if (type == HAKIOS_TOUCH_UP) {
+				os_atomic_andnot(&driver_down, 1u << finger, relaxed);
+			}
+		}
 	} else if (finger < 32 && (type == HAKIOS_TOUCH_DOWN || type == HAKIOS_TOUCH_MOVE || type == HAKIOS_TOUCH_UP)) {
 		os_atomic_inc(&synthetic_samples, relaxed);
 		if (type == HAKIOS_TOUCH_DOWN) {

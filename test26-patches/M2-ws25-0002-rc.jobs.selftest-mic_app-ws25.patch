@@ -1,0 +1,26 @@
+--- a/userland/rc.jobs.selftest
++++ b/userland/rc.jobs.selftest
+@@ -19,8 +19,13 @@
+ #   music   medialibraryd is alive, music_import put the track in the library, MediaPlayer's songs
+ #           query returns it, and AVPlayer (then MPMusicPlayerController) reaches the playing state
+ #           with the clock moving.
+-#   mic     3 s through AVAudioRecorder, analyzed from the WAV itself: peak, RMS, distinct sample
+-#           values. Silence (peak 0) and a stuck converter (every sample equal) are FAILs.
++#   mic     the same device, 3 s through AVAudioRecorder, analyzed from the WAV itself: peak, RMS,
++#           distinct sample values. Silence (peak 0) and a stuck converter (every sample equal)
++#           are FAILs.
++#   mic_app 5 s the way Voice Memos records: AVAudioSession play-and-record (every error logged with
++#           its domain and code), AVAudioRecorder into an AAC .m4a at the session's rate, metering,
++#           the recorder's delegate, TCC/Recordings paths, then AVAudioPlayer on the .m4a. Peak
++#           floor on the WAV too (the mic stage's all_equal criterion alone passed a peak-0 file).
+ #   camera  SelftestCamera.app, asked for through SpringBoard, takes one still and a 5 s movie; the
+ #           checker verifies the still's size and magic and the movie's top-level atoms (moov
+ #           present). The application is the foreground client on purpose: the capture stack gives
+@@ -44,6 +49,7 @@
+ /redwood/bin/selftest files --at=45
+ /redwood/bin/selftest music --at=80 --source=/redwood/share/music/Тёмный_принц-Отвратительный_король.mp3 --track=RDWD.mp3
+ /redwood/bin/selftest mic --at=140 --seconds=3
++/redwood/bin/selftest mic_app --at=145 --app-seconds=5
+ /redwood/bin/selftest swipe --at=150
+ /redwood/bin/selftest camera --at=170 --app-timeout=90
+ /redwood/bin/selftest summary

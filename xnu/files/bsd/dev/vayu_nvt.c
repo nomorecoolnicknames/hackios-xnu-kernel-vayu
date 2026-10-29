@@ -50,8 +50,9 @@
  *           marked regulator-boot-on with a 4 ms startup delay; reset is active low.
  *
  * No interrupt is used: the driver reads the event buffer every touch_poll_us
- * microseconds (8000 by default), whether or not the interrupt line moved; a report is
- * kept by the chip, so a missed edge is not a lost touch. touch_flip=N mirrors the
+ * microseconds (8000), whether or not the interrupt line moved; a report is
+ * kept by the chip, so a missed edge is not a lost touch. Since S8 the default is the
+ * panel's own 240 Hz (touch_hz=240, 4166 us): 8000 us is what touch_poll_us=N gives. touch_flip=N mirrors the
  * coordinates as in the Goodix driver. nvt_spi_us=N sets the bit-bang half period
  * (1 us by default, about 500 kHz).
  *
@@ -129,7 +130,13 @@ extern bool vayu_qup_nvt_resx(bool high);
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
 static bool nvt_qup;            /* boot arg nvt_qup=1 or touch_driver=nvt_qup */
-static uint32_t touch_hz;       /* boot arg touch_hz=N: sample at N Hz (0: touch_poll_us) */
+/*
+ * S8: 240 Hz by default, as Android reads this panel. The boot arg touch_hz=N still overrides it
+ * (touch_hz=0 or touch_poll_us=N goes back to the plain sleep, 8000 us in the old default). A
+ * finger-driven scroll at 120 frames a second needs the samples to come at the panel's own rate;
+ * at the old 125 Hz every frame of a 120 Hz scroll had less than one new position to show.
+ */
+static uint32_t touch_hz = 240; /* boot arg touch_hz=N: sample at N Hz (0: touch_poll_us) */
 static uint32_t nvt_host_cmd;   /* boot arg nvt_cmd=0xNN: one host command, after the download */
 static bool touch_tail;         /* boot arg touch_tail=1: show the five bytes after the records */
 static bool page_held;          /* the event-buffer page is selected and the last look saw data */
@@ -990,7 +997,8 @@ nvt_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t poll_us = 8000, status_every;
 	uint64_t reading = 0, reads = 0;
 
-	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
+	bool poll_given = PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
+
 	if (poll_us < 500) {
 		poll_us = 500;
 	}
@@ -1000,17 +1008,21 @@ nvt_thread(__unused void *parameter, __unused wait_result_t result)
 	/*
 	 * touch_hz=N: the sample rate, not the sleep. 240 Hz is 4166 us and is what Android sees from
 	 * this panel; the number the chip really produces is printed once a minute (see "new reports").
-	 * touch_hz wins over touch_poll_us when both are given.
+	 * touch_hz wins over touch_poll_us when both are given. S8: with neither given, touch_hz stays
+	 * at its default 240 -- the normal boot used to sample at touch_poll_us' 8000 us (125 Hz).
 	 */
 	if (PE_parse_boot_argn("touch_hz", &touch_hz, sizeof(touch_hz))) {
-		if (touch_hz >= 30 && touch_hz <= 2000) {
-			poll_us = 1000000 / touch_hz;
-			if (poll_us < 500) {
-				poll_us = 500;
-			}
-		} else {
+		if (touch_hz < 30 || touch_hz > 2000) {
 			printf("nvt: touch_hz=%u is outside 30..2000; using touch_poll_us=%u\n", touch_hz, poll_us);
 			touch_hz = 0;
+		}
+	} else if (poll_given) {
+		touch_hz = 0;           /* an explicit touch_poll_us=N is the old sleep, as before */
+	}
+	if (touch_hz >= 30 && touch_hz <= 2000) {
+		poll_us = 1000000 / touch_hz;
+		if (poll_us < 500) {
+			poll_us = 500;
 		}
 	}
 	{

@@ -234,8 +234,12 @@ static TUNABLE(uint32_t, gFit, "fb_fit", 0);
  * takes its "unscaled" path: rows memcpy'd, not a blend and a column lookup for every pixel. This
  * is fb_fit's crop without changing the size the display reports (fb_fit needs fbwidth/fbheight for
  * that); touch stays 1:1 with the panel, as the shown picture is.
+ *
+ * S8: on by default. iOS's 1125x2436 surface scaled down to 1080x2400 is the 5.5-7.9 ms a frame path
+ * measured in run 194827 -- too slow for 120; the crop is the same picture at 1.0-2.2 ms. `fb_crop=0`
+ * goes back to the scale.
  */
-static TUNABLE(uint32_t, gCrop, "fb_crop", 0);
+static TUNABLE(uint32_t, gCrop, "fb_crop", 1);
 /*
  * fb_zero=1 (vayu, with vayu_mdp=1 and the loader's fb_spare=N): a frame that is one 1125x2436 BGRA surface of
  * MiniIOSurface's scanout pool is not copied: the display controller's VIG0 is pointed at it (its centre 1080x2400,
@@ -259,11 +263,17 @@ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
 static TUNABLE(uint32_t, gVsyncDivisor, "fb_vsync_div", 0);
 /*
  * Boot-arg fb_120=1: iOS is told the display is the panel's 120 Hz one -- the mode's SyncRate, the
- * refresh timer and the refreshes themselves (see the top of this file). Off by default: the display
- * has been an iPhone X's 60 to iOS since the port began, and a window server with the software
- * renderer cannot fill 120 frames anyway.
+ * refresh timer and the refreshes themselves (see the top of this file).
+ *
+ * S8: on by default. The owner's normal boot (no selftest=1, no s5_..., t120=1 on the command line)
+ * had the display as an iPhone X's 60 to iOS, so UIScreen.maximumFramesPerSecond, the refresh
+ * timer and every CADisplayLink of UIKit's were built around 60, and no userland switch could make
+ * a finger-driven scroll faster than the clock behind it. The software renderer's cost is the one
+ * reason the flag used to be off; the phone now runs the window server on the GPU (gpu=1
+ * vayu_gpu=1, src/eagl.c), and TEST24 measured 105-121 frames a second during a scroll with this
+ * default on. `fb_120=0` gives the old 60 Hz identity back.
  */
-static TUNABLE(uint32_t, gFb120, "fb_120", 0);
+static TUNABLE(uint32_t, gFb120, "fb_120", 1);
 /*
  * Boot-arg fb_swap_fence_ms=N (default 20): how long a swap waits for the GPU's last submission as of
  * the SwapEnd that handed it over. The surfaces of a swap have fences of their own (the last submission
@@ -305,25 +315,28 @@ static bool gFb120Slow;                         /* the refreshes are now every 2
 static uint32_t gFb120Changes;                  /* ... and how often that changed, for the log */
 extern "C" uint64_t hakios_touch_idle_abs(void);       /* bsd/dev/hakios.input.c */
 extern "C" void hakios_touch_synthetic(uint32_t *samples, uint32_t *down);     /* ... and what a program posted */
+extern "C" void hakios_touch_driver(uint32_t *samples, uint32_t *down);        /* ... and what the screen's own driver posted */
 static uint32_t gModeHz;                        /* the refresh the display is said to run at (fb_120: 120) */
 static bool gPictureFit;                        /* rows copied, not scaled: fb_fit, or a 120 Hz frame's cost */
 static uint32_t gVSyncsTold;                    /* refreshes told to user space since the last 5 s line (atomic) */
 static uint64_t gFBDrawAbs;                     /* the copy's time per frame, a running average */
 static uint32_t gFBDivisor = 1;
 /*
- * Boot-arg fb_threads=N (1 to 8): so many processors scale a frame onto the panel together (see
- * drawRows()). Three by default: a frame is in the panel's memory 3 ms after its turn instead of 9
- * to 10 (the phone, 15 October; fb_threads=1 is how it was).
+ * Boot-arg fb_threads=N (1 to 8): so many processors copy a frame onto the panel together (see
+ * drawRows()). Six by default since S8: every 120 Hz run (TEST9 to TEST25) used six, and the copy
+ * measured 1.0-2.2 ms a frame with them -- half the 8.33 ms the panel gives a frame. Three (the old
+ * default) was enough at 60; `fb_threads=3` gives it back.
  */
-static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
+static TUNABLE(uint32_t, gThreads, "fb_threads", 6);
 /*
- * Boot-arg fb_queue=N (1 to SWAP_QUEUE, default 2): how many swaps may wait for the panel besides
- * the one being put there. A swap that comes when the queue is full is held in SwapEnd, and a window
- * server held past its next refresh makes that refresh late (the five-second "waited for the frame
- * before" says how often: 62 times in the 5 s of the 69 fps window, 0 in the 119 fps one).
+ * Boot-arg fb_queue=N (1 to SWAP_QUEUE, default 3 since S8): how many swaps may wait for the panel
+ * besides the one being put there. A swap that comes when the queue is full is held in SwapEnd, and
+ * a window server held past its next refresh makes that refresh late (the five-second "waited for
+ * the frame before" says how often: 62 times in the 5 s of the 69 fps window, 0 in the 119 fps one).
+ * The 120 Hz runs (TEST24/25) used 3; `fb_queue=2` is the old default.
  */
 #define SWAP_QUEUE              4                       /* frames that may wait for the panel at most (fb_queue) */
-static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
+static TUNABLE(uint32_t, gQueue, "fb_queue", 3);
 static inline unsigned
 swapQueue(void)
 {
@@ -346,17 +359,23 @@ static TUNABLE(uint32_t, gEarly, "fb_early", 0);
  */
 static TUNABLE(uint32_t, gTouchLat, "touch_lat", 0);
 /*
- * Boot-arg s5_fps=MS (default 0, off): the self-test's frame-rate window. The five-second line below
- * is printed every MS milliseconds instead (100 to 5000), preceded by one compact line that has what a
- * scroll's frame rate is read from: frames a second, refreshes told to user space a second, the mode
- * iOS is told in Hz (beside fb_hz, fb_120 and the divisor it comes from), how many of the touch
+ * Boot-arg s5_fps=MS (default 1000, on; 0 turns it off): the frame-rate window. The five-second line
+ * below is printed every MS milliseconds instead (100 to 5000), preceded by one compact line that has
+ * what a scroll's frame rate is read from: frames a second, refreshes told to user space a second, the
+ * mode iOS is told in Hz (beside fb_hz, fb_120 and the divisor it comes from), how many of the touch
  * samples in the window came from a program -- the self-test's synthetic swipe -- and whether such a
  * finger is down. During a swipe: "frames" is the answer, "refreshes told" the ceiling this driver
  * offers, "synthetic samples" whether the swipe reached the queue at all. A window of 240 samples a
  * second and 60 frames is the window server's own policy, not this driver: the budget line beside it
  * says how many of the late frames waited for neither the GPU's fence nor the copy.
+ *
+ * S8: it used to be off, so a normal boot (no selftest=1) had no line to read a finger's scroll
+ * from. It is now a one-second window by default -- one line a second, and only in a window in
+ * which a frame was drawn -- with the finger's own samples beside the synthetic ones (`screen
+ * samples`, `screen finger`), so the owner's scroll can be measured the way TEST24's synthetic
+ * one was. `s5_fps=0` turns it off.
  */
-static TUNABLE(uint32_t, gS5Fps, "s5_fps", 0);
+static TUNABLE(uint32_t, gS5Fps, "s5_fps", 1000);
 
 static inline uint64_t
 micros(uint64_t absolute)
@@ -693,6 +712,16 @@ IOMobileFramebuffer::start(IOService * provider)
 			    "120 frames a second are not to be expected\n", fWidth, fHeight);
 		}
 	}
+	/*
+	 * S8: one line at boot that says what a normal boot (no selftest=1, no fb_120/t120/s5_* on the
+	 * command line) runs at, so a log of a finger's scroll can be read without guessing which
+	 * defaults were in force. The values are the tunables' own; `fb_120=0`/`s5_fps=0` turn them off.
+	 */
+	IOLog("MiniIOMobileFramebuffer: s8: normal boot: display to iOS %u Hz (fb_120=%u, fb_hz=%u), a refresh every %u "
+	    "panel frame(s), frame window %u ms with screen touch samples in it (s5_fps=%u); copy: fb_crop=%u, "
+	    "fb_threads=%u, fb_queue=%u\n", refreshHz(), gFb120, gRefreshHz,
+	    gFb120 != 0 ? 1u : (gVsyncDivisor != 0 ? gVsyncDivisor : gFBDivisor),
+	    gS5Fps >= 100 && gS5Fps <= 5000 ? gS5Fps : 5000u, gS5Fps, gCrop, gThreads, gQueue);
 	if (gPictureFit && fWidth >= fPanelWidth && fHeight >= fPanelHeight) {
 		hakios_display_crop[0] = (fWidth - fPanelWidth) / 2;
 		hakios_display_crop[1] = (fHeight - fPanelHeight) / 2;
@@ -1586,10 +1615,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 		unsigned different;
 		const bool s5 = gS5Fps >= 100 && gS5Fps <= 5000;
 		uint32_t told = (s5 || gFb120 != 0) ? os_atomic_xchg(&gVSyncsTold, 0, relaxed) : 0;
-		uint32_t synthesized = 0, synth_down = 0;
+		uint32_t synthesized = 0, synth_down = 0, screened = 0, screen_down = 0;
 
 		if (s5) {
 			hakios_touch_synthetic(&synthesized, &synth_down);
+			/* S8: the screen's own driver (bsd/dev/vayu_nvt.c), so a real finger's scroll reads
+			 * the same way the self-test's synthetic one did. */
+			hakios_touch_driver(&screened, &screen_down);
 		}
 
 		absolutetime_to_nanoseconds(fStatDrawing, &drawing);
@@ -1602,18 +1634,22 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate);
 		/*
-		 * The self-test's window (boot-arg s5_fps): one line with the answer, right after the line
-		 * it is made of. `finger` is 1 while a synthetic finger is down, and `synthetic samples` is
-		 * what the swipe posted in this window: 0 there with a finger down means the swipe's writer
-		 * is not being read (nothing in backboardd's input thread), not that the window is idle.
+		 * The frame-rate window (boot-arg s5_fps; one second and on by default since S8): one line
+		 * with the answer, right after the line it is made of. `finger` is 1 while a synthetic
+		 * finger is down, and `synthetic samples` is what the swipe posted in this window: 0 there
+		 * with a finger down means the swipe's writer is not being read (nothing in backboardd's
+		 * input thread), not that the window is idle. `screen samples`/`screen finger` are the same
+		 * two numbers for the screen's own driver: a real finger.
 		 */
 		if (s5) {
 			IOLog("MiniIOMobileFramebuffer: S5FPS: %llu ms: %u frames (%llu a second), %u refreshes told (%u a second), "
-			    "mode %u Hz (fb_hz %u, fb_120 %u, every %u panel frame), %u synthetic touch samples, finger %u; "
+			    "mode %u Hz (fb_hz %u, fb_120 %u, every %u panel frame), %u synthetic touch samples, finger %u, "
+			    "%u screen touch samples, screen finger %u; "
 			    "%u waited for the frame before, %u came a refresh late, %u of %u late waited for neither the GPU's "
 			    "fence nor the copy\n", nanos / NSEC_PER_MSEC, fStatFrames, fStatFrames * NSEC_PER_SEC / nanos, told,
 			    (uint32_t)((uint64_t)told * NSEC_PER_SEC / nanos), refreshHz(), gRefreshHz, gFb120,
 			    gFb120 != 0 ? 1u : (gVsyncDivisor != 0 ? gVsyncDivisor : gFBDivisor), synthesized, synth_down,
+			    screened, screen_down,
 			    fStatHeld, fStatSwapsLate, fBudgetLateNeither, fBudgetFrames);
 		}
 		/*

@@ -1,0 +1,922 @@
+--- a/userland/src/inject.c
++++ b/userland/src/inject.c
+@@ -44,6 +44,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/sysctl.h>
++#include <sys/mman.h>
++#include <libkern/OSCacheControl.h>
++#include <stdbool.h>
+ #include <signal.h>
+ #include <sys/ucontext.h>
+ #include <unistd.h>
+@@ -980,6 +983,12 @@
+ 				if (hz >= 30 && hz <= 2000) {
+ 					report_interval_us = (int)(1000000 / hz);
+ 				}
++			} else if (strstr(arguments, "touchscreen=1") != NULL) {
++				/* S8: the screen's driver now samples at 240 Hz by default (bsd/dev/vayu_nvt.c);
++				 * tell the event server the rate it really produces, as touch_hz=240 did in the
++				 * test runs. Without a number the server is free to batch a drag at 60. Only when
++				 * this boot has the real touch screen: a QEMU run's virtio pointer is not 240 Hz. */
++				report_interval_us = 4166;
+ 			}
+ 			if (report_interval_us < 0 || report_interval_us > 100000) {
+ 				report_interval_us = 0;
+@@ -1196,6 +1205,8 @@
+  * does nothing: the key has to be answered for the bundle. The replacement below answers both
+  * spellings with true when the boot arg asks for 120, and passes every other key through.
+  */
++static int boot_token(const char *arguments, const char *name, char value);  /* S8, below */
++
+ static int
+ fb120_wanted(void)
+ {
+@@ -1205,8 +1216,12 @@
+ 		char arguments[4096] = "";
+ 		size_t size = sizeof(arguments) - 1;
+ 
+-		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+-		    strstr(arguments, "fb_120=1") != NULL;
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++			wanted = 1;             /* S8: on in a normal boot (see t120_wanted()) */
++		} else {
++			wanted = !boot_token(arguments, "fb_120", '0') && !boot_token(arguments, "t120", '0') &&
++			    !boot_token(arguments, "s8", '0');
++		}
+ 	}
+ 	return wanted;
+ }
+@@ -1292,24 +1307,41 @@
+ #define T120_QC_FR_PRINT        115
+ #define T120_QC_VELOCITY_FREE   124
+ 
+-/* t120_<name>=1 in the boot arguments. Deliberately not strstr(name) on "t120=1": the flags are
+- * separate variables of one experiment each. */
++/*
++ * S8: is NAME=VALUE one of the blank-separated tokens of ARGS? "fb_120=1" is found in
++ * "rd=md0 fb_120=1 -v" and not in "fb_120=10", "xfb_120=1" or "fb_120=". The experiments used to be
++ * found with strstr(), which is why "t120=1" could match a "t120=10" of another experiment's; a
++ * default that is now on has to be turned off reliably, so the token is matched exactly.
++ */
+ static int
+-t120_switch(const char *name)
++boot_token(const char *arguments, const char *name, char value)
+ {
+-	char arguments[4096] = "";
+-	char wanted[32];
+-	size_t size = sizeof(arguments) - 1;
++	size_t length = strlen(name);
+ 
+-	if (!t120_wanted() || snprintf(wanted, sizeof(wanted), "%s=1", name) >= (int)sizeof(wanted)) {
+-		return 0;
+-	}
+-	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+-		return 0;
++	for (const char *p = arguments; (p = strstr(p, name)) != NULL; p += length) {
++		const char *at = p + length;
++
++		if (p != arguments && p[-1] != ' ') {
++			continue;
++		}
++		if (*at == '=' && at[1] == value && (at[2] == ' ' || at[2] == '\0')) {
++			return 1;
++		}
+ 	}
+-	return strstr(arguments, wanted) != NULL;
++	return 0;
+ }
+ 
++/*
++ * S8: the 120 Hz switches are on in every boot now, not only when a test's command line asked.
++ *
++ * The owner's normal boot has no selftest=1 and none of the s5_..., t120=... or fb_120=1 tokens,
++ * so every one of these used to be off: the display was an iPhone X's 60 to iOS (kernel: fb_120), UIKit
++ * built its display links around 60 and QuartzCore kept its 16.7 ms floor and its frame-rate
++ * restriction (userland). The result was the 60-69 fps of TEST9/TEST11 in a boot that never had
++ * the flags. On is the default now; each feature keeps its own =0 to turn it off, and its =1 still
++ * means what it did. `s8=0` turns the whole set off at once (the way a run without the flags used
++ * to behave).
++ */
+ static int
+ t120_wanted(void)
+ {
+@@ -1319,12 +1351,36 @@
+ 		char arguments[4096] = "";
+ 		size_t size = sizeof(arguments) - 1;
+ 
+-		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+-		    strstr(arguments, "t120=1") != NULL;
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++			wanted = 1;             /* no command line to read: the normal boot, as above */
++		} else {
++			wanted = !boot_token(arguments, "t120", '0') && !boot_token(arguments, "s8", '0');
++		}
+ 	}
+ 	return wanted;
+ }
+ 
++/* t120_<name>: its =1 or =0, otherwise ON for the two that a finger's scroll needs (idle and
++ * velocity), OFF for the two that only diagnose or cost power everywhere (always render, the
++ * arbitration's log). */
++static int
++t120_switch(const char *name)
++{
++	char arguments[4096] = "";
++	size_t size = sizeof(arguments) - 1;
++
++	if (!t120_wanted() || sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++		return 0;
++	}
++	if (boot_token(arguments, name, '1')) {
++		return 1;
++	}
++	if (boot_token(arguments, name, '0')) {
++		return 0;
++	}
++	return strcmp(name, "t120_idle") == 0 || strcmp(name, "t120_vel") == 0;
++}
++
+ /* the loaded image whose LC_UUID is `uuid`, or NULL */
+ static const struct mach_header_64 *
+ t120_image(const unsigned char uuid[16])
+@@ -1427,6 +1483,11 @@
+ 	if (!t120_wanted()) {
+ 		return;
+ 	}
++	/* S8: one line per process that says the normal-boot defaults are in force, and what they are.
++	 * A log without selftest=1 must be able to answer "are S4/S5/S6 right now?" without guessing. */
++	say("hakios: %s: s8: normal boot: 120 Hz while a finger is down (t120=1, fb_120=%d, idle=%d, velocity=%d, "
++	    "always=%d); t120=0 or s8=0 turns it off\n", getprogname(), fb120_wanted(),
++	    t120_switch("t120_idle"), t120_switch("t120_vel"), t120_switch("t120_always"));
+ 	setenv("CA_FORCE_120HZ", "1", 1);
+ 	setenv("CA_ENABLE_ALL_FRAME_RATES", "1", 1);
+ 	setenv("CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION", "0", 1);
+@@ -1452,6 +1513,143 @@
+ 	});
+ }
+ 
++/*
++ * S8: is this process to be given 120 Hz touch delivery? On unless s8_touch=0 (or s8=0).
++ */
++static int
++s8_touch_wanted(void)
++{
++	static int wanted = -1;
++
++	if (wanted < 0) {
++		char arguments[4096] = "";
++		size_t size = sizeof(arguments) - 1;
++
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++			wanted = 1;
++		} else {
++			wanted = !boot_token(arguments, "s8_touch", '0') && !boot_token(arguments, "s8", '0');
++		}
++	}
++	return wanted;
++}
++
++/*
++ * S8: 120 Hz touch delivery -- the other half of a finger-driven scroll.
++ *
++ * TEST24's synthetic swipes produced 105-121 frames a second, but the application counted only
++ * 20-32 -[UIApplication sendEvent:] calls in the same seconds although 240 samples a second reached
++ * the kernel: the window server drew at 120 and handed the touch to UIKit at about 30. That is a
++ * second, separate gate from the frame-rate one, and iOS has a name for it: UIKitCore has
++ * -[<something> _shouldGenerate120HzEvents] and libMobileGestalt exports
++ * _MobileGestalt_get_touchDelivery120Hz (both in the 20F66 cache: the selector at
++ * dyld_shared_cache_arm64.01/17, the symbol in ...42.dyldlinkedit). On a device whose identity is an
++ * iPhone X (no ProMotion) the answer is expected to be NO.
++ *
++ * So, in a process that is to have it:
++ *   1. the MobileGestalt getter is asked once and its answer logged; if 0, its code is made to
++ *      answer 1 (`mov w0, #1; ret`), which is per-process and affects nothing else;
++ *   2. every class that has _shouldGenerate120HzEvents with a BOOL return has it answered YES.
++ * Both are logged with the old value, so a run says which of the two was the gate. `s8_touch=0`
++ * leaves both alone.
++ */
++typedef bool (*s8_bool_answer)(void);
++
++static BOOL
++s8_yes(id self, SEL selector)
++{
++	(void)self;
++	(void)selector;
++	return YES;
++}
++
++static void
++s8_touch_delivery(void)
++{
++	static bool said;
++	void *getter = dlsym(RTLD_DEFAULT, "_MobileGestalt_get_touchDelivery120Hz");
++	SEL selector = sel_registerName("_shouldGenerate120HzEvents");
++	Class *classes;
++	int count, replaced = 0;
++
++	if (!s8_touch_wanted()) {
++		if (!said) {
++			say("hakios: %s: s8_touch=0: 120 Hz touch delivery is left as it is\n", getprogname());
++			said = true;
++		}
++		return;
++	}
++	if (said) {
++		return;
++	}
++	said = true;
++	if (getter == NULL) {
++		say("hakios: %s: s8: no _MobileGestalt_get_touchDelivery120Hz in this process\n", getprogname());
++	} else {
++		bool answer = ((s8_bool_answer)getter)();
++
++		say("hakios: %s: s8: _MobileGestalt_get_touchDelivery120Hz at %p answers %d\n", getprogname(), getter,
++		    answer ? 1 : 0);
++		if (!answer) {
++			/*
++			 * mov w0, #1 ; ret -- bool is returned in w0. The page is in the dyld shared
++			 * cache; mprotect() makes this process's mapping writable, and the write is
++			 * private to it.
++			 */
++			static const uint32_t answer_yes[2] = { 0x52800020u, 0xd65f03c0u };
++			uintptr_t page = (uintptr_t)getter & ~(uintptr_t)0x3fffu;
++
++			if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
++				memcpy(getter, answer_yes, sizeof(answer_yes));
++				sys_icache_invalidate(getter, sizeof(answer_yes));
++				say("hakios: %s: s8: patched it to answer 1\n", getprogname());
++			} else {
++				say("hakios: %s: s8: mprotect(%p): %s: left at 0\n", getprogname(), (void *)page,
++				    strerror(errno));
++			}
++		}
++	}
++	count = objc_getClassList(NULL, 0);
++	classes = count > 0 ? malloc(sizeof(Class) * (size_t)count) : NULL;
++	if (classes != NULL) {
++		Method done[8];
++		unsigned done_count = 0;
++
++		count = objc_getClassList(classes, count);
++		for (int i = 0; i < count && done_count < 8; i++) {
++			Method method = class_getInstanceMethod(classes[i], selector);
++			if (method == NULL) {
++				method = class_getClassMethod(classes[i], selector);
++			}
++			const char *types = method != NULL ? method_getTypeEncoding(method) : NULL;
++			IMP old = method != NULL ? method_getImplementation(method) : NULL;
++			bool seen = false;
++
++			for (unsigned d = 0; d < done_count; d++) {
++				seen = seen || done[d] == method;
++			}
++			if (method == NULL || seen || old == (IMP)s8_yes) {
++				continue;
++			}
++			/* BOOL is 'B' (or 'c' on older encodings); anything else is not this switch. */
++			if (types == NULL || (types[0] != 'B' && types[0] != 'c')) {
++				say("hakios: %s: s8: -[%s _shouldGenerate120HzEvents] has type %s: left alone\n",
++				    getprogname(), class_getName(classes[i]), types != NULL ? types : "?");
++				continue;
++			}
++			done[done_count++] = method;
++			method_setImplementation(method, (IMP)s8_yes);
++			replaced++;
++			say("hakios: %s: s8: -[%s _shouldGenerate120HzEvents] (%s, was %p) answers YES\n", getprogname(),
++			    class_getName(classes[i]), types, old);
++		}
++		free(classes);
++	}
++	if (replaced == 0) {
++		say("hakios: %s: s8: no _shouldGenerate120HzEvents with a BOOL answer in this process\n", getprogname());
++	}
++}
++
+ __attribute__((constructor))
+ static void
+ hakios_init(void)
+@@ -1465,6 +1663,7 @@
+ 	}
+ 	slide = (uintptr_t)cache - CACHE_BASE;
+ 	t120_setup();
++	s8_touch_delivery();
+ 	if (strcmp(name, "backboardd") == 0) {
+ 		char arguments[4096] = "";
+ 		size_t size = sizeof(arguments) - 1;
+@@ -1491,10 +1690,14 @@
+ 		 * notifications taken below, the window server's clock can run at the mode's 120.
+ 		 */
+ 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+-			bool for120 = strstr(arguments, "fb_120=1") != NULL;
++			/* S8: fb120_wanted(), not the token itself: the display is 120 in a normal boot
++			 * too, and CA_FORCE_TIMER is what makes the window server take the driver's
++			 * refreshes instead of a 60 Hz timer of its own. */
++			bool for120 = fb120_wanted() != 0;
+ 
+ 			if (for120) {
+-				say("hakios: fb_120=1: CoreAnimation's 16.7 ms minimum frame duration is off for the window server\n");
++				say("hakios: %s: CoreAnimation's 16.7 ms minimum frame duration is off for the window server\n",
++				    strstr(arguments, "fb_120=1") != NULL ? "fb_120=1" : "s8: normal boot (fb_120)");
+ 			}
+ 			if (for120 || strstr(arguments, "ca_vbl=1") != NULL) {
+ 				setenv("CA_FORCE_TIMER", "1", 1);
+--- a/userland/src/inject_sb.c
++++ b/userland/src/inject_sb.c
+@@ -36,6 +36,7 @@
+ #include <IOKit/IOKitLib.h>
+ #include <dispatch/dispatch.h>
+ #include <dlfcn.h>
++#include <errno.h>
+ #include <fcntl.h>
+ #include <mach/mach_time.h>
+ #include <mach-o/dyld.h>
+@@ -50,6 +51,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/sysctl.h>
++#include <sys/mman.h>
++#include <libkern/OSCacheControl.h>
+ #include <unistd.h>
+ 
+ /* where what is said goes: the standard error, which is the console's for SpringBoard (an application's is nowhere) */
+@@ -783,6 +786,8 @@
+  * s7=1 behaves as before and a run with it says exactly what it found.
+  */
+ 
++static int boot_token(const char *arguments, const char *name, char value);  /* S8, below */
++
+ static bool
+ s7_wanted(void)
+ {
+@@ -792,7 +797,17 @@
+ 		char arguments[4096] = "";
+ 		size_t size = sizeof(arguments) - 1;
+ 
+-		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "s7=1") != NULL;
++		/*
++		 * S8: on in every boot. The activation alert of the fake SIM is not the self-test's
++		 * problem: it is up from boot in the owner's normal boot too (S7 found it at +0 s), its
++		 * SBAlertItemWindow eats every touch and makes the application's scene inactive. `s7=0`
++		 * (or s8=0) leaves it as it was.
++		 */
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++			wanted = 1;
++		} else {
++			wanted = !boot_token(arguments, "s7", '0') && !boot_token(arguments, "s8", '0');
++		}
+ 	}
+ 	return wanted;
+ }
+@@ -1693,6 +1708,28 @@
+  * "...OnPhone" at 0x1d5b6b198/0x1884c2d70), not from the environment. The replacement answers both
+  * with true when the boot arg asks for 120 and passes every other key through.
+  */
++/*
++ * S8: is NAME=VALUE one of the blank-separated tokens of ARGS? (the same helper as src/inject.c:
++ * an experiment that is on by default is turned off only by its own exact =0 token.)
++ */
++static int
++boot_token(const char *arguments, const char *name, char value)
++{
++	size_t length = strlen(name);
++
++	for (const char *p = arguments; (p = strstr(p, name)) != NULL; p += length) {
++		const char *at = p + length;
++
++		if (p != arguments && p[-1] != ' ') {
++			continue;
++		}
++		if (*at == '=' && at[1] == value && (at[2] == ' ' || at[2] == '\0')) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
+ static int
+ fb120_wanted(void)
+ {
+@@ -1702,8 +1739,12 @@
+ 		char arguments[4096] = "";
+ 		size_t size = sizeof(arguments) - 1;
+ 
+-		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+-		    strstr(arguments, "fb_120=1") != NULL;
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++			wanted = 1;             /* S8: the normal boot, 120 Hz by default */
++		} else {
++			wanted = !boot_token(arguments, "fb_120", '0') && !boot_token(arguments, "t120", '0') &&
++			    !boot_token(arguments, "s8", '0');
++		}
+ 	}
+ 	return wanted;
+ }
+@@ -1769,6 +1810,7 @@
+ #define T120_QC_FR_PRINT        115
+ #define T120_QC_VELOCITY_FREE   124
+ 
++/* S8: on in every boot; t120=0 or s8=0 gives the old (off) behaviour. */
+ static int
+ t120_wanted(void)
+ {
+@@ -1778,26 +1820,32 @@
+ 		char arguments[4096] = "";
+ 		size_t size = sizeof(arguments) - 1;
+ 
+-		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+-		    strstr(arguments, "t120=1") != NULL;
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++			wanted = 1;
++		} else {
++			wanted = !boot_token(arguments, "t120", '0') && !boot_token(arguments, "s8", '0');
++		}
+ 	}
+ 	return wanted;
+ }
+ 
++/* the =1 or =0 of t120_<name>; otherwise on for idle/velocity (what a finger's scroll needs). */
+ static int
+ t120_switch(const char *name)
+ {
+ 	char arguments[4096] = "";
+-	char wanted[32];
+ 	size_t size = sizeof(arguments) - 1;
+ 
+-	if (!t120_wanted() || snprintf(wanted, sizeof(wanted), "%s=1", name) >= (int)sizeof(wanted)) {
++	if (!t120_wanted() || sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+ 		return 0;
+ 	}
+-	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++	if (boot_token(arguments, name, '1')) {
++		return 1;
++	}
++	if (boot_token(arguments, name, '0')) {
+ 		return 0;
+ 	}
+-	return strstr(arguments, wanted) != NULL;
++	return strcmp(name, "t120_idle") == 0 || strcmp(name, "t120_vel") == 0;
+ }
+ 
+ static const struct mach_header_64 *
+@@ -1918,6 +1966,9 @@
+ 	if (!t120_wanted()) {
+ 		return;
+ 	}
++	say("hakios: %s: s8: normal boot: 120 Hz while a finger is down (t120=1, fb_120=%d, idle=%d, velocity=%d, "
++	    "always=%d); t120=0 or s8=0 turns it off\n", getprogname(), fb120_wanted(),
++	    t120_switch("t120_idle"), t120_switch("t120_vel"), t120_switch("t120_always"));
+ 	setenv("CA_FORCE_120HZ", "1", 1);
+ 	setenv("CA_ENABLE_ALL_FRAME_RATES", "1", 1);
+ 	setenv("CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION", "0", 1);
+@@ -1946,6 +1997,117 @@
+ }
+ 
+ 
++/*
++ * S8: 120 Hz touch delivery (see the long comment in src/inject.c): ask MobileGestalt's
++ * _MobileGestalt_get_touchDelivery120Hz, make it answer 1 if it says 0, and answer YES to every
++ * BOOL _shouldGenerate120HzEvents in this process. On unless s8_touch=0 (or s8=0).
++ */
++static int
++s8_touch_wanted(void)
++{
++	static int wanted = -1;
++
++	if (wanted < 0) {
++		char arguments[4096] = "";
++		size_t size = sizeof(arguments) - 1;
++
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++			wanted = 1;
++		} else {
++			wanted = !boot_token(arguments, "s8_touch", '0') && !boot_token(arguments, "s8", '0');
++		}
++	}
++	return wanted;
++}
++
++typedef bool (*s8_bool_answer)(void);
++
++static BOOL
++s8_yes(id self, SEL selector)
++{
++	(void)self;
++	(void)selector;
++	return YES;
++}
++
++static void
++s8_touch_delivery(void)
++{
++	static bool said;
++	void *getter = dlsym(RTLD_DEFAULT, "_MobileGestalt_get_touchDelivery120Hz");
++	SEL selector = sel_registerName("_shouldGenerate120HzEvents");
++	Class *classes;
++	int count, replaced = 0;
++
++	if (!s8_touch_wanted() || said) {
++		if (!said) {
++			say("hakios: %s: s8_touch=0: 120 Hz touch delivery is left as it is\n", getprogname());
++			said = true;
++		}
++		return;
++	}
++	said = true;
++	if (getter == NULL) {
++		say("hakios: %s: s8: no _MobileGestalt_get_touchDelivery120Hz in this process\n", getprogname());
++	} else {
++		bool answer = ((s8_bool_answer)getter)();
++
++		say("hakios: %s: s8: _MobileGestalt_get_touchDelivery120Hz at %p answers %d\n", getprogname(), getter,
++		    answer ? 1 : 0);
++		if (!answer) {
++			static const uint32_t answer_yes[2] = { 0x52800020u, 0xd65f03c0u };
++			uintptr_t page = (uintptr_t)getter & ~(uintptr_t)0x3fffu;
++
++			if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
++				memcpy(getter, answer_yes, sizeof(answer_yes));
++				sys_icache_invalidate(getter, sizeof(answer_yes));
++				say("hakios: %s: s8: patched it to answer 1\n", getprogname());
++			} else {
++				say("hakios: %s: s8: mprotect(%p): %s: left at 0\n", getprogname(), (void *)page,
++				    strerror(errno));
++			}
++		}
++	}
++	count = objc_getClassList(NULL, 0);
++	classes = count > 0 ? malloc(sizeof(Class) * (size_t)count) : NULL;
++	if (classes != NULL) {
++		Method done[8];
++		unsigned done_count = 0;
++
++		count = objc_getClassList(classes, count);
++		for (int i = 0; i < count && done_count < 8; i++) {
++			Method method = class_getInstanceMethod(classes[i], selector);
++			if (method == NULL) {
++				method = class_getClassMethod(classes[i], selector);
++			}
++			const char *types = method != NULL ? method_getTypeEncoding(method) : NULL;
++			IMP old = method != NULL ? method_getImplementation(method) : NULL;
++			bool seen = false;
++
++			for (unsigned d = 0; d < done_count; d++) {
++				seen = seen || done[d] == method;
++			}
++			if (method == NULL || seen || old == (IMP)s8_yes) {
++				continue;
++			}
++			if (types == NULL || (types[0] != 'B' && types[0] != 'c')) {
++				say("hakios: %s: s8: -[%s _shouldGenerate120HzEvents] has type %s: left alone\n",
++				    getprogname(), class_getName(classes[i]), types != NULL ? types : "?");
++				continue;
++			}
++			done[done_count++] = method;
++			method_setImplementation(method, (IMP)s8_yes);
++			replaced++;
++			say("hakios: %s: s8: -[%s _shouldGenerate120HzEvents] (%s, was %p) answers YES\n", getprogname(),
++			    class_getName(classes[i]), types, old);
++		}
++		free(classes);
++	}
++	if (replaced == 0) {
++		say("hakios: %s: s8: no _shouldGenerate120HzEvents with a BOOL answer in this process\n", getprogname());
++	}
++}
++
+ __attribute__((constructor))
+ static void
+ hakios_springboard_init(void)
+@@ -1959,6 +2121,7 @@
+ 		return;
+ 	}
+ 	t120_setup();
++	s8_touch_delivery();
+ 	if (strcmp(name, "SpringBoard") != 0) {
+ 		static char who[64];
+ 
+@@ -2028,7 +2191,8 @@
+ 	if (s7_wanted()) {
+ 		original_current_activation_alert = (void (*)(id, SEL, id))replace_method("SBTelephonyManager",
+ 		    "_setCurrentActivationAlertItem:", 0x1c4b29e50UL, (IMP)current_activation_alert);
+-		say("hakios: s7=1: -[SBTelephonyManager _setCurrentActivationAlertItem:] %s\n",
++		say("hakios: s7: -[SBTelephonyManager _setCurrentActivationAlertItem:] %s (on by default since S8; "
++		    "s7=0 turns it off)\n",
+ 		    original_current_activation_alert ? "replaced (activation alerts are dropped)" : "NOT replaced");
+ 	}
+ 	battery_lvl = (IMP)original_battery_level;
+--- a/userland/src/inject_app.c
++++ b/userland/src/inject_app.c
+@@ -12,10 +12,14 @@
+ #include <spawn.h>
+ #include <sys/stat.h>
+ #include <sys/sysctl.h>
++#include <sys/mman.h>
++#include <libkern/OSCacheControl.h>
++#include <stdbool.h>
+ #include <objc/message.h>
+ #include <objc/runtime.h>
+ #include <execinfo.h>
+ #include <dlfcn.h>
++#include <errno.h>
+ #include <fcntl.h>
+ #include <mach-o/dyld.h>
+ #include <mach-o/loader.h>
+@@ -348,6 +352,28 @@
+  * but not while scrolling"). The port's identity is iPhone10,3, whose application bundles do not
+  * carry the key. Answer both spellings with true here too when the boot asked for 120.
+  */
++/*
++ * S8: is NAME=VALUE one of the blank-separated tokens of ARGS? (the same helper as src/inject.c:
++ * a default that is on is turned off only by its own exact =0 token.)
++ */
++static int
++boot_token(const char *arguments, const char *name, char value)
++{
++	size_t length = strlen(name);
++
++	for (const char *p = arguments; (p = strstr(p, name)) != NULL; p += length) {
++		const char *at = p + length;
++
++		if (p != arguments && p[-1] != ' ') {
++			continue;
++		}
++		if (*at == '=' && at[1] == value && (at[2] == ' ' || at[2] == '\0')) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
+ static int
+ fb120_wanted(void)
+ {
+@@ -357,8 +383,12 @@
+ 		char arguments[4096] = "";
+ 		size_t size = sizeof(arguments) - 1;
+ 
+-		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+-		    strstr(arguments, "fb_120=1") != NULL;
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++			wanted = 1;             /* S8: the normal boot, 120 Hz by default */
++		} else {
++			wanted = !boot_token(arguments, "fb_120", '0') && !boot_token(arguments, "t120", '0') &&
++			    !boot_token(arguments, "s8", '0');
++		}
+ 	}
+ 	return wanted;
+ }
+@@ -442,6 +472,7 @@
+ 	}
+ }
+ 
++/* S8: on in every boot; t120=0 or s8=0 gives the old (off) behaviour. */
+ static int
+ t120_wanted(void)
+ {
+@@ -451,8 +482,11 @@
+ 		char arguments[4096] = "";
+ 		size_t size = sizeof(arguments) - 1;
+ 
+-		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+-		    strstr(arguments, "t120=1") != NULL;
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++			wanted = 1;
++		} else {
++			wanted = !boot_token(arguments, "t120", '0') && !boot_token(arguments, "s8", '0');
++		}
+ 	}
+ 	return wanted;
+ }
+@@ -462,6 +496,11 @@
+  * stage swipe). Its reporting is not part of t120's: a run that has the swipe but not t120 still
+  * has to say what the application asked a display link for, and which of QuartzCore's switches are
+  * on, or the frame rate the kernel reports has no explanation beside it.
++ *
++ * S8: on by default. The line it prints once a second while events arrive (s5_say_state()) is the
++ * application's half of the answer in a normal boot: how many events reached UIKit, what the display
++ * links asked for, and which QuartzCore switches are set -- the kernel's S5FPS says how many frames
++ * the window server made of them. `s5_swipe=0` (or s8=0) turns it off.
+  */
+ static int
+ s5_wanted(void)
+@@ -472,26 +511,32 @@
+ 		char arguments[4096] = "";
+ 		size_t size = sizeof(arguments) - 1;
+ 
+-		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+-		    strstr(arguments, "s5_swipe=1") != NULL;
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++			wanted = 1;
++		} else {
++			wanted = !boot_token(arguments, "s5_swipe", '0') && !boot_token(arguments, "s8", '0');
++		}
+ 	}
+ 	return wanted;
+ }
+ 
++/* the =1 or =0 of t120_<name>; otherwise on for idle/velocity (what a finger's scroll needs). */
+ static int
+ t120_switch(const char *name)
+ {
+ 	char arguments[4096] = "";
+-	char wanted[32];
+ 	size_t size = sizeof(arguments) - 1;
+ 
+-	if (!t120_wanted() || snprintf(wanted, sizeof(wanted), "%s=1", name) >= (int)sizeof(wanted)) {
++	if (!t120_wanted() || sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+ 		return 0;
+ 	}
+-	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++	if (boot_token(arguments, name, '1')) {
++		return 1;
++	}
++	if (boot_token(arguments, name, '0')) {
+ 		return 0;
+ 	}
+-	return strstr(arguments, wanted) != NULL;
++	return strcmp(name, "t120_idle") == 0 || strcmp(name, "t120_vel") == 0;
+ }
+ 
+ static const struct mach_header_64 *
+@@ -648,17 +693,26 @@
+ 		char arguments[4096] = "";
+ 		size_t size = sizeof(arguments) - 1;
+ 
+-		level = 0;
++		/*
++		 * S8: 3 by default -- every display link that asks for 60 or more (or for 0) is answered
++		 * 120. A normal boot used to be level 0: Settings asked its scroll view's link for 60 (S4:
++		 * 78 requests "60 a second"), and nothing answered. `t120_link=0` turns it off; 1..5 keep
++		 * their old meanings (1 = say, change nothing; 2 = scroll views only; 3 = all >= 60;
++		 * 4 = whatever was asked; 5 = and at the run loop).
++		 */
++		level = t120_wanted() ? 3 : 0;
+ 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+-			const char *at = strstr(arguments, "t120_link=");
+-
+-			if (at != NULL && at[10] >= '1' && at[10] <= '5') {
+-				level = at[10] - '0';
++			for (const char *at = strstr(arguments, "t120_link="); at != NULL;
++			    at = strstr(at + 10, "t120_link=")) {
++				if (at != arguments && at[-1] != ' ') {
++					continue;
++				}
++				if (at[10] >= '0' && at[10] <= '5') {
++					level = at[10] - '0';
++				}
++				break;
+ 			}
+ 		}
+-		if (level == 0 && s5_wanted()) {
+-			level = 1;      /* S5: say what is asked of a display link, change nothing */
+-		}
+ 		if (level != 0) {
+ 			sayf("hakios: %s: t120_link=%d: display links %s\n", who, level,
+ 			    level == 1 ? "are to be said, not changed" :
+@@ -1330,6 +1384,11 @@
+ 	if (!t120_wanted()) {
+ 		return;
+ 	}
++	/* S8: the application's half of "is 120 Hz on in a normal boot?" -- the kernel's line is
++	 * "MiniIOMobileFramebuffer: s8: normal boot: ...", this one names the process and the link level. */
++	sayf("hakios: %s: s8: normal boot: 120 Hz while a finger is down (t120=1, fb_120=%d, idle=%d, velocity=%d, "
++	    "always=%d, link=%d); t120=0 or s8=0 turns it off\n", who, fb120_wanted(), t120_switch("t120_idle"),
++	    t120_switch("t120_vel"), t120_switch("t120_always"), t120_link_level());
+ 	setenv("CA_FORCE_120HZ", "1", 1);
+ 	setenv("CA_ENABLE_ALL_FRAME_RATES", "1", 1);
+ 	setenv("CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION", "0", 1);
+@@ -1371,6 +1430,116 @@
+ 	});
+ }
+ 
++/*
++ * S8: 120 Hz touch delivery in an application (see the long comment in src/inject.c): ask
++ * MobileGestalt's _MobileGestalt_get_touchDelivery120Hz, make it answer 1 if it says 0, and answer
++ * YES to every BOOL _shouldGenerate120HzEvents in this process. On unless s8_touch=0 (or s8=0).
++ */
++static int
++s8_touch_wanted(void)
++{
++	static int wanted = -1;
++
++	if (wanted < 0) {
++		char arguments[4096] = "";
++		size_t size = sizeof(arguments) - 1;
++
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
++			wanted = 1;
++		} else {
++			wanted = !boot_token(arguments, "s8_touch", '0') && !boot_token(arguments, "s8", '0');
++		}
++	}
++	return wanted;
++}
++
++typedef bool (*s8_bool_answer)(void);
++
++static BOOL
++s8_yes(id self, SEL selector)
++{
++	(void)self;
++	(void)selector;
++	return YES;
++}
++
++static void
++s8_touch_delivery(void)
++{
++	static bool said;
++	void *getter = dlsym(RTLD_DEFAULT, "_MobileGestalt_get_touchDelivery120Hz");
++	SEL selector = sel_registerName("_shouldGenerate120HzEvents");
++	Class *classes;
++	int count, replaced = 0;
++
++	if (!s8_touch_wanted() || said) {
++		if (!said) {
++			sayf("hakios: %s: s8_touch=0: 120 Hz touch delivery is left as it is\n", who);
++			said = true;
++		}
++		return;
++	}
++	said = true;
++	if (getter == NULL) {
++		sayf("hakios: %s: s8: no _MobileGestalt_get_touchDelivery120Hz in this process\n", who);
++	} else {
++		bool answer = ((s8_bool_answer)getter)();
++
++		sayf("hakios: %s: s8: _MobileGestalt_get_touchDelivery120Hz at %p answers %d\n", who, getter,
++		    answer ? 1 : 0);
++		if (!answer) {
++			static const uint32_t answer_yes[2] = { 0x52800020u, 0xd65f03c0u };
++			uintptr_t page = (uintptr_t)getter & ~(uintptr_t)0x3fffu;
++
++			if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
++				memcpy(getter, answer_yes, sizeof(answer_yes));
++				sys_icache_invalidate(getter, sizeof(answer_yes));
++				sayf("hakios: %s: s8: patched it to answer 1\n", who);
++			} else {
++				sayf("hakios: %s: s8: mprotect(%p): %s: left at 0\n", who, (void *)page, strerror(errno));
++			}
++		}
++	}
++	count = objc_getClassList(NULL, 0);
++	classes = count > 0 ? malloc(sizeof(Class) * (size_t)count) : NULL;
++	if (classes != NULL) {
++		Method done[8];
++		unsigned done_count = 0;
++
++		count = objc_getClassList(classes, count);
++		for (int i = 0; i < count && done_count < 8; i++) {
++			Method method = class_getInstanceMethod(classes[i], selector);
++			if (method == NULL) {
++				method = class_getClassMethod(classes[i], selector);
++			}
++			const char *types = method != NULL ? method_getTypeEncoding(method) : NULL;
++			IMP old = method != NULL ? method_getImplementation(method) : NULL;
++			bool seen = false;
++
++			for (unsigned d = 0; d < done_count; d++) {
++				seen = seen || done[d] == method;
++			}
++			if (method == NULL || seen || old == (IMP)s8_yes) {
++				continue;
++			}
++			if (types == NULL || (types[0] != 'B' && types[0] != 'c')) {
++				sayf("hakios: %s: s8: -[%s _shouldGenerate120HzEvents] has type %s: left alone\n", who,
++				    class_getName(classes[i]), types != NULL ? types : "?");
++				continue;
++			}
++			done[done_count++] = method;
++			method_setImplementation(method, (IMP)s8_yes);
++			replaced++;
++			sayf("hakios: %s: s8: -[%s _shouldGenerate120HzEvents] (%s, was %p) answers YES\n", who,
++			    class_getName(classes[i]), types, old);
++		}
++		free(classes);
++	}
++	if (replaced == 0) {
++		sayf("hakios: %s: s8: no _shouldGenerate120HzEvents with a BOOL answer in this process\n", who);
++	}
++}
++
+ __attribute__((constructor))
+ static void
+ hakios_app_init(void)
+@@ -1388,6 +1557,7 @@
+ 	who = name;
+ 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+ 	t120_setup();
++	s8_touch_delivery();
+ 	if (s5_wanted()) {
+ 		/*
+ 		 * The self-test's swipe (boot-arg s5_swipe=1) with or without t120=1: what is asked of a
+@@ -1397,7 +1567,7 @@
+ 		t120_links();
+ 		t120_touch_setup();
+ 		s5_scroll_setup();
+-		sayf("hakios: %s: S5: s5_swipe=1: the frame rate of a synthetic scroll is to be said (links at "
++		sayf("hakios: %s: S5: the frame rate of a scroll (a finger's or a synthetic one) is to be said (links at "
+ 		    "t120_link=%d)\n", who, t120_link_level());
+ 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_global_queue(0, 0), ^{
+ 			t120_links();

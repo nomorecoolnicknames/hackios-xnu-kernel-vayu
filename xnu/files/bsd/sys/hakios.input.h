@@ -49,6 +49,9 @@ uint64_t hakios_touch_idle_abs(void);
  * a finger is down now: for the display driver's s5_fps line, which tells a window a synthetic swipe
  * produced from an idle one (iokit/Kernel/MiniIOMobileFramebuffer.cpp) */
 void hakios_touch_synthetic(uint32_t *samples, uint32_t *down);
+/* the same for the screen's own driver (a real finger, not a program's write): S8, so that a
+ * finger-driven scroll is measured by the display driver's S5FPS window in a normal boot */
+void hakios_touch_driver(uint32_t *samples, uint32_t *down);
 void hakios_input_init(void);
 void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */

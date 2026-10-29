@@ -1,0 +1,584 @@
+--- a/devices/poco-x3-pro/userland/src/selftest.m
++++ b/devices/poco-x3-pro/userland/src/selftest.m
+@@ -77,6 +77,7 @@
+ #define AT_FILES		45
+ #define AT_MUSIC		80
+ #define AT_MIC			140
++#define AT_MIC_APP		145
+ #define AT_CAMERA		170
+ /* S5: the synthetic swipe, between the microphone and the camera (a list in the foreground) */
+ #define AT_SWIPE		150
+@@ -1795,7 +1796,10 @@
+ 		return 0;
+ 	}
+ 	while ([recorder isRecording] && now_seconds() - started < seconds + 6.0) {
+-		usleep(100000);
++		/* the run loop, not usleep: AVAudioRecorder's state (isRecording) and its delegate
++		 * callbacks are delivered on the main queue. TEST24/TEST25's usleep loop left a 3 s
++		 * recording "recording" for 9.3 s although the file was cut at 3 s. */
++		pump_main(0.1);
+ 	}
+ 	[recorder stop];
+ 	usleep(300000);   /* AVAudioRecorder closes the file in its own time */
+@@ -1832,6 +1836,465 @@
+ 	return pass;
+ }
+ 
++/* ---- microphone in an application (Voice Memos's path) --------------------------------------- */
++
++/*
++ * mic_app: the recording an application makes, not just the device the kernel feeds.
++ *
++ * Voice Memos on this system is a normal AVAudioSession/AVAudioRecorder client: category
++ * play-and-record, mode default, an AAC .m4a at the hardware's rate (Settings.bundle's
++ * RCVoiceMemosAudioQualityKey defaults to 0 = AAC), metering for the waveform, and AVAudioPlayer
++ * for playback. The mic stage above uses AVAudioRecorder too, but it writes LinearPCM, never
++ * plays the result and never looks at the session's route, errors or the recorder's delegate; an
++ * application failure can therefore hide behind its PASS.
++ *
++ * This stage is deliberately the application's shape: it records BOTH an AAC .m4a (as the app
++ * does) and a 16-bit WAV (the kernel's own format, for the peak floor), logs every AVAudioSession
++ * error with its domain and code, the input route and data source ('imic' is the Codec's), the
++ * TCC database and Voice Memos's save directories, the recorder's delegate callback, and then
++ * plays the .m4a through AVAudioPlayer.
++ *
++ * Why every wait pumps the run loop: AVAudioRecorder's state, its delegate and AVAudioPlayer's
++ * updates are delivered on the main queue. The old mic stage busy-waited with usleep() and in
++ * TEST24/TEST25 `recordForDuration:3` was still "recording" 9.3 s later although the file had
++ * been cut at 3 s -- nothing pumped the queue. An application runs a run loop, so this stage does too.
++ */
++
++struct mic_app_wave {
++	int		ok;
++	char		why[200];
++	double		rate;
++	unsigned	channels;
++	double		seconds;
++	double		peak;		/* 0..1 of full scale */
++	double		rms;
++	unsigned long long frames;
++};
++
++@interface STMicAppDelegate : NSObject <AVAudioRecorderDelegate>
++@property (nonatomic) BOOL finished;
++@property (nonatomic) BOOL success;
++@property (nonatomic) BOOL encoded_error;
++@end
++
++@implementation STMicAppDelegate
++- (void)audioRecorderDidFinishRecording:(AVAudioRecorder *)recorder successfully:(BOOL)success
++{
++	(void)recorder;
++	self.finished = YES;
++	self.success = success;
++}
++
++- (void)audioRecorderEncodeErrorDidOccur:(AVAudioRecorder *)recorder error:(NSError *)error
++{
++	char text[256];
++
++	(void)recorder;
++	self.encoded_error = YES;
++	stage_say("the recorder's encoder error: %s", error_text(error, text, sizeof(text)));
++}
++@end
++
++/* Voice Memos saves under /var/mobile/Media/Recordings (its signature's absolute-path exception);
++ * the TCC database is where a non-entitled client's grant would live. Say what is there. */
++static void
++mic_app_probe_paths(void)
++{
++	static const char *const paths[] = {
++		"/private/var/mobile/Library/TCC/TCC.db",
++		"/private/var/mobile/Media/Recordings",
++		"/var/mobile/Media/Recordings",
++		"/private/var/mobile/Library/Recordings",
++		"/var/mobile/Library/Recordings",
++		"/Applications/VoiceMemos.app/VoiceMemos",
++		"/private/var/staged_system_apps/VoiceMemos.app/VoiceMemos",
++	};
++	struct stat status;
++
++	for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
++		memset(&status, 0, sizeof(status));
++		if (stat(paths[i], &status) == 0) {
++			stage_say("path %s: present, mode 0%o, owner %d:%d, %lld byte(s)%s", paths[i],
++			    (unsigned)status.st_mode & 07777, (int)status.st_uid, (int)status.st_gid,
++			    (long long)status.st_size, S_ISDIR(status.st_mode) && access(paths[i], W_OK) == 0 ?
++			    ", writable by this process" : "");
++		} else {
++			stage_say("path %s: %s", paths[i], strerror(errno));
++		}
++	}
++}
++
++/*
++ * An .m4a through AVFoundation, the way the application's encoder wrote it: decode with
++ * AVAudioFile (it goes through ExtAudioFile/the AAC decoder, not a WAV header) and take the peak
++ * and RMS of the float samples. A file that cannot be opened or decoded is a failure with the
++ * error, not a silent PASS.
++ */
++static void
++mic_app_analyze_audio(const char *path, struct mic_app_wave *out)
++{
++	memset(out, 0, sizeof(*out));
++	@autoreleasepool {
++		NSError *error = nil;
++		NSString *string = [NSString stringWithUTF8String:path];
++		AVAudioFile *file = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:string] error:&error];
++		AVAudioFormat *format;
++		AVAudioPCMBuffer *buffer;
++		double sum = 0.0, peak = 0.0, rate;
++		unsigned long long frames = 0;
++		unsigned channels;
++
++		if (file == nil) {
++			char text[160];
++
++			snprintf(out->why, sizeof(out->why), "AVAudioFile: %s", error_text(error, text, sizeof(text)));
++			return;
++		}
++		format = [file processingFormat];
++		rate = [format sampleRate];
++		channels = (unsigned)[format channelCount];
++		if (rate <= 0 || channels == 0) {
++			snprintf(out->why, sizeof(out->why), "the file's format is %.0f Hz, %u channel(s)", rate, channels);
++			return;
++		}
++		buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format
++		    frameCapacity:(AVAudioFrameCount)(rate * 0.5 > 1024 ? rate * 0.5 : 1024)];
++		if (buffer == nil) {
++			snprintf(out->why, sizeof(out->why), "no PCM buffer for %.0f Hz, %u channel(s)", rate, channels);
++			return;
++		}
++		for (int chunk = 0; chunk < 400; chunk++) {
++			AVAudioFrameCount count;
++			float *const *data;
++
++			buffer.frameLength = 0;
++			error = nil;
++			if (![file readIntoBuffer:buffer error:&error]) {
++				if (error != nil) {
++					char text[160];
++
++					snprintf(out->why, sizeof(out->why), "read: %s",
++					    error_text(error, text, sizeof(text)));
++				}
++				break;
++			}
++			count = [buffer frameLength];
++			if (count == 0) {
++				break;
++			}
++			data = [buffer floatChannelData];
++			if (data == NULL) {
++				snprintf(out->why, sizeof(out->why), "the processing format is interleaved (no floatChannelData)");
++				break;
++			}
++			for (unsigned c = 0; c < channels; c++) {
++				for (AVAudioFrameCount i = 0; i < count; i++) {
++					double v = data[c][i];
++					double magnitude = v < 0 ? -v : v;
++
++					peak = magnitude > peak ? magnitude : peak;
++					sum += v * v;
++				}
++			}
++			frames += count;
++		}
++		out->rate = rate;
++		out->channels = channels;
++		out->frames = frames;
++		out->seconds = rate > 0 ? (double)frames / rate : 0.0;
++		out->peak = peak;
++		out->rms = frames * channels > 0 ? sqrt(sum / (double)(frames * channels)) : 0.0;
++		out->ok = frames > 0;
++		if (!out->ok && out->why[0] == '\0') {
++			snprintf(out->why, sizeof(out->why), "the file decoded to no samples");
++		}
++	}
++}
++
++/* The application's playback: AVAudioPlayer on the .m4a it just recorded. Returns the seconds of
++ * the file whose clock moved (0 when it never started), which is what "played" means. */
++static double
++mic_app_play(const char *path, double seconds)
++{
++	@autoreleasepool {
++		NSError *error = nil;
++		NSString *string = [NSString stringWithUTF8String:path];
++		AVAudioPlayer *player = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:string]
++		    error:&error];
++		double began, heard, played;
++		BOOL prepared, started;
++		char text[256];
++
++		if (player == nil) {
++			stage_say("the playback: AVAudioPlayer could not be made: %s",
++			    error_text(error, text, sizeof(text)));
++			return 0.0;
++		}
++		(void)[player setVolume:1.0];
++		prepared = [player prepareToPlay];
++		started = [player play];
++		began = now_seconds();
++		heard = [player currentTime];
++		while (now_seconds() - began < 2.0 && heard <= 0.01 && ![player isPlaying]) {
++			pump_main(0.1);
++			heard = [player currentTime];
++		}
++		while ([player isPlaying] && now_seconds() - began < seconds + 3.0) {
++			pump_main(0.1);
++			heard = [player currentTime];
++		}
++		if ([player isPlaying]) {
++			[player stop];
++		}
++		played = heard;
++		stage_say("the playback of %s: AVAudioPlayer made, prepareToPlay %s, play %s, %.2f s of %.2f s "
++		    "played in %.2f s, %u channel(s), volume %.2f", path, prepared ? "yes" : "NO",
++		    started ? "yes" : "NO", played, [player duration], now_seconds() - began,
++		    (unsigned)[player numberOfChannels], [player volume]);
++		return played;
++	}
++}
++
++/* One AVAudioRecorder run, metered and stopped by hand (the application's record button, not
++ * recordForDuration: whose timer stage_mic's old usleep loop never drained). */
++static AVAudioRecorder *
++mic_app_record(const char *path, NSDictionary *settings, double seconds, STMicAppDelegate *delegate,
++    double *elapsed, double *average_low, double *average_high, double *peak_low, double *peak_high,
++    int *meter_reads, char *why, size_t why_size)
++{
++	NSError *error = nil;
++	NSString *string = [NSString stringWithUTF8String:path];
++	AVAudioRecorder *recorder = [[AVAudioRecorder alloc] initWithURL:[NSURL fileURLWithPath:string]
++	    settings:settings error:&error];
++	double began;
++	int reads = 0;
++
++	*elapsed = 0.0;
++	*meter_reads = 0;
++	if (recorder == nil) {
++		char text[160];
++
++		snprintf(why, why_size, "AVAudioRecorder: %s", error_text(error, text, sizeof(text)));
++		return nil;
++	}
++	[recorder setDelegate:delegate];
++	[recorder setMeteringEnabled:YES];
++	if (![recorder prepareToRecord]) {
++		snprintf(why, why_size, "prepareToRecord said NO");
++		return nil;
++	}
++	began = now_seconds();
++	if (![recorder record]) {
++		snprintf(why, why_size, "record said NO");
++		return nil;
++	}
++	while (now_seconds() - began < seconds) {
++		float average, peak;
++
++		pump_main(0.1);
++		[recorder updateMeters];
++		average = [recorder averagePowerForChannel:0];
++		peak = [recorder peakPowerForChannel:0];
++		if (reads == 0 || average < *average_low) {
++			*average_low = average;
++		}
++		if (reads == 0 || average > *average_high) {
++			*average_high = average;
++		}
++		if (reads == 0 || peak < *peak_low) {
++			*peak_low = peak;
++		}
++		if (reads == 0 || peak > *peak_high) {
++			*peak_high = peak;
++		}
++		reads++;
++	}
++	[recorder stop];
++	*elapsed = now_seconds() - began;
++	*meter_reads = reads;
++	pump_main(0.3);		/* the delegate's callback is delivered on the main queue */
++	return recorder;
++}
++
++static int
++stage_mic_app(double at, double seconds)
++{
++	AVAudioSession *session;
++	STMicAppDelegate *delegate;
++	NSDictionary *aac_settings, *pcm_settings;
++	struct st_wave pcm;
++	struct mic_app_wave aac;
++	NSError *error = nil;
++	char aac_path[PATH_MAX], pcm_path[PATH_MAX], why[256];
++	char meters[256];
++	unsigned long permission;
++	char permission_text[8];
++	double rate, elapsed, played, average_low = 0, average_high = 0, peak_low = 0, peak_high = 0;
++	int meter_reads = 0, session_ok, aac_ok, pcm_ok, play_ok;
++	BOOL category, active, recorded, aac_delegate_ok = NO;
++
++	g_stage = "mic_app";
++	if (!claim_stage()) {
++		return 0;
++	}
++	wait_until(at);
++	mic_app_probe_paths();
++
++	session = [AVAudioSession sharedInstance];
++	stage_say("the session: %s", session != nil ? "sharedInstance" : "NO SESSION");
++	if (session == nil) {
++		stage_result(0, "no AVAudioSession");
++		return 0;
++	}
++	category = [session setCategory:AVAudioSessionCategoryPlayAndRecord error:&error];
++	stage_say("setCategory play-and-record: %s", category ? "set" : "NOT SET");
++	if (!category) {
++		log_error("setCategory", error);
++	}
++	error = nil;
++	active = [session setActive:YES error:&error];
++	stage_say("setActive: %s", active ? "active" : "NOT ACTIVE");
++	if (!active) {
++		log_error("setActive", error);
++	}
++	permission = (unsigned long)[session recordPermission];
++	for (int i = 0; i < 4; i++) {
++		permission_text[i] = (char)((permission >> (24 - 8 * i)) & 0xff);
++		permission_text[i + 1] = '\0';
++	}
++	for (int i = 0; i < 4; i++) {
++		if (permission_text[i] < 0x20 || permission_text[i] > 0x7e) {
++			permission_text[i] = '?';
++		}
++	}
++	rate = [session sampleRate] > 0 ? [session sampleRate] : 48000;
++	stage_say("input available: %s; record permission 0x%lx ('%s'); %lu input channel(s), %.0f Hz, "
++	    "I/O buffer %.4f s, input gain %.2f, input latency %.4f s", [session isInputAvailable] ? "yes" : "NO",
++	    permission, permission_text, (unsigned long)[session inputNumberOfChannels], rate,
++	    [session IOBufferDuration], [session inputGain], [session inputLatency]);
++	log_audio_route("before the application records");
++	{
++		NSArray *inputs = [session availableInputs];
++		char joined[512];
++
++		join_ports(inputs, joined, sizeof(joined));
++		stage_say("available inputs: %lu [%s]", (unsigned long)[inputs count], joined);
++		for (AVAudioSessionPortDescription *port in inputs) {
++			stage_say("input port \"%s\": type %s, UID %s, %lu channel(s), %lu data source(s)",
++			    [[port portName] UTF8String], [[port portType] UTF8String],
++			    [[port UID] UTF8String], (unsigned long)[[port channels] count],
++			    (unsigned long)[[port dataSources] count]);
++			for (AVAudioSessionDataSourceDescription *source in [port dataSources]) {
++				stage_say("input port %s: data source %d (%s)%s", [[port portName] UTF8String],
++				    [[source dataSourceID] intValue], [[source dataSourceName] UTF8String],
++				    [[port selectedDataSource] isEqual:source] ? ", selected" : "");
++			}
++		}
++	}
++
++	ensure_dirs(SELFTEST_DIR);
++	snprintf(aac_path, sizeof(aac_path), "/tmp/selftest-micapp-%llu.m4a", g_run_id);
++	snprintf(pcm_path, sizeof(pcm_path), "/tmp/selftest-micapp-%llu.wav", g_run_id);
++	(void)unlink(aac_path);
++	(void)unlink(pcm_path);
++	/* Voice Memos: AAC, the session's own rate, one channel (Settings.bundle's quality default) */
++	aac_settings = @{
++		AVFormatIDKey: @(kAudioFormatMPEG4AAC),
++		AVSampleRateKey: @(rate),
++		AVNumberOfChannelsKey: @1,
++		AVEncoderAudioQualityKey: @(AVAudioQualityHigh),
++	};
++	pcm_settings = @{
++		AVFormatIDKey: @(kAudioFormatLinearPCM),
++		AVSampleRateKey: @(rate),
++		AVNumberOfChannelsKey: @1,
++		AVLinearPCMBitDepthKey: @16,
++		AVLinearPCMIsFloatKey: @NO,
++		AVLinearPCMIsBigEndianKey: @NO,
++	};
++
++	delegate = [[STMicAppDelegate alloc] init];
++	why[0] = '\0';
++	recorded = NO;
++	{
++		AVAudioRecorder *made = mic_app_record(aac_path, aac_settings, seconds, delegate, &elapsed,
++		    &average_low, &average_high, &peak_low, &peak_high, &meter_reads, why, sizeof(why));
++
++		recorded = made != nil;
++	}
++	{
++		BOOL finished = delegate.finished, success = delegate.success, encoded = delegate.encoded_error;
++
++		snprintf(meters, sizeof(meters), "metering %d read(s): average %.1f..%.1f dB, peak %.1f..%.1f dB",
++		    meter_reads, average_low, average_high, peak_low, peak_high);
++		if (recorded) {
++			stage_say("the AAC recording: %s, %.2f s asked for, stopped after %.2f s, %s, delegate %s "
++			    "(success %s)%s", aac_path, seconds, elapsed, meters, finished ? "fired" : "NOT FIRED",
++			    success ? "yes" : "no", encoded ? ", ENCODER ERROR" : "");
++		} else {
++			stage_say("the AAC recording: %s: %s", aac_path, why[0] != '\0' ? why : "no recorder");
++		}
++		aac_delegate_ok = finished && success;
++	}
++	mic_app_analyze_audio(aac_path, &aac);
++	if (aac.ok) {
++		stage_say("the AAC file: %.0f Hz, %u channel(s), %.2f s, %llu frame(s), peak %.4f (%.1f dBFS), "
++		    "rms %.4f (%.1f dBFS)", aac.rate, aac.channels, aac.seconds, aac.frames, aac.peak,
++		    aac.peak > 0 ? 20.0 * log10(aac.peak) : -999.0, aac.rms,
++		    aac.rms > 0 ? 20.0 * log10(aac.rms) : -999.0);
++	} else {
++		stage_say("the AAC file %s: %s", aac_path, aac.why);
++	}
++
++	delegate = [[STMicAppDelegate alloc] init];
++	why[0] = '\0';
++	average_low = average_high = peak_low = peak_high = 0;
++	meter_reads = 0;
++	{
++		AVAudioRecorder *made = mic_app_record(pcm_path, pcm_settings, seconds, delegate, &elapsed,
++		    &average_low, &average_high, &peak_low, &peak_high, &meter_reads, why, sizeof(why));
++
++		recorded = made != nil;
++	}
++	snprintf(meters, sizeof(meters), "metering %d read(s): average %.1f..%.1f dB, peak %.1f..%.1f dB",
++	    meter_reads, average_low, average_high, peak_low, peak_high);
++	if (recorded) {
++		stage_say("the WAV recording: %s, %.2f s asked for, stopped after %.2f s, %s, delegate %s "
++		    "(success %s)%s", pcm_path, seconds, elapsed, meters, delegate.finished ? "fired" : "NOT FIRED",
++		    delegate.success ? "yes" : "no", delegate.encoded_error ? ", ENCODER ERROR" : "");
++	} else {
++		stage_say("the WAV recording: %s: %s", pcm_path, why[0] != '\0' ? why : "no recorder");
++	}
++	memset(&pcm, 0, sizeof(pcm));
++	st_wave_analyze(pcm_path, &pcm);
++	if (pcm.ok) {
++		char line[1024];
++
++		st_wave_describe(&pcm, line, sizeof(line));
++		stage_say("the WAV file: %.2f s, %s", (double)pcm.frames / (double)(pcm.rate > 0 ? pcm.rate : 1), line);
++	} else {
++		stage_say("the WAV file %s: %s", pcm_path, pcm.why);
++	}
++
++	/* the application plays the recording it just made; the recording path is proved by the file,
++	 * the playback path by the clock moving */
++	played = mic_app_play(aac_path, seconds);
++
++	session_ok = category && active && [session isInputAvailable];
++	aac_ok = aac.ok && aac.seconds >= seconds * 0.8 && aac.peak > 1.0e-4 && aac.rms > 1.0e-5;
++	pcm_ok = pcm.ok && pcm.frames >= (unsigned long long)(rate * seconds * 0.5) && pcm.peak > 200 &&
++	    !pcm.all_equal;
++	play_ok = played >= (seconds * 0.5 < 1.0 ? 0.5 : seconds * 0.5);
++	stage_result(session_ok && aac_ok && pcm_ok && play_ok,
++	    "session=%s input=%s aac=%.2fs aac_peak=%.4f(%.1f dBFS) aac_rms=%.4f pcm=%.2fs pcm_peak=%d "
++	    "pcm_rms=%.1f playback=%.2fs delegate=%s", session_ok ? "active" : "NOT-ACTIVE",
++	    [session isInputAvailable] ? "yes" : "NO", aac.seconds, aac.peak,
++	    aac.peak > 0 ? 20.0 * log10(aac.peak) : -999.0, aac.rms,
++	    (double)pcm.frames / (double)(pcm.rate > 0 ? pcm.rate : 1), pcm.peak, pcm.rms, played,
++	    aac_delegate_ok ? "yes" : "no");
++	return session_ok && aac_ok && pcm_ok && play_ok;
++}
++
+ /* ---- camera --------------------------------------------------------------------------------- */
+ 
+ static void
+@@ -2553,7 +3016,7 @@
+ static int
+ stage_summary(void)
+ {
+-	static const char *stages[] = { "files", "music", "mic", "camera" };
++	static const char *stages[] = { "files", "music", "mic", "mic_app", "camera" };
+ 	static char text[262144];
+ 	char line[1024] = "";
+ 	int passed = 0;
+@@ -2682,10 +3145,10 @@
+ }
+ 
+ static int
+-run_all(const char *source, const char *track, double mic_seconds, int app_timeout)
++run_all(const char *source, const char *track, double mic_seconds, double app_seconds, int app_timeout)
+ {
+ 	char lock_path[PATH_MAX];
+-	char at_text[32], results_arg[PATH_MAX + 16], seconds_text[32], timeout_text[32];
++	char at_text[32], results_arg[PATH_MAX + 16], seconds_text[32], app_seconds_text[32], timeout_text[32];
+ 	struct stage_plan plan[6];
+ 	unsigned plans = 0;
+ 	int lock_fd, failures = 0, ran = 0;
+@@ -2716,9 +3179,11 @@
+ 	plan[plans++] = (struct stage_plan){ "music", AT_MUSIC, 360, { at_text, results_arg, "--source", source,
+ 	    "--track", track, NULL } };
+ 	plan[plans++] = (struct stage_plan){ "mic", AT_MIC, 180, { at_text, results_arg, seconds_text, NULL } };
++	plan[plans++] = (struct stage_plan){ "mic_app", AT_MIC_APP, 240, { at_text, results_arg, app_seconds_text, NULL } };
+ 	plan[plans++] = (struct stage_plan){ "swipe", AT_SWIPE, 120, { at_text, results_arg, NULL } };
+ 	plan[plans++] = (struct stage_plan){ "camera", AT_CAMERA, 300, { at_text, results_arg, timeout_text, NULL } };
+ 	snprintf(seconds_text, sizeof(seconds_text), "--seconds=%.1f", mic_seconds);
++	snprintf(app_seconds_text, sizeof(app_seconds_text), "--app-seconds=%.1f", app_seconds);
+ 	snprintf(timeout_text, sizeof(timeout_text), "--app-timeout=%d", app_timeout);
+ 
+ 	for (unsigned i = 0; i < plans; i++) {
+@@ -2799,8 +3264,8 @@
+ static void
+ usage(void)
+ {
+-	printf("selftest: run|files|music|mic|swipe|camera|summary|poweroff|export [--at=S] [--results=FILE]\n"
+-	    "          [--source=FILE] [--track=NAME] [--seconds=N] [--app-timeout=N] [--again]\n"
++	printf("selftest: run|files|music|mic|mic_app|swipe|camera|summary|poweroff|export [--at=S] [--results=FILE]\n"
++	    "          [--source=FILE] [--track=NAME] [--seconds=N] [--app-seconds=N] [--app-timeout=N] [--again]\n"
+ 	    "          swipe: [--hz=N] [--swipe-ms=N] [--swipes=N] (needs boot-arg s5_swipe=1)\n"
+ 	    "          selftest --write-file NAME (internal)\n"
+ 	    "          selftest --exec-mobile PROGRAM [ARG...] (internal: drop to 501, exec)\n"
+@@ -2814,7 +3279,7 @@
+ 	const char *command;
+ 	const char *source = MUSIC_SOURCE;
+ 	const char *track = MUSIC_TRACK;
+-	double at = -1, mic_seconds = 3.0;
++	double at = -1, mic_seconds = 3.0, app_seconds = 5.0;
+ 	int app_timeout = 90;
+ 	int hz = 240, swipe_ms = 1400, swipes = 4;
+ 	int result = 0;
+@@ -2863,12 +3328,16 @@
+ 			track = argv[i] + 8;
+ 		} else if (strncmp(argv[i], "--seconds=", 10) == 0) {
+ 			mic_seconds = atof(argv[i] + 10);
++		} else if (strncmp(argv[i], "--app-seconds=", 14) == 0) {
++			app_seconds = atof(argv[i] + 14);
+ 		} else if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) {
+ 			source = argv[++i];
+ 		} else if (strcmp(argv[i], "--track") == 0 && i + 1 < argc) {
+ 			track = argv[++i];
+ 		} else if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) {
+ 			mic_seconds = atof(argv[++i]);
++		} else if (strcmp(argv[i], "--app-seconds") == 0 && i + 1 < argc) {
++			app_seconds = atof(argv[++i]);
+ 		} else if (strcmp(argv[i], "--app-timeout") == 0 && i + 1 < argc) {
+ 			app_timeout = atoi(argv[++i]);
+ 		} else if (strncmp(argv[i], "--app-timeout=", 14) == 0) {
+@@ -2895,6 +3364,7 @@
+ 		at = strcmp(command, "files") == 0 ? AT_FILES :
+ 		    strcmp(command, "music") == 0 ? AT_MUSIC :
+ 		    strcmp(command, "mic") == 0 ? AT_MIC :
++		    strcmp(command, "mic_app") == 0 ? AT_MIC_APP :
+ 		    strcmp(command, "swipe") == 0 ? AT_SWIPE :
+ 		    strcmp(command, "camera") == 0 ? AT_CAMERA : 0;
+ 	}
+@@ -2910,13 +3380,15 @@
+ 	@autoreleasepool {
+ 		if (strcmp(command, "run") == 0) {
+ 			g_stage = "run";
+-			result = run_all(source, track, mic_seconds, app_timeout);
++			result = run_all(source, track, mic_seconds, app_seconds, app_timeout);
+ 		} else if (strcmp(command, "files") == 0) {
+ 			result = stage_files(at) ? 0 : 1;
+ 		} else if (strcmp(command, "music") == 0) {
+ 			result = stage_music(at, source, track) ? 0 : 1;
+ 		} else if (strcmp(command, "mic") == 0) {
+ 			result = stage_mic(at, mic_seconds) ? 0 : 1;
++		} else if (strcmp(command, "mic_app") == 0) {
++			result = stage_mic_app(at, app_seconds) ? 0 : 1;
+ 		} else if (strcmp(command, "swipe") == 0) {
+ 			result = stage_swipe(at, hz, swipe_ms, swipes) ? 0 : 1;
+ 		} else if (strcmp(command, "camera") == 0) {

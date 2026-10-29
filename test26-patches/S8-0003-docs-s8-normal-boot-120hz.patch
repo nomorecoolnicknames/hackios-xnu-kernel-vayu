@@ -1,0 +1,52 @@
+--- /dev/null
++++ b/docs/s8-normal-boot-120hz.md
+@@ -0,0 +1,49 @@
++# S8 — 120 Hz in a normal boot (no `selftest=1`)
++
++The 120 Hz work of S4–S7 was all behind boot arguments (`fb_120=1`, `t120=1`,
++`t120_idle=1`, `t120_vel=1`, `t120_link=3`, `s5_fps=1000`, `s5_swipe=1`, `s7=1`).
++A normal boot has none of them, so every one of those switches was off: the display
++was an iPhone X's 60 to iOS, CoreAnimation kept its 16.7 ms floor and its frame-rate
++restriction, the scroll view's display link asked for 60, the touch screen was read at
++125 Hz, and the activation alert of the fake SIM stayed on the screen and ate touches.
++That is the difference between TEST24's synthetic 105–121 frames/s and the owner's
++finger.
++
++Since S8 these are the defaults. Each keeps its own `...=0` to turn it off; `s8=0`
++turns the whole set off.
++
++| what | default | off |
++|---|---|---|
++| kernel: display told 120 Hz, a refresh every panel frame (`fb_120`) | 1 | `fb_120=0` |
++| kernel: one-second frame window with screen-touch samples (`s5_fps`) | 1000 | `s5_fps=0` |
++| kernel: 1125x2436 cropped onto 1080x2400, rows copied (`fb_crop`) | 1 | `fb_crop=0` |
++| kernel: six copy threads (`fb_threads`) | 6 | `fb_threads=3` |
++| kernel: three swaps may wait (`fb_queue`) | 3 | `fb_queue=2` |
++| kernel: touch sampled at the panel's rate (`touch_hz`) | 240 | `touch_hz=0` / `touch_poll_us=N` |
++| backboardd/SpringBoard/apps: QuartzCore restriction off, 120 Hz range, no idle/velocity cap (`t120`, `t120_idle`, `t120_vel`) | on | `t120=0`, `t120_idle=0`, `t120_vel=0` |
++| apps: every display link that asks for 60 or more is answered 120 (`t120_link`) | 3 | `t120_link=0` |
++| apps: the per-second `S5:` line (events, links, QuartzCore bytes) (`s5_swipe`) | on | `s5_swipe=0` |
++| SpringBoard: the fake SIM's activation alert, the switcher and the cover sheet are dropped (`s7`) | on | `s7=0` |
++| MobileGestalt `touchDelivery120Hz` and UIKit's `_shouldGenerate120HzEvents` are answered yes (`s8_touch`) | on | `s8_touch=0` |
++
++## What to read in a normal-boot log
++
++```
++MiniIOMobileFramebuffer: s8: normal boot: display to iOS 120 Hz (fb_120=1, ...), ... copy: fb_crop=1, fb_threads=6, fb_queue=3
++MiniIOMobileFramebuffer: S5FPS: 1000 ms: 120 frames (120 a second), 121 refreshes told..., 0 synthetic touch samples, finger 0, 240 screen touch samples, screen finger 1; ...
++hakios: backboardd: s8: normal boot: 120 Hz while a finger is down ...
++hakios: Preferences: s8: normal boot: 120 Hz while a finger is down (..., link=3)
++hakios: Preferences: S5: 240 events in 1000 ms (240 a second); display links 1 seen (asked 120: 0, 60 or more: 2, ..., raised: 2); UIScreen maximumFramesPerSecond 120; QuartzCore: CA_FORCE_120HZ=1 idle=1 velocity=1 ...
++hakios: Preferences: s8: _MobileGestalt_get_touchDelivery120Hz at ... answers 0
++hakios: Preferences: s8: -[<class> _shouldGenerate120HzEvents] (B16, was ...) answers YES
++```
++
++`S5FPS` is printed only in a window in which a frame was drawn, so an idle screen
++prints nothing there; the boot line and the `s8:` lines say the defaults are in force.
++
++## Conditions that are not code
++
++- The window server must be drawing on the GPU (`gpu=1 vayu_gpu=1`, `src/eagl.c`).
++  With the software renderer 120 frames cannot be filled regardless of the switches;
++  the `S5FPS` line then shows the frames and the driver's `neither` count says the
++  renderer, not the clock, is the limit.

@@ -1,0 +1,141 @@
+--- a/userland/src/audio_plugin.c
++++ b/userland/src/audio_plugin.c
+@@ -298,6 +298,25 @@
+ 	write(2, line, (size_t)n);
+ }
+ 
++/* The client's short name, for the log: which process bound the microphone (selftest / VoiceMemos /
++ * mediaserverd itself). kp_proc.p_comm is MAXCOMLEN+1 bytes; a failed lookup says "?". */
++static const char *
++client_name(pid_t pid, char *buffer, size_t size)
++{
++	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid };
++	struct kinfo_proc info;
++	size_t length = sizeof(info);
++
++	buffer[0] = '\0';
++	if (sysctl(mib, 4, &info, &length, NULL, 0) == 0 && length >= sizeof(info)) {
++		snprintf(buffer, size, "%s", info.kp_proc.p_comm);
++	}
++	if (buffer[0] == '\0') {
++		snprintf(buffer, size, "?");
++	}
++	return buffer;
++}
++
+ /* The volume control's scale: a straight line of decibels over VOLUME_RANGE_DB. */
+ static Float32
+ scalar_to_db(Float32 scalar)
+@@ -1096,7 +1115,10 @@
+ 		pthread_mutex_unlock(&lock);
+ 		/* the microphone's stream, on or off: the run's record of whether iOS takes the input (R10) */
+ 		if (device_of(object) != NULL && device_of(object)->input == object) {
+-			say("hakios: audio: the microphone's stream is %s\n", *(const UInt32 *)data != 0 ? "on" : "off");
++			char name[32];
++
++			say("hakios: audio: the microphone's stream is %s (client pid %d, %s)\n",
++			    *(const UInt32 *)data != 0 ? "on" : "off", (int)client, client_name(client, name, sizeof(name)));
+ 		}
+ 		return 0;
+ 	}
+@@ -1121,10 +1143,15 @@
+ 		return kAudioHardwareBadPropertySizeError;
+ 	} else {
+ 		const AudioStreamBasicDescription *wanted = data, format = format_of(object);
++		char name[32];
+ 
+ 		if (wanted->mFormatID != format.mFormatID || wanted->mChannelsPerFrame != format.mChannelsPerFrame ||
+ 		    wanted->mBitsPerChannel != format.mBitsPerChannel || !(wanted->mFormatFlags & kAudioFormatFlagIsSignedInteger)) {
+-			say("redwood: audio: format refused on object %u: %.0f Hz, %u channels, %u bits, flags 0x%x\n", object,
++			say("redwood: audio: format refused on object %u (%s, input %u), client pid %d (%s): %.0f Hz, %u channels, "
++			    "%u bits, flags 0x%x\n", object,
++			    device_of(object) != NULL ? CFStringGetCStringPtr(device_of(object)->uid, kCFStringEncodingUTF8) : "-",
++			    device_of(object) != NULL && device_of(object)->input == object, (int)client,
++			    client_name(client, name, sizeof(name)),
+ 			    wanted->mSampleRate, wanted->mChannelsPerFrame, wanted->mBitsPerChannel, wanted->mFormatFlags);
+ 			return kAudioDeviceUnsupportedFormatError;
+ 		}
+@@ -1133,8 +1160,21 @@
+ 			return request_rate(device_of(object), wanted->mSampleRate);
+ 		}
+ 		if (wanted->mSampleRate != format.mSampleRate) {
+-			say("redwood: audio: format at %.0f Hz asked for on object %u, keeps %.0f\n", wanted->mSampleRate, object,
+-			    format.mSampleRate);
++			say("redwood: audio: format at %.0f Hz asked for on object %u, keeps %.0f (client pid %d, %s)\n",
++			    wanted->mSampleRate, object, format.mSampleRate, (int)client,
++			    client_name(client, name, sizeof(name)));
++		} else if (device_of(object) != NULL && device_of(object)->input == object) {
++			/* the input the application bound: which client, and the format it will be read in. Eight
++			 * lines are enough for a run of a few recorders; a HAL that sets it per cycle would flood. */
++			static unsigned said;
++
++			if (said < 8) {
++				said++;
++				say("hakios: audio: the microphone's input format set by client pid %d (%s): %.0f Hz, %u channel(s), "
++				    "%u bits, flags 0x%x\n", (int)client, client_name(client, name, sizeof(name)),
++				    wanted->mSampleRate, wanted->mChannelsPerFrame, wanted->mBitsPerChannel,
++				    wanted->mFormatFlags);
++			}
+ 		}
+ 		return 0;
+ 	}
+@@ -1156,15 +1196,18 @@
+ static unsigned mic_reopens;
+ 
+ static void
+-codec_open(void)
++codec_open(pid_t client)
+ {
++	char name[32];
++
+ 	mic = open("/dev/hakios-mic", O_RDONLY | O_NONBLOCK);
+ 	mic_frames = mic_heard = mic_short = 0;
+ 	mic_peak = 0;
+ 	mic_zero_reads = mic_zero_frames = mic_empty_reads = 0;
+ 	mic_empty_since = 0;
+ 	mic_reopens = 0;
+-	say("hakios: audio: the microphone is listened to (/dev/hakios-mic: %s)\n", mic < 0 ? strerror(errno) : "open");
++	say("hakios: audio: the microphone is listened to (/dev/hakios-mic: %s), client pid %d (%s)\n",
++	    mic < 0 ? strerror(errno) : "open", (int)client, client_name(client, name, sizeof(name)));
+ 	/* what iOS is offered as its built-in microphone (R10), for the record of a run */
+ 	say("hakios: audio: the microphone's input: built in, 1 channel, %d Hz, 16-bit signed (the HAL's \"Codec\")\n",
+ 	    HAKIOS_AUDIO_RATE);
+@@ -1273,7 +1316,7 @@
+ }
+ 
+ static OSStatus
+-start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused UInt32 client)
++start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, UInt32 client)
+ {
+ 	struct device *d = device_of(object);
+ 
+@@ -1289,7 +1332,7 @@
+ 			say("hakios: audio: playing\n");
+ 		}
+ 		if (d->object == OBJECT_CODEC) {
+-			codec_open();
++			codec_open(client);
+ 		}
+ 	}
+ 	pthread_mutex_unlock(&lock);
+@@ -1297,7 +1340,7 @@
+ }
+ 
+ static OSStatus
+-stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused UInt32 client)
++stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, UInt32 client)
+ {
+ 	struct device *d = device_of(object);
+ 
+@@ -1307,7 +1350,11 @@
+ 	pthread_mutex_lock(&lock);
+ 	if (d->running != 0 && --d->running == 0) {
+ 		if (d->object == OBJECT_CODEC) {
++			char name[32];
++
+ 			codec_close();
++			say("hakios: audio: the microphone's input stopped, client pid %d (%s)\n", (int)client,
++			    client_name(client, name, sizeof(name)));
+ 		} else if (d->output != 0) {
+ 			say("hakios: audio: stopped after %llu.%02llu s (%llu frames not taken by %s)\n", written / HAKIOS_AUDIO_RATE,
+ 			    written % HAKIOS_AUDIO_RATE * 100 / HAKIOS_AUDIO_RATE, refused, HAKIOS_AUDIO_DEVICE);
