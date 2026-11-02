@@ -33,7 +33,9 @@
  *
  * Boot-args: vayu_sms=0/1 (default 0), vayu_sms_wait=S (30), vayu_sms_routes=1,
  * vayu_sms_store=0|1 (UIM|NV), vayu_sms_refresh=S (60, 0 off), vayu_sms_scan=N
- * (20, the largest index Raw Read sweeps when List Messages is refused).
+ * (20, the largest index Raw Read sweeps when List Messages is refused),
+ * vayu_sms_smsc=0|1 (0: Raw Send gets the TPDU and the modem uses EF_SMSC;
+ * 1: the full PDU with a leading 0x00 "default SMSC" byte).
  *
  * Facts behind the numbers: service 0x05, the message ids and the TLV layouts are
  * libqmi's data/qmi-service-wms.json (master, read 2026-11-02); the enums are
@@ -69,8 +71,8 @@ extern void loader_log_putc(char c);
 #define SMS_DEVICE              "vayu-sms"
 #define SMS_HANDLE_MAX          4096    /* the largest datagram the QMI handle takes */
 #define SMS_REPLY_MS            5000    /* one WMS request's reply */
-#define SMS_SEND_REPLY_MS       15000   /* Raw Send waits for the network's answer */
-#define SMS_STOP_MS             20000   /* one Raw Send may take 15 s; let it finish */
+#define SMS_SEND_REPLY_MS       30000   /* Raw Send waits for the network's answer (-119 dBm run) */
+#define SMS_STOP_MS             45000   /* one Raw Send may take 30 s; let it finish */
 #define SMS_EVENT_QUEUE         4
 #define SMS_NUMBER_TAIL         8
 
@@ -110,7 +112,7 @@ struct sms_state {
 	bool qmi_up;
 	volatile bool wms_there, stop, running, started;
 	uint32_t node, port, version, instance, generation;
-	uint32_t level, wait_s, routes_arg, store, refresh_s, scan_max;
+	uint32_t level, wait_s, routes_arg, store, refresh_s, scan_max, smsc_prefix;
 	uint64_t next_refresh_ms, next_config_ms;
 	/* the worker's inbox and the counters the device reports */
 	struct vayu_sms_message inbox[VAYU_SMS_INBOX];
@@ -209,18 +211,115 @@ static const struct qmi_ops sms_qmi_ops = {
 	.del_server = sms_del_server,
 };
 
+/* ---- the wire dump ------------------------------------------------------------------------------- */
+
+struct sms_dump {
+	bool request, response;
+	size_t mask_from, mask_to;      /* bytes in the request to print as "xx", 0/0: none */
+};
+
+/* The first 48 bytes, hex; an address range is printed as "xx" instead of its digits. */
+static void
+sms_dump_hex(const char *what, const uint8_t *data, size_t length, size_t mask_from, size_t mask_to)
+{
+	char line[3 * 48 + 8];
+	size_t shown = length < 48 ? length : 48, used = 0;
+
+	for (size_t i = 0; i < shown; i++) {
+		int wrote;
+
+		if (mask_to > mask_from && i >= mask_from && i < mask_to) {
+			wrote = snprintf(line + used, sizeof(line) - used, "xx%s", i + 1 < shown ? " " : "");
+		} else {
+			wrote = snprintf(line + used, sizeof(line) - used, "%02x%s", data[i], i + 1 < shown ? " " : "");
+		}
+		if (wrote < 0 || (size_t)wrote >= sizeof(line) - used) {
+			break;
+		}
+		used += (size_t)wrote;
+	}
+	say("vayu-sms: %s: first %u of %u bytes: %s%s\n", what, (unsigned int)shown, (unsigned int)length, line,
+	    length > shown ? " ..." : "");
+}
+
+/* The reply's header, its TLVs and, when present, result/error and the cause TLVs. */
+static void
+sms_dump_response(const char *what, const uint8_t *raw, size_t length)
+{
+	char tlvs[256];
+	size_t at, end, used = 0;
+	uint16_t result = 0xffff, error = 0xffff;
+	uint16_t cdma_cause = 0xffff;
+	uint16_t gw_rp = 0xffff;
+	uint8_t cdma_class = 0xff, gw_tp = 0xff;
+
+	if (length < QMI_HEADER_SIZE) {
+		say("vayu-sms: %s response: none (%u bytes)\n", what, (unsigned int)length);
+		return;
+	}
+	say("vayu-sms: %s response: type %u txn %u msg 0x%04x payload %u\n", what, raw[0],
+	    (unsigned int)vayu_sms_le16(raw + 1), (unsigned int)vayu_sms_le16(raw + 3),
+	    (unsigned int)vayu_sms_le16(raw + 5));
+	sms_dump_hex("response", raw, length, 0, 0);
+	tlvs[0] = 0;
+	end = QMI_HEADER_SIZE + (size_t)vayu_sms_le16(raw + 5);
+	if (end > length) {
+		end = length;
+	}
+	for (at = QMI_HEADER_SIZE; at + 3 <= end;) {
+		uint8_t type = raw[at];
+		uint16_t size = vayu_sms_le16(raw + at + 1);
+		const uint8_t *value = raw + at + 3;
+		int wrote;
+
+		if (at + 3u + size > end) {
+			break;
+		}
+		wrote = snprintf(tlvs + used, sizeof(tlvs) - used, "0x%02x/%u%s", type, (unsigned int)size,
+		    at + 3u + size < end ? " " : "");
+		if (wrote < 0 || (size_t)wrote >= sizeof(tlvs) - used) {
+			break;
+		}
+		used += (size_t)wrote;
+		if (type == 0x02 && size >= 4) {
+			result = vayu_sms_le16(value);
+			error = vayu_sms_le16(value + 2);
+		} else if (type == 0x10 && size >= 2) {
+			cdma_cause = vayu_sms_le16(value);
+		} else if (type == 0x11 && size >= 1) {
+			cdma_class = value[0];
+		} else if (type == 0x12 && size >= 3) {
+			gw_rp = vayu_sms_le16(value);
+			gw_tp = value[2];
+		}
+		at += 3u + size;
+	}
+	say("vayu-sms: %s TLVs: %s\n", what, tlvs[0] != 0 ? tlvs : "(none)");
+	if (result != 0xffff) {
+		say("vayu-sms: %s result %u error %u (%s)\n", what, (unsigned int)result, (unsigned int)error,
+		    error == 17 ? "MISSING_ARGUMENT" : error == 58 ? "WMS_ENCODING" : error == 1 ? "MALFORMED_MSG" : "?");
+	}
+	if (cdma_cause != 0xffff || cdma_class != 0xff || gw_rp != 0xffff) {
+		say("vayu-sms: %s cause: cdma-code %u class %u, gw-rp %u tp %u\n", what, (unsigned int)cdma_cause,
+		    (unsigned int)cdma_class, (unsigned int)gw_rp, (unsigned int)gw_tp);
+	}
+}
+
 /*
  * One request and its reply, waited `timeout` ms.  Called only from the worker
  * thread: an indication callback must never wait (its reply is delivered by the
  * same QRTR thread).  `quiet` suppresses the log and the failure counter for an
- * expected refusal (an empty Raw Read slot, for instance).
+ * expected refusal (an empty Raw Read slot, for instance).  `dump`, when set,
+ * prints the outgoing request (with an optional masked address) and the raw reply.
  */
 static int
 sms_request(const char *what, uint16_t message, const struct qmi_elem_info *req_ei, const void *req,
-    const struct qmi_elem_info *resp_ei, void *resp, struct vayu_sms_qmi_result *result, uint32_t timeout, bool quiet)
+    const struct qmi_elem_info *resp_ei, void *resp, struct vayu_sms_qmi_result *result, uint32_t timeout, bool quiet,
+    const struct sms_dump *dump)
 {
 	struct sockaddr_qrtr to = { .sq_family = AF_QIPCRTR, .sq_node = sms.node, .sq_port = sms.port };
 	struct qmi_txn txn;
+	uint8_t raw[512];
 	int ret;
 
 	if (sms.stop) {
@@ -235,6 +334,21 @@ sms_request(const char *what, uint16_t message, const struct qmi_elem_info *req_
 		}
 		return ret;
 	}
+	if (dump != NULL && dump->response) {
+		txn.raw = raw;
+		txn.raw_size = sizeof(raw);
+		txn.raw_length = 0;
+	}
+	if (dump != NULL && dump->request && req_ei != NULL) {
+		uint8_t encoded[VAYU_SMS_QMI_REQUEST_MAX + QMI_HEADER_SIZE];
+		int encoded_length = hakios_qmi_encode(QMI_REQUEST, message, txn.id, req_ei, req, encoded, sizeof(encoded));
+
+		if (encoded_length > 0) {
+			sms_dump_hex(what, encoded, (size_t)encoded_length, dump->mask_from, dump->mask_to);
+		} else {
+			say("vayu-sms: %s: the request cannot be encoded for the dump: %d\n", what, encoded_length);
+		}
+	}
 	ret = qmi_send_request(&sms.qmi, &to, &txn, message, VAYU_SMS_QMI_REQUEST_MAX, req_ei, req);
 	if (ret < 0) {
 		qmi_txn_cancel(&txn);
@@ -245,6 +359,9 @@ sms_request(const char *what, uint16_t message, const struct qmi_elem_info *req_
 		return ret;
 	}
 	ret = hakios_qmi_txn_wait_ms(&txn, timeout);
+	if (dump != NULL && dump->response) {
+		sms_dump_response(what, raw, ret < 0 ? 0 : txn.raw_length);
+	}
 	if (ret < 0) {
 		sms.failures++;
 		if (!quiet) {
@@ -456,7 +573,7 @@ sms_raw_read(uint8_t storage, uint32_t index, struct vayu_sms_qmi_raw_read_resp 
 	request.mode = VAYU_SMS_QMI_MODE_GSM;
 	memset(response, 0, sizeof(*response));
 	return sms_request("raw read", VAYU_SMS_QMI_RAW_READ, vayu_sms_qmi_raw_read_req_ei, &request,
-	    vayu_sms_qmi_raw_read_resp_ei, response, &response->result, quiet ? 2000 : SMS_REPLY_MS, quiet);
+	    vayu_sms_qmi_raw_read_resp_ei, response, &response->result, quiet ? 2000 : SMS_REPLY_MS, quiet, NULL);
 }
 
 /* One stored message: read it and decode it.  Returns 1 when a message was stored. */
@@ -497,15 +614,17 @@ sms_read_index(uint8_t storage, uint32_t index, bool quiet)
 static uint32_t
 sms_refresh_store(uint8_t storage, bool quiet)
 {
-	struct vayu_sms_qmi_list_req request = { .storage = storage };
+	struct vayu_sms_qmi_list_req request = { .storage = storage, .mode = VAYU_SMS_QMI_MODE_GSM };
 	struct vayu_sms_qmi_list_resp response;
 	struct vayu_sms_qmi_message_list list;
+	static const struct sms_dump list_dump = { .request = true, .response = true };
 	uint32_t found = 0;
 	int ret;
 
 	memset(&response, 0, sizeof(response));
 	ret = sms_request("list messages", VAYU_SMS_QMI_LIST_MESSAGES, vayu_sms_qmi_list_req_ei, &request,
-	    vayu_sms_qmi_list_resp_ei, &response, &response.result, SMS_REPLY_MS, quiet);
+	    vayu_sms_qmi_list_resp_ei, &response, &response.result, SMS_REPLY_MS, quiet,
+	    quiet ? NULL : &list_dump);
 	if (ret == 0 && response.list_valid) {
 		uint32_t count = vayu_sms_le32((const uint8_t *)response.list);
 		size_t payload = 4u + (size_t)count * 5u;
@@ -574,6 +693,36 @@ sms_action_name(uint8_t action)
 	}
 }
 
+/* Get Supported Messages (0x001E): read-only, says whether the six ids exist at all. */
+static void
+sms_query_supported(void)
+{
+	struct vayu_sms_qmi_supported supported;
+	bool raw_send = false, raw_read = false, list = false, delete = false, set_event = false;
+	int ret;
+
+	memset(&supported, 0, sizeof(supported));
+	ret = sms_request("get supported messages", VAYU_SMS_QMI_GET_SUPPORTED, NULL, NULL,
+	    vayu_sms_qmi_supported_ei, &supported, &supported.result, SMS_REPLY_MS, false, NULL);
+	if (ret != 0 || !supported.list_valid) {
+		say("vayu-sms: get supported messages gave no list\n");
+		return;
+	}
+	for (uint32_t i = 0; i < supported.count && i < VAYU_SMS_SUPPORTED_MAX; i++) {
+		switch (supported.ids[i]) {
+		case VAYU_SMS_QMI_RAW_SEND: raw_send = true; break;
+		case VAYU_SMS_QMI_RAW_READ: raw_read = true; break;
+		case VAYU_SMS_QMI_LIST_MESSAGES: list = true; break;
+		case VAYU_SMS_QMI_DELETE: delete = true; break;
+		case VAYU_SMS_QMI_SET_EVENT_REPORT: set_event = true; break;
+		default: break;
+		}
+	}
+	say("vayu-sms: supported: raw-send=%s raw-read=%s list=%s delete=%s set-event=%s (%u ids)\n",
+	    raw_send ? "yes" : "no", raw_read ? "yes" : "no", list ? "yes" : "no", delete ? "yes" : "no",
+	    set_event ? "yes" : "no", (unsigned int)supported.count);
+}
+
 /* Get Routes; install a store route only when the table is empty and explicitly allowed. */
 static void
 sms_configure_routes(void)
@@ -583,7 +732,7 @@ sms_configure_routes(void)
 
 	memset(&routes, 0, sizeof(routes));
 	ret = sms_request("get routes", VAYU_SMS_QMI_GET_ROUTES, NULL, NULL, vayu_sms_qmi_get_routes_resp_ei,
-	    &routes, &routes.result, SMS_REPLY_MS, false);
+	    &routes, &routes.result, SMS_REPLY_MS, false, NULL);
 	if (ret != 0 || !routes.routes_valid) {
 		say("vayu-sms: get routes gave no table; incoming messages depend on the modem's own table\n");
 		return;
@@ -621,7 +770,7 @@ sms_configure_routes(void)
 		memset(&response, 0, sizeof(response));
 		say("vayu-sms: vayu_sms_routes=1: Set Routes class 0 and 1, UIM, store-and-notify\n");
 		ret = sms_request("set routes", VAYU_SMS_QMI_SET_ROUTES, vayu_sms_qmi_set_routes_req_ei, &request,
-		    vayu_sms_qmi_result_resp_ei, &response, &response.result, SMS_REPLY_MS, false);
+		    vayu_sms_qmi_result_resp_ei, &response, &response.result, SMS_REPLY_MS, false, NULL);
 		if (ret != 0) {
 			say("vayu-sms: set routes was refused; incoming messages depend on the modem's table\n");
 			return;
@@ -630,7 +779,7 @@ sms_configure_routes(void)
 		/* verify what the modem now says, without trusting the write's echo */
 		memset(&routes, 0, sizeof(routes));
 		ret = sms_request("get routes after set", VAYU_SMS_QMI_GET_ROUTES, NULL, NULL,
-		    vayu_sms_qmi_get_routes_resp_ei, &routes, &routes.result, SMS_REPLY_MS, false);
+		    vayu_sms_qmi_get_routes_resp_ei, &routes, &routes.result, SMS_REPLY_MS, false, NULL);
 		if (ret == 0 && routes.routes_valid) {
 			sms.route_count = routes.routes.count;
 			say("vayu-sms: set routes: %u route(s) now\n", (unsigned int)routes.routes.count);
@@ -647,7 +796,7 @@ sms_configure_events(void)
 
 	memset(&response, 0, sizeof(response));
 	ret = sms_request("set event report", VAYU_SMS_QMI_SET_EVENT_REPORT, vayu_sms_qmi_set_event_report_req_ei,
-	    &request, vayu_sms_qmi_result_resp_ei, &response, &response.result, SMS_REPLY_MS, false);
+	    &request, vayu_sms_qmi_result_resp_ei, &response, &response.result, SMS_REPLY_MS, false, NULL);
 	lck_mtx_lock(&vayu_sms_lock);
 	sms.event_report = ret == 0;
 	sms.state = ret == 0 ? VAYU_SMS_STATE_READY : VAYU_SMS_STATE_FAILED;
@@ -730,7 +879,7 @@ sms_send_ack(uint32_t transaction, bool success)
 	request.info.success = success ? 1 : 0;
 	memset(&response, 0, sizeof(response));
 	(void)sms_request("send ack", VAYU_SMS_QMI_SEND_ACK, vayu_sms_qmi_send_ack_req_ei, &request,
-	    vayu_sms_qmi_result_resp_ei, &response, &response.result, SMS_REPLY_MS, true);
+	    vayu_sms_qmi_result_resp_ei, &response, &response.result, SMS_REPLY_MS, true, NULL);
 }
 
 static int
@@ -740,7 +889,9 @@ sms_do_send(const char *number, const char *text, uint32_t text_length, uint32_t
 	uint8_t pdu[VAYU_SMS_PDU_MAX];
 	struct vayu_sms_qmi_raw_send_req request;
 	struct vayu_sms_qmi_raw_send_resp response;
-	size_t length = 0;
+	struct sms_dump dump = { .request = true, .response = true };
+	size_t length = 0, digits, address_octets;
+	bool full_pdu = sms.smsc_prefix != 0;
 	uint32_t dcs = 0;
 	uint8_t mr = sms.mr++;
 	int ret;
@@ -751,13 +902,44 @@ sms_do_send(const char *number, const char *text, uint32_t text_length, uint32_t
 		    (unsigned int)text_length, dcs == 0x08 ? "UCS-2" : "GSM 7-bit");
 		return ret == VAYU_SMS_ERR_TOO_LONG ? -EMSGSIZE : -EINVAL;
 	}
+	if (!full_pdu) {
+		const uint8_t *tpdu;
+		size_t tpdu_length;
+
+		ret = vayu_sms_pdu_submit_tpdu(pdu, length, &tpdu, &tpdu_length);
+		if (ret != VAYU_SMS_OK) {
+			say("vayu-sms: send: the SMSC prefix cannot be removed: %d\n", ret);
+			return -EINVAL;
+		}
+		memmove(pdu, tpdu, tpdu_length);
+		length = tpdu_length;
+	}
 	if (vayu_sms_qmi_raw_send_fill(&request, pdu, length) != VAYU_SMS_OK) {
 		return -EMSGSIZE;
 	}
+	/*
+	 * The address's BCD bytes in the encoded QMI request: QMI header (7), TLV
+	 * header (3), format (1), u16 length (2), then the TPDU (first octet, MR,
+	 * DA length, TOA, digits) or the full PDU (SMSC length before those).
+	 */
+	digits = strlen(number);
+	if (digits > 0 && number[0] == '+') {
+		digits--;
+	}
+	address_octets = (digits + 1u) / 2u;
+	dump.mask_from = (size_t)QMI_HEADER_SIZE + 3u + 1u + 2u + (full_pdu ? 5u : 4u);
+	dump.mask_to = dump.mask_from + address_octets;
+	say("vayu-sms: raw send: %u-byte %s, SMSC %s, format 0x%02x, SMS-on-IMS 0\n", (unsigned int)length,
+	    full_pdu ? "PDU (with SMSC prefix)" : "TPDU (SMSC from EF_SMSC)", full_pdu ? "prefix 0x00" : "modem's",
+	    VAYU_SMS_QMI_FORMAT_GSM_P2P);
 	memset(&response, 0, sizeof(response));
 	ret = sms_request("raw send", VAYU_SMS_QMI_RAW_SEND, vayu_sms_qmi_raw_send_req_ei, &request,
-	    vayu_sms_qmi_raw_send_resp_ei, &response, &response.result, SMS_SEND_REPLY_MS, false);
+	    vayu_sms_qmi_raw_send_resp_ei, &response, &response.result, SMS_SEND_REPLY_MS, false, &dump);
 	if (ret != 0) {
+		if (response.cdma_cause_valid || response.cdma_class_valid) {
+			say("vayu-sms: raw send refused: CDMA cause %u, class %u\n",
+			    (unsigned int)response.cdma_cause, (unsigned int)response.cdma_class);
+		}
 		if (response.cause_valid) {
 			sms.last_gsm_cause = response.cause.rp_cause;
 			say("vayu-sms: raw send refused: GSM cause %u, TP cause %u\n",
@@ -769,7 +951,7 @@ sms_do_send(const char *number, const char *text, uint32_t text_length, uint32_t
 	*reference = mr;
 	*pdu_length = (uint32_t)length;
 	sms.sent++;
-	say("vayu-sms: one message sent: PDU %u bytes, %s, message id %u, MR %u\n", (unsigned int)length,
+	say("vayu-sms: one message sent: %u bytes, %s, message id %u, MR %u\n", (unsigned int)length,
 	    dcs == 0x08 ? "UCS-2" : "GSM 7-bit", (unsigned int)*message_id, (unsigned int)mr);
 	return 0;
 }
@@ -803,11 +985,12 @@ sms_do_delete(uint32_t seq)
 	request.storage = (uint8_t)message->storage;
 	request.index = message->index;
 	request.tag = (uint8_t)message->tag;
+	request.mode = VAYU_SMS_QMI_MODE_GSM;
 	lck_mtx_unlock(&vayu_sms_lock);
 
 	memset(&response, 0, sizeof(response));
 	ret = sms_request("delete", VAYU_SMS_QMI_DELETE, vayu_sms_qmi_delete_req_ei, &request,
-	    vayu_sms_qmi_result_resp_ei, &response, &response.result, SMS_REPLY_MS, false);
+	    vayu_sms_qmi_result_resp_ei, &response, &response.result, SMS_REPLY_MS, false, NULL);
 	if (ret != 0) {
 		return -EIO;
 	}
@@ -914,6 +1097,7 @@ sms_thread(void *argument __unused, wait_result_t wait __unused)
 	say("vayu-sms: WMS: node %u port %u, version %u instance %u\n", sms.node, sms.port, sms.version,
 	    sms.instance);
 
+	sms_query_supported();
 	sms_configure_routes();
 	sms_configure_events();
 	/* stored messages can be read whether or not the event report was accepted */
@@ -1241,7 +1425,7 @@ vayu_sms_start(struct vayu_qrtr *q)
 {
 	thread_t thread;
 	uint32_t level = 0, wait_s = 30, routes_arg = 0, store = VAYU_SMS_QMI_STORAGE_UIM, refresh_s = 60;
-	uint32_t scan_max = 20;
+	uint32_t scan_max = 20, smsc_prefix = 0;
 
 	if (!PE_parse_boot_argn("vayu_sms", &level, sizeof(level)) || level == 0) {
 		return 0;
@@ -1288,6 +1472,11 @@ vayu_sms_start(struct vayu_qrtr *q)
 	if (scan_max > 40) {
 		scan_max = 40;
 	}
+	PE_parse_boot_argn("vayu_sms_smsc", &smsc_prefix, sizeof(smsc_prefix));
+	if (smsc_prefix != 0 && smsc_prefix != 1) {
+		say("vayu-sms: vayu_sms_smsc=%u is refused: 0 (TPDU) and 1 (full PDU) only\n", smsc_prefix);
+		smsc_prefix = 0;
+	}
 	memset(&sms.inbox, 0, sizeof(sms.inbox));
 	sms.inbox_count = sms.inbox_unread = 0;
 	sms.next_seq = 1;
@@ -1298,6 +1487,7 @@ vayu_sms_start(struct vayu_qrtr *q)
 	sms.store = store;
 	sms.refresh_s = refresh_s;
 	sms.scan_max = scan_max;
+	sms.smsc_prefix = smsc_prefix;
 	sms.stop = false;
 	sms.running = true;
 	sms.state = VAYU_SMS_STATE_WAITING;
@@ -1318,7 +1508,8 @@ vayu_sms_start(struct vayu_qrtr *q)
 	sms.next_refresh_ms = 0;
 	sms.next_config_ms = now_ms() + 20000;
 	say("vayu-sms: vayu_sms=%u vayu_sms_wait=%u vayu_sms_routes=%u vayu_sms_store=%u vayu_sms_refresh=%u "
-	    "vayu_sms_scan=%u\n", level, wait_s, routes_arg, store, refresh_s, scan_max);
+	    "vayu_sms_scan=%u vayu_sms_smsc=%u\n", level, wait_s, routes_arg, store, refresh_s, scan_max,
+	    smsc_prefix);
 	say("vayu-sms: WMS 0x05 (routes, event report, list, raw read, raw send, delete, ack); "
 	    "the log masks numbers and never prints text\n");
 	(void)sms_make_node();

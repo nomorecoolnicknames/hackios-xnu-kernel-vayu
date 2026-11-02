@@ -161,6 +161,14 @@ struct qmi_txn {
 	void *dest;                     /* ... the structure it goes into */
 	struct qmi_txn *next;           /* the helpers' */
 	bool done, waiting;
+	/*
+	 * Optional: a copy of the whole reply datagram, taken before decoding.  A
+	 * caller that wants the raw bytes (the SMS debug dump) sets raw/raw_size
+	 * after qmi_txn_init(); raw_length is 0 when the reply did not fit or none
+	 * arrived.
+	 */
+	uint8_t *raw;
+	size_t raw_size, raw_length;
 };
 
 /*

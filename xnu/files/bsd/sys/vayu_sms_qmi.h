@@ -54,11 +54,13 @@
 #define VAYU_SMS_TIMESTAMP_MAX          26      /* "2026-11-02 06:30:00 +0300" and NUL */
 #define VAYU_SMS_ROUTE_MAX              16
 #define VAYU_SMS_LIST_MAX               32
+#define VAYU_SMS_SUPPORTED_MAX          64
 #define VAYU_SMS_QMI_REQUEST_MAX        512
 
 #define VAYU_SMS_QMI_WMS_SERVICE        0x05
 #define VAYU_SMS_QMI_SET_EVENT_REPORT   0x0001
 #define VAYU_SMS_QMI_EVENT_REPORT       0x0001
+#define VAYU_SMS_QMI_GET_SUPPORTED      0x001E
 #define VAYU_SMS_QMI_RAW_SEND           0x0020
 #define VAYU_SMS_QMI_RAW_READ           0x0022
 #define VAYU_SMS_QMI_DELETE             0x0024
@@ -888,6 +890,27 @@ vayu_sms_pdu_encode_submit(const char *number, const char *text, size_t text_len
 	return VAYU_SMS_OK;
 }
 
+/*
+ * The form WMS Raw Send wants: the TPDU alone, without the SMSC prefix.  The
+ * modem takes the service centre from EF_SMSC (Get/Set SMSC Address 0x0034/
+ * 0x0035); Android's RIL also passes only the TPDU of RIL_REQUEST_SEND_SMS.
+ * The full PDU (prefix 0x00) is kept for the PDU tests and for a modem that is
+ * found to want it.
+ */
+static __inline__ int
+vayu_sms_pdu_submit_tpdu(const uint8_t *pdu, size_t length, const uint8_t **tpdu, size_t *tpdu_length)
+{
+	if (pdu == NULL || tpdu == NULL || tpdu_length == NULL) {
+		return VAYU_SMS_ERR_ARGUMENT;
+	}
+	if (length < 2 || pdu[0] != 0x00) {
+		return VAYU_SMS_ERR_MALFORMED;
+	}
+	*tpdu = pdu + 1;
+	*tpdu_length = length - 1;
+	return VAYU_SMS_OK;
+}
+
 /* ---- QMI WMS: common ------------------------------------------------------------------------- */
 
 struct vayu_sms_qmi_result {
@@ -929,6 +952,33 @@ static const struct qmi_elem_info vayu_sms_qmi_result_resp_ei[] = {
 	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_result),
 	  .array_type = NO_ARRAY, .tlv_type = 0x02, .offset = offsetof(struct vayu_sms_qmi_result_resp, result),
 	  .ei_array = vayu_sms_qmi_result_ei },
+	{ .data_type = QMI_EOTI },
+};
+
+/* ---- Get Supported Messages (0x001E) --------------------------------------------------------- */
+
+/*
+ * Output TLV 0x10 is a uint16-counted array of one-byte message ids (the WMS ids
+ * are all below 0x0100).  It says whether Raw Send/Raw Read/List/Delete exist on
+ * this firmware at all, before a request is blamed for a refusal.
+ */
+struct vayu_sms_qmi_supported {
+	struct vayu_sms_qmi_result result;      /* TLV 0x02 */
+	uint8_t list_valid;                     /* TLV 0x10 */
+	uint32_t count;
+	uint8_t ids[VAYU_SMS_SUPPORTED_MAX];
+};
+
+static const struct qmi_elem_info vayu_sms_qmi_supported_ei[] = {
+	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_result),
+	  .array_type = NO_ARRAY, .tlv_type = 0x02, .offset = offsetof(struct vayu_sms_qmi_supported, result),
+	  .ei_array = vayu_sms_qmi_result_ei },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_supported, list_valid) },
+	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_supported, count) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = VAYU_SMS_SUPPORTED_MAX, .elem_size = sizeof(uint8_t),
+	  .array_type = VAR_LEN_ARRAY, .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_supported, ids) },
 	{ .data_type = QMI_EOTI },
 };
 
@@ -1025,6 +1075,8 @@ static const struct qmi_elem_info vayu_sms_qmi_raw_message_ei[] = {
 
 struct vayu_sms_qmi_raw_send_req {
 	struct vayu_sms_qmi_raw_message message;        /* TLV 0x01 */
+	uint8_t sms_on_ims_valid;                       /* TLV 0x13: optional */
+	uint8_t sms_on_ims;                             /* 0: 3GPP CS/NAS, not IMS */
 };
 
 static const struct qmi_elem_info vayu_sms_qmi_raw_send_req_ei[] = {
@@ -1032,6 +1084,10 @@ static const struct qmi_elem_info vayu_sms_qmi_raw_send_req_ei[] = {
 	  .array_type = NO_ARRAY, .tlv_type = 0x01,
 	  .offset = offsetof(struct vayu_sms_qmi_raw_send_req, message),
 	  .ei_array = vayu_sms_qmi_raw_message_ei },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x13, .offset = offsetof(struct vayu_sms_qmi_raw_send_req, sms_on_ims_valid) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x13, .offset = offsetof(struct vayu_sms_qmi_raw_send_req, sms_on_ims) },
 	{ .data_type = QMI_EOTI },
 };
 
@@ -1052,6 +1108,10 @@ struct vayu_sms_qmi_raw_send_resp {
 	struct vayu_sms_qmi_result result;      /* TLV 0x02 */
 	uint8_t message_id_valid;               /* TLV 0x01 */
 	uint16_t message_id;
+	uint8_t cdma_cause_valid;               /* TLV 0x10 */
+	uint16_t cdma_cause;
+	uint8_t cdma_class_valid;               /* TLV 0x11 */
+	uint8_t cdma_class;
 	uint8_t cause_valid;                    /* TLV 0x12 */
 	struct vayu_sms_qmi_gsm_cause cause;
 };
@@ -1064,6 +1124,14 @@ static const struct qmi_elem_info vayu_sms_qmi_raw_send_resp_ei[] = {
 	  .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_raw_send_resp, message_id_valid) },
 	{ .data_type = QMI_UNSIGNED_2_BYTE, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
 	  .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_raw_send_resp, message_id) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_raw_send_resp, cdma_cause_valid) },
+	{ .data_type = QMI_UNSIGNED_2_BYTE, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_raw_send_resp, cdma_cause) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x11, .offset = offsetof(struct vayu_sms_qmi_raw_send_resp, cdma_class_valid) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x11, .offset = offsetof(struct vayu_sms_qmi_raw_send_resp, cdma_class) },
 	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
 	  .tlv_type = 0x12, .offset = offsetof(struct vayu_sms_qmi_raw_send_resp, cause_valid) },
 	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_gsm_cause),
@@ -1144,13 +1212,22 @@ static const struct qmi_elem_info vayu_sms_qmi_raw_read_resp_ei[] = {
 
 /* ---- List Messages (0x0031) ------------------------------------------------------------------ */
 
+/*
+ * List Messages input: storage (0x01), optional tag (0x11) and message mode
+ * (0x12).  The mode is not optional for a GW modem: without it this one answers
+ * result 1 error 17 (MISSING_ARGUMENT, qmi-errors.h), as the 142105 run did.
+ * The tag is left out so every tag is listed.
+ */
 struct vayu_sms_qmi_list_req {
 	uint8_t storage;                /* TLV 0x01; a value, not a wildcard */
+	uint8_t mode;                   /* TLV 0x12: QMI_WMS_MESSAGE_MODE_GSM_WCDMA = 1 */
 };
 
 static const struct qmi_elem_info vayu_sms_qmi_list_req_ei[] = {
 	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
 	  .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_list_req, storage) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x12, .offset = offsetof(struct vayu_sms_qmi_list_req, mode) },
 	{ .data_type = QMI_EOTI },
 };
 
@@ -1238,6 +1315,7 @@ struct vayu_sms_qmi_delete_req {
 	uint8_t storage;                /* TLV 0x01 */
 	uint32_t index;                 /* TLV 0x10 */
 	uint8_t tag;                    /* TLV 0x11 */
+	uint8_t mode;                   /* TLV 0x12: GSM/WCDMA = 1, as List and Raw Read */
 };
 
 static const struct qmi_elem_info vayu_sms_qmi_delete_req_ei[] = {
@@ -1247,6 +1325,8 @@ static const struct qmi_elem_info vayu_sms_qmi_delete_req_ei[] = {
 	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_delete_req, index) },
 	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
 	  .tlv_type = 0x11, .offset = offsetof(struct vayu_sms_qmi_delete_req, tag) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x12, .offset = offsetof(struct vayu_sms_qmi_delete_req, mode) },
 	{ .data_type = QMI_EOTI },
 };
 
@@ -1367,6 +1447,8 @@ vayu_sms_qmi_raw_send_fill(struct vayu_sms_qmi_raw_send_req *request, const uint
 	request->message.format = VAYU_SMS_QMI_FORMAT_GSM_P2P;
 	request->message.raw_length = (uint32_t)pdu_length;
 	memcpy(request->message.raw, pdu, pdu_length);
+	request->sms_on_ims_valid = 1;          /* send on 3GPP CS/NAS, not IMS */
+	request->sms_on_ims = 0;
 	return VAYU_SMS_OK;
 }
 

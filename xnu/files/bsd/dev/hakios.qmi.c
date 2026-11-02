@@ -699,6 +699,12 @@ qmi_receive(void *context, uint32_t node, uint32_t port, const void *data, size_
 		found = find_transaction(s, NULL, id);
 		txn = found != NULL ? *found : NULL;
 		if (txn != NULL && !txn->done && txn->ei != NULL && txn->dest != NULL) {
+			if (txn->raw != NULL && txn->raw_size >= length) {
+				memcpy(txn->raw, data, length);
+				txn->raw_length = length;
+			} else {
+				txn->raw_length = 0;
+			}
 			txn->result = hakios_qmi_decode(data, length, txn->ei, txn->dest);
 			txn->done = true;
 			os_wake(&s->lock, txn);
