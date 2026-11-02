@@ -17,6 +17,10 @@ struct vayu_qrtr;
 void vayu_wifi_start(struct vayu_qrtr *q, uint32_t listen_s);
 /* Before vayu_qrtr_detach(q): the WLFW thread ended (waits up to 5 s for it), our ports closed, a summary line. */
 void vayu_wifi_stop(void);
+/* W13: call before vayu_pas_load() of the modem.  With vayu_wifi_qdss=1 this votes the WLAN rails and
+ * rfclka2 and sends the AOP QMP "{class: clock, res: qdss, val: 1}", as ios-flame does in wland.c:128-148
+ * before boot_modem(); with the default 0 it does nothing. */
+void vayu_wifi_pre_modem(void);
 
 #endif /* KERNEL */
 
