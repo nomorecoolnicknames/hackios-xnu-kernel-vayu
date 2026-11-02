@@ -1,0 +1,494 @@
+Subject: [PATCH] vayu camera S1/S3: the stills mode's first frame exposed from the usual mode's AE, and a per-100-frame preview timing line
+
+Base (kernel): the shared merge-all tree, bsd/dev/vayu_camera.c sha256
+537024ea776cfb812aeb9fbf45184547a613dfc52314b8e7236cb225c6692b86 (vayu-test26 + cam31).
+Base (userland): work/hkd-ws20/userland/src/camera_device.c =
+/mnt/ramdisk/ds-ui/userland/src/camera_device.c, sha256
+b3d92562bb61b3e04ec8e7b3bdba6f9c196850ca60a0d35b0b0d9e1017925f21 (the tree root-cam2 was
+rebuilt from).
+
+S1 (verification): cam_preview_half= and cam_neon= already default to 1 in camera_device.c
+(boot_number(..., 1)); work/hkd-ws20's and hackios-vayu's copies are byte-identical. root-ui1's
+cam_preview_half=0 came from an older build, not from this source. libhakios.media.dylib is
+rebuilt from this source for root-cam3. Added: a line every 100 frames with isp_measure's time
+and each preview output's render_piece() time (PrimaryScaler, SecondaryScaler), averaged since
+the previous line.
+
+S3: in mode 1 (the vendor's res1 block) the kernel wrote none of 0x0202/0x0204, and the vendor
+block's own 0x0202 is 11 lines (0.12 ms), so the first stills frame was black and
+cam_still_settle dropped two frames after it. cam_real_start() now hands cam_stream_up() the
+usual mode's last AE exposure and gain; cam_stream_up() writes 0x0202 = the usual lines scaled
+to the stills mode's line time (rear 13190 -> 10903 ns, front 8375 -> 16080 ns, computed from
+the vendor 0x0340 and the mode's fps), clamped to the vendor frame less the row's margin, and
+0x0204 = the usual gain's code, BEFORE the on block. 0x0340 stays the vendor block's (frame
+length and frame rate unchanged). cam_still_settle defaults to 0, and the userland logs the
+first stills frame's exposure/gain/green so one run proves it.
+
+No boot-arg changes: the new behaviour is the default; cam_still_settle=N (0..10) still drops
+the first N stills-mode frames.
+
+--- a/bsd/dev/vayu_camera.c
++++ b/bsd/dev/vayu_camera.c
+@@ -101,9 +101,11 @@
+  * A session is step 4's bring-up -- the tab load, the rails, the GDSC, PLL0, the clocks, ldoc3,
+  * the pins, the module's power-up, the chip ID (MATCH required), the vendor init and the mode's
+  * block. In mode 0 it then writes 0x0340/0x0202/0x0204 ALWAYS with the camera row's 4x frame and
+- * its exposure and gain (the fixed exposure: ~15.02 fps rear, ~30.10 front). Mode 1 writes none of
+- * them at bring-up: its frame length, exposure and gain are the vendor block's own, and the
+- * header's numbers come from that block (0x0340 as the IMX582's two 1-byte writes at 0x0340/0x0341
++ * its exposure and gain (the fixed exposure: ~15.02 fps rear, ~30.10 front). Mode 1 keeps the
++ * vendor block's 0x0340 (its frame length, and with it its frame rate) and writes the usual mode's
++ * last exposure and gain, in its own line time, into 0x0202/0x0204 before the on block: the block's
++ * own 0x0202 is 11 lines (0.12 ms), and the first stills frame came out black because of it. The
++ * header's numbers come from the block (0x0340 as the IMX582's two 1-byte writes at 0x0340/0x0341
+  * or the S5K3T2's one 2-byte write at 0x0340) and line_ns = 1e9 / (fps * frame_lines). AE later
+  * writes only 0x0202/0x0204; 0x0340 is never touched after bring-up, so mode 1 keeps the vendor's
+  * frame length. Then the SMMU maps the whole ring, CSID-lite 0 runs RDI 0, CSIPHY and IFE-lite 0
+@@ -221,8 +223,9 @@
+  *     and its lock is its own; vayu_camera_quiesce() has nothing of step 5 to take down;
+  *   - step 6 reuses step 4's sensor rules unchanged (the vendor blocks, the off block, the ID
+  *     MATCH) and adds only 0x0340/0x0202/0x0204, from the selected camera row, at every session
+- *     start in mode 0 (the fixed exposure; mode 1 writes none of them at bring-up, and AE writes
+- *     only 0x0202/0x0204); every wait is bounded (2 ms polls, 3 frame times + 100 ms per
++ *     start in mode 0 (the fixed exposure; mode 1 keeps the vendor's 0x0340 and gets the usual
++ *     mode's exposure and gain in its line time, written before the on block; AE writes only
++ *     0x0202/0x0204); every wait is bounded (2 ms polls, 3 frame times + 100 ms per
+  *     frame, 3 timeouts, 1 s of idle, 1 ms for PLL0's lock as step 4), the ring's places are
+  *     re-armed one at a time, and a failure tears the session down without touching the node's
+  *     memory: the first failure is retried once, the second ends the node.
+@@ -289,9 +292,10 @@
+  *               0x20 unity: 4x), the same numbers as vayu_camera_ae=1; the ABI header reports that
+  *               4x linearly, 4 * gain_unity (0x400 rear, 0x80 front). The header's line_ns is 1e9 /
+  *               (fps * frame_lines): 13190 ns rear (15.02 fps), 8375 ns front (30.10 fps). Mode 1
+- *               writes none of the three: the vendor res1 block's own 0x0340 (3054 lines rear at
+- *               10903 ns, 2064 front at 16080 ns) and 0x0202/0x0204 are the sensor's, and the
+- *               header reports them.
++ *               keeps the vendor res1 block's own 0x0340 (3054 lines rear at 10903 ns, 2064 front
++ *               at 16080 ns) and gets the usual mode's last exposure and gain in that line time,
++ *               written as 0x0202/0x0204 before the on block (cam_still_ae); the header reports
++ *               them.
+  *   CAMNOC/CPAS step 3 programs nothing there: HYPOTHESIS, their reset defaults pass one small
+  *               frame, and the run's log (show_paths()) is what will say.
+  *   TLMM        cfg at tile + 0x1000 * pin: [1:0] pull (0 none, 1 down, 3 up), [5:2] function,
+@@ -790,7 +794,8 @@
+ 	 * Mode 0 only. vayu_camera_ae=1 (the maintainers' ruling 2026-10-25: 0x0202/0x0204/0x0340 before
+ 	 * stream-on): a long frame, a long exposure and a moderate gain, ~16x the light of the vendor
+ 	 * mode, so one run tells "the scene is dark" from "the exposure is the problem". Step 6 mode 1
+-	 * writes none of these: its frame length, exposure and gain are the vendor block's own.
++	 * writes none of these three: its frame length is the vendor block's own, and its exposure and
++	 * gain are the usual mode's last ones (cam_real_start/cam_still_ae), not these.
+ 	 */
+ 	uint16_t ae_frame_lines;        /* 0x0340: 4x the mode's (IMX582 res3 0x04ee, S5K3T2 res2 0x03e0) */
+ 	uint16_t ae_lines;              /* 0x0202: frame lines - 48 (the vendor's own margin in res3: 0x04ee - 0x04be) */
+@@ -3539,6 +3544,24 @@
+ static uint64_t cam_fake_ring_bytes;
+ static uint32_t cam_fake_place_bytes, cam_fake_frame_bytes;
+ 
++/*
++ * Step 6's exposure, as the sensor has it: cam_real_lines (0x0202's lines) and cam_real_gain
++ * (linear, gain_unity = 1x). cam_stream_up() writes the stills session's first one before the on
++ * block, so the two are declared here, before it.
++ */
++static uint32_t cam_real_lines, cam_real_gain;
++/* the usual mode's last exposure and gain: what a stills session starts from (cam_real_start, cam_real_ae) */
++static uint32_t cam_real_usual_lines, cam_real_usual_gain;
++/*
++ * The stills session's first exposure, filled by cam_real_start() before cam_stream_up(): the usual
++ * mode's `lines' at its `line_ns', the linear `gain', its 0x0204 `gain_code', the stills row's
++ * `margin', and `written' the work cam_stream_up() did (0x0202/0x0204 before the on block).
++ */
++static struct {
++	uint32_t lines, line_ns, gain, gain_code, margin;
++	bool written;
++} cam_still_ae;
++
+ /* What one session's bring-up did, for its teardown (and for step 4's summary). */
+ struct cam_stream_state {
+ 	const struct cam_stream_cfg *cfg;
+@@ -3557,8 +3580,9 @@
+  * `ring' is 0 for step 4: its own frames are allocated (a 4 KB header, then two frames) and RDI 0
+  * is left halted for vayu_camera_skip_ms. Non-zero is step 6's ring: the whole ring is mapped in
+  * the SMMU, the pause is 0, the camera row's 4x frame/exposure/gain are written ALWAYS in mode 0,
+- * mode 1 writes none of them (its frame and exposure are the vendor block's), and RDI 0 runs from
+- * the start. `step' is "step 4"/"step 6" for the lines that have one.
++ * mode 1 keeps the vendor block's frame length (0x0340) and gets the usual mode's exposure and gain
++ * (0x0202/0x0204) before the on block, and RDI 0 runs from the start. `step' is "step 4"/"step 6"
++ * for the lines that have one.
+  *
+  * The caller tears down through cam_stream_down() on any false; st->teardown says whether a
+  * teardown is due (false only for the tab and rail refusals, which write nothing).
+@@ -3673,9 +3697,11 @@
+ 	/*
+ 	 * 0x0340/0x0202/0x0204, the camera row's values. Step 4 writes them only when asked
+ 	 * (vayu_camera_ae, or an exposure/gain boot-arg); step 6 mode 0 writes them at every session
+-	 * start, because its exposure is fixed. Mode 1 writes none of them: the vendor's mode block
+-	 * already set the sensor's own, its frame length stays the vendor's, and AE later writes only
+-	 * 0x0202/0x0204. Volatile registers: the power-down resets them.
++	 * start, because its exposure is fixed. Mode 1 keeps the vendor block's 0x0340 (its frame
++	 * length, and with it its frame rate, is the block's) and gets the usual mode's exposure and
++	 * gain in this mode's line time before the on block: the vendor block's own 0x0202 is 11
++	 * lines (0.12 ms), and the first frame of the stills mode came out black because of it.
++	 * Volatile registers: the power-down resets them.
+ 	 */
+ 	if (real && !full) {
+ 		uint32_t frame_lines = cfg->ae_frame_lines, lines = cfg->ae_lines, gain = cfg->ae_gain;
+@@ -3689,8 +3715,39 @@
+ 			return false;
+ 		}
+ 	} else if (real) {
+-		printf("vayu-camera: %s: mode 1: the vendor mode block's own 0x0340/0x0202/0x0204, nothing of ours written\n",
+-		    s->name);
++		/*
++		 * Mode 1, the vendor's full stills block: cam_real_start() put the usual mode's exposure
++		 * and gain into cam_still_ae. In this mode's line time (1e9 / (fps * the vendor's
++		 * 0x0340), the same formula cam_real_start() uses) that is lines * line_ns0 / line_ns1,
++		 * kept within the frames the block gives; 0x0204 is the usual gain's code. A block with
++		 * no 0x0340, or a session started before any usual one, leaves the vendor's own values,
++		 * as before.
++		 */
++		uint16_t vendor_frame_lines = 0;
++		uint32_t line_ns1, lines, most;
++		bool ok;
++
++		if (cam_still_ae.lines == 0 || cam_still_ae.line_ns == 0 || mode->fps_milli == 0 ||
++		    !cam_tab_reg16(&cam_tab[CAM_TAB_MODE], 0x0340, &vendor_frame_lines) || vendor_frame_lines == 0) {
++			printf("vayu-camera: %s: mode 1: the vendor mode block's own 0x0340/0x0202/0x0204 (no "
++			    "usual exposure to carry over), nothing of ours written\n", s->name);
++		} else {
++			line_ns1 = (uint32_t)(1000000000000ull / ((uint64_t)mode->fps_milli * vendor_frame_lines));
++			lines = (uint32_t)(((uint64_t)cam_still_ae.lines * cam_still_ae.line_ns + line_ns1 / 2) / line_ns1);
++			most = vendor_frame_lines > cam_still_ae.margin ? vendor_frame_lines - cam_still_ae.margin :
++			    vendor_frame_lines;
++			lines = lines < 4 ? 4 : lines > most ? most : lines;
++			ok = cam_i2c_write_reg(&st->bus, s->addr7, 0x0202, 2, (uint16_t)lines, 2) &&
++			    cam_i2c_write_reg(&st->bus, s->addr7, 0x0204, 2, (uint16_t)cam_still_ae.gain_code, 2);
++			printf("vayu-camera: %s: mode 1: exposure 0x0202 <- %u lines (the usual mode's %u lines at "
++			    "%u ns a line, %u ns here), gain 0x0204 <- %#x (the usual mode's %#x): %s\n", s->name,
++			    lines, cam_still_ae.lines, cam_still_ae.line_ns, line_ns1, cam_still_ae.gain_code,
++			    cam_still_ae.gain, ok ? "acknowledged" : "NOT ACKNOWLEDGED");
++			if (!ok) {
++				return false;
++			}
++			cam_still_ae.written = true;
++		}
+ 	} else if (g_ae || g_exposure != 0 || g_gain != 0) {
+ 		uint32_t frame_lines = g_ae ? cfg->ae_frame_lines : 0;
+ 		uint32_t lines = g_exposure != 0 ? g_exposure : g_ae ? cfg->ae_lines : 0;
+@@ -4254,8 +4311,9 @@
+  * the header's frame_lines_min/max say so, and mediaserverd's AE adds gain for the shorter exposure.
+  * Rear at 30: 2528 lines (29.99 fps, longest exposure 32.7 ms instead of 66.0); front at 30: 3980 > 3968,
+  * so it stays at 3968 (30.10 fps).
+- * Mode 1's rows (line_ns 0 here: cam_real_start() fills them from the vendor block) are left alone: that
+- * mode writes none of our registers and keeps the vendor's own 0x0340.
++ * Mode 1's rows (line_ns 0 here: cam_real_start() fills them from the vendor block) are left alone:
++ * fps= does not touch their 0x0340; their 0x0202/0x0204 get the usual mode's exposure and gain in
++ * their own line time (cam_still_ae), so the first stills frame is exposed.
+  */
+ static uint32_t g_cam_fps;              /* vayu_camera_fps */
+ 
+@@ -4579,7 +4637,6 @@
+  * the mode's own -- 4x in mode 0, the vendor block's in mode 1 -- and AE never writes 0x0340.
+  */
+ static struct { uint32_t lines, gain; bool pending; } cam_real_ask;
+-static uint32_t cam_real_lines, cam_real_gain;  /* what the sensor has now (linear gain) */
+ static uint32_t cam_real_ae_writes;
+ static void cam_af_up(void);
+ static void cam_af_frame(void);
+@@ -4636,6 +4693,14 @@
+ 	return gain > s->gain_max ? s->gain_max : gain;
+ }
+ 
++/* The 0x0204 code a linear gain takes (the inverse of cam_real_gain_from_code()): Sony's 1024 -
++ * 1024 * gain_unity / gain (0 is 1x), Samsung's linear code. */
++static uint32_t
++cam_real_gain_code(const struct cam_stream_cfg *cfg, const struct cam_abi_sensor *s, uint32_t gain)
++{
++	return cfg == &cam_streams[0] ? 1024u - (1024u * s->gain_unity) / gain : gain;
++}
++
+ static bool
+ cam_real_start(const struct cam_abi_sensor *s, uint32_t lines, uint32_t gain, uint32_t frame_lines)
+ {
+@@ -4668,17 +4733,38 @@
+ 	}
+ 	mode = &cfg->modes[s->mode];
+ 	full = s->mode != 0;
++	/*
++	 * A stills session starts from the usual mode's last exposure and gain (the AE's), not from the
++	 * vendor block's 11-line 0x0202: cam_stream_up() writes them, in the stills mode's line time,
++	 * before the on block. The usual mode's line time is the usual row's of this sensor; before any
++	 * usual session the camera row's own values stand in.
++	 */
++	cam_still_ae.written = false;
++	if (full) {
++		uint32_t line_ns0 = 0;
++
++		for (unsigned i = 0; i < CAM_REAL_SENSOR_COUNT; i++) {
++			if (cam_real_sensors[i].sensor == s->sensor && cam_real_sensors[i].mode == 0) {
++				line_ns0 = cam_real_sensors[i].line_ns;
++			}
++		}
++		cam_still_ae.lines = cam_real_usual_lines != 0 ? cam_real_usual_lines : cfg->ae_lines;
++		cam_still_ae.line_ns = line_ns0;
++		cam_still_ae.gain = cam_real_usual_gain != 0 ? cam_real_usual_gain : 4u * s->gain_unity;
++		cam_still_ae.gain_code = cam_real_gain_code(cfg, s, cam_still_ae.gain);
++		cam_still_ae.margin = s->margin;
++	}
+ 	if (!cam_stream_up(cfg, mode, cam_fake_ring, "step 6", &cam_real_stream)) {
+ 		printf("vayu-camera: step 6: session on sensor %u (%s) mode %u: the bring-up failed: the session ends\n",
+ 		    s->sensor, s->name, s->mode);
+ 		return false;
+ 	}
+ 	/*
+-	 * Mode 1: the vendor block just written set the sensor's own frame length, exposure and gain.
+-	 * Its 0x0340 gives the header its frame lines (IMX582: 1-byte writes at 0x0340 high and 0x0341
+-	 * low; S5K3T2: one 2-byte write at 0x0340) and line_ns = 1e9 / (fps * frame_lines); 0x0202 and
+-	 * 0x0204 (the mode block's, else the init block's) give the session's first exposure and gain.
+-	 * Neither register was written by us.
++	 * Mode 1: the vendor block just written set the sensor's own frame length. Its 0x0340 gives the
++	 * header its frame lines (IMX582: 1-byte writes at 0x0340 high and 0x0341 low; S5K3T2: one
++	 * 2-byte write at 0x0340) and line_ns = 1e9 / (fps * frame_lines). The exposure and gain are the
++	 * ones cam_stream_up() wrote (the usual mode's, in this line time); a block with no 0x0340 keeps
++	 * the vendor's own 0x0202/0x0204, as before.
+ 	 */
+ 	if (full) {
+ 		if (!cam_tab_reg16(&cam_tab[CAM_TAB_MODE], 0x0340, &vendor_frame_lines) ||
+@@ -4692,18 +4778,31 @@
+ 		row->line_ns = (uint32_t)(1000000000000ull /
+ 		    ((uint64_t)mode->fps_milli * vendor_frame_lines));
+ 		most = vendor_frame_lines > row->margin ? vendor_frame_lines - row->margin : vendor_frame_lines;
+-		/* the session's first exposure is the vendor block's 0x0202 (mode block first, then init) */
+-		cam_real_lines = most;
+-		if ((cam_tab_reg16(&cam_tab[CAM_TAB_MODE], 0x0202, &vendor_exposure) ||
+-		    cam_tab_reg16(&cam_tab[CAM_TAB_INIT], 0x0202, &vendor_exposure)) && vendor_exposure != 0) {
+-			cam_real_lines = vendor_exposure > most ? most : vendor_exposure;
+-		}
+-		cam_real_gain = (cam_tab_reg16(&cam_tab[CAM_TAB_MODE], 0x0204, &vendor_gain) ||
+-		    cam_tab_reg16(&cam_tab[CAM_TAB_INIT], 0x0204, &vendor_gain)) && vendor_gain != 0 ?
+-		    cam_real_gain_from_code(cfg, s, vendor_gain) : s->gain_unity;
++		if (cam_still_ae.written) {
++			cam_real_lines = (uint32_t)(((uint64_t)cam_still_ae.lines * cam_still_ae.line_ns +
++			    row->line_ns / 2) / row->line_ns);
++			cam_real_lines = cam_real_lines < 4 ? 4 : cam_real_lines > most ? most : cam_real_lines;
++			cam_real_gain = cam_still_ae.gain;
++			printf("vayu-camera: step 6: %s mode 1: the first frame is exposed with the usual mode's "
++			    "%u lines at %u ns (%u lines at %u ns a line), gain %#x (code %#x), not the vendor "
++			    "block's own 11 lines\n", s->name, cam_still_ae.lines, cam_still_ae.line_ns,
++			    cam_real_lines, row->line_ns, cam_real_gain, cam_still_ae.gain_code);
++		} else {
++			/* the session's first exposure is the vendor block's 0x0202 (mode block first, then init) */
++			cam_real_lines = most;
++			if ((cam_tab_reg16(&cam_tab[CAM_TAB_MODE], 0x0202, &vendor_exposure) ||
++			    cam_tab_reg16(&cam_tab[CAM_TAB_INIT], 0x0202, &vendor_exposure)) && vendor_exposure != 0) {
++				cam_real_lines = vendor_exposure > most ? most : vendor_exposure;
++			}
++			cam_real_gain = (cam_tab_reg16(&cam_tab[CAM_TAB_MODE], 0x0204, &vendor_gain) ||
++			    cam_tab_reg16(&cam_tab[CAM_TAB_INIT], 0x0204, &vendor_gain)) && vendor_gain != 0 ?
++			    cam_real_gain_from_code(cfg, s, vendor_gain) : s->gain_unity;
++		}
+ 	} else {
+ 		cam_real_lines = cfg->ae_lines;
+ 		cam_real_gain = 4u * s->gain_unity;
++		cam_real_usual_lines = cam_real_lines;
++		cam_real_usual_gain = cam_real_gain;
+ 	}
+ 	cam_real_frame_ns = (uint64_t)s->line_ns * s->frame_lines_min;
+ 	cam_real_timeout_ms = (uint32_t)((3 * cam_real_frame_ns + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC) + 100;
+@@ -4738,8 +4837,8 @@
+  * The header's exposure/gain are the ones this session has, but the gain is the ABI's LINEAR one,
+  * not the sensor's code: mode 0's fixed gain is 4x, and 0x0204 took the sensor's own code (IMX582
+  * 0x300, S5K3T2 0x80) while the ABI says 4 * gain_unity (0x400 / 0x80); mode 1 starts from the
+- * vendor block's own values. The frame length is the row's own (mode 0: 4x; mode 1: the vendor's),
+- * and AE never writes 0x0340.
++ * usual mode's last exposure and gain (cam_real_start, cam_still_ae), in the block's line time.
++ * The frame length is the row's own (mode 0: 4x; mode 1: the vendor's), and AE never writes 0x0340.
+  */
+ /*
+  * A pending AE request written to the sensor, between two frames (the frame that follows takes it,
+@@ -4778,7 +4877,7 @@
+ 	if (lines == cam_real_lines && gain == cam_real_gain) {
+ 		return;
+ 	}
+-	code = cfg == &cam_streams[0] ? 1024u - (1024u * s->gain_unity) / gain : gain;
++	code = cam_real_gain_code(cfg, s, gain);
+ 	ok = cam_i2c_write_reg(&cam_real_stream.bus, cam_real_stream.s->addr7, 0x0202, 2, (uint16_t)lines, 2) &&
+ 	    cam_i2c_write_reg(&cam_real_stream.bus, cam_real_stream.s->addr7, 0x0204, 2, (uint16_t)code, 2);
+ 	if (!ok) {
+@@ -4787,6 +4886,11 @@
+ 	}
+ 	cam_real_lines = lines;
+ 	cam_real_gain = gain;
++	if (s->mode == 0) {
++		/* the usual mode's exposure: what the next stills session starts from (cam_real_start) */
++		cam_real_usual_lines = lines;
++		cam_real_usual_gain = gain;
++	}
+ 	if (cam_real_ae_writes++ < 3) {
+ 		printf("vayu-camera: step 6: AE: exposure %u lines, gain %#x (code %#x)\n", lines, gain, code);
+ 	}
+--- a/userland/src/camera_device.c
++++ b/userland/src/camera_device.c
+@@ -31,9 +31,11 @@
+  * rear, 1280x720 front) for the preview, and the full 4:3 one (4000x3000, 2592x1940) for a
+  * photograph. A photograph asks the kernel for the full mode (HAKIOS_CAMERA_SENSOR with b = 1); the
+  * kernel ends its session and brings the sensor up in that mode, and the frames' headers say which
+- * mode they are (mode 1). The first frames of the mode are dropped (cam_still_settle=, 2: the
+- * vendor block's exposure is a guess and AE has just been re-seeded for the new line time), the
+- * next one is the photograph, and the stream asks for the usual mode again for the preview. The
++ * mode they are (mode 1). The kernel writes the usual mode's last exposure and gain into the stills
++ * session before its on block (vayu_camera.c, cam_still_ae: 0x0202/0x0204, in the line time of the
++ * vendor's res1 frame), so the stills mode's first frame is exposed: with cam_still_settle=0 (the
++ * default) it is the photograph, cam_still_settle=N drops N stills-mode frames before it. The
++ * stream then asks for the usual mode again for the preview. The
+  * preview is not served from the full mode (cam_still_preview=1 serves it too): a 12 Mpx picture
+  * made thirty times a second costs more than the preview can pay. A kernel that refuses the mode
+  * (EINVAL), answers the request with the usual mode, or fails the stills session, falls back: the
+@@ -420,6 +422,8 @@
+ 	void *          handler;                /* a block: ^(CVPixelBufferRef, CMTime) */
+ 	bool            said_shape;
+ 	uint64_t        delivered, refused, rendered;   /* (rendered: every picture made, for the timing line every 100) */
++	uint64_t        render_ns;              /* render_piece()'s time since the last timing line, and its pictures */
++	uint32_t        render_n;
+ 	CVPixelBufferRef held[HELD];            /* the pictures given last, kept from the pool (see deliver) */
+ 	unsigned        held_next;
+ 	bool            said_pool;
+@@ -477,6 +481,8 @@
+ 	bool            worker_started;
+ 	int             torch;
+ 	uint64_t        frames, stills_given;
++	uint64_t        measure_ns;     /* isp_measure()'s time since the last timing line (every 100 frames) */
++	uint32_t        measure_n;
+ 	/*
+ 	 * The stills mode's handshake (see the top comment): the kernel gives one sensor's frames at a
+ 	 * time and one mode's, so a photograph is a session change. frame_mode is the mode of the frames
+@@ -1080,6 +1086,18 @@
+ 	return m;
+ }
+ 
++/* a mach interval in milliseconds (the timing line's numbers and the pictures' own) */
++static double
++elapsed_ms(uint64_t began, uint64_t done)
++{
++	static mach_timebase_info_data_t tb;
++
++	if (tb.denom == 0) {
++		mach_timebase_info(&tb);
++	}
++	return (double)(done - began) * tb.numer / tb.denom / 1e6;
++}
++
+ static void
+ deliver(struct stream *s, struct output *out, const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw,
+     CFDictionaryRef metadata)
+@@ -1087,6 +1105,8 @@
+ 	CVPixelBufferRef pb = output_buffer(out);
+ 	uint32_t pf, width, height;
+ 	bool still;
++	uint64_t began, done;
++	double ms;
+ 
+ 	if (pb == NULL) {
+ 		return;
+@@ -1116,18 +1136,15 @@
+ 	CVPixelBufferLockBaseAddress(pb, 0);
+ 
+ 	struct render_job job = { isp, f, raw, pb, pf, width, height, s->pieces, still };
+-	uint64_t began = mach_absolute_time();
+ 
++	began = mach_absolute_time();
+ 	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
++	done = mach_absolute_time();
++	ms = elapsed_ms(began, done);
++	out->render_ns += done - began;
++	out->render_n++;
++	out->rendered++;
+ 	{
+-		static mach_timebase_info_data_t tb;
+-		double ms;
+-
+-		if (tb.denom == 0) {
+-			mach_timebase_info(&tb);
+-		}
+-		ms = (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6;
+-		out->rendered++;
+ 		if (job.still) {
+ 			struct isp_still_timing timing;
+ 
+@@ -1440,8 +1457,10 @@
+  * was), cam_neon=0 (the scalar inner loops), cam_still_async=0 (the photograph on the frame's thread, as
+  * it was), cam_pieces=N (8). All of them on but the last's default, which is the 8 pieces this made
+  * pictures in before. The stills handshake's: cam_still_mode=0 (photographs from the preview's frames, the
+- * way they were before the kernel had a stills mode), cam_still_settle=N (2 stills-mode frames dropped
+- * before the photograph), cam_still_preview=1 (the preview served from the stills mode's frames too).
++ * way they were before the kernel had a stills mode), cam_still_settle=N (0 stills-mode frames dropped
++ * before the photograph: the kernel writes the usual mode's exposure before the stills on block, so the
++ * first frame is exposed; N > 0 keeps that many of them out of the photograph), cam_still_preview=1 (the
++ * preview served from the stills mode's frames too).
+  */
+ static void
+ load_fast(struct isp *isp, struct stream *s)
+@@ -1450,7 +1469,7 @@
+ 	char arguments[4096] = "";
+ 	size_t size = sizeof(arguments) - 1;
+ 	struct isp_fast fast = { true, true };
+-	int pieces = 8, async = 1, settle = 2, stills = 1, still_preview = 0;
++	int pieces = 8, async = 1, settle = 0, stills = 1, still_preview = 0;
+ 
+ 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+ 		fast.preview_half = boot_number(arguments, "cam_preview_half=", 1) != 0;
+@@ -1458,7 +1477,7 @@
+ 		async = boot_number(arguments, "cam_still_async=", 1) != 0;
+ 		pieces = (int)boot_number(arguments, "cam_pieces=", 8);
+ 		stills = boot_number(arguments, "cam_still_mode=", 1) != 0;
+-		settle = (int)boot_number(arguments, "cam_still_settle=", 2);
++		settle = (int)boot_number(arguments, "cam_still_settle=", 0);
+ 		still_preview = boot_number(arguments, "cam_still_preview=", 0) != 0;
+ 	}
+ 	pieces = pieces < 1 ? 1 : pieces > 32 ? 32 : pieces;
+@@ -1728,7 +1747,11 @@
+ 		bool stills_frame = f->mode == FRAME_MODE_STILLS;
+ 		bool settled = !stills_frame || s->mode_frames > s->still_settle;
+ 
++		uint64_t measured = mach_absolute_time();
++
+ 		isp_measure(&isp, f, raw, &st);
++		s->measure_ns += mach_absolute_time() - measured;
++		s->measure_n++;
+ 		isp_awb(&isp, &st);
+ 		isp.fixed_frame = stills_frame;
+ 		if (f->sensor != tuned_for) {
+@@ -1776,6 +1799,34 @@
+ 		}
+ 		af_frame(device, &af, f, raw, s->af_window, s->af_locked);
+ 		s->frames++;
++		if (stills_frame && s->mode_frames == 1) {
++			/* (the kernel's first stills frame: its exposure, written before the on block) */
++			say("the first frame of the full stills mode: exposure %.1f ms, gain %.1fx, green %.0f above black%s",
++			    f->exposure_lines * (double)f->line_ns / 1e6, (double)f->gain / f->gain_unity, st.mean[1],
++			    s->still_settle == 0 ? " (it is the photograph)" : "");
++		}
++		if (s->frames % 100 == 0) {
++			/*
++			 * The frame's work, every 100 frames: where the time goes -- the statistics of the whole
++			 * frame, and the preview's render, output by output. Averaged over the frames since the
++			 * last line; the pictures may be fewer than the frames (a pool with no buffer to spare).
++			 */
++			struct output *primary = &s->out[0], *secondary = &s->out[1];
++
++			say("frame %llu: the last 100 frames: isp_measure %.2f ms a frame, %s render %.2f ms a picture (%u), "
++			    "%s render %.2f ms a picture (%u)", (unsigned long long)f->sequence,
++			    s->measure_n != 0 ? (double)s->measure_ns / s->measure_n / 1e6 : 0,
++			    primary->name, primary->render_n != 0 ? (double)primary->render_ns / primary->render_n / 1e6 : 0,
++			    primary->render_n, secondary->name,
++			    secondary->render_n != 0 ? (double)secondary->render_ns / secondary->render_n / 1e6 : 0,
++			    secondary->render_n);
++			s->measure_ns = 0;
++			s->measure_n = 0;
++			for (int i = 0; i < OUTPUTS; i++) {
++				s->out[i].render_ns = 0;
++				s->out[i].render_n = 0;
++			}
++		}
+ 
+ 		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port);
+ 

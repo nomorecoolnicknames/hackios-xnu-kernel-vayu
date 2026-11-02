@@ -1,0 +1,2209 @@
+Subject: [PATCH] camera S2: a GPU ISP prototype on Adreno 640 through OpenGL ES 3.0 (cam_gpu=1, NEON fallback)
+
+Base: work/hkd-ws20/userland (the root-cam2 line; src/camera_isp.c sha256 e8b35f8b0e98...,
+src/camera_device.c b3d92562bb61..., src/camera_isp.h 63187a8d65a1..., build.sh e9fcd752c9f3...).
+Everything else in that tree is unchanged. The paths are the repository's: `patch -p1` at the
+repository root, `patch -p2` inside the userland tree itself (as 0066 does: `a/userland/...`).
+
+What it adds:
+- src/camera_isp_gpu.c: the GPU ISP. OpenGL ES 3.0 off-screen through Mesa's OSMesa, the same
+  library and interface the window server draws with (src/gl_osmesa.c, lib/libOSMesa.8.dylib in
+  the image), only dlopen()ed: libhakios.media.dylib gains no load-time dependency (otool -L: the
+  system frameworks alone), and a mediaserverd whose image has no libOSMesa keeps the processor's
+  path. The context is made on the first frame that asks for it; a failure of any step (no library,
+  no context, a shader the driver will not take) leaves isp->gpu false for the rest of the run and
+  camera_isp.c makes the picture as before -- the fallback the boot argument promises.
+- src/camera_isp_gpu_shaders.h: the two passes. Pass 1: RAW10's four-in-five-bytes packing out of
+  an R8UI texture, black 64 off, the 17x13 lens-shading grid bilinear per 2x2 cell (as
+  camera_isp.c's lsc_at()), Malvar-He-Cutler 5x5 demosaic, the white balance's and AE's gains with
+  the colour matrix (pipe_init()'s rows) and the 4096-step sRGB/tone table, to RGBA8UI. Pass 2:
+  BT.601 in 1/65536ths with nv12_pair()'s rounding, an optional 3x3 bilateral on Y (sigma in
+  codes), the stills' unsharp mask (threshold 2, +-24), and the 2x2 block sums for U and V; MRT to
+  R8UI (Y) and RG8UI (UV), one draw. The UV target is picture-sized: each 2x2 block's four pixels
+  write the block's pair, and the readback keeps one column in two (cam_gpu_nr= is the sigma).
+- camera_isp.c: isp_set_gpu()/isp_gpu_start(), and the hook in isp_render_nv12() and
+  isp_render_nv12_half() for a whole picture (first_row 0, end_row >= height), false -> the
+  processor's path. camera_device.c: cam_gpu=1 and cam_gpu_nr=F parsed in load_fast(), one log
+  line ("the GPU ISP: on/off"), and render_piece() gives the whole frame to the first piece when
+  the GPU is on (the other pieces have nothing to do; stills and BGRA keep the processor's path).
+- tools/cam_gpu_bench.c (built to /redwood/bin/cam_gpu_bench, ad-hoc signed when ldid is there),
+  tools/cam_gpu_scene.h (a scene made up as an IMX582's RAW10: 1920x1080, stride 2400, black 64,
+  bayer 0), tools/cam_gpu_ref.h (the C reference of the shaders' arithmetic) and
+  tools/cam_gpu_host.c (the same shaders through Mesa's EGL on the host, held to the C reference
+  and to isp_render_nv12()).
+
+Host protocol (2026-11-02, no phone, no gunwest; Mesa 22.3.6 llvmpipe, EGL surfaceless, GL ES 3.2;
+frame 1920x1080 made up as above; the tuning is fw-poco-x3-pro/camera-imx582.isp):
+- shaders against the C reference of their own arithmetic: Y 50.18 dB, UV 56.02 dB (detail),
+  50.29/56.70 (smooth), 51.04/56.11 (sigma 1.5, unsharp 0.3), 50.98/56.63 (420v).
+- shaders against isp_render_nv12(): Y 26.93 dB, UV 34.96 dB (detail); 36.76/41.87 (smooth);
+  28.23/36.07 (420v). Below the plan's 38 dB: isp_render_nv12() is the preview's one-pixel-per-2x2-
+  cell picture (a quarter of the demosaic, upscaled), the shader is a full-resolution Malvar one;
+  the C reference differs from isp_render_nv12() by the same 26.87/36.35 dB, so the gap is the
+  algorithm, not the GLSL. A like-for-like 38 dB needs the cell path in the shader or a full-
+  resolution processor reference.
+- 29-43 ms a frame on llvmpipe (a host rasterizer; NOT the Adreno's time -- no phone run).
+- There is no dump of a real IMX582 RAW10 frame in artifacts/vayu (only .raw files that are not
+  frames: sel.tar.raw, vayu_ssc.c.raw, XBLCore.raw), so the frames above are made up; --raw takes
+  one when there is one.
+
+Not done: IOSurface memory as the textures and the targets (hakios_gl_surface_texture()'s way), so
+the frame's bytes are copied up (2.6 MB) and the picture down (Y in place, UV through a
+picture-sized buffer); that is the next step. No phone run: the arm64 side is compile- and
+link-checked only (media dylib and bench), the shaders are checked on the host.
+
+---
+diff -ruN a/userland/build.sh b/userland/build.sh
+--- a/userland/build.sh
++++ b/userland/build.sh
+@@ -238,7 +238,14 @@
+ 		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/sound_test.c
+ 		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/mg_test.c
+ 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/torch_test.c
+-		$DYN -O2 -o obj/camera_test src/camera_test.c src/camera_isp.c
++		$DYN -O2 -o obj/camera_test src/camera_test.c src/camera_isp.c src/camera_isp_gpu.c
++		# the GPU ISP's own bench (src/camera_isp_gpu.c; boot-arg cam_gpu=1 is the same path in mediaserverd),
++		# built whether the image carries libOSMesa or not: without it the bench says so and makes the
++		# processor's picture only. Ad-hoc signed, as the tools that run from /redwood/bin are
++		$DYN -O2 -Isrc -Itools -o obj/cam_gpu_bench tools/cam_gpu_bench.c src/camera_isp.c src/camera_isp_gpu.c &&
++			{ ${LDID:-ldid} -Cadhoc obj/cam_gpu_bench 2>/dev/null ||
++			  ${LDID:-ldid} -S obj/cam_gpu_bench 2>/dev/null ||
++			  echo "build.sh: no ldid: cam_gpu_bench is unsigned"; }
+ 		$DYN -fobjc-arc -framework Foundation -framework AVFoundation -o obj/camera_avtest src/camera_avtest.m
+ 		# (the microphone as an application records: allowed to, by an entitlement, if ldid is there)
+ 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/record_test src/record_test.c &&
+@@ -301,7 +308,7 @@
+ 			-o obj/libhakios.app.dylib src/inject_app.c
+ 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
+ 			-framework CoreVideo -framework IOSurface -lobjc \
+-			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
++			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c src/camera_isp_gpu.c
+ 		# ... and inside appstored (STOREFRONT=1), which answers with a storefront and watches for a bag
+ 		# request being built (src/inject_store.c)
+ 		# (-lc++abi for __cxa_throw: every C++ exception thrown in the process is watched, which is how
+@@ -380,6 +387,7 @@
+ 	[ -f obj/sound_test ] && cp obj/sound_test root/bin/
+ 	[ -f obj/torch_test ] && cp obj/torch_test root/bin/
+ 	[ -f obj/camera_test ] && cp obj/camera_test root/bin/
++	[ -f obj/cam_gpu_bench ] && cp obj/cam_gpu_bench root/bin/
+ 	[ -f obj/camera_avtest ] && cp obj/camera_avtest root/bin/
+ 	[ -f obj/record_test ] && cp obj/record_test root/bin/
+ 	for f in $DEVICE_BIN; do [ -f obj/$f ] && cp obj/$f root/bin/; done      # (devices/$DEVICE/userland/build.sh)
+diff -ruN a/userland/src/camera_device.c b/userland/src/camera_device.c
+--- a/userland/src/camera_device.c
++++ b/userland/src/camera_device.c
+@@ -854,9 +854,23 @@
+ {
+ 	struct render_job *j = context;
+ 	uint32_t rows = (j->height + j->pieces - 1) / j->pieces, first = (uint32_t)i * rows, end = first + rows;
++	bool whole = j->isp->gpu && !j->still && j->format != PF_BGRA;
+ 
+-	first &= ~1u;
+-	end = i + 1 == j->pieces ? j->height : end & ~1u;
++	/*
++	 * The GPU ISP (cam_gpu=1) draws the whole picture in one go: the first piece asks for all of it (its
++	 * shaders take the frame's bytes and make every row), and the other pieces have nothing left to do.
++	 * The processor's path is unchanged, a piece a thread.
++	 */
++	if (whole) {
++		if (i != 0) {
++			return;
++		}
++		first = 0;
++		end = j->height;
++	} else {
++		first &= ~1u;
++		end = i + 1 == j->pieces ? j->height : end & ~1u;
++	}
+ 	if (j->format == PF_BGRA) {
+ 		isp_render_bgra(j->isp, j->f, j->raw, CVPixelBufferGetBaseAddress(j->pb), CVPixelBufferGetBytesPerRow(j->pb), j->width,
+ 		    j->height, first, end);
+@@ -1450,7 +1464,8 @@
+ 	char arguments[4096] = "";
+ 	size_t size = sizeof(arguments) - 1;
+ 	struct isp_fast fast = { true, true };
+-	int pieces = 8, async = 1, settle = 2, stills = 1, still_preview = 0;
++	int pieces = 8, async = 1, settle = 2, stills = 1, still_preview = 0, gpu_on = 0;
++	float gpu_sigma = 0;
+ 
+ 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+ 		fast.preview_half = boot_number(arguments, "cam_preview_half=", 1) != 0;
+@@ -1460,10 +1475,13 @@
+ 		stills = boot_number(arguments, "cam_still_mode=", 1) != 0;
+ 		settle = (int)boot_number(arguments, "cam_still_settle=", 2);
+ 		still_preview = boot_number(arguments, "cam_still_preview=", 0) != 0;
++		gpu_on = boot_number(arguments, "cam_gpu=", 0) != 0;
++		gpu_sigma = boot_number(arguments, "cam_gpu_nr=", 0);
+ 	}
+ 	pieces = pieces < 1 ? 1 : pieces > 32 ? 32 : pieces;
+ 	settle = settle < 0 ? 0 : settle > 10 ? 10 : settle;
+ 	isp_set_fast(isp, &fast);
++	isp_set_gpu(isp, gpu_on != 0, gpu_sigma);
+ 	s->pieces = (uint32_t)pieces;
+ 	s->still_async = async != 0 && s->still_queue != NULL;
+ 	s->still_ok = stills != 0;
+@@ -1476,6 +1494,7 @@
+ 		say("the fast paths: the preview at half resolution (%s), the NEON loops (%s), %d pieces, the photograph on %s",
+ 		    fast.preview_half ? "on" : "off", fast.neon ? "on" : "off", pieces,
+ 		    s->still_async ? "the capture queue" : "the frame's thread (cam_still_async=0)");
++		say("the GPU ISP: %s", isp->gpu ? "on (cam_gpu=1), the whole picture in one draw" : "off (the processor's path)");
+ 		say("the stills mode: %s, %u frame(s) dropped before the photograph, the preview from the stills frames: %s",
+ 		    stills ? "asked for on every photograph" : "off (cam_still_mode=0)", s->still_settle,
+ 		    s->still_preview ? "yes (cam_still_preview=1)" : "no");
+diff -ruN a/userland/src/camera_isp.c b/userland/src/camera_isp.c
+--- a/userland/src/camera_isp.c
++++ b/userland/src/camera_isp.c
+@@ -89,6 +89,22 @@
+ }
+ 
+ /*
++ * The GPU ISP (boot-arg cam_gpu=1, camera_device.c): the picture on the phone's Adreno through OpenGL ES
++ * 3.0 (src/camera_isp_gpu.c). A GPU path that will not start leaves isp->gpu off and every picture the
++ * processor's, which is the fallback the boot argument promises.
++ */
++void
++isp_set_gpu(struct isp *isp, bool on, float sigma)
++{
++	isp->gpu = on;
++	isp->gpu_sigma = sigma > 0 ? sigma : 0;
++	if (!on) {
++		return;
++	}
++	isp->gpu = isp_gpu_start();
++}
++
++/*
+  * The gamma table again, with an S-curve of contrast c on sRGB's values (v + c * (smoothstep(v) - v): darker darks,
+  * brighter lights, the ends and the middle where they were), and the saturation the colour matrix gets from now on.
+  * vayu's pictures came out flat (camera work, 2026-10-26): sRGB's curve and a 15 % exposure target alone.
+@@ -912,6 +928,11 @@
+ {
+ 	uint8_t line[2][3 * 8192];
+ 
++	/* (the GPU ISP makes a whole picture: the frame thread asks it for the whole of one) */
++	if (isp->gpu && first_row == 0 && end_row >= height &&
++	    isp_gpu_render_nv12(isp, f, raw, y, y_stride, uv, uv_stride, width, height, video_range)) {
++		return;
++	}
+ 	if (width > 8192) {
+ 		return;
+ 	}
+@@ -1067,6 +1088,10 @@
+ 	struct half_preview *h = &half;
+ 	const uint8_t *lut = isp->gamma;
+ 
++	if (isp->gpu && first_row == 0 && end_row >= height &&
++	    isp_gpu_render_nv12(isp, f, raw, y, y_stride, uv, uv_stride, width, height, video_range)) {
++		return;
++	}
+ 	if (!isp->fast.preview_half || width > 8192) {
+ 		isp_render_nv12(isp, f, raw, y, y_stride, uv, uv_stride, width, height, first_row, end_row, video_range);
+ 		return;
+diff -ruN a/userland/src/camera_isp_gpu.c b/userland/src/camera_isp_gpu.c
+--- a/userland/src/camera_isp_gpu.c
++++ b/userland/src/camera_isp_gpu.c
+@@ -0,0 +1,598 @@
++/*
++ * The GPU ISP (boot-arg cam_gpu=1): the camera's RAW10 frame to NV12 on the phone's Adreno 640,
++ * through OpenGL ES 3.0 off-screen (Mesa's freedreno, the same library and off-screen interface
++ * the window server draws with: lib/libOSMesa.8.dylib, src/gl_osmesa.c).
++ *
++ * Why this file is separate from camera_isp.c: the processor's ISP is the fallback and the
++ * reference (tools/cam_gpu_host.c holds the shaders to a C reference of their arithmetic), and
++ * nothing of OpenGL ES is in the frame path when cam_gpu is not set. camera_isp.c calls
++ * isp_gpu_render_nv12() for a whole picture and takes its false for "the processor's path, then".
++ *
++ * The two passes are in src/camera_isp_gpu_shaders.h. What is here: the context (OSMesa, made
++ * once, on the first frame that asks for it, and made current on whichever thread renders), the
++ * textures (the frame's bytes as R8UI, the lens shading's 17x13 grid, the 4096-step curve, the
++ * colour matrix's rows), one draw a pass, and the reading back: Y as R8UI into its plane, UV as
++ * RG8UI into a buffer (each pixel of a 2x2 block has its block's U and V) and that compacted into
++ * the NV12 plane, one column in two.
++ *
++ * The cost that is not the GPU's: the frame's bytes go up (glTexSubImage2D, 2.6 MB at 1920x1080
++ * RAW10) and the picture comes down (glReadPixels; the Y plane in place, the UV through a buffer
++ * of the picture's size). With an IOSurface's memory as the textures and the targets
++ * (hakios_gl_surface_texture()'s way, the kernel's driver maps the surface) neither would be a
++ * copy; that is the next step, not this one, and this file says what it costs.
++ *
++ * Failure of any of it (no library in the image, no context, a shader the driver will not take)
++ * turns the GPU path off for the rest of the run, with one line saying which, and camera_isp.c
++ * makes the picture as it did before.
++ */
++#include <dlfcn.h>
++#include <math.h>
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "camera_isp.h"
++#include "camera_isp_gpu_shaders.h"
++
++/* ---- the OpenGL ES 3.0 functions this file calls, and nothing else ------------------------------ */
++
++typedef unsigned int GLenum, GLuint, GLbitfield;
++typedef int GLint, GLsizei;
++typedef unsigned char GLubyte, GLboolean;
++typedef float GLfloat;
++typedef char GLchar;
++typedef ptrdiff_t GLsizeiptr, GLintptr;
++typedef void GLvoid;
++
++typedef struct osmesa_context *OSMesaContext;
++
++#define GL_FALSE                  0
++#define GL_TRUE                   1
++#define GL_TRIANGLES              0x0004
++#define GL_UNSIGNED_BYTE          0x1401
++#define GL_FLOAT                  0x1406
++#define GL_TEXTURE_2D             0x0de1
++#define GL_TEXTURE0               0x84c0
++#define GL_TEXTURE_MAG_FILTER     0x2800
++#define GL_TEXTURE_MIN_FILTER     0x2801
++#define GL_TEXTURE_WRAP_S         0x2802
++#define GL_TEXTURE_WRAP_T         0x2803
++#define GL_NEAREST                0x2600
++#define GL_CLAMP_TO_EDGE          0x812f
++#define GL_TEXTURE_BINDING_2D     0x8069
++#define GL_RED                    0x1903
++#define GL_RG                     0x8227
++#define GL_RGB                    0x1907
++#define GL_RGBA                   0x1908
++#define GL_RED_INTEGER            0x8d94
++#define GL_RG_INTEGER             0x8228
++#define GL_R8                     0x8229
++#define GL_RG8                    0x822b
++#define GL_RGBA8                  0x8058
++#define GL_R8UI                   0x8232
++#define GL_RG8UI                  0x8238
++#define GL_RGBA8UI                0x8d7c
++#define GL_RGBA_INTEGER           0x8d99
++#define GL_RGB16F                 0x881b
++#define GL_UNSIGNED_INT           0x1405
++#define GL_FRAMEBUFFER            0x8d40
++#define GL_COLOR_ATTACHMENT0      0x8ce0
++#define GL_COLOR_ATTACHMENT1      0x8ce1
++#define GL_FRAMEBUFFER_COMPLETE   0x8cd5
++#define GL_VERTEX_SHADER          0x8b31
++#define GL_FRAGMENT_SHADER        0x8b30
++#define GL_COMPILE_STATUS         0x8b81
++#define GL_LINK_STATUS            0x8b82
++#define GL_INFO_LOG_LENGTH        0x8b84
++#define GL_ARRAY_BUFFER           0x8892
++#define GL_PACK_ALIGNMENT         0x0d05
++#define GL_PACK_ROW_LENGTH        0x0d02
++#define GL_UNPACK_ALIGNMENT       0x0cf5
++#define GL_UNPACK_ROW_LENGTH      0x0cf2
++#define GL_RENDERER               0x1f01
++#define GL_VERSION                0x1f02
++#define GL_VENDOR                 0x1f00
++#define GL_COLOR_BUFFER_BIT       0x00004000
++
++#define OSMESA_FORMAT             0x22
++#define OSMESA_DEPTH_BITS         0x30
++#define OSMESA_STENCIL_BITS       0x31
++#define OSMESA_PROFILE            0x33
++#define OSMESA_CONTEXT_MAJOR_VERSION 0x36
++#define OSMESA_CONTEXT_MINOR_VERSION 0x37
++#define OSMESA_ES_PROFILE         0x38
++
++#define GL_FUNCTIONS(X) \
++	X(void, UseProgram, (GLuint)) \
++	X(GLuint, CreateShader, (GLenum)) \
++	X(void, ShaderSource, (GLuint, GLsizei, const GLchar *const *, const GLint *)) \
++	X(void, CompileShader, (GLuint)) \
++	X(void, GetShaderiv, (GLuint, GLenum, GLint *)) \
++	X(void, GetShaderInfoLog, (GLuint, GLsizei, GLsizei *, GLchar *)) \
++	X(GLuint, CreateProgram, (void)) \
++	X(void, AttachShader, (GLuint, GLuint)) \
++	X(void, LinkProgram, (GLuint)) \
++	X(void, GetProgramiv, (GLuint, GLenum, GLint *)) \
++	X(void, GetProgramInfoLog, (GLuint, GLsizei, GLsizei *, GLchar *)) \
++	X(void, DeleteShader, (GLuint)) \
++	X(void, DeleteProgram, (GLuint)) \
++	X(GLint, GetUniformLocation, (GLuint, const GLchar *)) \
++	X(void, Uniform1i, (GLint, GLint)) \
++	X(void, Uniform1f, (GLint, GLfloat)) \
++	X(void, Uniform2i, (GLint, GLint, GLint)) \
++	X(void, Uniform3f, (GLint, GLfloat, GLfloat, GLfloat)) \
++	X(void, ActiveTexture, (GLenum)) \
++	X(void, GenTextures, (GLsizei, GLuint *)) \
++	X(void, BindTexture, (GLenum, GLuint)) \
++	X(void, DeleteTextures, (GLsizei, const GLuint *)) \
++	X(void, TexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \
++	X(void, TexSubImage2D, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *)) \
++	X(void, TexParameteri, (GLenum, GLenum, GLint)) \
++	X(void, GenFramebuffers, (GLsizei, GLuint *)) \
++	X(void, BindFramebuffer, (GLenum, GLuint)) \
++	X(void, DeleteFramebuffers, (GLsizei, const GLuint *)) \
++	X(void, FramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint)) \
++	X(GLenum, CheckFramebufferStatus, (GLenum)) \
++	X(void, DrawBuffers, (GLsizei, const GLenum *)) \
++	X(void, GenVertexArrays, (GLsizei, GLuint *)) \
++	X(void, BindVertexArray, (GLuint)) \
++	X(void, DeleteVertexArrays, (GLsizei, const GLuint *)) \
++	X(void, Viewport, (GLint, GLint, GLsizei, GLsizei)) \
++	X(void, ClearColor, (GLfloat, GLfloat, GLfloat, GLfloat)) \
++	X(void, Clear, (GLbitfield)) \
++	X(void, DrawArrays, (GLenum, GLint, GLsizei)) \
++	X(void, Finish, (void)) \
++	X(void, Flush, (void)) \
++	X(void, ReadPixels, (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *)) \
++	X(void, ReadBuffer, (GLenum)) \
++	X(void, PixelStorei, (GLenum, GLint)) \
++	X(const GLubyte *, GetString, (GLenum)) \
++	X(GLenum, GetError, (void)) \
++	X(void, Disable, (GLenum)) \
++	X(void, Enable, (GLenum))
++
++#define GL_DECLARE(ret, name, args)     static ret (*p_gl##name) args;
++GL_FUNCTIONS(GL_DECLARE)
++#undef GL_DECLARE
++
++/* ---- the one context, and its textures --------------------------------------------------------- */
++
++#define GPU_LIBRARIES   { "/redwood/lib/libOSMesa.8.dylib", "libOSMesa.8.dylib", "/usr/lib/libOSMesa.8.dylib" }
++#define GPU_WINDOW      16
++
++struct gpu {
++	int             tried;          /* the library has been looked for */
++	bool            ok;             /* the context and both programs are made */
++	bool            said_failure;
++	void            *library;
++	OSMesaContext   context;
++	unsigned char   window[GPU_WINDOW * GPU_WINDOW * 4];
++
++	GLuint          raw_program, nv12_program;
++	GLuint          raw_texture, lsc_texture, gamma_texture;
++	GLuint          rgb_texture, y_texture, uv_texture;
++	GLuint          raw_fbo, nv12_fbo;
++	GLuint          vao;
++
++	GLint           u_raw[16], u_nv12[8];   /* the uniforms' locations, by name */
++
++	uint32_t        raw_stride, raw_height;
++	uint32_t        width, height;
++	unsigned char   *uv_scratch;
++	size_t          uv_scratch_bytes;
++};
++
++static struct gpu gpu;
++static pthread_mutex_t gpu_lock = PTHREAD_MUTEX_INITIALIZER;
++static __thread struct gpu *gpu_current;
++
++static void
++gpu_say(const char *format, ...)
++{
++	va_list list;
++
++	va_start(list, format);
++	fprintf(stderr, "gpu_isp: ");
++	vfprintf(stderr, format, list);
++	fprintf(stderr, "\n");
++	va_end(list);
++}
++
++/* the library's functions: OSMesa's own out of it, the GL ones by its GetProcAddress (or dlsym) */
++static int
++gpu_load(void)
++{
++	static const char *const names[] = GPU_LIBRARIES;
++	OSMesaContext (*create)(const int *, OSMesaContext);
++	unsigned char (*make_current)(OSMesaContext, void *, unsigned, int, int);
++	void (*destroy)(OSMesaContext);
++	void (*(*get_proc)(const char *))(void);
++	const int attributes[] = {
++		OSMESA_FORMAT, GL_RGBA, OSMESA_DEPTH_BITS, 24, OSMESA_STENCIL_BITS, 8,
++		OSMESA_PROFILE, OSMESA_ES_PROFILE, OSMESA_CONTEXT_MAJOR_VERSION, 3, OSMESA_CONTEXT_MINOR_VERSION, 0,
++		0
++	};
++	const char *path = getenv("HAKIOS_OSMESA");
++	unsigned i;
++
++	for (i = 0; path == NULL && i < sizeof(names) / sizeof(names[0]); i++) {
++		path = names[i];
++		if (access(path, R_OK) != 0) {
++			path = NULL;
++		}
++	}
++	if (path == NULL) {
++		gpu_say("no libOSMesa.8.dylib in the image: the processor's ISP");
++		return 0;
++	}
++	gpu.library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++	if (gpu.library == NULL) {
++		gpu_say("dlopen(%s): %s", path, dlerror());
++		return 0;
++	}
++	create = (OSMesaContext (*)(const int *, OSMesaContext))dlsym(gpu.library, "OSMesaCreateContextAttribs");
++	make_current = (unsigned char (*)(OSMesaContext, void *, unsigned, int, int))dlsym(gpu.library, "OSMesaMakeCurrent");
++	destroy = (void (*)(OSMesaContext))dlsym(gpu.library, "OSMesaDestroyContext");
++	get_proc = (void (*(*)(const char *))(void))dlsym(gpu.library, "OSMesaGetProcAddress");
++	if (create == NULL || make_current == NULL || get_proc == NULL) {
++		gpu_say("%s is not an off-screen library of Mesa's", path);
++		return 0;
++	}
++	(void)destroy;
++	gpu.context = create(attributes, NULL);
++	if (gpu.context == NULL) {
++		gpu_say("%s: no OpenGL ES 3 context (gpu=1? the kernel's GPU driver)", path);
++		return 0;
++	}
++	if (!make_current(gpu.context, gpu.window, GL_UNSIGNED_BYTE, GPU_WINDOW, GPU_WINDOW)) {
++		gpu_say("%s: the context cannot be made current", path);
++		return 0;
++	}
++	gpu_current = &gpu;
++
++#define GL_LOAD(ret, name, args) \
++	do { \
++		p_gl##name = (ret (*) args)get_proc("gl" #name); \
++		if (p_gl##name == NULL) { \
++			p_gl##name = (ret (*) args)dlsym(gpu.library, "gl" #name); \
++		} \
++		if (p_gl##name == NULL) { \
++			gpu_say("%s has no gl%s", path, #name); \
++			return 0; \
++		} \
++	} while (0);
++	GL_FUNCTIONS(GL_LOAD)
++#undef GL_LOAD
++	gpu_say("%s on %s (%s)", path, (const char *)p_glGetString(GL_RENDERER), (const char *)p_glGetString(GL_VERSION));
++	return 1;
++}
++
++static GLuint
++gpu_shader(GLenum type, const char *text)
++{
++	GLuint shader = p_glCreateShader(type);
++	GLint ok = 0;
++
++	p_glShaderSource(shader, 1, &text, NULL);
++	p_glCompileShader(shader);
++	p_glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++	if (!ok) {
++		char log[1024] = "";
++
++		p_glGetShaderInfoLog(shader, sizeof(log) - 1, NULL, log);
++		gpu_say("a %s shader the driver will not take: %s", type == GL_VERTEX_SHADER ? "vertex" : "fragment", log);
++		p_glDeleteShader(shader);
++		return 0;
++	}
++	return shader;
++}
++
++static GLuint
++gpu_program(const char *fragment, const char *what)
++{
++	GLuint vertex = gpu_shader(GL_VERTEX_SHADER, isp_gpu_vertex_shader), frag, program;
++	GLint ok = 0;
++
++	if (vertex == 0) {
++		return 0;
++	}
++	frag = gpu_shader(GL_FRAGMENT_SHADER, fragment);
++	if (frag == 0) {
++		p_glDeleteShader(vertex);
++		return 0;
++	}
++	program = p_glCreateProgram();
++	p_glAttachShader(program, vertex);
++	p_glAttachShader(program, frag);
++	p_glLinkProgram(program);
++	p_glGetProgramiv(program, GL_LINK_STATUS, &ok);
++	p_glDeleteShader(vertex);
++	p_glDeleteShader(frag);
++	if (!ok) {
++		char log[1024] = "";
++
++		p_glGetProgramInfoLog(program, sizeof(log) - 1, NULL, log);
++		gpu_say("the %s program will not link: %s", what, log);
++		p_glDeleteProgram(program);
++		return 0;
++	}
++	return program;
++}
++
++static GLuint
++gpu_texture(GLenum internal, int w, int h, GLenum format, GLenum type, const void *pixels, int integer)
++{
++	GLuint texture = 0;
++
++	p_glGenTextures(1, &texture);
++	p_glBindTexture(GL_TEXTURE_2D, texture);
++	p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++	p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++	p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++	p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++	p_glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++	p_glTexImage2D(GL_TEXTURE_2D, 0, (GLint)internal, w, h, 0, format, type, pixels);
++	(void)integer;
++	return texture;
++}
++
++static int
++gpu_begin(void)
++{
++	const GLenum attachments[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
++
++	if (gpu.ok) {
++		return 1;
++	}
++	if (gpu.tried) {
++		return 0;
++	}
++	gpu.tried = 1;
++	if (!gpu_load()) {
++		return 0;
++	}
++	gpu.raw_program = gpu_program(isp_gpu_raw_shader, "RAW");
++	gpu.nv12_program = gpu_program(isp_gpu_nv12_shader, "NV12");
++	if (gpu.raw_program == 0 || gpu.nv12_program == 0) {
++		return 0;
++	}
++	gpu.vao = 0;
++	p_glGenVertexArrays(1, &gpu.vao);
++	p_glBindVertexArray(gpu.vao);
++	gpu.raw_texture = gpu_texture(GL_R8UI, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL, 1);
++	gpu.lsc_texture = gpu_texture(GL_RGB16F, 1, 1, GL_RGB, GL_FLOAT, NULL, 0);
++	gpu.gamma_texture = gpu_texture(GL_R8, 1, 1, GL_RED, GL_UNSIGNED_BYTE, NULL, 0);
++	gpu.rgb_texture = gpu_texture(GL_RGBA8UI, 1, 1, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, NULL, 1);
++	gpu.y_texture = gpu_texture(GL_R8UI, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL, 1);
++	gpu.uv_texture = gpu_texture(GL_RG8UI, 1, 1, GL_RG_INTEGER, GL_UNSIGNED_BYTE, NULL, 1);
++	p_glGenFramebuffers(1, &gpu.raw_fbo);
++	p_glBindFramebuffer(GL_FRAMEBUFFER, gpu.raw_fbo);
++	p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gpu.rgb_texture, 0);
++	if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++		gpu_say("the RAW pass's framebuffer is not complete");
++		return 0;
++	}
++	p_glGenFramebuffers(1, &gpu.nv12_fbo);
++	p_glBindFramebuffer(GL_FRAMEBUFFER, gpu.nv12_fbo);
++	p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gpu.y_texture, 0);
++	p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, gpu.uv_texture, 0);
++	p_glDrawBuffers(2, attachments);
++	if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++		gpu_say("the NV12 pass's framebuffer is not complete");
++		return 0;
++	}
++	p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
++	{
++		static const char *const raw_names[] = { "uRaw", "uRawW", "uRawH", "uBlack", "uLsc", "uLscOn", "uCellsW", "uCellsH",
++			"uGamma", "uRow0", "uRow1", "uRow2", "uRp", "uBp", "uOutW", "uOutH" };
++		static const char *const nv12_names[] = { "uRGB", "uW", "uH", "uSigma", "uAmount", "uVideoRange", NULL, NULL };
++		unsigned i;
++
++		for (i = 0; i < 16; i++) {
++			gpu.u_raw[i] = p_glGetUniformLocation(gpu.raw_program, raw_names[i]);
++		}
++		for (i = 0; i < 8; i++) {
++			gpu.u_nv12[i] = nv12_names[i] != NULL ? p_glGetUniformLocation(gpu.nv12_program, nv12_names[i]) : -1;
++		}
++	}
++	gpu.ok = true;
++	return 1;
++}
++
++/* the lens shading's grid and the tone's table, when the ISP's are not what the GPU last had */
++static void
++gpu_uplink(const struct isp *isp)
++{
++	static const struct isp *last_isp;
++	static uint8_t last_gamma[4096];
++	static float last_gain[3][LSC_H][LSC_W];
++	static bool have;
++
++	if (have && last_isp == isp && memcmp(last_gamma, isp->gamma, sizeof(last_gamma)) == 0 &&
++	    memcmp(last_gain, isp->lsc.gain, sizeof(last_gain)) == 0) {
++		return;
++	}
++	memcpy(last_gamma, isp->gamma, sizeof(last_gamma));
++	memcpy(last_gain, isp->lsc.gain, sizeof(last_gain));
++	last_isp = isp;
++	have = true;
++	{
++		float grid[LSC_H * LSC_W * 3];
++		unsigned x, y;
++
++		for (y = 0; y < LSC_H; y++) {
++			for (x = 0; x < LSC_W; x++) {
++				for (int c = 0; c < 3; c++) {
++					grid[(y * LSC_W + x) * 3 + c] = isp->lsc.on ? isp->lsc.gain[c][y][x] : 1.0f;
++				}
++			}
++		}
++		p_glActiveTexture(GL_TEXTURE0 + 1);
++		p_glBindTexture(GL_TEXTURE_2D, gpu.lsc_texture);
++		p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, LSC_W, LSC_H, 0, GL_RGB, GL_FLOAT, grid);
++	}
++	p_glActiveTexture(GL_TEXTURE0 + 2);
++	p_glBindTexture(GL_TEXTURE_2D, gpu.gamma_texture);
++	p_glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 4096, 1, 0, GL_RED, GL_UNSIGNED_BYTE, isp->gamma);
++	p_glActiveTexture(GL_TEXTURE0);
++}
++
++/* the colour matrix with the white balance's and AE's gains folded in, as camera_isp.c's pipe_init() */
++static void
++gpu_matrix(const struct isp *isp, float rows[3][3])
++{
++	for (int c = 0; c < 3; c++) {
++		for (int j = 0; j < 3; j++) {
++			rows[c][j] = isp->ccm[c][j] * isp->wb[j] * isp->digital * (3836.0f / 959.0f);
++		}
++	}
++}
++
++bool
++isp_gpu_start(void)
++{
++	bool ok;
++
++	pthread_mutex_lock(&gpu_lock);
++	ok = gpu_begin();
++	pthread_mutex_unlock(&gpu_lock);
++	return ok;
++}
++
++bool
++isp_gpu_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
++    uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, bool video_range)
++{
++	static const int red[4] = { 0, 1, 2, 3 }, blue[4] = { 3, 2, 1, 0 };
++	float rows[3][3];
++	uint32_t rw, rh;
++
++	if (!isp->gpu || width == 0 || height == 0 || f == NULL || raw == NULL || y == NULL || uv == NULL) {
++		return false;
++	}
++	if (pthread_mutex_trylock(&gpu_lock) != 0) {
++		return false;           /* (a frame is being made already: this one goes the processor's way) */
++	}
++	if (!gpu_begin()) {
++		pthread_mutex_unlock(&gpu_lock);
++		return false;
++	}
++	if (gpu_current != &gpu) {
++		/* (the library's make-current, out of the context made in gpu_load()) */
++		unsigned char (*make_current)(OSMesaContext, void *, unsigned, int, int) =
++			(unsigned char (*)(OSMesaContext, void *, unsigned, int, int))dlsym(gpu.library, "OSMesaMakeCurrent");
++
++		if (make_current == NULL || !make_current(gpu.context, gpu.window, GL_UNSIGNED_BYTE, GPU_WINDOW, GPU_WINDOW)) {
++			gpu_say("the context cannot be made current on this thread");
++			pthread_mutex_unlock(&gpu_lock);
++			return false;
++		}
++		gpu_current = &gpu;
++	}
++	/* the frame's bytes: four pixels in five, `stride` bytes a line */
++	rw = f->stride;
++	rh = f->height;
++	if (rw == 0 || rh == 0) {
++		pthread_mutex_unlock(&gpu_lock);
++		return false;
++	}
++	p_glActiveTexture(GL_TEXTURE0);
++	p_glBindTexture(GL_TEXTURE_2D, gpu.raw_texture);
++	p_glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++	if (rw != gpu.raw_stride || rh != gpu.raw_height) {
++		p_glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, (GLsizei)rw, (GLsizei)rh, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, raw);
++		gpu.raw_stride = rw;
++		gpu.raw_height = rh;
++	} else {
++		p_glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)rw, (GLsizei)rh, GL_RED_INTEGER, GL_UNSIGNED_BYTE, raw);
++	}
++	/* the picture's own targets, when they are another size */
++	if (width != gpu.width || height != gpu.height) {
++		p_glBindTexture(GL_TEXTURE_2D, gpu.rgb_texture);
++		p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, (GLsizei)width, (GLsizei)height, 0, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, NULL);
++		p_glBindTexture(GL_TEXTURE_2D, gpu.y_texture);
++		p_glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, (GLsizei)width, (GLsizei)height, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
++		p_glBindTexture(GL_TEXTURE_2D, gpu.uv_texture);
++		p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8UI, (GLsizei)width, (GLsizei)height, 0, GL_RG_INTEGER, GL_UNSIGNED_BYTE, NULL);
++		gpu.width = width;
++		gpu.height = height;
++		free(gpu.uv_scratch);
++		gpu.uv_scratch_bytes = (size_t)width * height * 2;
++		gpu.uv_scratch = malloc(gpu.uv_scratch_bytes);
++		if (gpu.uv_scratch == NULL) {
++			gpu_say("no memory for the picture (%ux%u)", width, height);
++			pthread_mutex_unlock(&gpu_lock);
++			return false;
++		}
++	}
++	gpu_uplink(isp);
++	gpu_matrix(isp, rows);
++
++	/* pass 1: the frame's bytes to R, G, B */
++	p_glUseProgram(gpu.raw_program);
++	p_glBindFramebuffer(GL_FRAMEBUFFER, gpu.raw_fbo);
++	p_glViewport(0, 0, (GLsizei)width, (GLsizei)height);
++	p_glBindVertexArray(gpu.vao);
++	p_glUniform1i(gpu.u_raw[0], 0);
++	p_glUniform1i(gpu.u_raw[1], (GLint)f->width);
++	p_glUniform1i(gpu.u_raw[2], (GLint)f->height);
++	p_glUniform1f(gpu.u_raw[3], (GLfloat)f->black);
++	p_glUniform1i(gpu.u_raw[4], 1);
++	p_glUniform1i(gpu.u_raw[5], isp->lsc.on ? 1 : 0);
++	p_glUniform1i(gpu.u_raw[6], (GLint)(f->width / 2));
++	p_glUniform1i(gpu.u_raw[7], (GLint)(f->height / 2));
++	p_glUniform1i(gpu.u_raw[8], 2);
++	p_glUniform3f(gpu.u_raw[9], rows[0][0], rows[0][1], rows[0][2]);
++	p_glUniform3f(gpu.u_raw[10], rows[1][0], rows[1][1], rows[1][2]);
++	p_glUniform3f(gpu.u_raw[11], rows[2][0], rows[2][1], rows[2][2]);
++	p_glUniform1i(gpu.u_raw[12], red[f->bayer & 3]);
++	p_glUniform1i(gpu.u_raw[13], blue[f->bayer & 3]);
++	p_glUniform1i(gpu.u_raw[14], (GLint)width);
++	p_glUniform1i(gpu.u_raw[15], (GLint)height);
++	p_glDrawArrays(GL_TRIANGLES, 0, 3);
++
++	/* pass 2: those bytes to NV12 (Y and UV at once) */
++	p_glBindFramebuffer(GL_FRAMEBUFFER, gpu.nv12_fbo);
++	p_glUseProgram(gpu.nv12_program);
++	p_glActiveTexture(GL_TEXTURE0);
++	p_glBindTexture(GL_TEXTURE_2D, gpu.rgb_texture);
++	p_glUniform1i(gpu.u_nv12[0], 0);
++	p_glUniform1i(gpu.u_nv12[1], (GLint)width);
++	p_glUniform1i(gpu.u_nv12[2], (GLint)height);
++	p_glUniform1f(gpu.u_nv12[3], isp->gpu_sigma);
++	p_glUniform1f(gpu.u_nv12[4], isp->look.preview_sharp);
++	p_glUniform1i(gpu.u_nv12[5], video_range ? 1 : 0);
++	p_glDrawArrays(GL_TRIANGLES, 0, 3);
++
++	/* Y in place, UV through the picture-sized buffer: each 2x2 block's pair, one column in two */
++	p_glReadBuffer(GL_COLOR_ATTACHMENT0);
++	p_glPixelStorei(GL_PACK_ALIGNMENT, 1);
++	p_glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(y_stride));
++	p_glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_RED_INTEGER, GL_UNSIGNED_BYTE, y);
++	p_glReadBuffer(GL_COLOR_ATTACHMENT1);
++	p_glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)width);
++	p_glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_RG_INTEGER, GL_UNSIGNED_BYTE, gpu.uv_scratch);
++	for (uint32_t row = 0; row < height / 2; row++) {
++		const uint8_t *in = gpu.uv_scratch + (size_t)row * 2 * width * 2;
++		uint8_t *out = uv + (size_t)row * uv_stride;
++
++		for (uint32_t x = 0; x < width / 2; x++) {
++			out[2 * x] = in[4 * x];
++			out[2 * x + 1] = in[4 * x + 1];
++		}
++	}
++	p_glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++	p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
++
++	if (p_glGetError() != 0 && !gpu.said_failure) {
++		gpu.said_failure = true;
++		gpu_say("OpenGL ES error: this frame may be wrong, and the next ones say if it is");
++	}
++	pthread_mutex_unlock(&gpu_lock);
++	return true;
++}
+diff -ruN a/userland/src/camera_isp_gpu_shaders.h b/userland/src/camera_isp_gpu_shaders.h
+--- a/userland/src/camera_isp_gpu_shaders.h
++++ b/userland/src/camera_isp_gpu_shaders.h
+@@ -0,0 +1,229 @@
++/*
++ * The shaders of the GPU ISP (src/camera_isp_gpu.c), as text: OpenGL ES 3.0, two passes.
++ *
++ * Pass 1, of the sensor's RAW10 frame to 8-bit R, G, B (an RGBA8UI target, so that the bytes are
++ * the bytes): each output pixel's nearest sensor site, its 10 bits out of the four-in-five-bytes
++ * packing, the black level off, the lens shading's grid (17 x 13 gains, bilinear, per cell as
++ * camera_isp.c takes it), Malvar's 5x5 demosaic, the white balance's and AE's gains with the
++ * colour matrix (rows made by camera_isp.c's pipe_init()), sRGB's curve and the tone out of the
++ * 4096-step table.
++ *
++ * Pass 2, of those R, G, B bytes to NV12 (two integer targets: Y as R8UI, UV as RG8UI, the same
++ * draw -- MRT): Y with BT.601's matrix in the 1/65536ths and the rounding camera_isp.c's
++ * nv12_pair() uses, an optional 3x3 bilateral on Y (sigma in codes; 0: none) and an unsharp mask
++ * on it with the stills' threshold of 2 and its +-24 limit; U and V from the sum of the four
++ * pixels of each 2x2 block, the same fixed point. A pixel of a 2x2 block computes its block's
++ * UV for all four of them (the caller keeps one column in two).
++ *
++ * The arithmetic is camera_isp.c's, in the same order, so that tools/cam_gpu_host.c can hold the
++ * shader to a C reference of it (tools/cam_gpu_ref.h) on the host: the two agree to the code.
++ */
++#ifndef CAMERA_ISP_GPU_SHADERS_H
++#define CAMERA_ISP_GPU_SHADERS_H
++
++/* the full-screen triangle: three corners, no buffers */
++static const char isp_gpu_vertex_shader[] =
++	"#version 300 es\n"
++	"void main()\n"
++	"{\n"
++	"	vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
++	"	gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
++	"}\n";
++
++static const char isp_gpu_raw_shader[] =
++	"#version 300 es\n"
++	"precision highp float;\n"
++	"precision highp int;\n"
++	"precision highp usampler2D;\n"
++	"\n"
++	"uniform usampler2D uRaw;      /* the frame's bytes: stride of them a line, height lines */\n"
++	"uniform int uRawW, uRawH;     /* the sensor's pixels */\n"
++	"uniform float uBlack;\n"
++	"uniform sampler2D uLsc;       /* 17 x 13, R, G and B gains */\n"
++	"uniform int uLscOn;\n"
++	"uniform int uCellsW, uCellsH; /* the frame's 2x2 cells */\n"
++	"uniform sampler2D uGamma;     /* 4096 steps, linear to 8 bits */\n"
++	"uniform vec3 uRow0, uRow1, uRow2;      /* the colour matrix with the gains folded in */\n"
++	"uniform int uRp, uBp;         /* where red and blue are in a 2x2 cell (0..3) */\n"
++	"uniform int uOutW, uOutH;\n"
++	"\n"
++	"out uvec4 oRGB;\n"
++	"\n"
++	"/* a pixel's 10 bits: four of them in five bytes, the low two in the fifth */\n"
++	"uint rawAt(int x, int y)\n"
++	"{\n"
++	"	int px = clamp(x, 0, uRawW - 1), py = clamp(y, 0, uRawH - 1);\n"
++	"	int g = px >> 2, b = px & 3;\n"
++	"	uint hi = texelFetch(uRaw, ivec2(g * 5 + b, py), 0).r;\n"
++	"	uint lo = texelFetch(uRaw, ivec2(g * 5 + 4, py), 0).r;\n"
++	"\n"
++	"	return (hi << 2) | ((lo >> (b * 2)) & 3u);\n"
++	"}\n"
++	"\n"
++	"float V(int x, int y)\n"
++	"{\n"
++	"	return max(float(rawAt(x, y)) - uBlack, 0.0);\n"
++	"}\n"
++	"\n"
++	"/* the lens shading's gains at a cell, between the grid's points, as camera_isp.c's lsc_at() */\n"
++	"vec3 LSC(int cx, int cy)\n"
++	"{\n"
++	"	if (uLscOn == 0) {\n"
++	"		return vec3(1.0);\n"
++	"	}\n"
++	"	float u = uCellsW > 1 ? float(cx) / float(uCellsW - 1) : 0.0;\n"
++	"	float v = uCellsH > 1 ? float(cy) / float(uCellsH - 1) : 0.0;\n"
++	"	float gx = u * 16.0, gy = v * 12.0;\n"
++	"	int x = int(gx), y = int(gy);\n"
++	"	float fx = gx - float(x), fy = gy - float(y);\n"
++	"\n"
++	"	x = clamp(x, 0, 15);\n"
++	"	y = clamp(y, 0, 11);\n"
++	"	vec3 a = mix(texelFetch(uLsc, ivec2(x, y), 0).rgb, texelFetch(uLsc, ivec2(x + 1, y), 0).rgb, fx);\n"
++	"	vec3 b = mix(texelFetch(uLsc, ivec2(x, y + 1), 0).rgb, texelFetch(uLsc, ivec2(x + 1, y + 1), 0).rgb, fx);\n"
++	"\n"
++	"	return mix(a, b, fy);\n"
++	"}\n"
++	"\n"
++	"/* 0 red, 1 blue, 2 green: which colour the site at (x, y) is */\n"
++	"int site(int x, int y)\n"
++	"{\n"
++	"	int q = (x & 1) + 2 * (y & 1);\n"
++	"\n"
++	"	return q == uRp ? 0 : q == uBp ? 1 : 2;\n"
++	"}\n"
++	"\n"
++	"/* Malvar, He and Cutler's 5x5 demosaic, in the paper's kernels (units of 1/8) */\n"
++	"vec3 demosaic(int x, int y, float c)\n"
++	"{\n"
++	"	float n = V(x, y - 1), s = V(x, y + 1), w = V(x - 1, y), e = V(x + 1, y);\n"
++	"	float nn = V(x, y - 2), ss = V(x, y + 2), ww = V(x - 2, y), ee = V(x + 2, y);\n"
++	"	float ne = V(x + 1, y - 1), nw = V(x - 1, y - 1), se = V(x + 1, y + 1), sw = V(x - 1, y + 1);\n"
++	"\n"
++	"	if (site(x, y) == 0) {\n"
++	"		float g = (4.0 * c + 2.0 * (n + s + w + e) - (nn + ss + ww + ee)) / 8.0;\n"
++	"		float b = (6.0 * c + 2.0 * (ne + nw + se + sw) - 1.5 * (nn + ss + ww + ee)) / 8.0;\n"
++	"\n"
++	"		return vec3(c, g, b);\n"
++	"	}\n"
++	"	if (site(x, y) == 1) {\n"
++	"		float g = (4.0 * c + 2.0 * (n + s + w + e) - (nn + ss + ww + ee)) / 8.0;\n"
++	"		float r = (6.0 * c + 2.0 * (ne + nw + se + sw) - 1.5 * (nn + ss + ww + ee)) / 8.0;\n"
++	"\n"
++	"		return vec3(r, g, c);\n"
++	"	}\n"
++	"	if (site(x - 1, y) == 0) {          /* green with red either side of it */\n"
++	"		float r = (5.0 * c + 4.0 * (w + e) - (ww + ee) - (n + s) + 0.5 * (nn + ss)) / 8.0;\n"
++	"		float b = (5.0 * c + 4.0 * (n + s) - (nn + ss) - (w + e) + 0.5 * (ww + ee)) / 8.0;\n"
++	"\n"
++	"		return vec3(r, c, b);\n"
++	"	}\n"
++	"	float r = (5.0 * c + 4.0 * (n + s) - (nn + ss) - (w + e) + 0.5 * (ww + ee)) / 8.0;\n"
++	"	float b = (5.0 * c + 4.0 * (w + e) - (ww + ee) - (n + s) + 0.5 * (nn + ss)) / 8.0;\n"
++	"\n"
++	"	return vec3(r, c, b);\n"
++	"}\n"
++	"\n"
++	"float curve(int i)\n"
++	"{\n"
++	"	return float(texelFetch(uGamma, ivec2(clamp(i, 0, 4095), 0), 0).r) * 255.0;   /* (R8 is 0..1) */\n"
++	"}\n"
++	"\n"
++	"void main()\n"
++	"{\n"
++	"	int x = int(gl_FragCoord.x), y = int(gl_FragCoord.y);\n"
++	"	/* the output pixel's nearest sensor site (the picture is the frame, or a whole part of it) */\n"
++	"	float fx = (float(x) + 0.5) * float(uRawW) / float(uOutW) - 0.5;\n"
++	"	float fy = (float(y) + 0.5) * float(uRawH) / float(uOutH) - 0.5;\n"
++	"	int sx = clamp(int(floor(fx + 0.5)), 0, uRawW - 1);\n"
++	"	int sy = clamp(int(floor(fy + 0.5)), 0, uRawH - 1);\n"
++	"	float c = V(sx, sy);\n"
++	"	vec3 rgb = demosaic(sx, sy, c);\n"
++	"	vec3 g = LSC(sx >> 1, sy >> 1);\n"
++	"\n"
++	"	rgb *= g;\n"
++	"	float r = dot(uRow0, rgb), gg = dot(uRow1, rgb), b = dot(uRow2, rgb);\n"
++	"\n"
++	"	oRGB = uvec4(uvec3(uint(curve(int(r + 0.5))), uint(curve(int(gg + 0.5))), uint(curve(int(b + 0.5)))), 255u);\n"
++	"}\n";
++
++static const char isp_gpu_nv12_shader[] =
++	"#version 300 es\n"
++	"precision highp float;\n"
++	"precision highp int;\n"
++	"precision highp usampler2D;\n"
++	"\n"
++	"uniform usampler2D uRGB;      /* pass 1's bytes */\n"
++	"uniform int uW, uH;\n"
++	"uniform float uSigma;         /* the bilateral's range sigma, in codes; 0: no noise reduction */\n"
++	"uniform float uAmount;        /* the unsharp mask's amount; 0: none */\n"
++	"uniform int uVideoRange;      /* 420v (BT.601 video range) rather than 420f */\n"
++	"\n"
++	"layout(location = 0) out uint oY;\n"
++	"layout(location = 1) out uvec2 oUV;\n"
++	"\n"
++	"ivec3 RGB(int x, int y)\n"
++	"{\n"
++	"	uvec4 c = texelFetch(uRGB, ivec2(clamp(x, 0, uW - 1), clamp(y, 0, uH - 1)), 0);\n"
++	"\n"
++	"	return ivec3(c.r, c.g, c.b);\n"
++	"}\n"
++	"\n"
++	"int luma(ivec3 c)\n"
++	"{\n"
++	"	int k0 = uVideoRange != 0 ? 16829 : 19595;\n"
++	"	int k1 = uVideoRange != 0 ? 33039 : 38470;\n"
++	"	int k2 = uVideoRange != 0 ? 6416 : 7471;\n"
++	"	int oy = uVideoRange != 0 ? (16 << 16) : 0;\n"
++	"\n"
++	"	return (k0 * c.r + k1 * c.g + k2 * c.b + oy + (1 << 15)) >> 16;\n"
++	"}\n"
++	"\n"
++	"void main()\n"
++	"{\n"
++	"	int x = int(gl_FragCoord.x), y = int(gl_FragCoord.y);\n"
++	"	int yc = luma(RGB(x, y));\n"
++	"	float blur = float(yc);\n"
++	"\n"
++	"	if (uSigma > 0.0) {         /* 3x3 bilateral on Y */\n"
++	"		float sum = float(yc), wsum = 1.0, ss = 2.0 * uSigma * uSigma;\n"
++	"\n"
++	"		for (int dy = -1; dy <= 1; dy++) {\n"
++	"			for (int dx = -1; dx <= 1; dx++) {\n"
++	"				float yn, d, w;\n"
++	"\n"
++	"				if (dx == 0 && dy == 0) {\n"
++	"					continue;\n"
++	"				}\n"
++	"				yn = float(luma(RGB(x + dx, y + dy)));\n"
++	"				d = yn - float(yc);\n"
++	"				w = 1.0 / (1.0 + d * d / ss);\n"
++	"				sum += w * yn;\n"
++	"				wsum += w;\n"
++	"			}\n"
++	"		}\n"
++	"		blur = sum / wsum;\n"
++	"	}\n"
++	"	float delta = float(yc) - blur;\n"
++	"	float t = abs(delta) > 2.0 ? delta - sign(delta) * 2.0 : 0.0;\n"
++	"	float add = t > 0.0 ? floor(t * uAmount + 0.5) : ceil(t * uAmount - 0.5);\n"
++	"	int outy = int(clamp(float(yc) + clamp(add, -24.0, 24.0), 0.0, 255.0) + 0.5);\n"
++	"\n"
++	"	/* the 2x2 block this pixel is in: its four pixels' sums, the same fixed point as nv12_pair() */\n"
++	"	int bx = (x >> 1) * 2, by = (y >> 1) * 2;\n"
++	"	ivec3 c00 = RGB(bx, by), c10 = RGB(bx + 1, by), c01 = RGB(bx, by + 1), c11 = RGB(bx + 1, by + 1);\n"
++	"	ivec3 sum = c00 + c10 + c01 + c11;\n"
++	"	int k3 = uVideoRange != 0 ? -9714 : -11058;\n"
++	"	int k4 = uVideoRange != 0 ? -19070 : -21710;\n"
++	"	int k5 = uVideoRange != 0 ? 28784 : 32768;\n"
++	"	int k6 = uVideoRange != 0 ? 28784 : 32768;\n"
++	"	int k7 = uVideoRange != 0 ? -24103 : -27439;\n"
++	"	int k8 = uVideoRange != 0 ? -4681 : -5329;\n"
++	"	int cb = (k3 * sum.r + k4 * sum.g + k5 * sum.b + (128 << 18) + (1 << 17) - 1) >> 18;\n"
++	"	int cr = (k6 * sum.r + k7 * sum.g + k8 * sum.b + (128 << 18) + (1 << 17) - 1) >> 18;\n"
++	"\n"
++	"	oY = uint(clamp(outy, 0, 255));\n"
++	"	oUV = uvec2(uint(clamp(cb, 0, 255)), uint(clamp(cr, 0, 255)));\n"
++	"}\n";
++
++#endif
+diff -ruN a/userland/src/camera_isp.h b/userland/src/camera_isp.h
+--- a/userland/src/camera_isp.h
++++ b/userland/src/camera_isp.h
+@@ -133,11 +133,29 @@
+ 	float           saturation;     /* applied to every colour matrix set (1: none) */
+ 	float           contrast;       /* the S-curve folded into the gamma table (0: none) */
+ 	struct isp_fast fast;           /* the preview's half-resolution debayer, the NEON loops */
++	/*
++	 * The GPU ISP (src/camera_isp_gpu.c; boot-arg cam_gpu=1): the picture on the phone's Adreno through
++	 * OpenGL ES 3.0 off-screen, the same arithmetic in shaders. Off by default, and off for good when the
++	 * context cannot be made (the processor's path is the picture then). gpu_sigma is the 3x3 bilateral's
++	 * range sigma in codes (0: none); the unsharp mask's amount is the look's preview_sharp.
++	 */
++	bool            gpu;
++	float           gpu_sigma;
+ };
+ 
+ void isp_init(struct isp *isp);
+ /* the fast paths (look NULL: the defaults -- both on) */
+ void isp_set_fast(struct isp *isp, const struct isp_fast *fast);
++/*
++ * The GPU ISP (src/camera_isp_gpu.c) instead of the processor's (cam_gpu=1): off is the processor's path,
++ * which is also what a GPU path that will not start falls back to. sigma: the bilateral's, in codes (0: none).
++ */
++void isp_set_gpu(struct isp *isp, bool on, float sigma);
++/* the context, the programs and the textures up (log lines say what the driver said); false: no GPU path */
++bool isp_gpu_start(void);
++/* a whole picture through the GPU ISP; false: it could not be made, the processor's path is to make it */
++bool isp_gpu_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y,
++    size_t y_stride, uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, bool video_range);
+ /* the tone of the picture: an S-curve of contrast c (0 none, ~0.3 gentle) into the gamma table, and saturation s
+  * (1 none) applied to the colour matrix from now on */
+ void isp_set_tone(struct isp *isp, float contrast, float saturation);
+diff -ruN a/userland/tools/cam_gpu_bench.c b/userland/tools/cam_gpu_bench.c
+--- a/userland/tools/cam_gpu_bench.c
++++ b/userland/tools/cam_gpu_bench.c
+@@ -0,0 +1,216 @@
++/*
++ * cam_gpu_bench: the GPU ISP on the phone, measured against the processor's picture of the same frame
++ * (src/camera_isp_gpu.c; boot-arg cam_gpu=1 is the same path inside Camera.app).
++ *
++ *   cam_gpu_bench [--raw FILE] [--tuning FILE] [--width N] [--height N] [--frames N]
++ *                 [--sigma F] [--amount F] [--video] [--flat] [--out FILE]
++ *
++ * Without --raw the frame is a scene made up as an IMX582's RAW10 (tools/cam_gpu_scene.h; there is
++ * no dump of a real one in artifacts/, see the report): 1920x1080, stride 2400, black 64, bayer 0.
++ * --tuning is the camera's tuning file (the image's /redwood/fw/camera-imx582.isp): the lens shading
++ * and the colour matrix the ISP applies, and the same grid the scene is made against.
++ *
++ * What it prints, one line each (the numbers the report quotes are these):
++ *
++ *   cam_gpu_bench: <renderer>, <GL version>                       the context that was made
++ *   cam_gpu_bench: the processor 1920x1080 in N.N ms a frame      isp_render_nv12() for the reference
++ *   cam_gpu_bench: the GPU 1920x1080 in N.N ms a frame            isp_gpu_render_nv12(), with the readback
++ *   cam_gpu_bench: PSNR Y N.N dB, UV N.N dB                       the GPU's picture against the processor's
++ *
++ * Exit 0: both pictures were made. 1: the GPU path would not start (the line before says why).
++ */
++#include <math.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include "camera_isp.h"
++#include "cam_gpu_scene.h"
++
++static double
++now_ms(void)
++{
++	struct timespec ts;
++
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
++}
++
++static double
++psnr(const uint8_t *a, size_t a_stride, const uint8_t *b, size_t b_stride, int w, int h, int channels)
++{
++	double se = 0;
++	size_t n = 0;
++
++	for (int y = 0; y < h; y++) {
++		for (int x = 0; x < w * channels; x++) {
++			double d = (double)a[(size_t)y * a_stride + x] - (double)b[(size_t)y * b_stride + x];
++
++			se += d * d;
++			n++;
++		}
++	}
++	return se == 0 ? 99.0 : 10.0 * log10(255.0 * 255.0 / (se / (double)n));
++}
++
++int
++main(int argc, char **argv)
++{
++	const char *raw_path = NULL, *tuning = "/redwood/fw/camera-imx582.isp", *out_path = NULL;
++	int tuning_given = 0;
++	int width = 1920, height = 1080, frames = 30, video = 0, flat = 0;
++	float sigma = 0, amount = 0;
++	struct scene scene;
++	struct isp isp;
++	struct hakios_camera_frame f;
++	uint8_t *raw, *cpu_y, *cpu_uv, *gpu_y, *gpu_uv;
++	uint32_t stride;
++	double t0, cpu_ms, gpu_ms = 0;
++	int i;
++
++	for (i = 1; i < argc; i++) {
++		if (strcmp(argv[i], "--raw") == 0 && i + 1 < argc) {
++			raw_path = argv[++i];
++		} else if (strcmp(argv[i], "--tuning") == 0 && i + 1 < argc) {
++			tuning = argv[++i];
++			tuning_given = 1;
++		} else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
++			out_path = argv[++i];
++		} else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
++			width = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
++			height = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
++			frames = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "--sigma") == 0 && i + 1 < argc) {
++			sigma = (float)atof(argv[++i]);
++		} else if (strcmp(argv[i], "--amount") == 0 && i + 1 < argc) {
++			amount = (float)atof(argv[++i]);
++		} else if (strcmp(argv[i], "--video") == 0) {
++			video = 1;
++		} else if (strcmp(argv[i], "--flat") == 0) {
++			flat = 1;
++		} else {
++			fprintf(stderr, "usage: %s [--raw FILE] [--tuning FILE] [--width N] [--height N] [--frames N] "
++			    "[--sigma F] [--amount F] [--video] [--flat] [--out FILE]\n", argv[0]);
++			return 2;
++		}
++	}
++	if (width < 64 || height < 64 || (width & 1) || (height & 1)) {
++		fprintf(stderr, "cam_gpu_bench: width and height must be even and at least 64\n");
++		return 2;
++	}
++	stride = (uint32_t)width * 5 / 4;
++	raw = malloc((size_t)stride * height);
++	cpu_y = malloc((size_t)width * height);
++	cpu_uv = malloc((size_t)width * height / 2);
++	gpu_y = malloc((size_t)width * height);
++	gpu_uv = malloc((size_t)width * height / 2);
++	if (raw == NULL || cpu_y == NULL || cpu_uv == NULL || gpu_y == NULL || gpu_uv == NULL) {
++		fprintf(stderr, "cam_gpu_bench: no memory for %dx%d\n", width, height);
++		return 2;
++	}
++	isp_init(&isp);
++	memset(&scene, 0, sizeof(scene));
++	scene.width = width;
++	scene.height = height;
++	scene.detail = !flat;
++	scene.black = 64;
++	if (tuning != NULL && !isp_load_tuning(&isp, tuning)) {
++		if (tuning_given) {
++			fprintf(stderr, "cam_gpu_bench: %s is not a tuning file\n", tuning);
++			return 2;
++		}
++		fprintf(stderr, "cam_gpu_bench: %s is not there: no tuning, a smooth lens shading instead\n", tuning);
++	}
++	if (isp.tuning != NULL) {
++		isp_tune(&isp, 0.6f, 5000);
++	}
++	if (!isp.lsc.on) {
++		/* (the image has no tuning: a smooth falloff, the same in the scene and in the ISP) */
++		for (int y = 0; y < 13; y++) {
++			for (int x = 0; x < 17; x++) {
++				float u = (float)x / 16.0f * 2 - 1, v = (float)y / 12.0f * 2 - 1;
++				float g = 1.0f + 0.45f * (u * u * 0.6f + v * v * 0.4f);
++
++				for (int c = 0; c < 3; c++) {
++					isp.lsc.gain[c][y][x] = g;
++				}
++			}
++		}
++		isp.lsc.on = true;
++	}
++	memcpy(scene.gain, isp.lsc.gain, sizeof(scene.gain));
++	isp_set_tone(&isp, 0.0f, 1.0f);
++	if (raw_path != NULL) {
++		FILE *file = fopen(raw_path, "rb");
++
++		if (file == NULL || fread(raw, 1, (size_t)stride * height, file) != (size_t)stride * height) {
++			fprintf(stderr, "cam_gpu_bench: %s is not %ux%u RAW10 (%u bytes a line)\n", raw_path, width, height, stride);
++			return 2;
++		}
++		fclose(file);
++	} else {
++		scene_make(&scene, raw, stride);
++	}
++	memset(&f, 0, sizeof(f));
++	memcpy(f.magic, "RWFRAME1", 8);
++	f.header_bytes = sizeof(f);
++	f.width = (uint32_t)width;
++	f.height = (uint32_t)height;
++	f.stride = stride;
++	f.format = 1;
++	f.bayer = 0;
++	f.black = 64;
++	f.sensor = 1;
++	f.exposure_lines = 1000;
++	f.line_ns = 13190;
++	f.frame_lines = 2528;
++	f.frame_lines_min = 2528;
++	f.frame_lines_max = 2528;
++	f.gain = f.gain_unity = 256;
++	f.gain_max = 4096;
++	f.focus = HAKIOS_CAMERA_NO_FOCUS;
++
++	/* the processor's picture: isp_render_nv12() without the GPU behind it */
++	isp.gpu = false;
++	t0 = now_ms();
++	isp_render_nv12(&isp, &f, raw, cpu_y, width, cpu_uv, width, (uint32_t)width, (uint32_t)height, 0, (uint32_t)height,
++	    video != 0);
++	cpu_ms = now_ms() - t0;
++	printf("cam_gpu_bench: the processor %dx%d in %.1f ms a frame\n", width, height, cpu_ms);
++
++	/* the GPU's, the same frame and the same ISP state */
++	if (!isp_gpu_start()) {
++		fprintf(stderr, "cam_gpu_bench: the GPU ISP would not start (see the gpu_isp: lines)\n");
++		return 1;
++	}
++	isp_set_gpu(&isp, true, sigma);
++	isp.look.preview_sharp = amount;
++	for (int frame = 0; frame < frames; frame++) {
++		t0 = now_ms();
++		if (!isp_gpu_render_nv12(&isp, &f, raw, gpu_y, width, gpu_uv, width, (uint32_t)width, (uint32_t)height, video != 0)) {
++			fprintf(stderr, "cam_gpu_bench: the GPU ISP made no picture (frame %d)\n", frame);
++			return 1;
++		}
++		gpu_ms += now_ms() - t0;
++	}
++	printf("cam_gpu_bench: the GPU %dx%d in %.1f ms a frame (%d frames, with the readback)\n", width, height, gpu_ms / frames,
++	    frames);
++	printf("cam_gpu_bench: PSNR Y %.2f dB, UV %.2f dB (the GPU's picture against the processor's)\n",
++	    psnr(gpu_y, width, cpu_y, width, width, height, 1), psnr(gpu_uv, width, cpu_uv, width, width / 2, height / 2, 2));
++	if (out_path != NULL) {
++		FILE *file = fopen(out_path, "wb");
++
++		if (file != NULL) {
++			fwrite(gpu_y, 1, (size_t)width * height, file);
++			fwrite(gpu_uv, 1, (size_t)width * height / 2, file);
++			fclose(file);
++			printf("cam_gpu_bench: the GPU's picture in %s (%dx%d NV12)\n", out_path, width, height);
++		}
++	}
++	return 0;
++}
+diff -ruN a/userland/tools/cam_gpu_host.c b/userland/tools/cam_gpu_host.c
+--- a/userland/tools/cam_gpu_host.c
++++ b/userland/tools/cam_gpu_host.c
+@@ -0,0 +1,531 @@
++/*
++ * cam_gpu_host: the GPU ISP's shaders (src/camera_isp_gpu_shaders.h) on this machine, through Mesa's
++ * EGL (a surfaceless OpenGL ES 3 context on llvmpipe/softpipe), held to two things:
++ *
++ *   - the C reference of the same arithmetic (tools/cam_gpu_ref.h): PSNR of the shader's NV12 against
++ *     it says whether the GLSL is right, a driver aside;
++ *   - the phone's own processor path (isp_render_nv12(), the same camera_isp.c the image ships): PSNR
++ *     of the shader's NV12 against that picture says what the GPU's demosaic, tone and colour cost
++ *     against the reference the camera work already has.
++ *
++ * The frame is a scene made up as an IMX582's RAW10 (tools/cam_gpu_scene.h; there is no dump of a real
++ * one in artifacts/), or a file given with --raw: the frame's bytes, 1920x1080, stride 2400, black 64,
++ * bayer 0. --tuning takes a camera's tuning file (fw-poco-x3-pro/camera-imx582.isp) for the lens
++ * shading and the colour matrix; without it the scene's own grid is a smooth falloff and the matrix
++ * is unity.
++ *
++ * Build (host): cc -O2 -I../src -I. cam_gpu_host.c ../src/camera_isp.c -lEGL -lGLESv2 -lm
++ * Run:          ./cam_gpu_host --tuning ../../fw-poco-x3-pro/camera-imx582.isp
++ */
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <GLES3/gl3.h>
++#include <math.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include "camera_isp.h"
++#include "camera_isp_gpu_shaders.h"
++#include "cam_gpu_ref.h"
++#include "cam_gpu_scene.h"
++
++#define PF_420F         0x34323066
++
++static void
++check(const char *where)
++{
++	GLenum e;
++
++	while ((e = glGetError()) != GL_NO_ERROR) {
++		fprintf(stderr, "cam_gpu_host: GL error 0x%x at %s\n", e, where);
++	}
++}
++
++static double
++now_ms(void)
++{
++	struct timespec ts;
++
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
++}
++
++static double
++psnr(const uint8_t *a, size_t a_stride, const uint8_t *b, size_t b_stride, int w, int h, int channels)
++{
++	double se = 0;
++	size_t n = 0;
++
++	for (int y = 0; y < h; y++) {
++		for (int x = 0; x < w * channels; x++) {
++			double d = (double)a[(size_t)y * a_stride + x] - (double)b[(size_t)y * b_stride + x];
++
++			se += d * d;
++			n++;
++		}
++	}
++	if (se == 0) {
++		return 99.0;
++	}
++	return 10.0 * log10(255.0 * 255.0 / (se / (double)n));
++}
++
++static GLuint
++shader(GLenum type, const char *text)
++{
++	GLuint s = glCreateShader(type);
++	GLint ok = 0;
++
++	glShaderSource(s, 1, &text, NULL);
++	glCompileShader(s);
++	glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
++	if (!ok) {
++		char log[2048] = "";
++
++		glGetShaderInfoLog(s, sizeof(log) - 1, NULL, log);
++		fprintf(stderr, "cam_gpu_host: a shader will not compile: %s\n", log);
++		exit(1);
++	}
++	return s;
++}
++
++static GLuint
++program(const char *fragment)
++{
++	GLuint v = shader(GL_VERTEX_SHADER, isp_gpu_vertex_shader), f = shader(GL_FRAGMENT_SHADER, fragment), p = glCreateProgram();
++	GLint ok = 0;
++
++	glAttachShader(p, v);
++	glAttachShader(p, f);
++	glLinkProgram(p);
++	glGetProgramiv(p, GL_LINK_STATUS, &ok);
++	if (!ok) {
++		char log[2048] = "";
++
++		glGetProgramInfoLog(p, sizeof(log) - 1, NULL, log);
++		fprintf(stderr, "cam_gpu_host: a program will not link: %s\n", log);
++		exit(1);
++	}
++	return p;
++}
++
++static bool
++egl_start(EGLDisplay *display, EGLContext *context, EGLSurface *surface)
++{
++	PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform = (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
++	EGLConfig config = NULL;
++	EGLint count = 0;
++	const EGLint attributes[] = {
++		EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
++		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
++		EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
++		EGL_NONE
++	};
++	const EGLint context_attributes[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
++	const EGLint pbuffer_attributes[] = { EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE };
++
++	*display = get_platform != NULL ? get_platform(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL) : EGL_NO_DISPLAY;
++	if (*display == EGL_NO_DISPLAY) {
++		*display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++	}
++	if (*display == EGL_NO_DISPLAY || !eglInitialize(*display, NULL, NULL)) {
++		fprintf(stderr, "cam_gpu_host: no EGL display: %s\n", eglGetError() == EGL_SUCCESS ? "?" : "eglInitialize failed");
++		return false;
++	}
++	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
++		fprintf(stderr, "cam_gpu_host: eglBindAPI(OpenGL ES) failed\n");
++		return false;
++	}
++	if (!eglChooseConfig(*display, attributes, &config, 1, &count) || count < 1) {
++		fprintf(stderr, "cam_gpu_host: no OpenGL ES 3 configuration\n");
++		return false;
++	}
++	*surface = eglCreatePbufferSurface(*display, config, pbuffer_attributes);
++	*context = eglCreateContext(*display, config, EGL_NO_CONTEXT, context_attributes);
++	if (*context == EGL_NO_CONTEXT || !eglMakeCurrent(*display, *surface, *surface, *context)) {
++		fprintf(stderr, "cam_gpu_host: no OpenGL ES 3 context (0x%x)\n", eglGetError());
++		return false;
++	}
++	return true;
++}
++
++static void
++fill_lsc_synthetic(float gain[3][13][17])
++{
++	for (int y = 0; y < 13; y++) {
++		for (int x = 0; x < 17; x++) {
++			float u = (float)x / 16.0f * 2 - 1, v = (float)y / 12.0f * 2 - 1;
++			float r2 = u * u * 0.6f + v * v * 0.4f;
++			float g = 1.0f + 0.45f * r2;
++
++			for (int c = 0; c < 3; c++) {
++				gain[c][y][x] = g;
++			}
++		}
++	}
++}
++
++int
++main(int argc, char **argv)
++{
++	const char *raw_path = NULL, *tuning = NULL;
++	int width = 1920, height = 1080, frames = 3, video = 0, flat = 0;
++	float sigma = 0, amount = 0;
++	struct scene scene;
++	struct isp isp;
++	struct hakios_camera_frame f;
++	uint8_t *raw, *rgb = NULL;
++	uint8_t *cpu_y, *cpu_uv, *gl_y, *gl_uv, *ref_y, *ref_uv;
++	float rows[3][3];
++	uint32_t stride;
++	EGLDisplay display;
++	EGLContext context;
++	EGLSurface surface;
++	GLuint raw_texture, lsc_texture, gamma_texture, rgb_texture, y_texture, uv_texture, raw_fbo, nv12_fbo, vao, raw_program, nv12_program;
++	uint8_t *uv_scratch;
++	double t0, gl_ms = 0;
++	int i;
++
++	for (i = 1; i < argc; i++) {
++		if (strcmp(argv[i], "--raw") == 0 && i + 1 < argc) {
++			raw_path = argv[++i];
++		} else if (strcmp(argv[i], "--tuning") == 0 && i + 1 < argc) {
++			tuning = argv[++i];
++		} else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
++			width = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
++			height = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
++			frames = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "--sigma") == 0 && i + 1 < argc) {
++			sigma = (float)atof(argv[++i]);
++		} else if (strcmp(argv[i], "--amount") == 0 && i + 1 < argc) {
++			amount = (float)atof(argv[++i]);
++		} else if (strcmp(argv[i], "--video") == 0) {
++			video = 1;
++		} else if (strcmp(argv[i], "--flat") == 0) {
++			flat = 1;
++		} else {
++			fprintf(stderr, "usage: %s [--raw FILE] [--tuning FILE] [--width N] [--height N] [--frames N] "
++			    "[--sigma F] [--amount F] [--video]\n", argv[0]);
++			return 2;
++		}
++	}
++	if (width < 64 || height < 64 || (width & 1) || (height & 1)) {
++		fprintf(stderr, "cam_gpu_host: width and height must be even and at least 64\n");
++		return 2;
++	}
++	stride = (uint32_t)((width * 10 + 7) / 8);
++	/* the sensor's line is 2400 bytes at 1920; a packed line of any width is 5 bytes a four pixels */
++	if ((stride & 1) || stride < (uint32_t)width * 5 / 4) {
++		stride = (uint32_t)width * 5 / 4;
++	}
++	raw = malloc((size_t)stride * height);
++	if (raw == NULL) {
++		return 2;
++	}
++	isp_init(&isp);
++	isp.fast.preview_half = true;
++	isp.fast.neon = false;
++	memset(&scene, 0, sizeof(scene));
++	scene.width = width;
++	scene.height = height;
++	scene.detail = !flat;
++	scene.black = 64;
++	fill_lsc_synthetic(scene.gain);
++	if (tuning != NULL && !isp_load_tuning(&isp, tuning)) {
++		fprintf(stderr, "cam_gpu_host: %s is not a tuning file\n", tuning);
++		return 2;
++	}
++	if (tuning != NULL) {
++		isp_tune(&isp, 0.6f, 5000);
++		if (isp.lsc.on) {
++			memcpy(scene.gain, isp.lsc.gain, sizeof(scene.gain));
++		}
++	} else {
++		isp.lsc.on = true;
++		memcpy(isp.lsc.gain, scene.gain, sizeof(scene.gain));
++	}
++	{
++		static const float grey[9] = { 1.0f, 0, 0, 0, 1.0f, 0, 0, 0, 1.0f };
++
++		isp_set_ccm(&isp, grey);
++		isp_set_tone(&isp, 0.0f, 1.0f);
++	}
++	if (raw_path != NULL) {
++		FILE *file = fopen(raw_path, "rb");
++
++		if (file == NULL || fread(raw, 1, (size_t)stride * height, file) != (size_t)stride * height) {
++			fprintf(stderr, "cam_gpu_host: %s is not %ux%u RAW10 (%u bytes a line)\n", raw_path, width, height, stride);
++			return 2;
++		}
++		fclose(file);
++	} else {
++		scene_make(&scene, raw, stride);
++	}
++	memset(&f, 0, sizeof(f));
++	memcpy(f.magic, "RWFRAME1", 8);
++	f.header_bytes = sizeof(f);
++	f.width = (uint32_t)width;
++	f.height = (uint32_t)height;
++	f.stride = stride;
++	f.format = 1;
++	f.bayer = 0;
++	f.black = 64;
++	f.sensor = 1;
++
++	for (int c = 0; c < 3; c++) {
++		for (int j = 0; j < 3; j++) {
++			rows[c][j] = isp.ccm[c][j] * isp.wb[j] * isp.digital * (3836.0f / 959.0f);
++		}
++	}
++	cpu_y = malloc((size_t)width * height);
++	cpu_uv = malloc((size_t)width * height / 2);
++	gl_y = malloc((size_t)width * height);
++	gl_uv = malloc((size_t)width * height / 2);
++	ref_y = malloc((size_t)width * height);
++	ref_uv = malloc((size_t)width * height / 2);
++	rgb = malloc((size_t)width * height * 3);
++	uv_scratch = malloc((size_t)width * height * 2);
++	if (cpu_y == NULL || cpu_uv == NULL || gl_y == NULL || gl_uv == NULL || ref_y == NULL || ref_uv == NULL || rgb == NULL ||
++	    uv_scratch == NULL) {
++		fprintf(stderr, "cam_gpu_host: no memory for %dx%d\n", width, height);
++		return 2;
++	}
++	/* the processor's picture, the reference the camera work already has */
++	t0 = now_ms();
++	isp_render_nv12(&isp, &f, raw, cpu_y, width, cpu_uv, width, (uint32_t)width, (uint32_t)height, 0, (uint32_t)height, video != 0);
++	printf("cam_gpu_host: isp_render_nv12 %dx%d in %.1f ms\n", width, height, now_ms() - t0);
++	/* the C reference of the shaders */
++	{
++		struct gpu_ref ref;
++
++		memset(&ref, 0, sizeof(ref));
++		ref.raw = raw;
++		ref.raw_w = width;
++		ref.raw_h = height;
++		ref.stride = stride;
++		ref.black = 64;
++		ref.bayer = 0;
++		ref.lsc_on = isp.lsc.on ? 1 : 0;
++		ref.lsc = &isp.lsc.gain[0][0][0];
++		ref.gamma = isp.gamma;
++		ref.rows = &rows[0][0];
++		ref.out_w = width;
++		ref.out_h = height;
++		ref.sigma = sigma;
++		ref.amount = amount;
++		ref.video_range = video;
++		t0 = now_ms();
++		ref_pass1(&ref, rgb);
++		ref_pass2(&ref, rgb, ref_y, width, ref_uv, width);
++		printf("cam_gpu_host: the C reference in %.1f ms\n", now_ms() - t0);
++	}
++
++	if (!egl_start(&display, &context, &surface)) {
++		return 1;
++	}
++	printf("cam_gpu_host: %s / %s\n", glGetString(GL_RENDERER), glGetString(GL_VERSION));
++	raw_program = program(isp_gpu_raw_shader);
++	nv12_program = program(isp_gpu_nv12_shader);
++	glGenVertexArrays(1, &vao);
++	glBindVertexArray(vao);
++	glGenTextures(1, &raw_texture);
++	glBindTexture(GL_TEXTURE_2D, raw_texture);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, (GLsizei)stride, height, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, raw);
++	glGenTextures(1, &lsc_texture);
++	glBindTexture(GL_TEXTURE_2D, lsc_texture);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++	{
++		float grid[13 * 17 * 3];
++
++		for (int y = 0; y < 13; y++) {
++			for (int x = 0; x < 17; x++) {
++				for (int c = 0; c < 3; c++) {
++					grid[(y * 17 + x) * 3 + c] = isp.lsc.on ? isp.lsc.gain[c][y][x] : 1.0f;
++				}
++			}
++		}
++		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, 17, 13, 0, GL_RGB, GL_FLOAT, grid);
++	}
++	glGenTextures(1, &gamma_texture);
++	glBindTexture(GL_TEXTURE_2D, gamma_texture);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 4096, 1, 0, GL_RED, GL_UNSIGNED_BYTE, isp.gamma);
++	glGenTextures(1, &rgb_texture);
++	glBindTexture(GL_TEXTURE_2D, rgb_texture);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, width, height, 0, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, NULL);
++	glGenTextures(1, &y_texture);
++	glBindTexture(GL_TEXTURE_2D, y_texture);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, width, height, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
++	glGenTextures(1, &uv_texture);
++	glBindTexture(GL_TEXTURE_2D, uv_texture);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8UI, width, height, 0, GL_RG_INTEGER, GL_UNSIGNED_BYTE, NULL);
++	check("textures");
++	glGenFramebuffers(1, &raw_fbo);
++	glBindFramebuffer(GL_FRAMEBUFFER, raw_fbo);
++	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rgb_texture, 0);
++	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++		fprintf(stderr, "cam_gpu_host: the RAW pass's framebuffer is not complete\n");
++		return 1;
++	}
++	{
++		const GLenum attachments[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
++
++		glGenFramebuffers(1, &nv12_fbo);
++		glBindFramebuffer(GL_FRAMEBUFFER, nv12_fbo);
++		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, y_texture, 0);
++		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, uv_texture, 0);
++		glDrawBuffers(2, attachments);
++		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++			fprintf(stderr, "cam_gpu_host: the NV12 pass's framebuffer is not complete\n");
++			return 1;
++		}
++	}
++	check("framebuffers");
++	for (int frame = 0; frame < frames; frame++) {
++		t0 = now_ms();
++		glUseProgram(raw_program);
++		glActiveTexture(GL_TEXTURE0);
++		glBindTexture(GL_TEXTURE_2D, raw_texture);
++		glActiveTexture(GL_TEXTURE1);
++		glBindTexture(GL_TEXTURE_2D, lsc_texture);
++		glActiveTexture(GL_TEXTURE2);
++		glBindTexture(GL_TEXTURE_2D, gamma_texture);
++		glBindFramebuffer(GL_FRAMEBUFFER, raw_fbo);
++		glViewport(0, 0, width, height);
++		glUniform1i(glGetUniformLocation(raw_program, "uRaw"), 0);
++		glUniform1i(glGetUniformLocation(raw_program, "uRawW"), width);
++		glUniform1i(glGetUniformLocation(raw_program, "uRawH"), height);
++		glUniform1f(glGetUniformLocation(raw_program, "uBlack"), 64.0f);
++		glUniform1i(glGetUniformLocation(raw_program, "uLsc"), 1);
++		glUniform1i(glGetUniformLocation(raw_program, "uLscOn"), isp.lsc.on ? 1 : 0);
++		glUniform1i(glGetUniformLocation(raw_program, "uCellsW"), width / 2);
++		glUniform1i(glGetUniformLocation(raw_program, "uCellsH"), height / 2);
++		glUniform1i(glGetUniformLocation(raw_program, "uGamma"), 2);
++		glUniform3f(glGetUniformLocation(raw_program, "uRow0"), rows[0][0], rows[0][1], rows[0][2]);
++		glUniform3f(glGetUniformLocation(raw_program, "uRow1"), rows[1][0], rows[1][1], rows[1][2]);
++		glUniform3f(glGetUniformLocation(raw_program, "uRow2"), rows[2][0], rows[2][1], rows[2][2]);
++		glUniform1i(glGetUniformLocation(raw_program, "uRp"), 0);
++		glUniform1i(glGetUniformLocation(raw_program, "uBp"), 3);
++		glUniform1i(glGetUniformLocation(raw_program, "uOutW"), width);
++		glUniform1i(glGetUniformLocation(raw_program, "uOutH"), height);
++		glDrawArrays(GL_TRIANGLES, 0, 3);
++		check("pass 1");
++		glBindFramebuffer(GL_FRAMEBUFFER, nv12_fbo);
++		glUseProgram(nv12_program);
++		glActiveTexture(GL_TEXTURE0);
++		glBindTexture(GL_TEXTURE_2D, rgb_texture);
++		glUniform1i(glGetUniformLocation(nv12_program, "uRGB"), 0);
++		glUniform1i(glGetUniformLocation(nv12_program, "uW"), width);
++		glUniform1i(glGetUniformLocation(nv12_program, "uH"), height);
++		glUniform1f(glGetUniformLocation(nv12_program, "uSigma"), sigma);
++		glUniform1f(glGetUniformLocation(nv12_program, "uAmount"), amount);
++		glUniform1i(glGetUniformLocation(nv12_program, "uVideoRange"), video);
++		glDrawArrays(GL_TRIANGLES, 0, 3);
++		glDrawArrays(GL_TRIANGLES, 0, 3);
++		check("pass 2");
++		glReadBuffer(GL_COLOR_ATTACHMENT0);
++		glPixelStorei(GL_PACK_ALIGNMENT, 1);
++		glPixelStorei(GL_PACK_ROW_LENGTH, width);
++		glReadPixels(0, 0, width, height, GL_RED_INTEGER, GL_UNSIGNED_BYTE, gl_y);
++		glReadBuffer(GL_COLOR_ATTACHMENT1);
++		glReadPixels(0, 0, width, height, GL_RG_INTEGER, GL_UNSIGNED_BYTE, uv_scratch);
++		glFinish();
++		gl_ms += now_ms() - t0;
++		if (glGetError() != GL_NO_ERROR) {
++			fprintf(stderr, "cam_gpu_host: an OpenGL ES error in frame %d\n", frame);
++			return 1;
++		}
++		for (int row = 0; row < height / 2; row++) {
++			const uint8_t *in = uv_scratch + (size_t)row * 2 * width * 2;
++			uint8_t *out = gl_uv + (size_t)row * width;
++
++			for (int x = 0; x < width / 2; x++) {
++				out[2 * x] = in[4 * x];
++				out[2 * x + 1] = in[4 * x + 1];
++			}
++		}
++	}
++	printf("cam_gpu_host: the shaders %dx%d in %.1f ms a frame (%.1f with the readback and the copy)\n", width, height,
++	    gl_ms / frames, gl_ms / frames);
++	{
++		double mg = 0, mr = 0, mc = 0;
++
++		for (int k = 0; k < width * height; k++) {
++			mg += gl_y[k];
++			mr += ref_y[k];
++			mc += cpu_y[k];
++		}
++		printf("cam_gpu_host: means Y shaders %.1f reference %.1f processor %.1f\n", mg / (width * height), mr / (width * height),
++		    mc / (width * height));
++	}
++	printf("cam_gpu_host: PSNR shaders against the C reference: Y %.2f dB, UV %.2f dB\n",
++	    psnr(gl_y, width, ref_y, width, width, height, 1), psnr(gl_uv, width, ref_uv, width, width / 2, height / 2, 2));
++	printf("cam_gpu_host: PSNR shaders against isp_render_nv12:   Y %.2f dB, UV %.2f dB\n",
++	    psnr(gl_y, width, cpu_y, width, width, height, 1), psnr(gl_uv, width, cpu_uv, width, width / 2, height / 2, 2));
++	printf("cam_gpu_host: PSNR C reference against isp_render_nv12: Y %.2f dB, UV %.2f dB\n",
++	    psnr(ref_y, width, cpu_y, width, width, height, 1), psnr(ref_uv, width, cpu_uv, width, width / 2, height / 2, 2));
++	{
++		FILE *file = fopen("cam_gpu_host.nv12", "wb");
++
++		if (file != NULL) {
++			fwrite(gl_y, 1, (size_t)width * height, file);
++			fwrite(gl_uv, 1, (size_t)width * height / 2, file);
++			fclose(file);
++			printf("cam_gpu_host: the shaders' picture in cam_gpu_host.nv12 (%dx%d)\n", width, height);
++		}
++	}
++	(void)PF_420F;
++	(void)surface;
++	return 0;
++}
++
++/*
++ * camera_isp.c's GPU path, which this program replaces with its own GL (the shaders are the same, the
++ * setting up is EGL's here instead of OSMesa's): the processor's picture in this program is the
++ * reference, made by isp_render_nv12() with no GPU behind it.
++ */
++bool
++isp_gpu_start(void)
++{
++	return false;
++}
++
++bool
++isp_gpu_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y,
++    size_t y_stride, uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, bool video_range)
++{
++	(void)isp;
++	(void)f;
++	(void)raw;
++	(void)y;
++	(void)y_stride;
++	(void)uv;
++	(void)uv_stride;
++	(void)width;
++	(void)height;
++	(void)video_range;
++	return false;
++}
+diff -ruN a/userland/tools/cam_gpu_ref.h b/userland/tools/cam_gpu_ref.h
+--- a/userland/tools/cam_gpu_ref.h
++++ b/userland/tools/cam_gpu_ref.h
+@@ -0,0 +1,230 @@
++/*
++ * The C reference of the GPU ISP's shaders (src/camera_isp_gpu_shaders.h): the same arithmetic, the
++ * same order, so that tools/cam_gpu_host.c can hold the GLSL to something that is not a driver --
++ * and tools/cam_gpu_bench.c can say what the GPU's picture differs from on the phone (a second
++ * frame, the processor's, isp_render_nv12()'s).
++ *
++ * Not the phone's ISP: no OpenGL, no IOSurface, no threading. The inputs are what the shaders get:
++ * the frame's bytes, the lens shading's grid, the tone's table and the colour matrix's rows.
++ */
++#ifndef CAM_GPU_REF_H
++#define CAM_GPU_REF_H
++
++#include <math.h>
++#include <stdint.h>
++#include <string.h>
++
++#define REF_LSC_W       17
++#define REF_LSC_H       13
++
++struct gpu_ref {
++	const uint8_t  *raw;
++	int             raw_w, raw_h;   /* the sensor's pixels */
++	uint32_t        stride;
++	float           black;
++	int             bayer;
++	int             lsc_on;
++	const float    *lsc;            /* [3][REF_LSC_H][REF_LSC_W] */
++	const uint8_t  *gamma;          /* 4096 */
++	const float    *rows;           /* [3][3], the matrix with the gains folded in */
++	int             out_w, out_h;
++	float           sigma, amount;
++	int             video_range;
++};
++
++static inline uint32_t
++ref_raw_at(const struct gpu_ref *r, int x, int y)
++{
++	int px = x < 0 ? 0 : x > r->raw_w - 1 ? r->raw_w - 1 : x;
++	int py = y < 0 ? 0 : y > r->raw_h - 1 ? r->raw_h - 1 : y;
++	int g = px >> 2, b = px & 3;
++	uint32_t hi = r->raw[(size_t)py * r->stride + (size_t)g * 5 + b];
++	uint32_t lo = r->raw[(size_t)py * r->stride + (size_t)g * 5 + 4];
++
++	return (hi << 2) | ((lo >> (b * 2)) & 3u);
++}
++
++static inline float
++ref_V(const struct gpu_ref *r, int x, int y)
++{
++	float v = (float)ref_raw_at(r, x, y) - r->black;
++
++	return v < 0 ? 0 : v;
++}
++
++static inline int
++ref_site(const struct gpu_ref *r, int x, int y)
++{
++	int q = (x & 1) + 2 * (y & 1);
++	int rp = r->bayer == 1 ? 1 : r->bayer == 2 ? 2 : r->bayer == 3 ? 3 : 0;
++	int bp = 3 - rp;
++
++	return q == rp ? 0 : q == bp ? 1 : 2;
++}
++
++static inline void
++ref_demosaic(const struct gpu_ref *r, int x, int y, float c, float rgb[3])
++{
++	float n = ref_V(r, x, y - 1), s = ref_V(r, x, y + 1), w = ref_V(r, x - 1, y), e = ref_V(r, x + 1, y);
++	float nn = ref_V(r, x, y - 2), ss = ref_V(r, x, y + 2), ww = ref_V(r, x - 2, y), ee = ref_V(r, x + 2, y);
++	float ne = ref_V(r, x + 1, y - 1), nw = ref_V(r, x - 1, y - 1), se = ref_V(r, x + 1, y + 1), sw = ref_V(r, x - 1, y + 1);
++	float g = (4.0f * c + 2.0f * (n + s + w + e) - (nn + ss + ww + ee)) / 8.0f;
++
++	if (ref_site(r, x, y) == 0) {
++		rgb[0] = c;
++		rgb[1] = g;
++		rgb[2] = (6.0f * c + 2.0f * (ne + nw + se + sw) - 1.5f * (nn + ss + ww + ee)) / 8.0f;
++	} else if (ref_site(r, x, y) == 1) {
++		rgb[0] = (6.0f * c + 2.0f * (ne + nw + se + sw) - 1.5f * (nn + ss + ww + ee)) / 8.0f;
++		rgb[1] = g;
++		rgb[2] = c;
++	} else if (ref_site(r, x - 1, y) == 0) {
++		rgb[0] = (5.0f * c + 4.0f * (w + e) - (ww + ee) - (n + s) + 0.5f * (nn + ss)) / 8.0f;
++		rgb[1] = c;
++		rgb[2] = (5.0f * c + 4.0f * (n + s) - (nn + ss) - (w + e) + 0.5f * (ww + ee)) / 8.0f;
++	} else {
++		rgb[0] = (5.0f * c + 4.0f * (n + s) - (nn + ss) - (w + e) + 0.5f * (ww + ee)) / 8.0f;
++		rgb[1] = c;
++		rgb[2] = (5.0f * c + 4.0f * (w + e) - (ww + ee) - (n + s) + 0.5f * (nn + ss)) / 8.0f;
++	}
++}
++
++static inline void
++ref_lsc(const struct gpu_ref *r, int cx, int cy, float g[3])
++{
++	int cells_w = r->raw_w / 2, cells_h = r->raw_h / 2;
++	float u = cells_w > 1 ? (float)cx / (float)(cells_w - 1) : 0;
++	float v = cells_h > 1 ? (float)cy / (float)(cells_h - 1) : 0;
++	float gx = u * (REF_LSC_W - 1), gy = v * (REF_LSC_H - 1);
++	int x = (int)gx, y = (int)gy;
++	float fx, fy;
++
++	x = x < 0 ? 0 : x > REF_LSC_W - 2 ? REF_LSC_W - 2 : x;
++	y = y < 0 ? 0 : y > REF_LSC_H - 2 ? REF_LSC_H - 2 : y;
++	fx = gx - x;
++	fy = gy - y;
++	for (int c = 0; c < 3; c++) {
++		const float *t = r->lsc + ((size_t)c * REF_LSC_H + y) * REF_LSC_W + x;
++
++		g[c] = (t[0] * (1 - fx) + t[1] * fx) * (1 - fy) + (t[REF_LSC_W] * (1 - fx) + t[REF_LSC_W + 1] * fx) * fy;
++	}
++}
++
++static inline int
++ref_curve(const struct gpu_ref *r, float v)
++{
++	int i = (int)(v + 0.5f);
++
++	return r->gamma[i < 0 ? 0 : i > 4095 ? 4095 : i];
++}
++
++/* the frame to 8-bit R, G, B (pass 1): rgb is out_w x out_h x 3 */
++static inline void
++ref_pass1(const struct gpu_ref *r, uint8_t *rgb)
++{
++	for (int y = 0; y < r->out_h; y++) {
++		for (int x = 0; x < r->out_w; x++) {
++			float fx = ((float)x + 0.5f) * (float)r->raw_w / (float)r->out_w - 0.5f;
++			float fy = ((float)y + 0.5f) * (float)r->raw_h / (float)r->out_h - 0.5f;
++			int sx = (int)floorf(fx + 0.5f), sy = (int)floorf(fy + 0.5f);
++			float c, v[3], g[3];
++
++			sx = sx < 0 ? 0 : sx > r->raw_w - 1 ? r->raw_w - 1 : sx;
++			sy = sy < 0 ? 0 : sy > r->raw_h - 1 ? r->raw_h - 1 : sy;
++			c = ref_V(r, sx, sy);
++			ref_demosaic(r, sx, sy, c, v);
++			if (r->lsc_on) {
++				ref_lsc(r, sx >> 1, sy >> 1, g);
++			} else {
++				g[0] = g[1] = g[2] = 1;
++			}
++			v[0] *= g[0];
++			v[1] *= g[1];
++			v[2] *= g[2];
++			for (int k = 0; k < 3; k++) {
++				float s = r->rows[k * 3 + 0] * v[0] + r->rows[k * 3 + 1] * v[1] + r->rows[k * 3 + 2] * v[2];
++
++				rgb[((size_t)y * r->out_w + x) * 3 + k] = (uint8_t)ref_curve(r, s);
++			}
++		}
++	}
++}
++
++static inline int
++ref_luma(const struct gpu_ref *r, const uint8_t *rgb, int x, int y)
++{
++	int k0 = r->video_range ? 16829 : 19595, k1 = r->video_range ? 33039 : 38470, k2 = r->video_range ? 6416 : 7471;
++	int oy = r->video_range ? (16 << 16) : 0;
++	const uint8_t *p = rgb + ((size_t)y * r->out_w + x) * 3;
++
++	return (k0 * p[0] + k1 * p[1] + k2 * p[2] + oy + (1 << 15)) >> 16;
++}
++
++/* the R, G, B bytes to NV12 (pass 2) */
++static inline void
++ref_pass2(const struct gpu_ref *r, const uint8_t *rgb, uint8_t *y, size_t y_stride, uint8_t *uv, size_t uv_stride)
++{
++	int k3 = r->video_range ? -9714 : -11058, k4 = r->video_range ? -19070 : -21710, k5 = r->video_range ? 28784 : 32768;
++	int k6 = r->video_range ? 28784 : 32768, k7 = r->video_range ? -24103 : -27439, k8 = r->video_range ? -4681 : -5329;
++
++	for (int row = 0; row < r->out_h; row++) {
++		uint8_t *out = y + (size_t)row * y_stride;
++
++		for (int x = 0; x < r->out_w; x++) {
++			int yc = ref_luma(r, rgb, x, row);
++			float blur = (float)yc;
++
++			if (r->sigma > 0) {
++				float sum = (float)yc, wsum = 1, ss = 2.0f * r->sigma * r->sigma;
++
++				for (int dy = -1; dy <= 1; dy++) {
++					for (int dx = -1; dx <= 1; dx++) {
++						int nx = x + dx, ny = row + dy;
++						float yn, d, w;
++
++						if (dx == 0 && dy == 0) {
++							continue;
++						}
++						nx = nx < 0 ? 0 : nx > r->out_w - 1 ? r->out_w - 1 : nx;
++						ny = ny < 0 ? 0 : ny > r->out_h - 1 ? r->out_h - 1 : ny;
++						yn = (float)ref_luma(r, rgb, nx, ny);
++						d = yn - (float)yc;
++						w = 1.0f / (1.0f + d * d / ss);
++						sum += w * yn;
++						wsum += w;
++					}
++				}
++				blur = sum / wsum;
++			}
++			{
++				float delta = (float)yc - blur;
++				float t = fabsf(delta) > 2.0f ? delta - (delta > 0 ? 2.0f : -2.0f) : 0.0f;
++				float add = t > 0 ? floorf(t * r->amount + 0.5f) : ceilf(t * r->amount - 0.5f);
++				float o = (float)yc + (add < -24 ? -24 : add > 24 ? 24 : add);
++
++				out[x] = (uint8_t)(o < 0 ? 0 : o > 255 ? 255 : (int)(o + 0.5f));
++			}
++		}
++	}
++	for (int row = 0; row < r->out_h / 2; row++) {
++		uint8_t *out = uv + (size_t)row * uv_stride;
++
++		for (int x = 0; x < r->out_w / 2; x++) {
++			int bx = 2 * x, by = 2 * row;
++			const uint8_t *c00 = rgb + ((size_t)by * r->out_w + bx) * 3;
++			const uint8_t *c10 = rgb + ((size_t)by * r->out_w + bx + 1) * 3;
++			const uint8_t *c01 = rgb + ((size_t)(by + 1) * r->out_w + bx) * 3;
++			const uint8_t *c11 = rgb + ((size_t)(by + 1) * r->out_w + bx + 1) * 3;
++			int R = c00[0] + c10[0] + c01[0] + c11[0];
++			int G = c00[1] + c10[1] + c01[1] + c11[1];
++			int B = c00[2] + c10[2] + c01[2] + c11[2];
++			int cb = (k3 * R + k4 * G + k5 * B + (128 << 18) + (1 << 17) - 1) >> 18;
++			int cr = (k6 * R + k7 * G + k8 * B + (128 << 18) + (1 << 17) - 1) >> 18;
++
++			out[2 * x] = (uint8_t)(cb < 0 ? 0 : cb > 255 ? 255 : cb);
++			out[2 * x + 1] = (uint8_t)(cr < 0 ? 0 : cr > 255 ? 255 : cr);
++		}
++	}
++}
++
++#endif
+diff -ruN a/userland/tools/cam_gpu_scene.h b/userland/tools/cam_gpu_scene.h
+--- a/userland/tools/cam_gpu_scene.h
++++ b/userland/tools/cam_gpu_scene.h
+@@ -0,0 +1,147 @@
++/*
++ * A frame for the GPU ISP's tests, when there is no dump of a real one (there is none of the IMX582's
++ * RAW10 in artifacts/: see the report): a scene of colour patches, a grey ramp, lines and a circle,
++ * made into the sensor's own numbers -- sRGB's curve undone, the lens shading's gains divided out (so
++ * that the ISP's grid puts them back), black 64, white 959 above it, a little noise -- and packed as
++ * MIPI RAW10, four pixels in five bytes, the way /dev/hakios-camera hands a frame over (the header's
++ * struct hakios_camera_frame: 1920x1080, stride 2400, bayer 0 (RGGB), format 1).
++ *
++ * The scene is the same on the host (tools/cam_gpu_host.c) and on the phone (tools/cam_gpu_bench.c):
++ * the two compare the same bytes, and the numbers in the report are of these frames.
++ */
++#ifndef CAM_GPU_SCENE_H
++#define CAM_GPU_SCENE_H
++
++#include <math.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define SCENE_LSC_W     17
++#define SCENE_LSC_H     13
++
++struct scene {
++	int             width, height;
++	int             detail;         /* the chart, the bars and the ramp (0: only the smooth background and the circle) */
++	uint32_t        black;
++	float           gain[3][SCENE_LSC_H][SCENE_LSC_W];      /* the lens shading's, as the ISP's grid has it */
++};
++
++/* the 24 patches of a colour chart, in sRGB's 8-bit values */
++static const uint8_t scene_patches[24][3] = {
++	{ 115, 82, 68 }, { 194, 150, 130 }, { 98, 122, 157 }, { 87, 108, 67 }, { 133, 128, 177 }, { 103, 189, 170 },
++	{ 214, 126, 44 }, { 80, 91, 166 }, { 193, 90, 99 }, { 94, 60, 108 }, { 157, 188, 64 }, { 224, 163, 46 },
++	{ 56, 61, 150 }, { 70, 148, 73 }, { 175, 54, 60 }, { 231, 199, 31 }, { 187, 86, 149 }, { 8, 133, 161 },
++	{ 243, 243, 242 }, { 200, 200, 200 }, { 160, 160, 160 }, { 122, 122, 121 }, { 85, 85, 85 }, { 52, 52, 52 },
++};
++
++static float
++scene_srgb_to_linear(float v)
++{
++	return v <= 0.04045f ? v / 12.92f : (float)pow((v + 0.055) / 1.055, 2.4);
++}
++
++/* the lens shading's gain at a cell, bilinear between the grid's points (camera_isp.c's lsc_at()) */
++static float
++scene_gain(const struct scene *s, int c, int cx, int cy, int cells_w, int cells_h)
++{
++	float u = cells_w > 1 ? (float)cx / (float)(cells_w - 1) : 0;
++	float v = cells_h > 1 ? (float)cy / (float)(cells_h - 1) : 0;
++	float gx = u * (SCENE_LSC_W - 1), gy = v * (SCENE_LSC_H - 1);
++	int x = (int)gx, y = (int)gy;
++	float fx, fy;
++
++	x = x < 0 ? 0 : x > SCENE_LSC_W - 2 ? SCENE_LSC_W - 2 : x;
++	y = y < 0 ? 0 : y > SCENE_LSC_H - 2 ? SCENE_LSC_H - 2 : y;
++	fx = gx - x;
++	fy = gy - y;
++	return (s->gain[c][y][x] * (1 - fx) + s->gain[c][y][x + 1] * fx) * (1 - fy) +
++	    (s->gain[c][y + 1][x] * (1 - fx) + s->gain[c][y + 1][x + 1] * fx) * fy;
++}
++
++/* one channel of the scene at (x, y), in sRGB 0..1 */
++static float
++scene_at(const struct scene *s, int x, int y, int c)
++{
++	int w = s->width, h = s->height;
++	float v;
++
++	/* the background: a smooth gradient, brighter to the right and to the middle */
++	v = 0.10f + 0.55f * ((float)x / (float)(w - 1)) * (0.55f + 0.45f * (1.0f - (float)abs(2 * y - h) / (float)h));
++	/* the chart: 6 columns by 4 rows, its left part */
++	if (s->detail) {
++		int px0 = w / 20, py0 = h / 10, pw = (w * 11 / 20) / 6, ph = (h * 3 / 5) / 4;
++		int px = x - px0, py = y - py0;
++
++		if (px >= 0 && py >= 0 && px < 6 * pw && py < 4 * ph) {
++			int patch = (py / ph) * 6 + px / pw;
++
++			/* a border of the background around each patch */
++			if ((px % pw) > 6 && (py % ph) > 6) {
++				v = scene_patches[patch][c] / 255.0f;
++			}
++		}
++	}
++	/* the grey ramp, the lower right */
++	if (s->detail) {
++		int rx = w * 13 / 20, ry = h * 7 / 10;
++
++		if (x >= rx && y >= ry && x < w * 19 / 20 && y < ry + h / 10) {
++			v = (float)(x - rx) / (float)(w * 6 / 20);
++		}
++	}
++	/* lines: 2-pixel bars, to see the demosaic and the unsharp mask work */
++	if (s->detail && y >= h * 3 / 4 && y < h * 3 / 4 + 40 && x >= w / 20 && x < w / 2) {
++		v = ((x / 2) % 2) ? 0.95f : 0.03f;
++	}
++	/* a circle, for the edges */
++	{
++		float dx = (float)(x - w * 3 / 4) / (float)w, dy = (float)(y - h / 4) / (float)h;
++
++		if (dx * dx + dy * dy < 0.0025f) {
++			v = 0.8f;
++		}
++	}
++	return v < 0 ? 0 : v > 1 ? 1 : v;
++}
++
++/* the frame's bytes: four sites in five, `stride` a line */
++static void
++scene_make(const struct scene *s, uint8_t *raw, uint32_t stride)
++{
++	int w = s->width, h = s->height;
++	uint32_t seed = 12345;
++	int cells_w = w / 2, cells_h = h / 2;
++
++	memset(raw, 0, (size_t)stride * h);
++	for (int y = 0; y < h; y++) {
++		uint8_t *line = raw + (size_t)y * stride;
++
++		for (int x = 0; x < w; x++) {
++			int q = (x & 1) + 2 * (y & 1);
++			int c = q == 0 ? 0 : q == 3 ? 2 : 1;      /* bayer 0, RGGB */
++			float v = scene_srgb_to_linear(scene_at(s, x, y, c)), g;
++			int code;
++
++			g = scene_gain(s, c, (x / 2) % cells_w, (y / 2) % cells_h, cells_w, cells_h);
++			v = g > 0.01f ? v / g : v;
++			seed = seed * 1664525u + 1013904223u;
++			code = (int)((float)s->black + v * 959.0f + (float)((int)((seed >> 16) % 7) - 3) + 0.5f);
++			if (code < 0) {
++				code = 0;
++			}
++			if (code > 1023) {
++				code = 1023;
++			}
++			{
++				int group = x >> 2, lane = x & 3;
++				uint8_t *g5 = line + (size_t)group * 5;
++
++				g5[lane] = (uint8_t)(code >> 2);
++				g5[4] = (uint8_t)(g5[4] | ((code & 3) << (lane * 2)));
++			}
++		}
++	}
++}
++
++#endif
