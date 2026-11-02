@@ -623,6 +623,16 @@ nfc_recv(uint8_t *packet, unsigned capacity, unsigned timeout_ms)
 		say("rx: the 3-byte header is not read\n");
 		return 0;
 	}
+	/*
+	 * N13b: an idle or not-ready NXP controller reads back 0xff on I2C (the same "empty read"
+	 * phTmlNfc_i2c and nxp-nci guard against with the IRQ). MT 4..7 is not NCI, and a length of
+	 * 0xff from such a header would pull 255 more garbage bytes, so the header is dropped here.
+	 */
+	if ((header[0] >> 5) > 3) {
+		say("rx: header %02x %02x %02x is not NCI (MT %u): empty read, dropped\n",
+		    header[0], header[1], header[2], header[0] >> 5);
+		return 0;
+	}
 	length = header[2];
 	if (3 + (unsigned)length > capacity) {
 		say("rx: %u bytes do not fit the %u-byte buffer: dropped\n", 3 + length, capacity);

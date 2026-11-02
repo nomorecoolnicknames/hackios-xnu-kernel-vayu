@@ -57,6 +57,29 @@
  * phLibNfc_GetPlatformInfo (libPN548_API 0x1f1401f74) maps the CORE_INIT_RSP hardware byte to a
  * controller generation and _NFDriverEnableCRC 0x1f13e6638 skips the whole A0BF/CRC/re-init step
  * when that generation is < 5; 0x42 maps to 5 (step 2 runs, as TEST23B/C show), 0x06 maps to 1.
+ *
+ * N13 (TEST25): with generation 1 the next wall is the HSU baud-rate step. nfcd's TML writes
+ * ff ff 2f 03 07 10 00 00 5a 05 dc 02; the leading ff ff is the UART wake-up preamble, not NCI
+ * (MT 7), and the old reassembly dropped all 12 bytes as desync. ctlReassemblyAppend() now strips
+ * the preamble before length/CRC parsing. The 2F 03 step itself is answered locally (SPMI/I2C,
+ * no baud change) as before, through deliverToNfcd() so it gets the SPMI CRC16 when that mode is
+ * on. The HSU sequence behind it (gphLibNfc_HsuBrSequence 0x21171d858) continues with a second
+ * 2F 03 (phLibNfc_ReApplyHsuBrCmd 0x1f45d85d8), 2F 02 00 (phLibNfc_EnablePropExtn 0x1f458f3a4)
+ * and 2F 21 00 (phLibNfc_FlushSramData 0x1f4591218 -> phNciNfc_FlushDataCmd 0x1f45e5618); the
+ * last one is a flash write and is answered locally 4F 21 01 00, never forwarded. The main init
+ * sequence (gphLibNfc_InitSequence 0x21171a538) then has steps 5..18 (10..14 are skipped by
+ * the 0xC3C3A5A5 bConfig "Skipping set config" path): 2F 19, 2F 02, 2F 06, 2F 00,
+ * 20 03 A0 0F, 20 02, 20 02 A0 0F, 21 01, 21 00, 20 02 A0, 20 03 A0 EC/A0 ED, 22 00 -
+ * all already handled by filter()/filterSetConfig()/filterGetConfig()/filterNfcee(). Two of the
+ * local answers were corrected for generation 1: 2F 19 now returns 0x0022 (34) because
+ * phLibNfc_MwFwCompatibilityChkProcess 0x1f458f1ec expects 34 for ctx[2812] (hw 6..8), not the
+ * 0x0015 that belongs to hw 0x42; and 2F 06 now returns the 2-byte payload [status 0][fw type 3]
+ * that phNciNfc_GetFwTypeRsp 0x1f455e6e4 requires (the old 1-byte answer fails the length check).
+ *
+ * N13b: the ff ff is nfcd's own framing on the write path; the chip never sends it, so stripping
+ * it (vayu_nfc_preamble, default 1) invents nothing. The answer changes of N13 are synthetic and
+ * are off unless vayu_nfc_synth asks for them; vayu_nfc_propfwd sends the read-only 2F 19/06/00
+ * to the PN553 instead, so its real answers can be compared with the local ones run by run.
  */
 
 #include <IOKit/IOLib.h>
@@ -406,6 +429,24 @@ static uint32_t gResetNtfInjected;
 static uint32_t gNfcCrc = 1;            /* vayu_nfc_crc=0: no CRC emulation (diagnostic) */
 static uint32_t gCrcAppended, gCrcStripped, gCrcPlainFromNfcd;
 static uint32_t gNfcdTxCrc;             /* N12: last nfcd frame seen with a valid CRC (1) or plain (0) */
+static uint32_t gPreambleStripped;      /* N13: leading ff ff UART/HSU wake-up preambles removed */
+/*
+ * N13b: what is real and what is made up. vayu_nfc_preamble only removes framing that nfcd puts
+ * in front of its own frames (nothing is invented). The two masks below are the switches for the
+ * answers: vayu_nfc_synth enables the N13 synthetic answers (default 0: TEST26 behaviour), and
+ * vayu_nfc_propfwd sends the read-only 2F queries to the PN553 so that nfcd gets the chip's own
+ * answer instead of any local one. propfwd wins over synth.
+ */
+static uint32_t gNfcPreamble = 1;       /* vayu_nfc_preamble=0: old desync on ff ff (TEST26) */
+static uint32_t gNfcSynth;              /* vayu_nfc_synth: 1 = 2F 21 local ok, 2 = unused since N13c (2F 19 always per hw byte), 4 = 2F 06 2-byte */
+static uint32_t gNfcPropFwd;            /* vayu_nfc_propfwd: 1 = 2F 19, 2 = 2F 06, 4 = 2F 00 forwarded to the chip */
+static uint32_t gNfcFwIf;               /* N13c: vayu_nfc_fwif=0xNNNN forces the 2F 19 version; 0 = per platform group */
+#define NFC_SYNTH_FLUSH         0x1u
+#define NFC_SYNTH_FWIF          0x2u
+#define NFC_SYNTH_FWTYPE        0x4u
+#define NFC_PROPFWD_FWIF        0x1u
+#define NFC_PROPFWD_FWTYPE      0x2u
+#define NFC_PROPFWD_STANDBY     0x4u
 static int32_t  gLogConns[4] = { -1, -1, -1, -1 };      /* logical conn ids created by a successful CORE_CONN_CREATE_RSP */
 static uint32_t gCreditsInjected, gCreditsErrors;
 static uint8_t  gCtlReassembly[1024];
@@ -1014,12 +1055,52 @@ filter(const uint8_t * packet, unsigned length)
 		 * "_openDriver: Failed to start stack : 16" (TEST10: the third command of the session,
 		 * 2F 03 08 10 00 00 5A 05 DC 02 04 -> the old blanket 4F 03 01 01). Status 0 with no
 		 * payload is what phTmlNfc_ConfigHsuBaudRate() then needs; the kctl accepts the ioctl.
+		 *
+		 * N13: in TEST25 this is the frame that arrived as ff ff 2f 03 07 10 00 00 5a 05 dc 02.
+		 * The ff ff is the UART/HSU wake-up preamble and is removed in ctlReassemblyAppend()
+		 * before this function sees the packet, so the payload here is 7 bytes, not 9. The
+		 * answer goes through answerNfcd() -> deliverToNfcd(), which appends the SPMI CRC16
+		 * automatically when nfcd has asked for that mode (gen 1 does not: phLibNfc_CrcConfig
+		 * is skipped for controller generation < 5, so gSpmiCrc stays 0).
 		 */
 		if (oid == 0x03) {
 			static const uint8_t hsu_ok[] = { 0x4f, 0x03, 0x01, 0x00 };
 
-			filterLog(packet, length, "answer 4f 03 01 00 (no HSU here)");
+			filterLog(packet, length, "answer 4f 03 01 00 (SYNTHETIC, no HSU here)");
+			stockholmLog("MiniAppleStockholm: hsu: 2F 03 baud-rate step answered locally, %u-byte "
+			    "payload, %s; the SPMI/I2C link keeps its speed\n",
+			    length > 3 ? length - 3 : 0,
+			    spmiCrcEnabled() ? "with SPMI CRC16" : "plain (SPMI CRC off)");
 			answerNfcd(hsu_ok, sizeof(hsu_ok));
+			return;
+		}
+		/*
+		 * N13: 2F 21 = phNciNfc_FlushDataCmd 0x1f45e5618 ("flush SRAM to flash"), the fourth
+		 * step of the HSU sequence that follows the baud-rate step (gphLibNfc_HsuBrSequence
+		 * 0x21171d858: ConfigHsuBrCmd -> ReApplyHsuBrCmd -> EnablePropExtn -> FlushSramData).
+		 * It writes the controller's SRAM to its flash: exactly the class of operation this
+		 * bridge must not perform (same rule as 2F 2C), and there is no SRAM/flash to flush on
+		 * the SPMI/I2C path. phNciNfc_FlushDataRsp 0x1f45e5718 accepts only status 0 (status 1
+		 * is "Flush Data command rejected by NFCC", 0x1f45e57c0), so answer 4F 21 01 00 locally
+		 * and never forward it. Only the zero-length form is the flush command; a 2F 21 with a
+		 * payload is refused.
+		 */
+		if (oid == 0x21) {
+			static const uint8_t flush_ok[] = { 0x4f, 0x21, 0x01, 0x00 };
+
+			if (length != 3) {
+				filterLog(packet, length, "refuse 4f 21 01 01 (2F 21 with payload)");
+				answerRejected(packet, length, 0x4f, oid);
+				return;
+			}
+			if ((gNfcSynth & NFC_SYNTH_FLUSH) == 0) {
+				/* N13b: never to the chip; without vayu_nfc_synth bit 1 the answer is the truth */
+				filterLog(packet, length, "refuse 4f 21 01 01 (flush SRAM; vayu_nfc_synth&1 off)");
+				answerRejected(packet, length, 0x4f, oid);
+				return;
+			}
+			filterLog(packet, length, "answer 4f 21 01 00 (SYNTHETIC, flush SRAM: no flash write)");
+			answerNfcd(flush_ok, sizeof(flush_ok));
 			return;
 		}
 		/*
@@ -1034,13 +1115,81 @@ filter(const uint8_t * packet, unsigned length)
 		 * prints "Stack load failed with 0x2" -> "_openDriver: Failed to start stack : 2".
 		 * The answer needs three payload bytes [status 0][version high][version low]; the
 		 * response handler requires length 3 and phLibNfc_MwFwCompatibilityChkProcess
-		 * 0x1f458f1ec compares rev16(the two bytes) with 21 for hw 0x42 (phLibNfc_GetNfccFeatures
-		 * 0x1f4592b14 sets ctx[2811]=1 for hw 66; 0x1f458f274 expects 21). Hence 0x00 0x15.
+		 * 0x1f458f1ec compares rev16(the two bytes) with a per-platform constant.
+		 *
+		 * N13: that constant is not always 21. phLibNfc_GetNfccFeatures 0x1f45929f4 maps the
+		 * (spoofed) hardware byte to a platform group, and 0x1f458f1ec picks the expected
+		 * version from it:
+		 *   ctx[2811] (hw 66 = 0x42)                  -> 21 (0x15)  [old answer, TEST23C]
+		 *   ctx[2812] (hw 6..8, 162..164)             -> 34 (0x22)  [vayu_nfc_hwbyte=0x06]
+		 *   ctx[2813] (hw 177/178/186 = 0xb1/0xb2/0xba) -> 38 (0x26)
+		 *   ctx[2809] (hw 13 = 0x0d)                  -> 5
+		 *   ctx[2810] (hw 29 = 0x1d)                  -> 9
+		 * With hwbyte 0x06 the old 0x0015 would be "FW IS TOO OLD" (status 128 at 0x1f458f348),
+		 * and _NFDriverLoadMW would fail with "Incompatible firmware !". Hence the switch.
+		 *
+		 * N13c: the N13 table above is wrong for hw 6..8, and TEST 152455 (hwbyte 0x06, answer
+		 * 0x0015) got "FW IS TOO NEW", not "too old". Read again from the dyld cache of
+		 * system-test22 (subcache .33, libNFC_Comet): phLibNfc_GetNfccFeatures 0x1f4592adc
+		 * does "w11 = hw - 6; if (w11 < 3) strb 1, [ctx + 0xaf8]" - hw 6..8 set ctx[2808], and
+		 * only hw 0xa2..0xa4 set ctx[2812] (0x1f4592b00). In 0x1f458f1ec ctx[2808] == 1 branches
+		 * to the compare with w9 still holding the flag byte, so the expected version is 1:
+		 *   ctx[2809] hw 0x0d -> 5      ctx[2808] hw 6..8 -> 1     ctx[2810] hw 0x1d -> 9
+		 *   ctx[2811] hw 0x42 -> 0x15   ctx[2812] hw 0xa2..0xa4 -> 0x22
+		 *   ctx[2813] hw 0xb1/0xb2/0xba -> 0x26   ctx[2819] hw 0xd0..0xd2 -> 3, or 0x0c when
+		 *   ctx[2820] (hw 0xd1/0xd2) is also set; anything else -> "Invalid platform" (0xff).
+		 * The real PN553 byte 0x41 is in none of the groups, so the chip's own 2F 19 answer
+		 * cannot pass this check without hwspoof anyway. The answer now follows the byte nfcd is
+		 * shown (gNfcHwByte with hwspoof on, 0x42 otherwise); vayu_nfc_fwif=0xNNNN forces a
+		 * value (vayu_nfc_fwif=0x15 is the N13b answer).
 		 */
+		if (oid == 0x19 && (gNfcPropFwd & NFC_PROPFWD_FWIF) != 0 && length == 3) {
+			forwardPacket(packet, length, packet, length, "forward (vayu_nfc_propfwd&1: chip answers 2F 19)");
+			return;
+		}
 		if (oid == 0x19) {
-			static const uint8_t fw_interface_ok[] = { 0x4f, 0x19, 0x03, 0x00, 0x00, 0x15 };
+			uint8_t fw_interface_ok[6] = { 0x4f, 0x19, 0x03, 0x00, 0x00, 0x15 };
+			char decision[48];
+			unsigned fw_version;
 
-			filterLog(packet, length, "answer 4f 19 03 00 00 15");
+			switch (gHwSpoof != 0 ? gNfcHwByte : 0x42u) {
+			case 0x06: case 0x07: case 0x08:
+				fw_version = 0x01;
+				break;
+			case 0xa2: case 0xa3: case 0xa4:
+				fw_version = 0x22;
+				break;
+			case 0xd0:
+				fw_version = 0x03;
+				break;
+			case 0xd1: case 0xd2:
+				fw_version = 0x0c;
+				break;
+			case 0x0d:
+				fw_version = 0x05;
+				break;
+			case 0x1d:
+				fw_version = 0x09;
+				break;
+			case 0xba: case 0xb1: case 0xb2:
+				fw_version = 0x26;
+				break;
+			default:
+				fw_version = 0x15;
+				break;
+			}
+			if (gNfcFwIf != 0) {
+				fw_version = gNfcFwIf & 0xffff;
+			}
+			fw_interface_ok[4] = (uint8_t)(fw_version >> 8);
+			fw_interface_ok[5] = (uint8_t)(fw_version & 0xff);
+			snprintf(decision, sizeof(decision), "answer 4f 19 03 00 %02x %02x (SYNTHETIC)",
+			    fw_version >> 8, fw_version & 0xff);
+			filterLog(packet, length, decision);
+			stockholmLog("MiniAppleStockholm: mwfw: 2F 19 FW interface version 0x%04x for hw byte "
+			    "0x%02x (%s; N13c table: phLibNfc_MwFwCompatibilityChkProcess 0x1f458f1ec)\n",
+			    fw_version, gHwSpoof != 0 ? gNfcHwByte : 0x42u,
+			    gNfcFwIf != 0 ? "forced by vayu_nfc_fwif" : "per platform group");
 			answerNfcd(fw_interface_ok, sizeof(fw_interface_ok));
 			return;
 		}
@@ -1053,17 +1202,40 @@ filter(const uint8_t * packet, unsigned length)
 		 * 2F 00 standby - phLibNfc_SetStandbyModeProcess 0x1f458f76c returns 255 on any non-zero
 		 * status. Off by default so the next run still proves one variable at a time.
 		 */
-		if (gPropInit != 0 && oid == 0x06) {
-			static const uint8_t fwtype_ok[] = { 0x4f, 0x06, 0x01, 0x00 };
+		if (oid == 0x06 && (gNfcPropFwd & NFC_PROPFWD_FWTYPE) != 0 && length == 3) {
+			forwardPacket(packet, length, packet, length, "forward (vayu_nfc_propfwd&2: chip answers 2F 06)");
+			return;
+		}
+		if (oid == 0x00 && (gNfcPropFwd & NFC_PROPFWD_STANDBY) != 0 && length == 4 && packet[3] <= 0x01) {
+			forwardPacket(packet, length, packet, length, "forward (vayu_nfc_propfwd&4: chip answers 2F 00)");
+			return;
+		}
+		if (gPropInit != 0 && oid == 0x06 && (gNfcSynth & NFC_SYNTH_FWTYPE) == 0) {
+			static const uint8_t fwtype_old[] = { 0x4f, 0x06, 0x01, 0x00 };
 
-			filterLog(packet, length, "answer 4f 06 01 00 (fw type 3)");
+			filterLog(packet, length, "answer 4f 06 01 00 (SYNTHETIC, fw type 3; TEST26 form)");
+			answerNfcd(fwtype_old, sizeof(fwtype_old));
+			return;
+		}
+		if (gPropInit != 0 && oid == 0x06) {
+			/*
+			 * N13: the NCI response handler phNciNfc_GetFwTypeRsp 0x1f455e6e4 requires a
+			 * payload of exactly 2 bytes (0x1f455e760 cmp w9,#2); the old 1-byte answer
+			 * 4F 06 01 00 takes the "invalid payload length" branch (0x1f455e7c0) and
+			 * phLibNfc_GetFwTypeProc 0x1f45e37a0 then reports "operation failed". The
+			 * two bytes are status 0 and the FW type; 3 is what the proc clamps an
+			 * unknown type to (0x1f45e38a4), so answer 4F 06 02 00 03.
+			 */
+			static const uint8_t fwtype_ok[] = { 0x4f, 0x06, 0x02, 0x00, 0x03 };
+
+			filterLog(packet, length, "answer 4f 06 02 00 03 (SYNTHETIC, fw type 3)");
 			answerNfcd(fwtype_ok, sizeof(fwtype_ok));
 			return;
 		}
 		if (gPropInit != 0 && oid == 0x00) {
 			static const uint8_t standby_ok[] = { 0x4f, 0x00, 0x01, 0x00 };
 
-			filterLog(packet, length, "answer 4f 00 01 00 (standby)");
+			filterLog(packet, length, "answer 4f 00 01 00 (SYNTHETIC, standby)");
 			answerNfcd(standby_ok, sizeof(standby_ok));
 			return;
 		}
@@ -1100,11 +1272,63 @@ ctlReassemblyAppend(const uint8_t * bytes, size_t count, bool final)
 	}
 	memcpy(gCtlReassembly + gCtlReassemblyLength, bytes, count);
 	gCtlReassemblyLength += count;
-	while (gCtlReassemblyLength >= 3) {
-		size_t packet_length = 3u + gCtlReassembly[2];
-		size_t consumed = packet_length;
-		uint8_t mt = gCtlReassembly[0] >> 5;
+	/*
+	 * N13: nfcd's HSU/UART transport writes the two-byte wake-up preamble ff ff in front of
+	 * the NCI packet (TEST25: ff ff 2f 03 07 10 00 00 5a 05 dc 02, 12 bytes in one write).
+	 * 0xff is not a valid NCI MT (MT = 7), so the old code declared desync and dropped the
+	 * whole write; nfcd then retried the baud-rate step four times, each attempt waiting
+	 * 2.03 s for an NCI response, and the stack never loaded ("Baudrate retry reached max
+	 * count"). A real PN553 consumes this
+	 * preamble in its UART before the NCI frame; this bridge is SPMI/I2C and has no baud
+	 * rate to wake, so the preamble is removed here - before the length and CRC parsing,
+	 * because the SPMI CRC (when nfcd enables one) covers the NCI frame and not the
+	 * preamble. The check sits at the top of the reassembly loop, not before it, so a
+	 * preamble in front of a second frame in the same write is stripped too. Pairs are
+	 * stripped in a loop so ff ff ff ff (two wake characters repeated) also works; a lone
+	 * 0xff is left in the buffer until the next write, because the two bytes can be split
+	 * across writes.
+	 */
+	while (gCtlReassemblyLength >= 1) {
+		size_t packet_length;
+		size_t consumed;
+		uint8_t mt;
 		char hex[3 * 300 + 8];
+
+		if (gNfcPreamble != 0 && gCtlReassembly[0] == 0xff) {
+			if (gCtlReassemblyLength < 2) {
+				/* the second preamble byte is still in flight */
+				break;
+			}
+			if (gCtlReassembly[1] == 0xff) {
+				char preamble_hex[3 * 300 + 8];
+
+				gPreambleStripped++;
+				stockholmLog("MiniAppleStockholm: reassembly: UART/HSU preamble ff ff "
+				    "stripped (#%u, %zu bytes left): %s\n", gPreambleStripped,
+				    gCtlReassemblyLength - 2,
+				    hexAll(gCtlReassembly + 2,
+				    (unsigned)(gCtlReassemblyLength - 2), preamble_hex,
+				    sizeof(preamble_hex)));
+				gCtlReassemblyLength -= 2;
+				if (gCtlReassemblyLength != 0) {
+					memmove(gCtlReassembly, gCtlReassembly + 2,
+					    gCtlReassemblyLength);
+				}
+				continue;
+			}
+			/* ff followed by something else: not the wake-up preamble, a real desync. */
+			stockholmLog("MiniAppleStockholm: reassembly: desync (first byte 0x%02x, "
+			    "second 0x%02x, %zu bytes held): dropping %zu bytes: %s\n",
+			    gCtlReassembly[0], gCtlReassembly[1], gCtlReassemblyLength,
+			    gCtlReassemblyLength, hexAll(gCtlReassembly,
+			    (unsigned)gCtlReassemblyLength, hex, sizeof(hex)));
+			gCtlReassemblyLength = 0;
+			break;
+		}
+		if (gCtlReassemblyLength < 3) break;
+		packet_length = 3u + gCtlReassembly[2];
+		consumed = packet_length;
+		mt = gCtlReassembly[0] >> 5;
 
 		if (mt != 0 && mt != 1) {
 			stockholmLog("MiniAppleStockholm: reassembly: desync (first byte 0x%02x, MT %u, "
@@ -1565,6 +1789,22 @@ MiniAppleStockholmStart(void)
 		stockholmLog("MiniAppleStockholm: hwspoof: on (CORE_INIT_RSP hardware byte -> 0x%02x for nfcd)\n",
 		    (uint8_t)gNfcHwByte);
 	}
+	(void)PE_parse_boot_argn("vayu_nfc_preamble", &gNfcPreamble, sizeof(gNfcPreamble));
+	(void)PE_parse_boot_argn("vayu_nfc_synth", &gNfcSynth, sizeof(gNfcSynth));
+	(void)PE_parse_boot_argn("vayu_nfc_propfwd", &gNfcPropFwd, sizeof(gNfcPropFwd));
+	(void)PE_parse_boot_argn("vayu_nfc_fwif", &gNfcFwIf, sizeof(gNfcFwIf));
+	stockholmLog("MiniAppleStockholm: n13c: 2F 19 version %s 0x%x\n",
+	    gNfcFwIf != 0 ? "forced to" : "per platform group (N13c table), fwif", gNfcFwIf);
+	stockholmLog("MiniAppleStockholm: n13b: preamble %s, synth 0x%x (2F 21 %s, 2F 19 %s, 2F 06 %s), "
+	    "propfwd 0x%x (2F 19 %s, 2F 06 %s, 2F 00 %s)\n",
+	    gNfcPreamble != 0 ? "strip ff ff" : "off (desync)", gNfcSynth,
+	    (gNfcSynth & NFC_SYNTH_FLUSH) != 0 ? "local ok" : "refused",
+	    "per hw byte (N13c)",
+	    (gNfcSynth & NFC_SYNTH_FWTYPE) != 0 ? "2-byte" : "1-byte",
+	    gNfcPropFwd,
+	    (gNfcPropFwd & NFC_PROPFWD_FWIF) != 0 ? "chip" : "local",
+	    (gNfcPropFwd & NFC_PROPFWD_FWTYPE) != 0 ? "chip" : "local",
+	    (gNfcPropFwd & NFC_PROPFWD_STANDBY) != 0 ? "chip" : "local");
 	(void)PE_parse_boot_argn("vayu_nfc_propinit", &gPropInit, sizeof(gPropInit));
 	if (gPropInit != 0) {
 		stockholmLog("MiniAppleStockholm: propinit: on (2F 06 GET_FW_TYPE and 2F 00 standby get a local "
