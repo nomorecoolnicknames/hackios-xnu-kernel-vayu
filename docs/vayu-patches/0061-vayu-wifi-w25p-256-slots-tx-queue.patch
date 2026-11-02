@@ -1,0 +1,407 @@
+Subject: [PATCH] vayu_wifi W25p: 256 TX slots, a 32-frame queue when the pool is full (the "no slot"
+ drops at the TCP window's peak), and the in-flight cap from the CE4 source ring
+
+Base: the merged W25o tree (/mnt/ramdisk/merge-all, 0060 applied; run 150920: 9987 frames sent,
+9987 completed, status 0:9959 1:25 2:3, slots back to 0 in flight, but "drops: no slot 290").
+
+Changes:
+ - bsd/dev/vayu_wifi_scan.c: TX_SLOTS 64 -> 256 (a uint64_t[4] bitmap, all of it under tx_lock);
+   the TX pool htt_pool_alloc()s 256 x 2048 = 512 KiB, the frag bank already has room for
+   HTT_MAX_PENDING_TX (1056) entries.  The msdu id is the slot number, 0..255, well inside the
+   16-bit field of htt_data_tx_desc_64.
+ - the in-flight limit is min(256, CE4 source ring entries - 2): the HTC/HTT layer hands the CE4
+   source ring size over in vayu_scan_ops.tx_ring (bsd/dev/vayu_wifi_htc_connect.c, from
+   src_ring(VAYU_HTCC_HTT_TX_CE)), so the H2T ring can never run dry behind the pool.
+ - a full pool is no longer a drop: tx_frame() returns -2 and bsd/dev/vayu_wifi_net.c puts the
+   frame in a 32-frame queue (kalloc'd once, its own lock).  The HTT completion path kicks the
+   queue as slots come free (vayu_net_tx_kick(), called from vayu_scan_htt_tx_compl() and once per
+   100 ms from the station loop).  The interface's transmit callback accepts the frame in that
+   case (true to ifnet) instead of dropping it, so TCP keeps its window.
+ - the 10 s line now prints slots in flight/free of 256, the ring cap, the queue depth, and the
+   queue counters are in vayu_net_summary ("queue N queued/M sent/K dropped (depth D)").
+
+Expected: "no slot" stops growing (it now means "queued", and the queue drains within a
+completion), the line reads "slots in flight 0..40, free 216..256 of 256 (ring cap 2046); queue 0",
+and no "dropped" on en0 at the peak.
+
+Artifact: /mnt/ramdisk/ds-wifi-out/mach-wifi25p.bin 16478720 B
+sha256 09049378262ce44171603bd54660bc56591a39e832035db5086e387b7e29806c
+
+--- a/bsd/dev/vayu_wifi_scan.c
++++ b/bsd/dev/vayu_wifi_scan.c
+@@ -105,7 +105,9 @@
+ #define H2T_FRAG_DESC_BANK_CFG  6U
+ #define H2T_TX_FRM              1U
+ /* W25: HTT data TX (ath10k_htt_tx_64, flame radio.c) */
+-#define TX_SLOTS                64U
++#define TX_SLOTS                256U   /* W25p: 64 was the TCP window's worth, 290 frames found it full */
++#define TX_WORDS                (TX_SLOTS / 64U)
++#define TX_BUSY_RETURN          (-2)   /* no slot: the caller queues the frame instead of dropping it */
+ #define TX_SLOT_SIZE            2048U
+ #define TXF0_MAC_HDR            0x01U
+ #define TXF0_NO_ENCRYPT         0x04U
+@@ -192,7 +194,8 @@
+ static const struct vayu_scan_ops *tx_ops;
+ static uint64_t tx_pool_pa;
+ static vm_offset_t tx_pool_va;
+-static uint64_t tx_busy;
++static uint64_t tx_busy[TX_WORDS];      /* W25p: 256 slots, four words */
++static uint32_t tx_inflight_max = TX_SLOTS;     /* min(slots, CE4 source ring entries - 2) */
+ static uint32_t tx_sent, tx_done, tx_fail;
+ static uint32_t tx_status[8];           /* completions by the firmware's status nibble */
+ /* W25n: why a frame was not sent (the numbers the 10 s line prints). */
+@@ -1119,20 +1122,26 @@
+ 		    (unsigned long long)pool);
+ 	}
+ 	lck_mtx_lock(&tx_lock);
+-	for (id = 0; id < TX_SLOTS && (tx_busy & (1ULL << id)) != 0; id++) {
++	if (__builtin_popcountll(tx_busy[0]) + __builtin_popcountll(tx_busy[1]) +
++	    __builtin_popcountll(tx_busy[2]) + __builtin_popcountll(tx_busy[3]) >= tx_inflight_max) {
++		tx_drop_noslot++;               /* (the caller queues it: this is the counter that used to grow) */
++		lck_mtx_unlock(&tx_lock);
++		return TX_BUSY_RETURN;
++	}
++	for (id = 0; id < TX_SLOTS && (tx_busy[id >> 6] & (1ULL << (id & 63))) != 0; id++) {
+ 		;
+ 	}
+ 	if (id == TX_SLOTS) {
+ 		tx_drop_noslot++;
+ 		lck_mtx_unlock(&tx_lock);
+-		return -1;
++		return TX_BUSY_RETURN;
+ 	}
+ 	/* W25n: the bit goes up before the frame does.  tx_frame() runs on the interface's thread
+ 	 * while the completion is processed by the poll thread; the send waits for the CE doorbell
+ 	 * (about a millisecond), so a completion could clear a bit that was not set yet and the
+ 	 * slot stayed busy for good.  After ~64 such races every new frame found the pool full --
+ 	 * the log's "frames tx 92 ... 371 dropped". */
+-	tx_busy |= 1ULL << id;
++	tx_busy[id >> 6] |= 1ULL << (id & 63);
+ 	pa = tx_pool_pa + (uint64_t)id * TX_SLOT_SIZE;
+ 	{
+ 		uint8_t *dst = (uint8_t *)(tx_pool_va + (vm_offset_t)(pa - tx_pool_pa));
+@@ -1183,7 +1192,7 @@
+ 	memcpy(p, (const void *)(tx_pool_va + (vm_offset_t)(pa - tx_pool_pa)), pf);
+ 	rc = tx_ops->htt_send(m, 20 + pf);
+ 	if (rc != 0) {
+-		tx_busy &= ~(1ULL << id);
++		tx_busy[id >> 6] &= ~(1ULL << (id & 63));
+ 		tx_drop_send++;
+ 		lck_mtx_unlock(&tx_lock);
+ 		return -1;
+@@ -1203,11 +1212,14 @@
+ 		uint32_t id = rd16(p + 4 + 2 * i);
+ 
+ 		if (id < TX_SLOTS) {
+-			tx_busy &= ~(1ULL << id);
++			tx_busy[id >> 6] &= ~(1ULL << (id & 63));
+ 		}
+ 	}
+ 	lck_mtx_unlock(&tx_lock);
+ 	tx_done += n;
++	if (n != 0) {
++		vayu_net_tx_kick();             /* W25p: send what the pool had no room for */
++	}
+ 	if (st < 8) {
+ 		tx_status[st] += n;
+ 	}
+@@ -1221,7 +1233,7 @@
+ 
+ 
+ void
+-vayu_scan_tx_stats(uint32_t credits)
++vayu_scan_tx_stats(uint32_t credits, uint32_t queued)
+ {
+ 	uint32_t busy;
+ 
+@@ -1229,13 +1241,15 @@
+ 		return;
+ 	}
+ 	lck_mtx_lock(&tx_lock);
+-	busy = (uint32_t)__builtin_popcountll(tx_busy);
++	busy = (uint32_t)(__builtin_popcountll(tx_busy[0]) + __builtin_popcountll(tx_busy[1]) +
++	    __builtin_popcountll(tx_busy[2]) + __builtin_popcountll(tx_busy[3]));
+ 	lck_mtx_unlock(&tx_lock);
+ 	slog("vayu-wifi: W25 tx: %u sent, %u completed (status 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7:%u); "
+-	    "slots in flight %u, free %u of %u; drops: no slot %u, send %u, length %u, pool %u; wmi credits %u\n",
+-	    tx_sent, tx_done, tx_status[0], tx_status[1], tx_status[2], tx_status[3], tx_status[4],
+-	    tx_status[5], tx_status[6], tx_status[7], busy, TX_SLOTS - busy, TX_SLOTS, tx_drop_noslot,
+-	    tx_drop_send, tx_drop_len, tx_drop_pool, credits);
++	    "slots in flight %u, free %u of %u (ring cap %u); queue %u; drops: no slot %u, send %u, "
++	    "length %u, pool %u; wmi credits %u\n", tx_sent, tx_done, tx_status[0], tx_status[1],
++	    tx_status[2], tx_status[3], tx_status[4], tx_status[5], tx_status[6], tx_status[7], busy,
++	    TX_SLOTS - busy, TX_SLOTS, tx_inflight_max, queued, tx_drop_noslot, tx_drop_send, tx_drop_len,
++	    tx_drop_pool, credits);
+ }
+ 
+ int
+@@ -1253,6 +1267,11 @@
+ 		return -1;
+ 	}
+ 	tx_ops = o;
++	/* W25p: as many frames in flight as the smaller of the slots and the CE4 source ring */
++	tx_inflight_max = TX_SLOTS;
++	if (o->tx_ring > 2 && o->tx_ring - 2 < tx_inflight_max) {
++		tx_inflight_max = o->tx_ring - 2;
++	}
+ 	vayu_net_sta_attach(o->mac);            /* W25o: Apple80211 has a station before the scan */
+ 	o->log("vayu-wifi: w22: scan stage: reg events %u (rules %u, country %s), freq_avoid events %u\n",
+ 	    sc.reg_events, sc.nrules, sc.reg_seen ? sc.alpha2 : "-", sc.avoid_events);
+--- a/bsd/sys/vayu_wifi_scan.h
++++ b/bsd/sys/vayu_wifi_scan.h
+@@ -53,6 +53,7 @@
+ 	/* Zeroed contiguous DMA memory below 4 GiB, SMMU-mapped (IOVA = PA), never freed; 0 = none. */
+ 	uint64_t (*dma_alloc)(uint32_t size);
+ 	const uint8_t *mac;             /* the MAC from WMI READY (6 bytes) */
++	uint32_t tx_ring;               /* W25p: CE4 source ring entries (0: unknown) */
+ };
+ 
+ /* boot-arg vayu_wifi_scan: 0 off (W21h behaviour), 1 = HTT rx ring + passive scan after READY. */
+@@ -69,7 +70,8 @@
+ int vayu_scan_run(const struct vayu_scan_ops *ops);
+ /* W25: one native-wifi data frame on the HTT endpoint (clear = unencrypted, for EAPOL). 0 = sent. */
+ int vayu_scan_tx_frame(const uint8_t *frame, uint32_t len, bool clear);
+-/* W25n: the TX counters, one line: sent, completed, status, slots in flight/free, drops, credits. */
+-void vayu_scan_tx_stats(uint32_t wmi_credits);
++/* W25p: the TX counters, one line: sent, completed, status, slots in flight/free, ring cap, queue,
++ * drops, credits. */
++void vayu_scan_tx_stats(uint32_t wmi_credits, uint32_t queued);
+ 
+ #endif /* _SYS_VAYU_WIFI_SCAN_H_ */
+--- a/bsd/dev/vayu_wifi_net.c
++++ b/bsd/dev/vayu_wifi_net.c
+@@ -111,14 +111,15 @@
+ 
+ /* ---- sending ----------------------------------------------------------------------------------- */
+ 
+-static bool
+-send_eth(const uint8_t *frame, uint32_t len)
++/* 0 sent, -1 an error, -2 no room in the radio's TX pool (the frame may be queued) */
++static int
++net_send_eth(const uint8_t *frame, uint32_t len)
+ {
+ 	uint8_t f[1600];
+ 	uint32_t flen;
+ 
+ 	if (!net.started || net.tx80211 == NULL || len < ETH_HLEN || len - ETH_HLEN + 32 > sizeof(f)) {
+-		return false;
++		return -1;
+ 	}
+ 	/* Ethernet -> native wifi: 24-byte data header, to DS, LLC/SNAP, then the payload */
+ 	memset(f, 0, 24);
+@@ -137,13 +138,19 @@
+ 	f[31] = frame[13];
+ 	memcpy(f + 32, frame + ETH_HLEN, len - ETH_HLEN);
+ 	flen = len - ETH_HLEN + 32;
+-	if (net.tx80211(f, flen, false) != 0) {
+-		net.tx_drop++;
+-		return false;
++	{
++		int rc = net.tx80211(f, flen, false);
++
++		if (rc != 0) {
++			if (rc != -2) {
++				net.tx_drop++;
++			}
++			return rc;
++		}
+ 	}
+ 	net.tx_frames++;
+ 	net.tx_bytes += len;
+-	return true;
++	return 0;
+ }
+ 
+ /* ---- DHCP -------------------------------------------------------------------------------------- */
+@@ -219,7 +226,7 @@
+ 	ip[23] = (uint8_t)DHCP_SERVER_PORT;
+ 	ip[24] = (uint8_t)(udp_len >> 8);
+ 	ip[25] = (uint8_t)udp_len;
+-	return send_eth(e, ETH_HLEN + total);
++	return net_send_eth(e, ETH_HLEN + total) == 0;
+ }
+ 
+ 
+@@ -413,7 +420,7 @@
+ 	memcpy(e + 28, net.lease_ip, 4);
+ 	memset(e + 32, 0, 6);
+ 	memcpy(e + 38, net.router, 4);
+-	return send_eth(e, sizeof(e));
++	return net_send_eth(e, sizeof(e)) == 0;
+ }
+ 
+ static void
+@@ -470,7 +477,7 @@
+ 	sum = fold(sum16(icmp, 8 + 32, 0));
+ 	icmp[2] = (uint8_t)(sum >> 8);
+ 	icmp[3] = (uint8_t)sum;
+-	return send_eth(e, sizeof(e));
++	return net_send_eth(e, sizeof(e)) == 0;
+ }
+ 
+ static void
+@@ -542,12 +549,87 @@
+ 	}
+ }
+ 
++/* ---- W25p: a short queue for when the radio's TX pool is full -------------------------------- */
++
++#define NET_TX_QUEUE    32
++#define NET_TX_MAX      1600
++
++static struct net_tx_q {
++	uint32_t len;
++	uint8_t data[NET_TX_MAX];
++} *tx_q;
++static LCK_GRP_DECLARE(txq_lck_grp, "vayu-wifi-txq");
++static LCK_MTX_DECLARE(txq_lock, &txq_lck_grp);
++static uint32_t tx_q_head, tx_q_count, tx_q_drop, tx_q_queued, tx_q_sent;
++
++static bool
++net_tx_enqueue(const uint8_t *frame, uint32_t len)
++{
++	bool ok = false;
++
++	if (len == 0 || len > NET_TX_MAX) {
++		return false;
++	}
++	lck_mtx_lock(&txq_lock);
++	if (tx_q == NULL) {
++		tx_q = kalloc_data(sizeof(*tx_q) * NET_TX_QUEUE, Z_WAITOK | Z_ZERO);
++	}
++	if (tx_q != NULL && tx_q_count < NET_TX_QUEUE) {
++		struct net_tx_q *e = &tx_q[(tx_q_head + tx_q_count) % NET_TX_QUEUE];
++
++		e->len = len;
++		memcpy(e->data, frame, len);
++		tx_q_count++;
++		tx_q_queued++;
++		ok = true;
++	}
++	if (!ok) {
++		tx_q_drop++;
++	}
++	lck_mtx_unlock(&txq_lock);
++	return ok;
++}
++
++uint32_t
++vayu_net_tx_queue_depth(void)
++{
++	return tx_q_count;
++}
++
++/* Called by the HTT completion path (bsd/dev/vayu_wifi_scan.c) as slots come free, and from the
++ * station loop: send what the pool had no room for, oldest first. */
++void
++vayu_net_tx_kick(void)
++{
++	uint8_t frame[NET_TX_MAX];
++	uint32_t len;
++
++	lck_mtx_lock(&txq_lock);
++	if (tx_q == NULL || tx_q_count == 0) {
++		lck_mtx_unlock(&txq_lock);
++		return;
++	}
++	len = tx_q[tx_q_head].len;
++	memcpy(frame, tx_q[tx_q_head].data, len);
++	lck_mtx_unlock(&txq_lock);
++
++	if (net_send_eth(frame, len) != 0) {
++		return;                         /* (still full or an error: the next completion tries again) */
++	}
++	lck_mtx_lock(&txq_lock);
++	tx_q_head = (tx_q_head + 1) % NET_TX_QUEUE;
++	tx_q_count--;
++	tx_q_sent++;
++	lck_mtx_unlock(&txq_lock);
++}
++
+ /* ---- the interface's transmit callback --------------------------------------------------------- */
+ 
+ static bool
+ net_transmit(mbuf_t packet, size_t length)
+ {
+ 	static uint8_t e[1600];
++	int rc;
+ 
+ 	if (length < ETH_HLEN || length > sizeof(e)) {
+ 		return false;
+@@ -555,7 +637,14 @@
+ 	if (mbuf_copydata(packet, 0, length, e) != 0) {
+ 		return false;
+ 	}
+-	return send_eth(e, (uint32_t)length);
++	rc = net_send_eth(e, (uint32_t)length);
++	if (rc == 0) {
++		return true;
++	}
++	if (rc == -2 && net_tx_enqueue(e, (uint32_t)length)) {
++		return true;                    /* accepted: the completion path sends it */
++	}
++	return false;
+ }
+ 
+ /* ---- the station boundary (what wifid's Apple80211 requests are answered from) ------------------ */
+@@ -759,6 +848,8 @@
+ {
+ 	uint64_t now = now_ms();
+ 
++	vayu_net_tx_kick();                     /* W25p: in case completions are the slow side */
++
+ 	/* W25o: the fallback (vayu_wifi_dhcp=2): give iOS's configd 30 s, then ask ourselves --
+ 	 * but only if en0 really has no IPv4 address by then. */
+ 	if (net.dhcp_mode == 2 && net.dhcp_state == DHCP_OFF && net.fallback_armed &&
+@@ -845,7 +936,8 @@
+ vayu_net_summary(void)
+ {
+ 	net.log("vayu-wifi: W25 data: frames tx %u (%u bytes, %u dropped), rx %u (%u bytes, %u dropped); "
+-	    "dhcp %s, probe %s\n", net.tx_frames, net.tx_bytes, net.tx_drop, net.rx_frames, net.rx_bytes,
+-	    net.rx_drop, net.dhcp_state == DHCP_BOUND ? "bound" : (net.dhcp_on ? "no lease" : "off"),
++	    "queue %u queued/%u sent/%u dropped (depth %u); dhcp %s, probe %s\n", net.tx_frames,
++	    net.tx_bytes, net.tx_drop, net.rx_frames, net.rx_bytes, net.rx_drop, tx_q_queued, tx_q_sent,
++	    tx_q_drop, tx_q_count, net.dhcp_state == DHCP_BOUND ? "bound" : (net.dhcp_on ? "no lease" : "off"),
+ 	    net.probe_stage >= 3 ? "ok" : "no");
+ }
+--- a/bsd/sys/vayu_wifi_net.h
++++ b/bsd/sys/vayu_wifi_net.h
+@@ -26,6 +26,10 @@
+ bool vayu_net_linked(void);
+ /* boot-arg vayu_wifi_keep=1: stay joined after the handshake instead of tearing down. */
+ bool vayu_net_keep(void);
++/* W25p: frames the radio's TX pool had no room for wait here; the completion path calls the kick. */
++void vayu_net_tx_kick(void);
++uint32_t vayu_net_tx_queue_depth(void);
++
+ /* One tick of the DHCP/probe state machine: 0 = done (or off), 1 = waiting, -1 = failed. */
+ int vayu_net_poll(void);
+ /* One received MSDU from the HTT ring (native wifi or Ethernet, as the firmware decaps it). */
+--- a/bsd/dev/vayu_wifi_sta.c
++++ b/bsd/dev/vayu_wifi_sta.c
+@@ -1077,7 +1077,7 @@
+ 				break;
+ 			}
+ 			if (waited % 10000U == 0) {
+-				vayu_scan_tx_stats(vayu_htcc_credits());   /* W25n: slots, drops, credits */
++				vayu_scan_tx_stats(vayu_htcc_credits(), vayu_net_tx_queue_depth());
+ 			}
+ 			if (waited % 30000U == 0) {
+ 				vayu_net_summary();
+--- a/bsd/dev/vayu_wifi_htc_connect.c
++++ b/bsd/dev/vayu_wifi_htc_connect.c
+@@ -631,6 +631,14 @@
+ 	sops.htt_send = htcc_send_htt;
+ 	sops.dma_alloc = htcc_ops->dma_alloc;
+ 	sops.mac = vayu_wmi_mac();
++	{
++		uint8_t *ring = NULL;
++		uint32_t n = 0, wr = 0;
++
++		if (htcc_ops->src_ring(VAYU_HTCC_HTT_TX_CE, &ring, &n, &wr)) {
++			sops.tx_ring = n;       /* W25p: the CE4 source ring the HTT TX shares */
++		}
++	}
+ 	if (vayu_scan_run(&sops) == 0) {
+ 		sops.log("vayu-wifi: W25 S1 scan: OK passive scan completed\n");
+ 	} else {

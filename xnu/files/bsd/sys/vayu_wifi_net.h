@@ -26,6 +26,10 @@ void vayu_net_stop(void);
 bool vayu_net_linked(void);
 /* boot-arg vayu_wifi_keep=1: stay joined after the handshake instead of tearing down. */
 bool vayu_net_keep(void);
+/* W25p: frames the radio's TX pool had no room for wait here; the completion path calls the kick. */
+void vayu_net_tx_kick(void);
+uint32_t vayu_net_tx_queue_depth(void);
+
 /* One tick of the DHCP/probe state machine: 0 = done (or off), 1 = waiting, -1 = failed. */
 int vayu_net_poll(void);
 /* One received MSDU from the HTT ring (native wifi or Ethernet, as the firmware decaps it). */

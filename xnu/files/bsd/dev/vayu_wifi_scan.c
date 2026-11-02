@@ -105,7 +105,9 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 #define H2T_FRAG_DESC_BANK_CFG  6U
 #define H2T_TX_FRM              1U
 /* W25: HTT data TX (ath10k_htt_tx_64, flame radio.c) */
-#define TX_SLOTS                64U
+#define TX_SLOTS                256U   /* W25p: 64 was the TCP window's worth, 290 frames found it full */
+#define TX_WORDS                (TX_SLOTS / 64U)
+#define TX_BUSY_RETURN          (-2)   /* no slot: the caller queues the frame instead of dropping it */
 #define TX_SLOT_SIZE            2048U
 #define TXF0_MAC_HDR            0x01U
 #define TXF0_NO_ENCRYPT         0x04U
@@ -192,7 +194,8 @@ static LCK_MTX_DECLARE(tx_lock, &tx_lck_grp);
 static const struct vayu_scan_ops *tx_ops;
 static uint64_t tx_pool_pa;
 static vm_offset_t tx_pool_va;
-static uint64_t tx_busy;
+static uint64_t tx_busy[TX_WORDS];      /* W25p: 256 slots, four words */
+static uint32_t tx_inflight_max = TX_SLOTS;     /* min(slots, CE4 source ring entries - 2) */
 static uint32_t tx_sent, tx_done, tx_fail;
 static uint32_t tx_status[8];           /* completions by the firmware's status nibble */
 /* W25n: why a frame was not sent (the numbers the 10 s line prints). */
@@ -1119,20 +1122,26 @@ vayu_scan_tx_frame(const uint8_t *f, uint32_t len, bool clear)
 		    (unsigned long long)pool);
 	}
 	lck_mtx_lock(&tx_lock);
-	for (id = 0; id < TX_SLOTS && (tx_busy & (1ULL << id)) != 0; id++) {
+	if (__builtin_popcountll(tx_busy[0]) + __builtin_popcountll(tx_busy[1]) +
+	    __builtin_popcountll(tx_busy[2]) + __builtin_popcountll(tx_busy[3]) >= tx_inflight_max) {
+		tx_drop_noslot++;               /* (the caller queues it: this is the counter that used to grow) */
+		lck_mtx_unlock(&tx_lock);
+		return TX_BUSY_RETURN;
+	}
+	for (id = 0; id < TX_SLOTS && (tx_busy[id >> 6] & (1ULL << (id & 63))) != 0; id++) {
 		;
 	}
 	if (id == TX_SLOTS) {
 		tx_drop_noslot++;
 		lck_mtx_unlock(&tx_lock);
-		return -1;
+		return TX_BUSY_RETURN;
 	}
 	/* W25n: the bit goes up before the frame does.  tx_frame() runs on the interface's thread
 	 * while the completion is processed by the poll thread; the send waits for the CE doorbell
 	 * (about a millisecond), so a completion could clear a bit that was not set yet and the
 	 * slot stayed busy for good.  After ~64 such races every new frame found the pool full --
 	 * the log's "frames tx 92 ... 371 dropped". */
-	tx_busy |= 1ULL << id;
+	tx_busy[id >> 6] |= 1ULL << (id & 63);
 	pa = tx_pool_pa + (uint64_t)id * TX_SLOT_SIZE;
 	{
 		uint8_t *dst = (uint8_t *)(tx_pool_va + (vm_offset_t)(pa - tx_pool_pa));
@@ -1183,7 +1192,7 @@ vayu_scan_tx_frame(const uint8_t *f, uint32_t len, bool clear)
 	memcpy(p, (const void *)(tx_pool_va + (vm_offset_t)(pa - tx_pool_pa)), pf);
 	rc = tx_ops->htt_send(m, 20 + pf);
 	if (rc != 0) {
-		tx_busy &= ~(1ULL << id);
+		tx_busy[id >> 6] &= ~(1ULL << (id & 63));
 		tx_drop_send++;
 		lck_mtx_unlock(&tx_lock);
 		return -1;
@@ -1203,11 +1212,14 @@ vayu_scan_htt_tx_compl(const uint8_t *p, uint32_t len)
 		uint32_t id = rd16(p + 4 + 2 * i);
 
 		if (id < TX_SLOTS) {
-			tx_busy &= ~(1ULL << id);
+			tx_busy[id >> 6] &= ~(1ULL << (id & 63));
 		}
 	}
 	lck_mtx_unlock(&tx_lock);
 	tx_done += n;
+	if (n != 0) {
+		vayu_net_tx_kick();             /* W25p: send what the pool had no room for */
+	}
 	if (st < 8) {
 		tx_status[st] += n;
 	}
@@ -1221,7 +1233,7 @@ vayu_scan_htt_tx_compl(const uint8_t *p, uint32_t len)
 
 
 void
-vayu_scan_tx_stats(uint32_t credits)
+vayu_scan_tx_stats(uint32_t credits, uint32_t queued)
 {
 	uint32_t busy;
 
@@ -1229,13 +1241,15 @@ vayu_scan_tx_stats(uint32_t credits)
 		return;
 	}
 	lck_mtx_lock(&tx_lock);
-	busy = (uint32_t)__builtin_popcountll(tx_busy);
+	busy = (uint32_t)(__builtin_popcountll(tx_busy[0]) + __builtin_popcountll(tx_busy[1]) +
+	    __builtin_popcountll(tx_busy[2]) + __builtin_popcountll(tx_busy[3]));
 	lck_mtx_unlock(&tx_lock);
 	slog("vayu-wifi: W25 tx: %u sent, %u completed (status 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7:%u); "
-	    "slots in flight %u, free %u of %u; drops: no slot %u, send %u, length %u, pool %u; wmi credits %u\n",
-	    tx_sent, tx_done, tx_status[0], tx_status[1], tx_status[2], tx_status[3], tx_status[4],
-	    tx_status[5], tx_status[6], tx_status[7], busy, TX_SLOTS - busy, TX_SLOTS, tx_drop_noslot,
-	    tx_drop_send, tx_drop_len, tx_drop_pool, credits);
+	    "slots in flight %u, free %u of %u (ring cap %u); queue %u; drops: no slot %u, send %u, "
+	    "length %u, pool %u; wmi credits %u\n", tx_sent, tx_done, tx_status[0], tx_status[1],
+	    tx_status[2], tx_status[3], tx_status[4], tx_status[5], tx_status[6], tx_status[7], busy,
+	    TX_SLOTS - busy, TX_SLOTS, tx_inflight_max, queued, tx_drop_noslot, tx_drop_send, tx_drop_len,
+	    tx_drop_pool, credits);
 }
 
 int
@@ -1253,6 +1267,11 @@ vayu_scan_run(const struct vayu_scan_ops *o)
 		return -1;
 	}
 	tx_ops = o;
+	/* W25p: as many frames in flight as the smaller of the slots and the CE4 source ring */
+	tx_inflight_max = TX_SLOTS;
+	if (o->tx_ring > 2 && o->tx_ring - 2 < tx_inflight_max) {
+		tx_inflight_max = o->tx_ring - 2;
+	}
 	vayu_net_sta_attach(o->mac);            /* W25o: Apple80211 has a station before the scan */
 	o->log("vayu-wifi: w22: scan stage: reg events %u (rules %u, country %s), freq_avoid events %u\n",
 	    sc.reg_events, sc.nrules, sc.reg_seen ? sc.alpha2 : "-", sc.avoid_events);

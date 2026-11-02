@@ -1077,7 +1077,7 @@ vayu_sta_run(const struct vayu_scan_ops *o)
 				break;
 			}
 			if (waited % 10000U == 0) {
-				vayu_scan_tx_stats(vayu_htcc_credits());   /* W25n: slots, drops, credits */
+				vayu_scan_tx_stats(vayu_htcc_credits(), vayu_net_tx_queue_depth());
 			}
 			if (waited % 30000U == 0) {
 				vayu_net_summary();

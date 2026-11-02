@@ -631,6 +631,14 @@ htcc_scan(void)
 	sops.htt_send = htcc_send_htt;
 	sops.dma_alloc = htcc_ops->dma_alloc;
 	sops.mac = vayu_wmi_mac();
+	{
+		uint8_t *ring = NULL;
+		uint32_t n = 0, wr = 0;
+
+		if (htcc_ops->src_ring(VAYU_HTCC_HTT_TX_CE, &ring, &n, &wr)) {
+			sops.tx_ring = n;       /* W25p: the CE4 source ring the HTT TX shares */
+		}
+	}
 	if (vayu_scan_run(&sops) == 0) {
 		sops.log("vayu-wifi: W25 S1 scan: OK passive scan completed\n");
 	} else {

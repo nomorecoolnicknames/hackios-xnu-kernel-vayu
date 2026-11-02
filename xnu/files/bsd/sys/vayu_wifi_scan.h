@@ -53,6 +53,7 @@ struct vayu_scan_ops {
 	/* Zeroed contiguous DMA memory below 4 GiB, SMMU-mapped (IOVA = PA), never freed; 0 = none. */
 	uint64_t (*dma_alloc)(uint32_t size);
 	const uint8_t *mac;             /* the MAC from WMI READY (6 bytes) */
+	uint32_t tx_ring;               /* W25p: CE4 source ring entries (0: unknown) */
 };
 
 /* boot-arg vayu_wifi_scan: 0 off (W21h behaviour), 1 = HTT rx ring + passive scan after READY. */
@@ -69,7 +70,8 @@ void vayu_scan_note_htt(const uint8_t *p, uint32_t len);
 int vayu_scan_run(const struct vayu_scan_ops *ops);
 /* W25: one native-wifi data frame on the HTT endpoint (clear = unencrypted, for EAPOL). 0 = sent. */
 int vayu_scan_tx_frame(const uint8_t *frame, uint32_t len, bool clear);
-/* W25n: the TX counters, one line: sent, completed, status, slots in flight/free, drops, credits. */
-void vayu_scan_tx_stats(uint32_t wmi_credits);
+/* W25p: the TX counters, one line: sent, completed, status, slots in flight/free, ring cap, queue,
+ * drops, credits. */
+void vayu_scan_tx_stats(uint32_t wmi_credits, uint32_t queued);
 
 #endif /* _SYS_VAYU_WIFI_SCAN_H_ */

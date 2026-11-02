@@ -111,14 +111,15 @@ fold(uint32_t sum)
 
 /* ---- sending ----------------------------------------------------------------------------------- */
 
-static bool
-send_eth(const uint8_t *frame, uint32_t len)
+/* 0 sent, -1 an error, -2 no room in the radio's TX pool (the frame may be queued) */
+static int
+net_send_eth(const uint8_t *frame, uint32_t len)
 {
 	uint8_t f[1600];
 	uint32_t flen;
 
 	if (!net.started || net.tx80211 == NULL || len < ETH_HLEN || len - ETH_HLEN + 32 > sizeof(f)) {
-		return false;
+		return -1;
 	}
 	/* Ethernet -> native wifi: 24-byte data header, to DS, LLC/SNAP, then the payload */
 	memset(f, 0, 24);
@@ -137,13 +138,19 @@ send_eth(const uint8_t *frame, uint32_t len)
 	f[31] = frame[13];
 	memcpy(f + 32, frame + ETH_HLEN, len - ETH_HLEN);
 	flen = len - ETH_HLEN + 32;
-	if (net.tx80211(f, flen, false) != 0) {
-		net.tx_drop++;
-		return false;
+	{
+		int rc = net.tx80211(f, flen, false);
+
+		if (rc != 0) {
+			if (rc != -2) {
+				net.tx_drop++;
+			}
+			return rc;
+		}
 	}
 	net.tx_frames++;
 	net.tx_bytes += len;
-	return true;
+	return 0;
 }
 
 /* ---- DHCP -------------------------------------------------------------------------------------- */
@@ -219,7 +226,7 @@ dhcp_send(uint8_t type)
 	ip[23] = (uint8_t)DHCP_SERVER_PORT;
 	ip[24] = (uint8_t)(udp_len >> 8);
 	ip[25] = (uint8_t)udp_len;
-	return send_eth(e, ETH_HLEN + total);
+	return net_send_eth(e, ETH_HLEN + total) == 0;
 }
 
 
@@ -413,7 +420,7 @@ send_arp(void)
 	memcpy(e + 28, net.lease_ip, 4);
 	memset(e + 32, 0, 6);
 	memcpy(e + 38, net.router, 4);
-	return send_eth(e, sizeof(e));
+	return net_send_eth(e, sizeof(e)) == 0;
 }
 
 static void
@@ -470,7 +477,7 @@ send_icmp(void)
 	sum = fold(sum16(icmp, 8 + 32, 0));
 	icmp[2] = (uint8_t)(sum >> 8);
 	icmp[3] = (uint8_t)sum;
-	return send_eth(e, sizeof(e));
+	return net_send_eth(e, sizeof(e)) == 0;
 }
 
 static void
@@ -542,12 +549,87 @@ vayu_net_rx_80211(const uint8_t *f, uint32_t len, uint32_t decap, uint32_t hdr)
 	}
 }
 
+/* ---- W25p: a short queue for when the radio's TX pool is full -------------------------------- */
+
+#define NET_TX_QUEUE    32
+#define NET_TX_MAX      1600
+
+static struct net_tx_q {
+	uint32_t len;
+	uint8_t data[NET_TX_MAX];
+} *tx_q;
+static LCK_GRP_DECLARE(txq_lck_grp, "vayu-wifi-txq");
+static LCK_MTX_DECLARE(txq_lock, &txq_lck_grp);
+static uint32_t tx_q_head, tx_q_count, tx_q_drop, tx_q_queued, tx_q_sent;
+
+static bool
+net_tx_enqueue(const uint8_t *frame, uint32_t len)
+{
+	bool ok = false;
+
+	if (len == 0 || len > NET_TX_MAX) {
+		return false;
+	}
+	lck_mtx_lock(&txq_lock);
+	if (tx_q == NULL) {
+		tx_q = kalloc_data(sizeof(*tx_q) * NET_TX_QUEUE, Z_WAITOK | Z_ZERO);
+	}
+	if (tx_q != NULL && tx_q_count < NET_TX_QUEUE) {
+		struct net_tx_q *e = &tx_q[(tx_q_head + tx_q_count) % NET_TX_QUEUE];
+
+		e->len = len;
+		memcpy(e->data, frame, len);
+		tx_q_count++;
+		tx_q_queued++;
+		ok = true;
+	}
+	if (!ok) {
+		tx_q_drop++;
+	}
+	lck_mtx_unlock(&txq_lock);
+	return ok;
+}
+
+uint32_t
+vayu_net_tx_queue_depth(void)
+{
+	return tx_q_count;
+}
+
+/* Called by the HTT completion path (bsd/dev/vayu_wifi_scan.c) as slots come free, and from the
+ * station loop: send what the pool had no room for, oldest first. */
+void
+vayu_net_tx_kick(void)
+{
+	uint8_t frame[NET_TX_MAX];
+	uint32_t len;
+
+	lck_mtx_lock(&txq_lock);
+	if (tx_q == NULL || tx_q_count == 0) {
+		lck_mtx_unlock(&txq_lock);
+		return;
+	}
+	len = tx_q[tx_q_head].len;
+	memcpy(frame, tx_q[tx_q_head].data, len);
+	lck_mtx_unlock(&txq_lock);
+
+	if (net_send_eth(frame, len) != 0) {
+		return;                         /* (still full or an error: the next completion tries again) */
+	}
+	lck_mtx_lock(&txq_lock);
+	tx_q_head = (tx_q_head + 1) % NET_TX_QUEUE;
+	tx_q_count--;
+	tx_q_sent++;
+	lck_mtx_unlock(&txq_lock);
+}
+
 /* ---- the interface's transmit callback --------------------------------------------------------- */
 
 static bool
 net_transmit(mbuf_t packet, size_t length)
 {
 	static uint8_t e[1600];
+	int rc;
 
 	if (length < ETH_HLEN || length > sizeof(e)) {
 		return false;
@@ -555,7 +637,14 @@ net_transmit(mbuf_t packet, size_t length)
 	if (mbuf_copydata(packet, 0, length, e) != 0) {
 		return false;
 	}
-	return send_eth(e, (uint32_t)length);
+	rc = net_send_eth(e, (uint32_t)length);
+	if (rc == 0) {
+		return true;
+	}
+	if (rc == -2 && net_tx_enqueue(e, (uint32_t)length)) {
+		return true;                    /* accepted: the completion path sends it */
+	}
+	return false;
 }
 
 /* ---- the station boundary (what wifid's Apple80211 requests are answered from) ------------------ */
@@ -626,6 +715,8 @@ static struct hakios_sta_ops net_sta_ops;
 
 /* ---- start / stop ------------------------------------------------------------------------------- */
 
+static uint32_t wifi_a80211;          /* W25q: 0 = attach at S4, no events (the 150920 behaviour: iOS ran DHCP) */
+
 void
 vayu_net_reset(int (*log)(const char *format, ...) __printflike(1, 2))
 {
@@ -638,6 +729,7 @@ vayu_net_reset(int (*log)(const char *format, ...) __printflike(1, 2))
 	net.dhcp_on = net.dhcp_mode != 0;
 	v = 0;
 	PE_parse_boot_argn("vayu_wifi_keep", &v, sizeof(v));
+	PE_parse_boot_argn("vayu_wifi_a80211", &wifi_a80211, sizeof(wifi_a80211));
 	net.keep = v != 0;
 }
 
@@ -659,15 +751,30 @@ vayu_net_set_tx(int (*tx80211)(const uint8_t *frame, uint32_t len, bool clear),
 
 /* W25o: the radio is there as soon as the MAC is known (before the scan and the join), so
  * wifid finds a powered station instead of an interface with nothing behind it. */
+static void sta_attach_now(void);
+
 void
 vayu_net_sta_attach(const uint8_t *mac)
 {
+	if (wifi_a80211 == 0) {
+		if (mac != NULL && net.mac[0] == 0) {
+			memcpy(net.mac, mac, 6);
+		}
+		return;
+	}
 	if (net.mac[0] != 0 && mac != NULL) {
 		return;                         /* (already attached) */
 	}
 	if (mac != NULL) {
 		memcpy(net.mac, mac, 6);
 	}
+	sta_attach_now();
+	hakios_apple80211_event(HAKIOS_STA_POWER, 1);
+}
+
+static void
+sta_attach_now(void)
+{
 	memset(&net_sta_ops, 0, sizeof(net_sta_ops));
 	net_sta_ops.power = sta_power;
 	net_sta_ops.scan = sta_scan;
@@ -679,7 +786,6 @@ vayu_net_sta_attach(const uint8_t *mac)
 	memcpy(net_sta_ops.address, net.mac, 6);
 	hakios_sta_attach(&net_sta_ops);
 	net.sta_attached = true;
-	hakios_apple80211_event(HAKIOS_STA_POWER, 1);
 }
 
 /* Called after the keys are in: en0 comes up and the data path is open. */
@@ -721,8 +827,13 @@ vayu_net_start(const uint8_t *mac, const uint8_t *bssid, const uint8_t *ssid, ui
 	/* W25o: wifid learns that the station joined from these events as well as from the state
 	 * request; without them the interface is "up" but nothing tells iOS's Wi-Fi side that a
 	 * network is associated. */
-	hakios_apple80211_event(HAKIOS_STA_JOIN_DONE, 0);
-	hakios_apple80211_event(HAKIOS_STA_LINK, 1);
+	if (!net.sta_attached) {
+		sta_attach_now();
+	}
+	if (wifi_a80211 != 0) {
+		hakios_apple80211_event(HAKIOS_STA_JOIN_DONE, 0);
+		hakios_apple80211_event(HAKIOS_STA_LINK, 1);
+	}
 	net.link_ms = now_ms();
 	if (net.dhcp_mode == 1) {
 		net.dhcp_state = DHCP_INIT;
@@ -758,6 +869,8 @@ int
 vayu_net_poll(void)
 {
 	uint64_t now = now_ms();
+
+	vayu_net_tx_kick();                     /* W25p: in case completions are the slow side */
 
 	/* W25o: the fallback (vayu_wifi_dhcp=2): give iOS's configd 30 s, then ask ourselves --
 	 * but only if en0 really has no IPv4 address by then. */
@@ -845,7 +958,8 @@ void
 vayu_net_summary(void)
 {
 	net.log("vayu-wifi: W25 data: frames tx %u (%u bytes, %u dropped), rx %u (%u bytes, %u dropped); "
-	    "dhcp %s, probe %s\n", net.tx_frames, net.tx_bytes, net.tx_drop, net.rx_frames, net.rx_bytes,
-	    net.rx_drop, net.dhcp_state == DHCP_BOUND ? "bound" : (net.dhcp_on ? "no lease" : "off"),
+	    "queue %u queued/%u sent/%u dropped (depth %u); dhcp %s, probe %s\n", net.tx_frames,
+	    net.tx_bytes, net.tx_drop, net.rx_frames, net.rx_bytes, net.rx_drop, tx_q_queued, tx_q_sent,
+	    tx_q_drop, tx_q_count, net.dhcp_state == DHCP_BOUND ? "bound" : (net.dhcp_on ? "no lease" : "off"),
 	    net.probe_stage >= 3 ? "ok" : "no");
 }
