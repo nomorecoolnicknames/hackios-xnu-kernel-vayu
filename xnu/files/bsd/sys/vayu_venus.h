@@ -3,7 +3,9 @@
  * bsd/dev/vayu_venus.c.
  *
  * vayu_venus_init() starts a kernel thread.  Nothing at all is touched unless boot-arg
- * vayu_venus=1 asks for it.  Milestone M1 does, in this order, and only logs:
+ * vayu_venus is at least 1.
+ *
+ * Milestone M1 (vayu_venus=1) does, in this order, and only logs:
  *
  *   1. the shared RPMh votes "mmcx.lvl" and "mx.lvl" (raised once, never given back: they
  *      are the whole multimedia island's, as the display's and the camera's are), and the
@@ -27,30 +29,43 @@
  *      firmware doorbell, and a bounded poll for HFI_MSG_SYS_INIT;
  *   7. HFI debug config, the codec power-plane property, the firmware image version and a
  *      SYS_PING; the version string is logged if the firmware answers;
- *   8. everything down again in reverse (PAS shutdown first, then the SMMU, the queues,
- *      the clocks, PLL0 and the GDSCs, then the video NoC's MM3 vote; SH0/MC0/ACV are left
- *      up).  The two RPMh rails are shared and stay up.
+ *   8. with vayu_venus=2: a buffer pool right after the HFI block (IOVA 0x27e00000) in the
+ *      same SMMU context, one encode session (SESSION_INIT, SET_PROPERTY, the firmware's
+ *      BUFFER_REQUIREMENTS, SET_BUFFERS, LOAD_RESOURCES, START), one generated NV12 frame
+ *      through EMPTY_BUFFER/FILL_BUFFER, and the bitstream: its NAL units, the first 64
+ *      bytes in hex, and /private/var/tmp/venus_out.h265 if that file can be written;
+ *   9. everything down again in reverse (PAS shutdown first, then the SMMU, the queues and
+ *      the pool, the clocks, PLL0 and the GDSCs, then the video NoC's MM3 vote; SH0/MC0/ACV
+ *      are left up).  The two RPMh rails are shared and stay up.
  *
- * The firmware-to-host interrupt is MASKED in the wrapper for M1 (WRAPPER_INTR_MASK = 0)
- * and the message queue is polled: no GIC handler exists yet, and a level line left
- * asserted by the firmware on an unhandled SPI is a boot hazard.  M2 will install the
- * GIC SPI 174 handler and unmask A2HVCODEC.
+ * The firmware-to-host interrupt is MASKED in the wrapper (WRAPPER_INTR_MASK = 0) and the
+ * message queue is polled: no GIC handler exists yet, and a level line left asserted by the
+ * firmware on an unhandled SPI is a boot hazard.  M2 keeps that rule; the GIC handler for
+ * SPI 174 is later work.
  *
  * Boot-args (nothing at all unless vayu_venus is at least 1):
- *   vayu_venus=1        M1 (levels above 1 say only M1 exists, and M1 is done)
- *   vayu_venus_wait=MS  the SYS_INIT/version/ping poll, default 3000 ms (100..30000)
+ *   vayu_venus=1        M1 (power, PAS, HFI SYS_INIT, version, ping)
+ *   vayu_venus=2        M1 and one NV12 frame to HEVC/H.264 (M2/M3)
+ *   vayu_venus_wait=MS  every HFI wait, default 3000 ms (100..30000)
  *   vayu_venus_secs=S   kept up after M1 succeeds, for late messages, default 2 (0..30)
  *   vayu_venus_rails=0  no RPMh vote at all (default 1: mmcx.lvl and mx.lvl)
  *   vayu_venus_level=N  that vote's RPMh level, default 384 (TURBO)
  *   vayu_venus_bcm=0    no video NoC/DDR BCM votes (default 1: MM3, SH0, MC0, ACV)
  *   vayu_venus_rate=N   iris clock in MHz, default 200 (200/225/300/365/432/480)
  *   vayu_venus_xo=1     no PLL0: the iris RCG from XO at 19.2 MHz (a diagnostic)
- *   vayu_venus_gdsc=M   bit 0 mvsc (default), bit 1 mvs0, bit 2 mvs1
+ *   vayu_venus_gdsc=M   bit 0 mvsc (default), bit 1 mvs0, bit 2 mvs1; level 2 adds mvs0
  *   vayu_venus_debug=N  HFI debug config, default 0x18 (ERROR | FATAL)
+ *   vayu_venus_codec=N  0 H.264, 1 HEVC (default)
+ *   vayu_venus_width=N  default 1920 (128..1920, even)
+ *   vayu_venus_height=N default 1080 (128..1080, even)
+ *   vayu_venus_fps=N    default 30 (1..60)
+ *   vayu_venus_bitrate=N default 8000000 bits per second
+ *   vayu_venus_frame_ms=MS the wait for FILL_BUFFER done, default 3000
+ *   vayu_venus_dump=0   do not write /private/var/tmp/venus_out.h265 (default: write)
  *
- * What M1 does NOT do: no HFI session, no NV12/bitstream buffer, no VideoToolbox device,
- * no secure (content-protection) context, no GIC handler, and nothing is left powered up
- * when the thread ends.
+ * What M2 does NOT do: no GIC handler, no second frame, no ring of buffers, no secure
+ * (content-protection) context, no /dev/hakios-venus and no VideoToolbox.  The bitstream
+ * goes to the log and to a file; nothing claims to be an encoder yet.
  *
  * vayu_venus_quiesce() is for the loader-return/panic path: it masks the firmware's
  * interrupt, shuts the firmware down through TrustZone, turns our SMMU context off and

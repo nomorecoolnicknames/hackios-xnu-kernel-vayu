@@ -24,21 +24,80 @@
 #define VAYU_HFI_CMD_SYS_INIT                  0x00010001u
 #define VAYU_HFI_CMD_SYS_SET_PROPERTY          0x00010005u
 #define VAYU_HFI_CMD_SYS_GET_PROPERTY          0x00010006u
+#define VAYU_HFI_CMD_SYS_SESSION_INIT          0x00010007u     /* hfi_cmds.h:23 */
+#define VAYU_HFI_CMD_SYS_SESSION_END           0x00010008u
+#define VAYU_HFI_CMD_SESSION_SET_PROPERTY      0x00011001u     /* hfi_cmds.h:28 */
+#define VAYU_HFI_CMD_SESSION_SET_BUFFERS       0x00011002u
+#define VAYU_HFI_CMD_SESSION_GET_SEQUENCE_HEADER 0x00011003u
 #define VAYU_HFI_CMD_SYS_PING                  0x00210002u
+#define VAYU_HFI_CMD_SESSION_LOAD_RESOURCES    0x00211001u     /* hfi_cmds.h:33-40 */
+#define VAYU_HFI_CMD_SESSION_START             0x00211002u
+#define VAYU_HFI_CMD_SESSION_STOP              0x00211003u
+#define VAYU_HFI_CMD_SESSION_EMPTY_BUFFER      0x00211004u
+#define VAYU_HFI_CMD_SESSION_FILL_BUFFER       0x00211005u
+#define VAYU_HFI_CMD_SESSION_GET_PROPERTY      0x00211009u
+#define VAYU_HFI_CMD_SESSION_RELEASE_RESOURCES 0x0021100cu
 
 /* Packet types, firmware -> host. */
 #define VAYU_HFI_MSG_SYS_INIT                  0x00020001u
+#define VAYU_HFI_MSG_SYS_SESSION_INIT          0x00020006u     /* hfi_msgs.h:14 */
 #define VAYU_HFI_MSG_SYS_PROPERTY_INFO         0x0002000au
 #define VAYU_HFI_MSG_EVENT_NOTIFY              0x00021001u
 #define VAYU_HFI_MSG_SYS_PING_ACK              0x00220002u
+#define VAYU_HFI_MSG_SESSION_LOAD_RESOURCES    0x00221001u     /* hfi_msgs.h:30-48 */
+#define VAYU_HFI_MSG_SESSION_START             0x00221002u
+#define VAYU_HFI_MSG_SESSION_STOP              0x00221003u
+#define VAYU_HFI_MSG_SESSION_EMPTY_BUFFER      0x00221007u
+#define VAYU_HFI_MSG_SESSION_FILL_BUFFER       0x00221008u
+#define VAYU_HFI_MSG_SESSION_PROPERTY_INFO     0x00221009u
+#define VAYU_HFI_MSG_SESSION_RELEASE_RESOURCES 0x0022100au
+#define VAYU_HFI_MSG_SESSION_END               0x00020007u
 
 /* Properties used by M1. */
 #define VAYU_HFI_PROPERTY_SYS_DEBUG_CONFIG     0x00000001u
 #define VAYU_HFI_PROPERTY_SYS_CODEC_POWER_PLANE_CTRL 0x00000005u
 #define VAYU_HFI_PROPERTY_SYS_IMAGE_VERSION    0x00000006u
 
+/* Session properties (hfi_helper.h:436-460, :482-538). */
+#define VAYU_HFI_PROPERTY_PARAM_FRAME_SIZE                       0x00001001u
+#define VAYU_HFI_PROPERTY_PARAM_UNCOMPRESSED_PLANE_ACTUAL_INFO   0x00001002u
+#define VAYU_HFI_PROPERTY_PARAM_UNCOMPRESSED_FORMAT_SELECT       0x00001003u
+#define VAYU_HFI_PROPERTY_PARAM_PROFILE_LEVEL_CURRENT            0x00001005u
+#define VAYU_HFI_PROPERTY_PARAM_WORK_MODE                        0x00001015u
+#define VAYU_HFI_PROPERTY_CONFIG_FRAME_RATE                      0x00002001u
+#define VAYU_HFI_PROPERTY_PARAM_VENC_RATE_CONTROL                0x02005004u
+#define VAYU_HFI_PROPERTY_CONFIG_VENC_TARGET_BITRATE             0x02006001u
+#define VAYU_HFI_PROPERTY_CONFIG_VENC_MAX_BITRATE                0x02006007u
+#define VAYU_HFI_PROPERTY_CONFIG_VENC_SYNC_FRAME_SEQUENCE_HEADER 0x02006008u
+#define VAYU_HFI_PROPERTY_CONFIG_BUFFER_REQUIREMENTS             0x00202001u
+
+/* Session domain, codec, colour format and rate control (hfi.h:15-17, hfi_helper.h:237-247, :968, :230-235). */
+#define VAYU_HFI_SESSION_TYPE_ENC              1u
+#define VAYU_HFI_CODEC_H264                    0x00000002u
+#define VAYU_HFI_CODEC_HEVC                    0x00002000u
+#define VAYU_HFI_COLOR_FORMAT_NV12             0x00000002u
+#define VAYU_HFI_HEVC_PROFILE_MAIN             0x00000001u
+#define VAYU_HFI_HEVC_LEVEL_51                 0x00000100u
+#define VAYU_HFI_RATE_CONTROL_VBR_CFR          0x01000003u
+#define VAYU_HFI_WORK_MODE_2                   0x00000002u
+
+/* Buffer types (hfi_helper.h:393-413): the 4xx numbers. */
+#define VAYU_HFI_BUFFER_INPUT                  0x00000001u
+#define VAYU_HFI_BUFFER_OUTPUT                 0x00000002u
+#define VAYU_HFI_BUFFER_OUTPUT2                0x00000003u
+#define VAYU_HFI_BUFFER_INTERNAL_PERSIST       0x00000004u
+#define VAYU_HFI_BUFFER_INTERNAL_PERSIST_1     0x00000005u
+#define VAYU_HFI_BUFFER_INTERNAL_SCRATCH       0x00000006u
+#define VAYU_HFI_BUFFER_INTERNAL_SCRATCH_1     0x00000007u
+#define VAYU_HFI_BUFFER_INTERNAL_SCRATCH_2     0x00000008u
+#define VAYU_HFI_BUFFER_TYPE_MAX               11u
+
+/* The one buffer-requirement record (hfi_helper.h:1173-1181), eight words. */
+#define VAYU_HFI_BUFFER_REQUIREMENT_WORDS      8u
+
 #define VAYU_HFI_DEBUG_MODE_QUEUE              0x00000001u
 #define VAYU_HFI_EVENT_SYS_ERROR               0x00000001u
+#define VAYU_HFI_EVENT_SESSION_ERROR           0x00000002u
 #define VAYU_HFI_VIDEO_ARCH_OX                 0x00000001u
 
 /* The queue table and the three interface queues (mainline hfi_venus.c:32-94). */
@@ -325,6 +384,407 @@ vayu_hfi_event(const uint32_t *packet, uint32_t size, uint32_t *session, uint32_
 	}
 	if (data1 != NULL) {
 		*data1 = size >= 24 ? packet[5] : 0;
+	}
+	return true;
+}
+
+/* ---- sessions: M2 (open) and M3 (one frame) -------------------------------------------------- */
+
+/*
+ * SESSION_INIT: {20, 0x10007, session_id, session_domain, session_codec}; mainline
+ * pkt_session_init() (hfi_cmds.c:163-176) with session_domain VIDC_SESSION_TYPE_ENC = 1
+ * (hfi.h:15-17) and the codec from hfi_helper.h:237,247.
+ */
+static inline uint32_t
+vayu_hfi_session_init(uint32_t *packet, uint32_t words, uint32_t session, uint32_t domain,
+    uint32_t codec)
+{
+	if (packet == NULL || words < 5 || session == 0 || codec == 0) {
+		return 0;
+	}
+	packet[0] = 20;
+	packet[1] = VAYU_HFI_CMD_SYS_SESSION_INIT;
+	packet[2] = session;
+	packet[3] = domain;
+	packet[4] = codec;
+	return 20;
+}
+
+/*
+ * SESSION_SET_PROPERTY, one property: {20 + 4*n, 0x11001, session, 1, property, values...}.
+ * The layout is hfi_session_set_property_pkt (hfi_cmds.h:101-105): the header is sixteen
+ * bytes, then the property word, then its payload (pkt_session_set_property_1x()).
+ */
+static inline uint32_t
+vayu_hfi_session_property(uint32_t *packet, uint32_t words, uint32_t session,
+    uint32_t property, const uint32_t *values, uint32_t count)
+{
+	uint32_t size = 20 + 4 * count;
+
+	if (packet == NULL || session == 0 || (count != 0 && values == NULL) || count > 10 ||
+	    words * 4 < size) {
+		return 0;
+	}
+	packet[0] = size;
+	packet[1] = VAYU_HFI_CMD_SESSION_SET_PROPERTY;
+	packet[2] = session;
+	packet[3] = 1;                                  /* num_properties */
+	packet[4] = property;
+	for (uint32_t i = 0; i < count; i++) {
+		packet[5 + i] = values[i];
+	}
+	return size;
+}
+
+/* FRAME_SIZE: {buffer_type, width, height} (hfi_helper.h:889-893). */
+static inline uint32_t
+vayu_hfi_session_frame_size(uint32_t *packet, uint32_t words, uint32_t session,
+    uint32_t buffer_type, uint32_t width, uint32_t height)
+{
+	const uint32_t values[3] = { buffer_type, width, height };
+
+	return vayu_hfi_session_property(packet, words, session,
+	           VAYU_HFI_PROPERTY_PARAM_FRAME_SIZE, values, 3);
+}
+
+/* UNCOMPRESSED_FORMAT_SELECT: {buffer_type, format} (hfi_helper.h:993-996). */
+static inline uint32_t
+vayu_hfi_session_color_format(uint32_t *packet, uint32_t words, uint32_t session,
+    uint32_t buffer_type, uint32_t format)
+{
+	const uint32_t values[2] = { buffer_type, format };
+
+	return vayu_hfi_session_property(packet, words, session,
+	           VAYU_HFI_PROPERTY_PARAM_UNCOMPRESSED_FORMAT_SELECT, values, 2);
+}
+
+/* CONFIG_FRAME_RATE: {buffer_type, framerate in 16.16} (hfi_helper.h:682-685). */
+static inline uint32_t
+vayu_hfi_session_frame_rate(uint32_t *packet, uint32_t words, uint32_t session,
+    uint32_t buffer_type, uint32_t fps)
+{
+	const uint32_t values[2] = { buffer_type, fps << 16 };
+
+	return vayu_hfi_session_property(packet, words, session,
+	           VAYU_HFI_PROPERTY_CONFIG_FRAME_RATE, values, 2);
+}
+
+/* The encoder's profile and level: {profile, level} (hfi_helper.h:796-799). */
+static inline uint32_t
+vayu_hfi_session_profile_level(uint32_t *packet, uint32_t words, uint32_t session,
+    uint32_t profile, uint32_t level)
+{
+	const uint32_t values[2] = { profile, level };
+
+	return vayu_hfi_session_property(packet, words, session,
+	           VAYU_HFI_PROPERTY_PARAM_PROFILE_LEVEL_CURRENT, values, 2);
+}
+
+/* CONFIG_VENC_TARGET_BITRATE: {bits per second, layer} (hfi_helper.h:571-574). */
+static inline uint32_t
+vayu_hfi_session_bitrate(uint32_t *packet, uint32_t words, uint32_t session, uint32_t property,
+    uint32_t bitrate, uint32_t layer)
+{
+	const uint32_t values[2] = { bitrate, layer };
+
+	return vayu_hfi_session_property(packet, words, session, property, values, 2);
+}
+
+/* One scalar property (work mode, rate control, sync-frame header): {value}. */
+static inline uint32_t
+vayu_hfi_session_scalar(uint32_t *packet, uint32_t words, uint32_t session, uint32_t property,
+    uint32_t value)
+{
+	return vayu_hfi_session_property(packet, words, session, property, &value, 1);
+}
+
+/* SESSION_LOAD_RESOURCES / START / STOP / RELEASE_RESOURCES / END: {12, type, session}. */
+static inline uint32_t
+vayu_hfi_session_command(uint32_t *packet, uint32_t words, uint32_t session, uint32_t type)
+{
+	if (packet == NULL || words < 3 || session == 0) {
+		return 0;
+	}
+	packet[0] = 12;
+	packet[1] = type;
+	packet[2] = session;
+	return 12;
+}
+
+/* SESSION_GET_PROPERTY, one property: {20, 0x211009, session, 1, property} (hfi_cmds.h:140-145). */
+static inline uint32_t
+vayu_hfi_session_get_property(uint32_t *packet, uint32_t words, uint32_t session,
+    uint32_t property)
+{
+	if (packet == NULL || words < 5 || session == 0) {
+		return 0;
+	}
+	packet[0] = 20;
+	packet[1] = VAYU_HFI_CMD_SESSION_GET_PROPERTY;
+	packet[2] = session;
+	packet[3] = 1;
+	packet[4] = property;
+	return 20;
+}
+
+/*
+ * SESSION_SET_BUFFERS: hfi_session_set_buffers_pkt (hfi_cmds.h:141-149), eight header words
+ * then one address per buffer for input/internal, and an {address, extradata} pair per buffer
+ * for output (pkt_session_set_buffers(), hfi_cmds.c:182-215).
+ */
+static inline uint32_t
+vayu_hfi_session_set_buffers(uint32_t *packet, uint32_t words, uint32_t session,
+    uint32_t buffer_type, uint32_t buffer_size, const uint32_t *addresses, uint32_t count)
+{
+	bool output = buffer_type == VAYU_HFI_BUFFER_OUTPUT || buffer_type == VAYU_HFI_BUFFER_OUTPUT2;
+	uint32_t size = 32 + (output ? 8 : 4) * count;
+
+	if (packet == NULL || session == 0 || addresses == NULL || count == 0 || count > 32 ||
+	    words * 4 < size) {
+		return 0;
+	}
+	packet[0] = size;
+	packet[1] = VAYU_HFI_CMD_SESSION_SET_BUFFERS;
+	packet[2] = session;
+	packet[3] = buffer_type;
+	packet[4] = buffer_size;
+	packet[5] = 0;                                  /* extradata_size */
+	packet[6] = buffer_size;                        /* min_buffer_size */
+	packet[7] = count;
+	for (uint32_t i = 0; i < count; i++) {
+		if (output) {
+			packet[8 + 2 * i] = addresses[i];
+			packet[9 + 2 * i] = 0;          /* extradata address */
+		} else {
+			packet[8 + i] = addresses[i];
+		}
+	}
+	return size;
+}
+
+/*
+ * SESSION_EMPTY_BUFFER with an uncompressed NV12 frame (the encoder's input):
+ * hfi_session_empty_buffer_uncompressed_plane0_pkt (hfi_cmds.h:157-172), sixteen words.
+ */
+static inline uint32_t
+vayu_hfi_session_empty_buffer(uint32_t *packet, uint32_t words, uint32_t session,
+    uint32_t address, uint32_t alloc_len, uint32_t filled_len, uint32_t tag)
+{
+	if (packet == NULL || words < 16 || session == 0 || address == 0) {
+		return 0;
+	}
+	packet[0] = 64;
+	packet[1] = VAYU_HFI_CMD_SESSION_EMPTY_BUFFER;
+	packet[2] = session;
+	packet[3] = 0;                                  /* view_id */
+	packet[4] = 0;                                  /* time_stamp_hi */
+	packet[5] = 0;                                  /* time_stamp_lo */
+	packet[6] = 0;                                  /* flags */
+	packet[7] = 0;                                  /* mark_target */
+	packet[8] = 0;                                  /* mark_data */
+	packet[9] = alloc_len;
+	packet[10] = filled_len;
+	packet[11] = 0;                                 /* offset */
+	packet[12] = tag;                               /* input_tag */
+	packet[13] = address;                           /* packet_buffer */
+	packet[14] = 0;                                 /* extradata_buffer */
+	packet[15] = 0;                                 /* data */
+	return 64;
+}
+
+/*
+ * SESSION_FILL_BUFFER: hfi_session_fill_buffer_pkt (hfi_cmds.h:192-202), eleven words.
+ * stream_id 0 is HFI_BUFFER_OUTPUT (pkt_session_ftb(), hfi_cmds.c:315-340).
+ */
+static inline uint32_t
+vayu_hfi_session_fill_buffer(uint32_t *packet, uint32_t words, uint32_t session,
+    uint32_t stream, uint32_t address, uint32_t alloc_len, uint32_t tag)
+{
+	if (packet == NULL || words < 11 || session == 0 || address == 0) {
+		return 0;
+	}
+	packet[0] = 44;
+	packet[1] = VAYU_HFI_CMD_SESSION_FILL_BUFFER;
+	packet[2] = session;
+	packet[3] = stream;
+	packet[4] = 0;                                  /* offset */
+	packet[5] = alloc_len;
+	packet[6] = 0;                                  /* filled_len */
+	packet[7] = tag;                                /* output_tag */
+	packet[8] = address;                            /* packet_buffer */
+	packet[9] = 0;                                  /* extradata_buffer */
+	packet[10] = 0;                                 /* data */
+	return 44;
+}
+
+/* ---- session replies ------------------------------------------------------------------------- */
+
+/*
+ * The simple done packets: {size, type, session_id, error_type}; the session's id is word 2 and
+ * the error word 3 (hfi_msgs.h:120-149). `want' is one of VAYU_HFI_MSG_SESSION_*.
+ */
+static inline bool
+vayu_hfi_session_done(const uint32_t *packet, uint32_t size, uint32_t want, uint32_t *session,
+    uint32_t *error)
+{
+	if (!vayu_hfi_message(packet, size, NULL) || packet[1] != want || size < 16) {
+		return false;
+	}
+	if (session != NULL) {
+		*session = packet[2];
+	}
+	if (error != NULL) {
+		*error = packet[3];
+	}
+	return true;
+}
+
+/* SESSION_INIT done: {size, 0x20006, session, error, num_properties, data...} (hfi_msgs.h:104-109). */
+static inline bool
+vayu_hfi_session_init_done(const uint32_t *packet, uint32_t size, uint32_t *session,
+    uint32_t *error, uint32_t *properties)
+{
+	if (!vayu_hfi_message(packet, size, NULL) || packet[1] != VAYU_HFI_MSG_SYS_SESSION_INIT ||
+	    size < 20) {
+		return false;
+	}
+	if (session != NULL) {
+		*session = packet[2];
+	}
+	if (error != NULL) {
+		*error = packet[3];
+	}
+	if (properties != NULL) {
+		*properties = packet[4];
+	}
+	return true;
+}
+
+/*
+ * SESSION_PROPERTY_INFO: {size, 0x221009, session, num_properties, property, data...}
+ * (hfi_msgs.h:222-227). The payload of BUFFER_REQUIREMENTS is an array of eight-word records
+ * (hfi_helper.h:1173-1181), indexed by buffer type.
+ */
+static inline bool
+vayu_hfi_session_property_info(const uint32_t *packet, uint32_t size, uint32_t *session,
+    uint32_t *property, const uint32_t **data, uint32_t *data_words)
+{
+	if (!vayu_hfi_message(packet, size, NULL) ||
+	    packet[1] != VAYU_HFI_MSG_SESSION_PROPERTY_INFO || size < 20) {
+		return false;
+	}
+	if (session != NULL) {
+		*session = packet[2];
+	}
+	if (property != NULL) {
+		*property = packet[4];
+	}
+	if (data != NULL) {
+		*data = &packet[5];
+	}
+	if (data_words != NULL) {
+		*data_words = (size - 20) / 4;
+	}
+	return true;
+}
+
+/* The one buffer-requirement record. */
+struct vayu_hfi_buffer_requirement {
+	uint32_t type;
+	uint32_t size;
+	uint32_t region_size;
+	uint32_t hold_count;
+	uint32_t count_min;
+	uint32_t count_actual;
+	uint32_t contiguous;
+	uint32_t alignment;
+};
+
+static inline bool
+vayu_hfi_buffer_requirement(const uint32_t *data, uint32_t data_words, uint32_t index,
+    struct vayu_hfi_buffer_requirement *out)
+{
+	uint32_t at = index * VAYU_HFI_BUFFER_REQUIREMENT_WORDS;
+	const uint32_t *w;
+
+	if (data == NULL || out == NULL ||
+	    (uint64_t)(index + 1) * VAYU_HFI_BUFFER_REQUIREMENT_WORDS > data_words) {
+		return false;
+	}
+	w = &data[at];
+	out->type = w[0];
+	out->size = w[1];
+	out->region_size = w[2];
+	out->hold_count = w[3];
+	out->count_min = w[4];
+	out->count_actual = w[5];
+	out->contiguous = w[6];
+	out->alignment = w[7];
+	return true;
+}
+
+/* The encoder's compressed FILL_BUFFER done, hfi_msg_session_fbd_compressed_pkt (hfi_msgs.h:190-210). */
+struct vayu_hfi_fill_done {
+	uint32_t session;
+	uint32_t timestamp_hi;
+	uint32_t timestamp_lo;
+	uint32_t error;
+	uint32_t flags;
+	uint32_t offset;
+	uint32_t alloc_len;
+	uint32_t filled_len;
+	uint32_t input_tag;
+	uint32_t output_tag;
+	uint32_t picture_type;
+	uint32_t packet_buffer;
+	uint32_t extradata_buffer;
+};
+
+static inline bool
+vayu_hfi_session_fill_done(const uint32_t *packet, uint32_t size, struct vayu_hfi_fill_done *out)
+{
+	if (!vayu_hfi_message(packet, size, NULL) ||
+	    packet[1] != VAYU_HFI_MSG_SESSION_FILL_BUFFER || size < 72) {
+		return false;
+	}
+	if (out != NULL) {
+		out->session = packet[2];
+		out->timestamp_hi = packet[3];
+		out->timestamp_lo = packet[4];
+		out->error = packet[5];
+		out->flags = packet[6];
+		out->offset = packet[10];
+		out->alloc_len = packet[11];
+		out->filled_len = packet[12];
+		out->input_tag = packet[13];
+		out->output_tag = packet[14];
+		out->picture_type = packet[15];
+		out->packet_buffer = packet[16];
+		out->extradata_buffer = packet[17];
+	}
+	return true;
+}
+
+/* EMPTY_BUFFER done: {size, 0x221007, session, error, offset, filled_len, input_tag, buffer}. */
+static inline bool
+vayu_hfi_session_empty_done(const uint32_t *packet, uint32_t size, uint32_t *session,
+    uint32_t *error, uint32_t *filled_len, uint32_t *buffer)
+{
+	if (!vayu_hfi_message(packet, size, NULL) ||
+	    packet[1] != VAYU_HFI_MSG_SESSION_EMPTY_BUFFER || size < 32) {
+		return false;
+	}
+	if (session != NULL) {
+		*session = packet[2];
+	}
+	if (error != NULL) {
+		*error = packet[3];
+	}
+	if (filled_len != NULL) {
+		*filled_len = packet[5];
+	}
+	if (buffer != NULL) {
+		*buffer = packet[7];
 	}
 	return true;
 }

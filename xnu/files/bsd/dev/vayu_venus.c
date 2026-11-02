@@ -1,9 +1,13 @@
 /*
- * The hardware video encoder of the POCO X3 Pro (vayu, SM8150-AC): Venus / IRIS1, M1.
+ * The hardware video encoder of the POCO X3 Pro (vayu, SM8150-AC): Venus / IRIS1.
  * bsd/sys/vayu_venus.h is the interface and the boot-args.  Nothing here is touched unless
- * boot-arg vayu_venus=1 asks for it.  This file does M1 only: power, firmware through PAS,
- * the HFI queues behind our own apps-SMMU context, SYS_INIT and the version string, then
- * everything down again.  It logs; it opens no session and moves no frame.
+ * boot-arg vayu_venus asks for it.  Level 1 does M1 only: power, firmware through PAS, the
+ * HFI queues behind our own apps-SMMU context, SYS_INIT and the version string, then
+ * everything down again; it opens no session and moves no frame.  Level 2 adds one encode
+ * session and one generated NV12 frame (M2/M3): SESSION_INIT, the encoder's properties, the
+ * firmware's BUFFER_REQUIREMENTS, SET_BUFFERS, LOAD_RESOURCES, START, EMPTY_BUFFER and
+ * FILL_BUFFER, and logs the bitstream's NAL units, its first 64 bytes and, if it can, writes
+ * it to /private/var/tmp/venus_out.h265.
  *
  * The hardware, with its sources (FACT unless marked HYPOTHESIS):
  *
@@ -136,7 +140,10 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <stdbool.h>
+#include <sys/errno.h>
+#include <sys/fcntl.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
 #include <sys/vayu_pas.h>
@@ -265,7 +272,7 @@ put(vm_offset_t base, const char *what, uint32_t offset, uint32_t value, uint32_
 
 /* ---- what the boot args asked for ----------------------------------------------------------------- */
 
-static uint32_t g_level;                /* vayu_venus: 0 off, 1 M1 */
+static uint32_t g_level;                /* vayu_venus: 0 off, 1 M1, 2 M1+M2+M3 (one frame) */
 static uint32_t g_wait_ms = 3000;       /* vayu_venus_wait */
 static uint32_t g_secs = 2;             /* vayu_venus_secs */
 static uint32_t g_rails = 1;            /* vayu_venus_rails */
@@ -275,6 +282,15 @@ static uint32_t g_xo;                   /* vayu_venus_xo=1: no PLL0 */
 static uint32_t g_gdsc_mask = 1;        /* vayu_venus_gdsc: bit 0 mvsc, 1 mvs0, 2 mvs1 */
 static uint32_t g_debug = 0x18;         /* vayu_venus_debug: ERROR | FATAL */
 static uint32_t g_bcm = 1;              /* vayu_venus_bcm=0: no video NoC/DDR BCM vote */
+
+/* The one frame of M3: 1080p30 NV12 to HEVC unless the boot args say otherwise. */
+static uint32_t g_codec = VAYU_HFI_CODEC_HEVC;  /* vayu_venus_codec: 0 H.264, 1 HEVC */
+static uint32_t g_width = 1920;         /* vayu_venus_width */
+static uint32_t g_height = 1080;        /* vayu_venus_height */
+static uint32_t g_fps = 30;             /* vayu_venus_fps */
+static uint32_t g_bitrate = 8000000;    /* vayu_venus_bitrate, bits per second */
+static uint32_t g_frame_ms = 3000;      /* vayu_venus_frame_ms: the wait for FILL_BUFFER done */
+static uint32_t g_dump = 1;             /* vayu_venus_dump=0: do not write /private/var/tmp/venus_out.h265 */
 
 /* ---- state, so the teardown knows exactly what to put back ---------------------------------------- */
 
@@ -306,6 +322,16 @@ static vm_offset_t g_shared_kva;        /* the kmem_alloc_contig() address (cach
 static vm_offset_t g_shared;            /* the same memory, VM_WIMG_WCOMB: every queue access */
 static uint64_t g_shared_bytes;
 static uint32_t g_table_iova, g_sfr_iova;
+
+/*
+ * M2/M3's buffers: one contiguous block of ours, right after the 38 MB HFI block in the same
+ * venus_ns IOVA pool (0x27e00000 = 0x25800000 + 0x2600000), mapped by the same SMMU context.
+ * The CPU alias is cached: every hand-off does its own cache maintenance (clean before the
+ * firmware reads, invalidate before we read what it wrote).
+ */
+static vm_offset_t g_pool_kva;
+static uint64_t g_pool_bytes, g_pool_used;
+static uint32_t g_pool_iova;
 
 static bool g_queues_ready, g_firmware_up, g_inited;
 
@@ -1119,17 +1145,21 @@ smmu_find(void)
 }
 
 /*
- * The queues' physical pages at VENUS_IOVA behind a stage-1 context of ours: context first,
- * then the match register, exactly vayu_camera.c's order (vayu_camera.c:2403-2521).
+ * The queues' and (M2) the buffer pool's physical pages at VENUS_IOVA behind a stage-1 context
+ * of ours: context first, then the match register, exactly vayu_camera.c's order
+ * (vayu_camera.c:2403-2521). The two blocks are contiguous in IOVA space -- the pool starts
+ * at VENUS_IOVA + VENUS_SHARED_BYTES, a 2 MB boundary -- but not in physical memory.
  */
 static bool
-smmu_up(vm_offset_t base, uint64_t bytes)
+smmu_up(vm_offset_t base, uint64_t bytes, vm_offset_t pool, uint64_t pool_bytes)
 {
-	uint64_t *root, *second, *third, table_root;
-	uint32_t thirds = (uint32_t)((bytes + 0x1fffff) >> 21), pages = (uint32_t)(bytes >> 12);
+	uint64_t *root, *second, *third, table_root, total = bytes + pool_bytes;
+	uint32_t thirds = (uint32_t)((total + 0x1fffff) >> 21), pages = (uint32_t)(total >> 12);
+	uint32_t shared_pages = (uint32_t)(bytes >> 12);
 	uint32_t value, sees = 1u << 31 | (uint32_t)VENUS_SID_MASK << 16 | VENUS_SID;
 
-	if (bytes == 0 || base == 0 || (bytes & 0xfff) != 0) {
+	if (bytes == 0 || base == 0 || (bytes & 0xfff) != 0 ||
+	    (pool_bytes != 0 && (pool == 0 || (pool_bytes & 0xfff) != 0))) {
 		say("vayu-venus: 1: FAILED: no queue memory to map\n");
 		return false;
 	}
@@ -1154,7 +1184,11 @@ smmu_up(vm_offset_t base, uint64_t bytes)
 
 		second[((VENUS_IOVA >> 21) & 0x1ff) + t] = kvtophys((vm_offset_t)third) | 3;
 		for (uint32_t p = 0; p < 512 && t * 512 + p < pages; p++) {
-			third[p] = kvtophys(base + 4096ull * (t * 512 + p)) | VENUS_PTE;
+			uint32_t index = t * 512 + p;
+			vm_offset_t phys = index < shared_pages ? base + 4096ull * index :
+			                   pool + 4096ull * (index - shared_pages);
+
+			third[p] = kvtophys(phys) | VENUS_PTE;
 		}
 	}
 	for (vm_offset_t line = g_smmu_tables; line < g_smmu_tables + (2 + thirds) * 4096; line += 64) {
@@ -1162,9 +1196,11 @@ smmu_up(vm_offset_t base, uint64_t bytes)
 	}
 	__asm__ volatile ("dsb sy");
 	table_root = kvtophys(g_smmu_tables) | (uint64_t)g_smmu_context_n << 48;
-	say("vayu-venus: 1: smmu: context %u gets our tables for %llu KB at %#llx; match register %u sends "
-	    "streams %#x/%#x through it\n", g_smmu_context_n, (unsigned long long)(bytes >> 10),
-	    (unsigned long long)VENUS_IOVA, g_smmu_match, VENUS_SID, VENUS_SID_MASK);
+	say("vayu-venus: 1: smmu: context %u gets our tables for %llu KB at %#llx%s; match register %u sends "
+	    "streams %#x/%#x through it\n", g_smmu_context_n, (unsigned long long)(total >> 10),
+	    (unsigned long long)VENUS_IOVA,
+	    pool_bytes != 0 ? " and the buffer pool after them" : "",
+	    g_smmu_match, VENUS_SID, VENUS_SID_MASK);
 	if (!put(g_smmu_context, "smmu sctlr", SMMU_CB_SCTLR, 0, ~0u) ||
 	    !put(g_smmu_second, "smmu cba2r", SMMU_CBA2R(g_smmu_context_n), SMMU_CBA2R_64_BIT, ~0u) ||
 	    !put(g_smmu_second, "smmu cbar", SMMU_CBAR(g_smmu_context_n), SMMU_CBAR_STAGE_1, 0x30000) ||
@@ -1311,10 +1347,14 @@ smmu_down_quiesce(void)
 #define VENUS_QUEUE_BYTES       VAYU_HFI_QUEUE_BYTES  /* 1024 * 50 * 16, hfi_venus.c:36-44 */
 #define VENUS_QUEUES_OFF        (VENUS_TABLE_OFF + VENUS_TABLE_BYTES)
 #define VENUS_SHARED_BYTES      0x2600000       /* ALIGN(4K + table + 3 rings + 4K, 1M), hfi_venus.c:88-94 */
+#define VENUS_POOL_IOVA         (VENUS_IOVA + VENUS_SHARED_BYTES)       /* 0x27e00000 */
 
 /* The one block must hold what the firmware is told it holds. */
 #if VENUS_SHARED_BYTES < (VENUS_SFR_BYTES + VENUS_TABLE_BYTES + VENUS_QUEUE_COUNT * VENUS_QUEUE_BYTES)
 #error "the HFI shared block is smaller than the SFR, table and queues"
+#endif
+#if VENUS_POOL_IOVA != 0x27e00000ull
+#error "M2's buffers are expected at 0x27e00000, right after the HFI block"
 #endif
 
 static volatile uint32_t *
@@ -1400,6 +1440,98 @@ queues_free(void)
 	g_queues_ready = false;
 }
 
+/* ---- M2/M3's buffer pool, right after the HFI block in the same SMMU context ---------------------- */
+
+static void
+cache_clean(vm_offset_t address, uint64_t bytes)
+{
+	for (vm_offset_t line = address & ~(vm_offset_t)63; line < address + bytes; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
+	}
+	__asm__ volatile ("dsb sy" : : : "memory");
+}
+
+static void
+cache_invalidate(vm_offset_t address, uint64_t bytes)
+{
+	for (vm_offset_t line = address & ~(vm_offset_t)63; line < address + bytes; line += 64) {
+		__asm__ volatile ("dc ivac, %0" : : "r" (line) : "memory");
+	}
+	__asm__ volatile ("dsb sy" : : : "memory");
+}
+
+/*
+ * 64 MB first, then 48 and 32: a 1080p NV12 frame is 3 MB, and the firmware's own scratch and
+ * persistent buffers (its answer to BUFFER_REQUIREMENTS) come out of the same block. If even
+ * 32 MB is not contiguous the session stops with a line saying so; nothing else is touched.
+ */
+static bool
+pool_alloc(void)
+{
+	static const uint64_t sizes[] = { 0x4000000, 0x3000000, 0x2000000 };
+
+	if (g_pool_kva != 0) {
+		return true;
+	}
+	for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+		if (kmem_alloc_contig(kernel_map, &g_pool_kva, (vm_size_t)sizes[i], PAGE_MASK, 0, 0,
+		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			g_pool_kva = 0;
+			continue;
+		}
+		g_pool_bytes = sizes[i];
+		g_pool_used = 0;
+		g_pool_iova = (uint32_t)VENUS_POOL_IOVA;
+		/* KMA_ZERO wrote through the cache: clean it out before the firmware may read it. */
+		cache_clean(g_pool_kva, g_pool_bytes);
+		say("vayu-venus: 2: buffer pool: %llu MB, phys %#llx, IOVA %#x (after the HFI block)\n",
+		    (unsigned long long)(g_pool_bytes >> 20), (unsigned long long)kvtophys(g_pool_kva),
+		    g_pool_iova);
+		return true;
+	}
+	say("vayu-venus: 2: FAILED: no 32..64 MB of contiguous memory for the encoder's buffers\n");
+	return false;
+}
+
+static void
+pool_free(void)
+{
+	if (g_pool_kva != 0) {
+		kmem_free(kernel_map, g_pool_kva, g_pool_bytes);
+		g_pool_kva = 0;
+	}
+	g_pool_bytes = 0;
+	g_pool_used = 0;
+}
+
+/* A slice of the pool: IOVA for the firmware, the cached address for us. */
+static bool
+pool_take(uint32_t bytes, uint32_t alignment, uint32_t *iova, vm_offset_t *kva)
+{
+	uint64_t at;
+
+	if (g_pool_kva == 0 || bytes == 0) {
+		return false;
+	}
+	if (alignment < 4096 || (alignment & (alignment - 1)) != 0 || alignment > 0x100000) {
+		alignment = 4096;
+	}
+	at = (g_pool_used + alignment - 1) & ~(uint64_t)(alignment - 1);
+	if (at + bytes > g_pool_bytes) {
+		say("vayu-venus: 2: the pool is full: %u bytes asked, %llu of %llu used\n", bytes,
+		    (unsigned long long)g_pool_used, (unsigned long long)g_pool_bytes);
+		return false;
+	}
+	g_pool_used = at + bytes;
+	if (iova != NULL) {
+		*iova = g_pool_iova + (uint32_t)at;
+	}
+	if (kva != NULL) {
+		*kva = g_pool_kva + (vm_offset_t)at;
+	}
+	return true;
+}
+
 /* ---- HFI packets ---------------------------------------------------------------------------------- */
 
 /*
@@ -1415,6 +1547,14 @@ queues_free(void)
 #define HFI_MSG_SYS_PROPERTY_INFO VAYU_HFI_MSG_SYS_PROPERTY_INFO
 #define HFI_MSG_EVENT_NOTIFY    VAYU_HFI_MSG_EVENT_NOTIFY
 #define HFI_MSG_SYS_PING_ACK    VAYU_HFI_MSG_SYS_PING_ACK
+#define HFI_MSG_SYS_SESSION_INIT VAYU_HFI_MSG_SYS_SESSION_INIT
+#define HFI_MSG_SESSION_LOAD_RESOURCES VAYU_HFI_MSG_SESSION_LOAD_RESOURCES
+#define HFI_MSG_SESSION_START   VAYU_HFI_MSG_SESSION_START
+#define HFI_MSG_SESSION_STOP    VAYU_HFI_MSG_SESSION_STOP
+#define HFI_MSG_SESSION_FILL_BUFFER VAYU_HFI_MSG_SESSION_FILL_BUFFER
+#define HFI_MSG_SESSION_PROPERTY_INFO VAYU_HFI_MSG_SESSION_PROPERTY_INFO
+#define HFI_MSG_SESSION_RELEASE_RESOURCES VAYU_HFI_MSG_SESSION_RELEASE_RESOURCES
+#define HFI_MSG_SESSION_END     VAYU_HFI_MSG_SESSION_END
 #define HFI_VIDEO_ARCH_OX       VAYU_HFI_VIDEO_ARCH_OX
 #define HFI_PROPERTY_SYS_DEBUG_CONFIG VAYU_HFI_PROPERTY_SYS_DEBUG_CONFIG
 #define HFI_PROPERTY_SYS_CODEC_POWER_PLANE_CTRL VAYU_HFI_PROPERTY_SYS_CODEC_POWER_PLANE_CTRL
@@ -1699,7 +1839,664 @@ hfi_exchange(void)
 	return true;
 }
 
-/* ---- the firmware's registers, and the host-to-firmware doorbell ---------------------------------- */
+/* ---- M2/M3: one session, one NV12 frame, the bitstream -------------------------------------------- */
+
+/*
+ * The session id is ours: mainline hashes the instance pointer (hash32_ptr), the firmware only
+ * echoes it back. A fixed non-zero value is enough here and makes the log readable.
+ */
+#define HFI_SESSION_ID          0x5e551001u
+#define VENUS_INPUT_MAX         4u
+#define VENUS_OUTPUT_MAX        4u
+#define VENUS_INTERNAL_MAX      5u
+#define VENUS_INTERNAL_COUNT_MAX 4u
+
+struct venus_buffer {
+	uint32_t iova;
+	vm_offset_t kva;
+	uint32_t bytes;
+	uint32_t type;
+};
+
+struct venus_internal_set {
+	uint32_t type;
+	uint32_t count;
+	struct venus_buffer buffer[VENUS_INTERNAL_COUNT_MAX];
+};
+
+static uint32_t g_session = HFI_SESSION_ID;
+static uint32_t g_session_frames;
+static bool g_session_open, g_session_started, g_hfi_fatal;
+static struct venus_buffer g_input[VENUS_INPUT_MAX], g_output[VENUS_OUTPUT_MAX];
+static uint32_t g_input_n, g_output_n;
+static struct venus_internal_set g_internal[VENUS_INTERNAL_MAX];
+static uint32_t g_internal_n;
+
+/*
+ * Read the message queue until a packet of `want' arrives or timeout_ms passes. Everything else
+ * is logged and dropped; an EVENT_NOTIFY that says SYS_ERROR or SESSION_ERROR stops the wait.
+ * The firmware's interrupt stays masked in the wrapper: this is the polling path of M2.
+ */
+static bool
+hfi_wait(uint32_t want, uint32_t timeout_ms, uint32_t *got_size)
+{
+	for (uint32_t ms = 0; ms < timeout_ms; ms++) {
+		uint32_t size;
+
+		while ((size = hfi_read(g_packet, sizeof(g_packet))) != 0) {
+			uint32_t *p = (uint32_t *)g_packet;
+			uint32_t type = 0;
+
+			hfi_irq_ack();
+			if (!vayu_hfi_message(p, size, &type)) {
+				say("vayu-venus: 2: HFI: a message whose size word does not match (%u bytes, first word %#x)\n",
+				    size, p[0]);
+				continue;
+			}
+			if (type == HFI_MSG_EVENT_NOTIFY) {
+				uint32_t session = 0, event = 0, data0 = 0, data1 = 0;
+
+				if (vayu_hfi_event(p, size, &session, &event, &data0, &data1)) {
+					say("vayu-venus: 2: HFI: EVENT_NOTIFY: session %#x, event %#x, data %#x/%#x\n",
+					    session, event, data0, data1);
+					if (event == VAYU_HFI_EVENT_SYS_ERROR ||
+					    event == VAYU_HFI_EVENT_SESSION_ERROR) {
+						g_hfi_fatal = true;
+						show_sfr();
+					}
+				}
+				continue;
+			}
+			if (type == VAYU_HFI_MSG_SESSION_EMPTY_BUFFER) {
+				uint32_t session = 0, error = 0, filled = 0, buffer = 0;
+
+				if (vayu_hfi_session_empty_done(p, size, &session, &error, &filled, &buffer)) {
+					say("vayu-venus: 2: HFI: EMPTY_BUFFER done: session %#x, error %u, filled_len %u, buffer %#x\n",
+					    session, error, filled, buffer);
+				}
+				continue;
+			}
+			if (type == want) {
+				if (got_size != NULL) {
+					*got_size = size;
+				}
+				return true;
+			}
+			say("vayu-venus: 2: HFI: while waiting for %#x: message %#x, %u bytes (dropped)\n",
+			    want, type, size);
+		}
+		if (g_hfi_fatal) {
+			return false;
+		}
+		IOSleep(1);
+	}
+	return false;
+}
+
+/* One command into the queue; `sync' asks the firmware for a prompt message (hfi_write()). */
+static bool
+hfi_command(const char *name, uint32_t size, bool sync)
+{
+	if (size == 0) {
+		say("vayu-venus: 2: FAILED: %s: the packet does not fit\n", name);
+		return false;
+	}
+	if (!hfi_write(g_packet, size, sync)) {
+		say("vayu-venus: 2: FAILED: %s: the command queue refused the packet\n", name);
+		return false;
+	}
+	return true;
+}
+
+/* A property is fire-and-forget in HFI: nothing answers it, the next message is the proof. */
+static bool
+hfi_property(const char *name, uint32_t property, uint32_t size)
+{
+	if (size == 0) {
+		say("vayu-venus: 2: FAILED: SET_PROPERTY %s (%#x): the packet does not fit\n", name, property);
+		return false;
+	}
+	if (!hfi_write(g_packet, size, false)) {
+		say("vayu-venus: 2: FAILED: SET_PROPERTY %s (%#x): the command queue refused it\n", name, property);
+		return false;
+	}
+	say("vayu-venus: 2: HFI: SET_PROPERTY %s (%#x): %u bytes\n", name, property, size);
+	return true;
+}
+
+static bool
+venus_session_open(void)
+{
+	uint32_t size, session = 0, error = ~0u, properties = 0;
+
+	say("vayu-venus: 2: M2: SESSION_INIT: domain ENC, codec %s, session %#x\n",
+	    g_codec == VAYU_HFI_CODEC_HEVC ? "HEVC" : "H.264", g_session);
+	size = vayu_hfi_session_init((uint32_t *)g_packet, sizeof(g_packet) / 4, g_session,
+	    VAYU_HFI_SESSION_TYPE_ENC, g_codec);
+	if (!hfi_command("SESSION_INIT", size, true) ||
+	    !hfi_wait(HFI_MSG_SYS_SESSION_INIT, g_wait_ms, &size)) {
+		say("vayu-venus: 2: FAILED: no SESSION_INIT done in %u ms\n", g_wait_ms);
+		return false;
+	}
+	if (!vayu_hfi_session_init_done((uint32_t *)g_packet, size, &session, &error, &properties)) {
+		say("vayu-venus: 2: FAILED: SESSION_INIT done, %u bytes, malformed\n", size);
+		return false;
+	}
+	say("vayu-venus: 2: HFI: SESSION_INIT done: session %#x, error %u, %u properties, %u bytes\n",
+	    session, error, properties, size);
+	if (error != 0) {
+		say("vayu-venus: 2: FAILED: the firmware refused the session (error %u)\n", error);
+		return false;
+	}
+	if (session != g_session) {
+		say("vayu-venus: 2: FAILED: the firmware answered session %#x, not ours %#x\n", session, g_session);
+		return false;
+	}
+	g_session_open = true;
+	return true;
+}
+
+static bool
+venus_session_properties(void)
+{
+	uint32_t packet_words = sizeof(g_packet) / 4;
+	const uint32_t stride[6] = { VAYU_HFI_BUFFER_INPUT, 2, g_width, g_height, g_width, g_height / 2 };
+	uint32_t max_bitrate = g_bitrate > 0x7fffffffu / 2 ? g_bitrate : g_bitrate * 2;
+
+	if (!hfi_property("plane actual info (stride)", VAYU_HFI_PROPERTY_PARAM_UNCOMPRESSED_PLANE_ACTUAL_INFO,
+	    vayu_hfi_session_property((uint32_t *)g_packet, packet_words, g_session,
+	    VAYU_HFI_PROPERTY_PARAM_UNCOMPRESSED_PLANE_ACTUAL_INFO, stride, 6)) ||
+	    !hfi_property("FRAME_SIZE input", VAYU_HFI_PROPERTY_PARAM_FRAME_SIZE,
+	    vayu_hfi_session_frame_size((uint32_t *)g_packet, packet_words, g_session,
+	    VAYU_HFI_BUFFER_INPUT, g_width, g_height)) ||
+	    !hfi_property("FRAME_SIZE output", VAYU_HFI_PROPERTY_PARAM_FRAME_SIZE,
+	    vayu_hfi_session_frame_size((uint32_t *)g_packet, packet_words, g_session,
+	    VAYU_HFI_BUFFER_OUTPUT, g_width, g_height)) ||
+	    !hfi_property("color format NV12", VAYU_HFI_PROPERTY_PARAM_UNCOMPRESSED_FORMAT_SELECT,
+	    vayu_hfi_session_color_format((uint32_t *)g_packet, packet_words, g_session,
+	    VAYU_HFI_BUFFER_INPUT, VAYU_HFI_COLOR_FORMAT_NV12)) ||
+	    !hfi_property("work mode 2", VAYU_HFI_PROPERTY_PARAM_WORK_MODE,
+	    vayu_hfi_session_scalar((uint32_t *)g_packet, packet_words, g_session,
+	    VAYU_HFI_PROPERTY_PARAM_WORK_MODE, VAYU_HFI_WORK_MODE_2)) ||
+	    !hfi_property("frame rate", VAYU_HFI_PROPERTY_CONFIG_FRAME_RATE,
+	    vayu_hfi_session_frame_rate((uint32_t *)g_packet, packet_words, g_session,
+	    VAYU_HFI_BUFFER_OUTPUT, g_fps))) {
+		return false;
+	}
+	if (g_codec == VAYU_HFI_CODEC_HEVC &&
+	    !hfi_property("profile/level", VAYU_HFI_PROPERTY_PARAM_PROFILE_LEVEL_CURRENT,
+	    vayu_hfi_session_profile_level((uint32_t *)g_packet, packet_words, g_session,
+	    VAYU_HFI_HEVC_PROFILE_MAIN, VAYU_HFI_HEVC_LEVEL_51))) {
+		return false;
+	}
+	return hfi_property("rate control VBR_CFR", VAYU_HFI_PROPERTY_PARAM_VENC_RATE_CONTROL,
+	           vayu_hfi_session_scalar((uint32_t *)g_packet, packet_words, g_session,
+	           VAYU_HFI_PROPERTY_PARAM_VENC_RATE_CONTROL, VAYU_HFI_RATE_CONTROL_VBR_CFR)) &&
+	       hfi_property("target bitrate", VAYU_HFI_PROPERTY_CONFIG_VENC_TARGET_BITRATE,
+	           vayu_hfi_session_bitrate((uint32_t *)g_packet, packet_words, g_session,
+	           VAYU_HFI_PROPERTY_CONFIG_VENC_TARGET_BITRATE, g_bitrate, 0)) &&
+	       hfi_property("maximum bitrate", VAYU_HFI_PROPERTY_CONFIG_VENC_MAX_BITRATE,
+	           vayu_hfi_session_bitrate((uint32_t *)g_packet, packet_words, g_session,
+	           VAYU_HFI_PROPERTY_CONFIG_VENC_MAX_BITRATE, max_bitrate, 0)) &&
+	       hfi_property("sequence header with frame", VAYU_HFI_PROPERTY_CONFIG_VENC_SYNC_FRAME_SEQUENCE_HEADER,
+	           vayu_hfi_session_scalar((uint32_t *)g_packet, packet_words, g_session,
+	           VAYU_HFI_PROPERTY_CONFIG_VENC_SYNC_FRAME_SEQUENCE_HEADER, 1));
+}
+
+/*
+ * BUFFER_REQUIREMENTS: GET_PROPERTY 0x202001, answered by SESSION_PROPERTY_INFO 0x221009 with
+ * one eight-word record per buffer type (hfi_helper.h:1173-1181; hfi_msgs.c:430-460).
+ */
+static bool
+venus_buffer_requirements(struct vayu_hfi_buffer_requirement *req)
+{
+	uint32_t size, session = 0, property = 0, words = 0, records;
+	const uint32_t *data = NULL;
+
+	if (!hfi_command("GET BUFFER_REQUIREMENTS",
+	    vayu_hfi_session_get_property((uint32_t *)g_packet, sizeof(g_packet) / 4, g_session,
+	    VAYU_HFI_PROPERTY_CONFIG_BUFFER_REQUIREMENTS), true) ||
+	    !hfi_wait(HFI_MSG_SESSION_PROPERTY_INFO, g_wait_ms, &size)) {
+		say("vayu-venus: 2: FAILED: no BUFFER_REQUIREMENTS answer in %u ms\n", g_wait_ms);
+		return false;
+	}
+	if (!vayu_hfi_session_property_info((uint32_t *)g_packet, size, &session, &property,
+	    &data, &words)) {
+		say("vayu-venus: 2: FAILED: BUFFER_REQUIREMENTS answer, %u bytes, malformed\n", size);
+		return false;
+	}
+	if (session != g_session || property != VAYU_HFI_PROPERTY_CONFIG_BUFFER_REQUIREMENTS) {
+		say("vayu-venus: 2: FAILED: property info for session %#x property %#x, not the buffer requirements\n",
+		    session, property);
+		return false;
+	}
+	records = words / VAYU_HFI_BUFFER_REQUIREMENT_WORDS;
+	say("vayu-venus: 2: HFI: BUFFER_REQUIREMENTS: %u records, %u bytes\n", records, size);
+	for (uint32_t i = 0; i < records; i++) {
+		struct vayu_hfi_buffer_requirement one;
+
+		if (!vayu_hfi_buffer_requirement(data, words, i, &one)) {
+			break;
+		}
+		if (one.type >= VAYU_HFI_BUFFER_TYPE_MAX) {
+			continue;
+		}
+		req[one.type] = one;
+		say("vayu-venus: 2: HFI: buffer type %u: size %u, region %u, min %u, actual %u, "
+		    "contiguous %u, alignment %u\n", one.type, one.size, one.region_size,
+		    one.count_min, one.count_actual, one.contiguous, one.alignment);
+	}
+	return records != 0;
+}
+
+static uint32_t
+venus_align_up(uint32_t value, uint32_t alignment)
+{
+	if (alignment < 4096 || (alignment & (alignment - 1)) != 0 || alignment > 0x100000) {
+		alignment = 4096;
+	}
+	return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static bool
+venus_input_and_output(const struct vayu_hfi_buffer_requirement *req)
+{
+	uint32_t addresses[VENUS_OUTPUT_MAX], frame = g_width * g_height * 3 / 2;
+	uint32_t in_size = req[VAYU_HFI_BUFFER_INPUT].size, out_size = req[VAYU_HFI_BUFFER_OUTPUT].size;
+	uint32_t in_count = req[VAYU_HFI_BUFFER_INPUT].count_actual;
+	uint32_t out_count = req[VAYU_HFI_BUFFER_OUTPUT].count_actual;
+
+	if (in_size < frame) {
+		in_size = frame;
+	}
+	in_size = venus_align_up(in_size, req[VAYU_HFI_BUFFER_INPUT].alignment);
+	if (out_size < 0x100000) {
+		out_size = 0x100000;
+	}
+	out_size = venus_align_up(out_size, req[VAYU_HFI_BUFFER_OUTPUT].alignment);
+	in_count = in_count == 0 ? 2 : in_count;
+	out_count = out_count == 0 ? 2 : out_count;
+	if (in_count > VENUS_INPUT_MAX) {
+		in_count = VENUS_INPUT_MAX;
+	}
+	if (out_count > VENUS_OUTPUT_MAX) {
+		out_count = VENUS_OUTPUT_MAX;
+	}
+	for (g_input_n = 0; g_input_n < in_count; g_input_n++) {
+		if (!pool_take(in_size, req[VAYU_HFI_BUFFER_INPUT].alignment,
+		    &g_input[g_input_n].iova, &g_input[g_input_n].kva)) {
+			return false;
+		}
+		g_input[g_input_n].bytes = in_size;
+		g_input[g_input_n].type = VAYU_HFI_BUFFER_INPUT;
+		addresses[g_input_n] = g_input[g_input_n].iova;
+	}
+	if (!hfi_command("SET_BUFFERS input",
+	    vayu_hfi_session_set_buffers((uint32_t *)g_packet, sizeof(g_packet) / 4, g_session,
+	    VAYU_HFI_BUFFER_INPUT, in_size, addresses, g_input_n), true)) {
+		return false;
+	}
+	say("vayu-venus: 2: HFI: %u input buffers of %u bytes at %#x (%ux%u NV12)\n",
+	    g_input_n, in_size, g_input[0].iova, g_width, g_height);
+	for (g_output_n = 0; g_output_n < out_count; g_output_n++) {
+		if (!pool_take(out_size, req[VAYU_HFI_BUFFER_OUTPUT].alignment,
+		    &g_output[g_output_n].iova, &g_output[g_output_n].kva)) {
+			return false;
+		}
+		g_output[g_output_n].bytes = out_size;
+		g_output[g_output_n].type = VAYU_HFI_BUFFER_OUTPUT;
+		addresses[g_output_n] = g_output[g_output_n].iova;
+	}
+	if (!hfi_command("SET_BUFFERS output",
+	    vayu_hfi_session_set_buffers((uint32_t *)g_packet, sizeof(g_packet) / 4, g_session,
+	    VAYU_HFI_BUFFER_OUTPUT, out_size, addresses, g_output_n), true)) {
+		return false;
+	}
+	say("vayu-venus: 2: HFI: %u output buffers of %u bytes at %#x\n", g_output_n, out_size,
+	    g_output[0].iova);
+	return true;
+}
+
+/* The firmware's own scratch/persistent buffers: one SET_BUFFERS per buffer, as mainline does. */
+static bool
+venus_internal_buffers(const struct vayu_hfi_buffer_requirement *req)
+{
+	static const uint32_t types[VENUS_INTERNAL_MAX] = {
+		VAYU_HFI_BUFFER_INTERNAL_SCRATCH, VAYU_HFI_BUFFER_INTERNAL_SCRATCH_1,
+		VAYU_HFI_BUFFER_INTERNAL_SCRATCH_2, VAYU_HFI_BUFFER_INTERNAL_PERSIST,
+		VAYU_HFI_BUFFER_INTERNAL_PERSIST_1,
+	};
+
+	g_internal_n = 0;
+	for (uint32_t t = 0; t < VENUS_INTERNAL_MAX; t++) {
+		struct venus_internal_set *set = &g_internal[g_internal_n];
+		uint32_t type = types[t], count = req[type].count_actual;
+
+		if (req[type].size == 0 || count == 0) {
+			continue;
+		}
+		if (count > VENUS_INTERNAL_COUNT_MAX) {
+			count = VENUS_INTERNAL_COUNT_MAX;
+		}
+		set->type = type;
+		set->count = 0;
+		for (uint32_t i = 0; i < count; i++) {
+			uint32_t address;
+
+			if (!pool_take(req[type].size, req[type].alignment, &address,
+			    &set->buffer[i].kva)) {
+				return false;
+			}
+			set->buffer[i].iova = address;
+			set->buffer[i].bytes = req[type].size;
+			set->buffer[i].type = type;
+			if (!hfi_command("SET_BUFFERS internal",
+			    vayu_hfi_session_set_buffers((uint32_t *)g_packet, sizeof(g_packet) / 4,
+			    g_session, type, req[type].size, &address, 1), true)) {
+				return false;
+			}
+			set->count++;
+		}
+		say("vayu-venus: 2: HFI: %u internal buffers of type %u, %u bytes each\n", set->count,
+		    type, req[type].size);
+		g_internal_n++;
+	}
+	return true;
+}
+
+static bool
+venus_session_start(void)
+{
+	uint32_t size, session = 0, error = ~0u;
+
+	if (!hfi_command("LOAD_RESOURCES",
+	    vayu_hfi_session_command((uint32_t *)g_packet, sizeof(g_packet) / 4, g_session,
+	    VAYU_HFI_CMD_SESSION_LOAD_RESOURCES), true) ||
+	    !hfi_wait(HFI_MSG_SESSION_LOAD_RESOURCES, g_wait_ms, &size)) {
+		say("vayu-venus: 2: FAILED: no LOAD_RESOURCES done in %u ms\n", g_wait_ms);
+		return false;
+	}
+	if (!vayu_hfi_session_done((uint32_t *)g_packet, size, HFI_MSG_SESSION_LOAD_RESOURCES,
+	    &session, &error)) {
+		say("vayu-venus: 2: FAILED: LOAD_RESOURCES done, %u bytes, malformed\n", size);
+		return false;
+	}
+	say("vayu-venus: 2: HFI: LOAD_RESOURCES done: error %u\n", error);
+	if (error != 0 || !hfi_command("START",
+	    vayu_hfi_session_command((uint32_t *)g_packet, sizeof(g_packet) / 4, g_session,
+	    VAYU_HFI_CMD_SESSION_START), true) ||
+	    !hfi_wait(HFI_MSG_SESSION_START, g_wait_ms, &size)) {
+		say("vayu-venus: 2: FAILED: the session did not start (error %u)\n", error);
+		return false;
+	}
+	if (!vayu_hfi_session_done((uint32_t *)g_packet, size, HFI_MSG_SESSION_START, &session,
+	    &error) || error != 0) {
+		say("vayu-venus: 2: FAILED: START done, %u bytes, error %u\n", size, error);
+		return false;
+	}
+	say("vayu-venus: 2: HFI: START done: error %u\n", error);
+	g_session_started = true;
+	return true;
+}
+
+/* A horizontal luma ramp with a slight vertical tilt; chroma neutral at 128 (the NV12 layout). */
+static void
+venus_fill_gradient(const struct venus_buffer *buffer, uint32_t frame)
+{
+	uint8_t *y = (uint8_t *)buffer->kva;
+	uint8_t *uv = y + g_width * g_height;
+	uint32_t chroma_height = g_height / 2;
+
+	for (uint32_t row = 0; row < g_height; row++) {
+		uint32_t tilt = row * 16 / g_height;
+		uint8_t *line = y + (uint64_t)row * g_width;
+
+		for (uint32_t column = 0; column < g_width; column++) {
+			uint32_t value = 16 + (column * 219) / (g_width - 1) + tilt;
+
+			line[column] = (uint8_t)(value > 235 ? 235 : value);
+		}
+	}
+	memset(uv, 128, g_width * chroma_height);
+	cache_clean(buffer->kva, frame);
+}
+
+static const char *
+venus_nal_name(uint32_t type, bool hevc)
+{
+	if (hevc) {
+		switch (type) {
+		case 32: return "VPS";
+		case 33: return "SPS";
+		case 34: return "PPS";
+		case 19:
+		case 20: return "IDR";
+		case 21: return "CRA";
+		case 39: return "SEI";
+		case 1: return "TRAIL_R";
+		default: return NULL;
+		}
+	}
+	switch (type) {
+	case 7: return "SPS";
+	case 8: return "PPS";
+	case 5: return "IDR";
+	case 6: return "SEI";
+	case 1: return "non-IDR";
+	default: return NULL;
+	}
+}
+
+/* The Annex-B start codes, and the NAL unit type behind each: the first six, space separated. */
+static void
+venus_nal_scan(char *out, size_t out_size, const uint8_t *data, uint32_t length)
+{
+	bool hevc = g_codec == VAYU_HFI_CODEC_HEVC;
+	uint32_t found = 0;
+
+	out[0] = 0;
+	for (uint32_t i = 0; i + 4 < length && found < 6; i++) {
+		uint32_t at, type;
+		const char *name;
+		size_t used;
+
+		if (data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1) {
+			continue;
+		}
+		at = i + 3;
+		if (at + (hevc ? 1u : 0u) >= length) {
+			break;
+		}
+		type = hevc ? (uint32_t)((data[at] >> 1) & 0x3f) : (uint32_t)(data[at] & 0x1f);
+		name = venus_nal_name(type, hevc);
+		i = at;
+		if (name == NULL) {
+			continue;
+		}
+		used = strlen(out);
+		if (used + 2 < out_size) {
+			snprintf(out + used, out_size - used, "%s%s", found == 0 ? "" : " ", name);
+			found++;
+		}
+	}
+	if (found == 0) {
+		snprintf(out, out_size, "none");
+	}
+}
+
+static void
+venus_hex_line(char *out, size_t out_size, const uint8_t *data, uint32_t length)
+{
+	uint32_t bytes = length > 64 ? 64 : length, at = 0;
+
+	for (uint32_t i = 0; i < bytes && at + 3 < out_size; i++) {
+		at += (uint32_t)snprintf(out + at, out_size - at, "%02x", data[i]);
+	}
+	out[at] = 0;
+}
+
+/* Write the bitstream where the lead can pull it; the first path that opens wins. */
+static void
+venus_dump_bitstream(const uint8_t *data, uint32_t length)
+{
+	static const char *const paths[] = {
+		"/private/var/tmp/venus_out.h265", "/var/tmp/venus_out.h265", "/venus_out.h265",
+	};
+	vfs_context_t context = vfs_context_kernel();
+
+	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		vnode_t vnode = NULLVP;
+		int written = 0, error;
+
+		error = vnode_open(paths[i], O_CREAT | FWRITE | O_TRUNC, 0644, 0, &vnode, context);
+		if (error != 0) {
+			continue;
+		}
+		error = vn_rdwr(UIO_WRITE, vnode, (caddr_t)data, (int)length, 0, UIO_SYSSPACE,
+		    IO_UNIT | IO_SYNC, vfs_context_ucred(context), &written, vfs_context_proc(context));
+		vnode_close(vnode, FWRITE, context);
+		if (error == 0 && written == (int)length) {
+			say("vayu-venus: 2: wrote %u bytes to %s\n", length, paths[i]);
+			return;
+		}
+		say("vayu-venus: 2: %s: write error %d, %d of %u bytes\n", paths[i], error, written,
+		    length);
+	}
+	say("vayu-venus: 2: the bitstream could not be written to /private/var/tmp, /var/tmp or /\n");
+}
+
+/* The one frame: FTB on every output buffer, then ETB with the gradient. */
+static bool
+venus_encode_frame(void)
+{
+	uint32_t size;
+	uint32_t frame = g_width * g_height * 3 / 2;
+	struct vayu_hfi_fill_done fbd;
+	struct venus_buffer *output = NULL;
+	uint8_t *bits;
+	char line[3 * 64 + 1], nals[64];
+
+	for (uint32_t i = 0; i < g_output_n; i++) {
+		if (!hfi_command("FILL_BUFFER",
+		    vayu_hfi_session_fill_buffer((uint32_t *)g_packet, sizeof(g_packet) / 4, g_session,
+		    0, g_output[i].iova, g_output[i].bytes, i), true)) {
+			return false;
+		}
+	}
+	say("vayu-venus: 2: HFI: %u FILL_BUFFER commands; the output buffers are the firmware's\n", g_output_n);
+	venus_fill_gradient(&g_input[0], frame);
+	if (!hfi_command("EMPTY_BUFFER",
+	    vayu_hfi_session_empty_buffer((uint32_t *)g_packet, sizeof(g_packet) / 4, g_session,
+	    g_input[0].iova, g_input[0].bytes, frame, 0), true)) {
+		return false;
+	}
+	say("vayu-venus: 2: HFI: EMPTY_BUFFER: %u bytes of NV12 at %#x, %ux%u, %u fps, %u bit/s\n",
+	    frame, g_input[0].iova, g_width, g_height, g_fps, g_bitrate);
+	if (!hfi_wait(HFI_MSG_SESSION_FILL_BUFFER, g_frame_ms, &size)) {
+		say("vayu-venus: 2: FAILED: no FILL_BUFFER done in %u ms\n", g_frame_ms);
+		return false;
+	}
+	if (!vayu_hfi_session_fill_done((uint32_t *)g_packet, size, &fbd)) {
+		say("vayu-venus: 2: FAILED: FILL_BUFFER done, %u bytes, malformed\n", size);
+		return false;
+	}
+	for (uint32_t i = 0; i < g_output_n; i++) {
+		if (g_output[i].iova == fbd.packet_buffer) {
+			output = &g_output[i];
+			break;
+		}
+	}
+	if (output == NULL) {
+		say("vayu-venus: 2: FAILED: FILL_BUFFER done names buffer %#x, not one of ours\n",
+		    fbd.packet_buffer);
+		return false;
+	}
+	if (fbd.error != 0) {
+		say("vayu-venus: 2: FAILED: FILL_BUFFER done: error %u, filled_len %u\n", fbd.error,
+		    fbd.filled_len);
+		return false;
+	}
+	if (fbd.offset >= output->bytes || fbd.filled_len > output->bytes - fbd.offset) {
+		say("vayu-venus: 2: FAILED: FILL_BUFFER done: offset %u + length %u past the %u-byte buffer\n",
+		    fbd.offset, fbd.filled_len, output->bytes);
+		return false;
+	}
+	bits = (uint8_t *)(output->kva + fbd.offset);
+	cache_invalidate(output->kva, output->bytes);
+	venus_nal_scan(nals, sizeof(nals), bits, fbd.filled_len);
+	venus_hex_line(line, sizeof(line), bits, fbd.filled_len);
+	say("vayu-venus: 2: HFI: FILL_BUFFER_DONE flags=%#x filled_len=%u (nal: %s), smmu_faults=%u\n",
+	    fbd.flags, fbd.filled_len, nals, smmu_faults() ? 1u : 0u);
+	say("vayu-venus: 2: bitstream[0..%u] %s\n", fbd.filled_len > 64 ? 64 : fbd.filled_len, line);
+	if (fbd.filled_len >= 4) {
+		say("vayu-venus: 2: bitstream starts %02x %02x %02x %02x; picture type %#x, tag %u\n",
+		    bits[0], bits[1], bits[2], bits[3], fbd.picture_type, fbd.output_tag);
+	}
+	if (g_dump) {
+		venus_dump_bitstream(bits, fbd.filled_len);
+	}
+	return fbd.filled_len != 0;
+}
+
+static void
+venus_session_close(void)
+{
+	uint32_t size, session = 0, error = 0;
+
+	if (g_session_started) {
+		if (hfi_command("STOP", vayu_hfi_session_command((uint32_t *)g_packet,
+		    sizeof(g_packet) / 4, g_session, VAYU_HFI_CMD_SESSION_STOP), true) &&
+		    hfi_wait(HFI_MSG_SESSION_STOP, 1000, &size) &&
+		    vayu_hfi_session_done((uint32_t *)g_packet, size, HFI_MSG_SESSION_STOP, &session,
+		    &error)) {
+			say("vayu-venus: 2: HFI: STOP done: error %u\n", error);
+		}
+		g_session_started = false;
+	}
+	if (g_session_open) {
+		(void)hfi_command("RELEASE_RESOURCES", vayu_hfi_session_command((uint32_t *)g_packet,
+		    sizeof(g_packet) / 4, g_session, VAYU_HFI_CMD_SESSION_RELEASE_RESOURCES), true);
+		(void)hfi_wait(HFI_MSG_SESSION_RELEASE_RESOURCES, 1000, &size);
+		(void)hfi_command("SESSION_END", vayu_hfi_session_command((uint32_t *)g_packet,
+		    sizeof(g_packet) / 4, g_session, VAYU_HFI_CMD_SYS_SESSION_END), true);
+		(void)hfi_wait(HFI_MSG_SESSION_END, 1000, &size);
+		g_session_open = false;
+	}
+}
+
+static bool
+step_m2(void)
+{
+	struct vayu_hfi_buffer_requirement requirements[VAYU_HFI_BUFFER_TYPE_MAX] = { 0 };
+
+	say("vayu-venus: 2: M2/M3: one %ux%u NV12 frame (%u bytes) to %s, bitrate %u bit/s\n",
+	    g_width, g_height, g_width * g_height * 3 / 2,
+	    g_codec == VAYU_HFI_CODEC_HEVC ? "HEVC" : "H.264", g_bitrate);
+	if (!venus_session_open()) {
+		return false;
+	}
+	if (!venus_session_properties()) {
+		say("vayu-venus: 2: FAILED: a session property did not fit the queue\n");
+		return false;
+	}
+	if (!venus_buffer_requirements(requirements)) {
+		say("vayu-venus: 2: FAILED: no buffer requirements: the firmware will not be given guessed sizes\n");
+		return false;
+	}
+	if (!venus_input_and_output(requirements) || !venus_internal_buffers(requirements)) {
+		say("vayu-venus: 2: FAILED: the buffers do not fit the pool (or a SET_BUFFERS was refused)\n");
+		return false;
+	}
+	if (!venus_session_start()) {
+		return false;
+	}
+	if (!venus_encode_frame()) {
+		return false;
+	}
+	g_session_frames++;
+	venus_session_close();
+	return true;
+}
 
 static bool
 venus_run(void)
@@ -1862,7 +2659,11 @@ step_m1(void)
 		say("vayu-venus: 1: FAILED: queues\n");
 		return false;
 	}
-	if (!smmu_up(g_shared_kva, g_shared_bytes)) {
+	if (g_level >= 2 && !pool_alloc()) {
+		say("vayu-venus: 1: FAILED: buffer pool\n");
+		return false;
+	}
+	if (!smmu_up(g_shared_kva, g_shared_bytes, g_pool_kva, g_pool_bytes)) {
 		say("vayu-venus: 1: FAILED: SMMU\n");
 		return false;
 	}
@@ -1877,6 +2678,16 @@ step_m1(void)
 	if (!hfi_exchange()) {
 		say("vayu-venus: 1: FAILED: HFI\n");
 		return false;
+	}
+	say("vayu-venus: 1: PASS\n");
+	if (g_level >= 2) {
+		if (step_m2()) {
+			say("vayu-venus: 2: PASS: one NV12 frame became a bitstream, %u frames\n",
+			    g_session_frames);
+		} else {
+			say("vayu-venus: 2: FAILED: M2/M3 did not finish; M1's lines above are the proof it ran\n");
+			venus_session_close();
+		}
 	}
 	if (g_secs != 0) {
 		say("vayu-venus: 1: M1 OK; kept up for %u s more, for late messages\n", g_secs);
@@ -1908,6 +2719,7 @@ venus_down(void)
 	firmware_down();
 	smmu_down();
 	queues_free();
+	pool_free();
 	if (videoc_va != 0) {
 		venus_power_down();
 	}
@@ -2028,8 +2840,11 @@ vayu_venus_init(void)
 		return;
 	}
 	if (g_level > 1) {
-		say("vayu-venus: vayu_venus=%u: only M1 exists; M1 is done\n", g_level);
-		g_level = 1;
+		if (g_level > 2) {
+			say("vayu-venus: vayu_venus=%u: the levels are 1 (M1) and 2 (M1+M2+M3); 2 is used\n",
+			    g_level);
+		}
+		g_level = 2;
 	}
 	PE_parse_boot_argn("vayu_venus_wait", &g_wait_ms, sizeof(g_wait_ms));
 	if (g_wait_ms < 100) {
@@ -2059,10 +2874,57 @@ vayu_venus_init(void)
 	if (g_gdsc_mask == 0) {
 		g_gdsc_mask = 1;
 	}
+	if (g_level >= 2) {
+		/* the encoder core's own GDSC; M1 alone leaves it as found */
+		g_gdsc_mask |= 2;
+	}
 	PE_parse_boot_argn("vayu_venus_debug", &g_debug, sizeof(g_debug));
 	PE_parse_boot_argn("vayu_venus_bcm", &g_bcm, sizeof(g_bcm));
+	if (g_level >= 2) {
+		uint32_t codec = 1, width = g_width, height = g_height, fps = g_fps;
+		uint32_t bitrate = g_bitrate, frame_ms = g_frame_ms, dump = g_dump;
+
+		PE_parse_boot_argn("vayu_venus_codec", &codec, sizeof(codec));
+		PE_parse_boot_argn("vayu_venus_width", &width, sizeof(width));
+		PE_parse_boot_argn("vayu_venus_height", &height, sizeof(height));
+		PE_parse_boot_argn("vayu_venus_fps", &fps, sizeof(fps));
+		PE_parse_boot_argn("vayu_venus_bitrate", &bitrate, sizeof(bitrate));
+		PE_parse_boot_argn("vayu_venus_frame_ms", &frame_ms, sizeof(frame_ms));
+		PE_parse_boot_argn("vayu_venus_dump", &dump, sizeof(dump));
+		g_codec = codec == 0 ? VAYU_HFI_CODEC_H264 : VAYU_HFI_CODEC_HEVC;
+		if (width < 128 || width > 1920 || (width & 1) != 0) {
+			say("vayu-venus: vayu_venus_width=%u is not 128..1920 even; 1920 is used\n", width);
+			width = 1920;
+		}
+		if (height < 128 || height > 1080 || (height & 1) != 0) {
+			say("vayu-venus: vayu_venus_height=%u is not 128..1080 even; 1080 is used\n", height);
+			height = 1080;
+		}
+		if (fps < 1 || fps > 60) {
+			say("vayu-venus: vayu_venus_fps=%u is not 1..60; 30 is used\n", fps);
+			fps = 30;
+		}
+		if (bitrate < 64000 || bitrate > 100000000) {
+			say("vayu-venus: vayu_venus_bitrate=%u is not 64000..100000000; 8000000 is used\n", bitrate);
+			bitrate = 8000000;
+		}
+		if (frame_ms < 100 || frame_ms > 30000) {
+			frame_ms = 3000;
+		}
+		g_width = width;
+		g_height = height;
+		g_fps = fps;
+		g_bitrate = bitrate;
+		g_frame_ms = frame_ms;
+		g_dump = dump != 0;
+	}
 	say("vayu-venus: vayu_venus=%u wait=%u secs=%u rails=%u level=%u rate=%u xo=%u gdsc=%#x debug=%#x bcm=%u\n",
 	    g_level, g_wait_ms, g_secs, g_rails, g_rail_level, g_rate_mhz, g_xo, g_gdsc_mask, g_debug, g_bcm);
+	if (g_level >= 2) {
+		say("vayu-venus: M2/M3: %s %ux%u at %u fps, %u bit/s, %u ms for one frame, dump %s, session %#x\n",
+		    g_codec == VAYU_HFI_CODEC_HEVC ? "HEVC" : "H.264", g_width, g_height, g_fps,
+		    g_bitrate, g_frame_ms, g_dump ? "on" : "off", g_session);
+	}
 	if (kernel_thread_start(venus_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	} else {
