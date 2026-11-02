@@ -32,7 +32,9 @@
 #include <sys/systm.h>
 #include <sys/vayu_cell_data.h>
 #include <sys/vayu_cell_data_qmi.h>
+#include <sys/vayu_cell_net.h>
 #include <sys/vayu_ipa.h>
+#include <sys/vayu_ipa_data.h>
 #include <sys/vayu_pas.h>
 
 #define DATA_REPLY_MS           5000
@@ -61,6 +63,25 @@ say(const char *format, ...)
 	}
 	printf("%s", line);
 	return length;
+}
+
+/*
+ * One summary line per bring-up stage, the shape the reports grep:
+ *   vayu-data: S<n> <step>: OK|ERROR|TIMEOUT <detail>
+ * The detailed vayu-cell-data/vayu-ipa-data lines stay as they are; this is the index.
+ */
+static void
+data_stage_line(uint32_t stage, const char *step, const char *result, const char *format, ...)
+{
+	char detail[180], line[260];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(detail, sizeof(detail), format, list);
+	va_end(list);
+	snprintf(line, sizeof(line), "vayu-data: S%u %s: %s %s\n", stage, step, result, detail);
+	for (const char *c = line; *c != 0; c++) loader_log_putc(*c);
+	printf("%s", line);
 }
 
 static uint64_t
@@ -248,6 +269,9 @@ data_request(const char *what, uint32_t node, uint32_t port, uint16_t message,
 static void
 data_clear_sysctls(void)
 {
+	if (cellular_data != 0) {
+		vayu_cell_net_session(false, 0, 0, 0, 0, 0, 0);
+	}
 	cellular_data = 0;
 	cellular_mtu = 0;
 	cellular_ip[0] = 0;
@@ -403,6 +427,8 @@ data_dpm(void)
 	    vayu_cell_dpm_open_port_req_ei, &req, vayu_cell_result_resp_ei, &resp, &resp.result);
 	if (data_idempotent_ok(ret, &resp)) {
 		say("vayu-cell-data: DPM embedded data port is open\n");
+		data_stage_line(3, "DPM OPEN PORT", "OK", "embedded interface %u, modem RX EP %u, TX EP %u",
+		    VAYU_CELL_ENDPOINT_INTERFACE, req.ports[0].rx_endpoint_number, req.ports[0].tx_endpoint_number);
 		data_advance(DATA_WDA);
 	} else {
 		data_retry("DPM Open Port", resp.result.error);
@@ -429,6 +455,8 @@ data_wda(void)
 	    vayu_cell_wda_set_format_req_ei, &req, vayu_cell_result_resp_ei, &resp, &resp.result);
 	if (data_idempotent_ok(ret, &resp)) {
 		say("vayu-cell-data: WDA data format accepted\n");
+		data_stage_line(4, "WDA SET DATA FORMAT", "OK", "raw IP in QMAP, downlink max %u x %#x",
+		    req.downlink_max_datagrams, req.downlink_max_size);
 		data_advance(DATA_BIND);
 	} else {
 		data_retry("WDA Set Data Format", resp.result.error);
@@ -451,6 +479,8 @@ data_bind(void)
 	    vayu_cell_wds_bind_req_ei, &req, vayu_cell_result_resp_ei, &resp, &resp.result);
 	if (data_idempotent_ok(ret, &resp)) {
 		say("vayu-cell-data: WDS client bound to mux %u\n", VAYU_CELL_DATA_MUX);
+		data_stage_line(5, "WDS BIND MUX", "OK", "embedded interface %u mux %u", VAYU_CELL_ENDPOINT_INTERFACE,
+		    VAYU_CELL_DATA_MUX);
 		data_advance(DATA_FAMILY);
 	} else {
 		data_retry("WDS Bind Mux Data Port", resp.result.error);
@@ -469,6 +499,7 @@ data_family(void)
 	    vayu_cell_wds_ip_family_req_ei, &req, vayu_cell_result_resp_ei, &resp, &resp.result);
 	if (data_idempotent_ok(ret, &resp)) {
 		say("vayu-cell-data: WDS IP family is IPv4\n");
+		data_stage_line(6, "WDS IP FAMILY", "OK", "IPv4");
 		data_advance(DATA_START);
 	} else {
 		data_retry("WDS Set IP Family IPv4", resp.result.error);
@@ -491,6 +522,30 @@ data_start_session(void)
 	}
 	if (!data.registered || data.stop || data.cleanup || data.session_uncertain) {
 		return;
+	}
+	/* 0041 stage 4: a Start is only legal after the whole chain is up. */
+	if (!vayu_ipa_ready() || !vayu_ipa_data_ready() || !vayu_cell_net_ready()) {
+		static uint64_t last_blocked;
+		if (now_ms() - last_blocked > 5000) {
+			last_blocked = now_ms();
+			data_stage_line(7, "WDS START", "ERROR", "blocked: IPA handshake %s, GSI %s, en1 %s",
+			    vayu_ipa_ready() ? "ready" : "NOT READY", vayu_ipa_data_ready() ? "ready" : "NOT READY",
+			    vayu_cell_net_ready() ? "ready" : "NOT READY (need vayu_cell_net=1)");
+		}
+		return;
+	}
+	{
+		uint32_t qmi_stage = vayu_ipa_qmi_stage();
+
+		if (qmi_stage < 4) {
+			static uint64_t last_refused;
+			if (now_ms() - last_refused > 5000) {
+				last_refused = now_ms();
+				data_stage_line(7, "WDS START", "ERROR",
+				    "vayu_ipa_qmi=%u: stage 4 is not enabled; no data session", qmi_stage);
+			}
+			return;
+		}
 	}
 	data.stage_attempts++;
 	say("vayu-cell-data: WDS Start Network Interface: IPv4, %s\n",
@@ -518,6 +573,7 @@ data_start_session(void)
 	if (ret == -ETIMEDOUT) {
 		/* Start is not idempotent: a lost reply cannot be followed by another Start. */
 		say("vayu-cell-data: Start timed out; no duplicate Start is sent (possible session needs modem reset)\n");
+		data_stage_line(7, "WDS START", "TIMEOUT", "no reply in %u ms; no duplicate Start", DATA_START_REPLY_MS);
 		data.session_uncertain = true;
 		data.stage = DATA_FAILED;
 		data.cleanup = true;
@@ -527,6 +583,8 @@ data_start_session(void)
 	if (ret == 0 && resp.handle_valid) {
 		data.wds_handle = resp.handle;
 		say("vayu-cell-data: WDS data session accepted, handle %#x; asking for settings\n", data.wds_handle);
+		data_stage_line(7, "WDS START", "OK", "IPv4 %s, handle %#x",
+		    data.apn[0] != 0 ? "boot-arg APN" : "SIM default profile", data.wds_handle);
 		data_advance(DATA_SETTINGS);
 	} else {
 		if (ret == 0) {
@@ -580,6 +638,8 @@ data_settings(void)
 	    VAYU_CELL_WDS_GET_CURRENT_SETTINGS, vayu_cell_wds_settings_req_ei, &req,
 	    vayu_cell_wds_settings_resp_ei, &resp, &resp.result);
 	if (ret != 0) {
+		data_stage_line(8, "WDS GET SETTINGS", ret == -ETIMEDOUT ? "TIMEOUT" : "ERROR", "result %u error %u",
+		    (unsigned)resp.result.result, (unsigned)resp.result.error);
 		data_retry("WDS Get Current Settings", resp.result.error);
 		return;
 	}
@@ -621,8 +681,14 @@ data_settings(void)
 	}
 	cellular_data = 1;
 	data.stage = DATA_UP;
-	say("vayu-cell-data: CONTROL PLANE UP: IPv4 session and settings accepted; "
-	    "kern.vayu.cellular_* are set. IPA/GSI/en1 is NOT up: no packets or internet yet\n");
+	vayu_cell_net_session(true, resp.address, resp.mask_valid ? resp.mask : 0,
+	    resp.gateway_valid ? resp.gateway : 0, resp.dns1_valid ? resp.dns1 : 0,
+	    resp.dns2_valid ? resp.dns2 : 0, resp.mtu_valid ? resp.mtu : 0);
+	data_stage_line(8, "WDS GET SETTINGS", "OK", "address %s gateway %s mask %s DNS %s %s MTU %u",
+	    ip, gw, mask, dns1, dns2, resp.mtu_valid ? resp.mtu : 0);
+	data_stage_line(9, "EN1 SESSION", "OK", "configuration queued (vayu_cell_net=1): address %s peer %s", ip, gw);
+	say("vayu-cell-data: CONTROL PLANE UP: IPv4 session/settings accepted; en1 configuration queued. "
+	    "IPA/GSI packet counters, not this line, prove transport\n");
 }
 
 static void
@@ -637,15 +703,30 @@ data_round(void)
 	if (!data.registered || data.stage == DATA_UP || data.stage == DATA_FAILED || now_ms() < data.next_ms) {
 		return;
 	}
-	if (!vayu_ipa_ready()) {
+	if (!vayu_ipa_ready() || !vayu_ipa_data_ready() || !vayu_cell_net_ready()) {
 		static uint64_t last_gate_log;
 		if (now_ms() - last_gate_log > 5000) {
 			last_gate_log = now_ms();
-			say("vayu-cell-data: WDS/DPM blocked: vayu IPA 4.1 is not ready%s%s\n",
-			    vayu_ipa_pending() ? " (vayu_ipa=1 pending INIT_MODEM_DRIVER)" :
-			    " (enable vayu_ipa=1 first; no Start is sent)", "");
+			say("vayu-cell-data: WDS/DPM blocked: IPA handshake %s, GSI/tables %s, en1 %s; no Start is sent\n",
+			    vayu_ipa_ready() ? "ready" : "NOT READY", vayu_ipa_data_ready() ? "ready" : "NOT READY",
+			    vayu_cell_net_ready() ? "ready" : "NOT READY (need vayu_cell_net=1)");
+			data_stage_line(1, "IPA QMI READY", vayu_ipa_ready() ? "OK" : "TIMEOUT",
+			    "vayu_ipa_qmi=%u; handshake %s", vayu_ipa_qmi_stage(),
+			    vayu_ipa_ready() ? "done" : "not complete");
+			data_stage_line(2, "GSI CHANNELS", vayu_ipa_data_ready() ? "OK" : "ERROR",
+			    "vayu_ipa_data=%s; %s", vayu_ipa_data_ready() ? "1" : "off/not ready",
+			    vayu_ipa_data_ready() ? "4 channels, endpoints and tables ready" : "data path not ready");
 		}
 		return;
+	}
+	{
+		static bool announced;
+
+		if (!announced) {
+			announced = true;
+			data_stage_line(1, "IPA QMI READY", "OK",
+			    "vayu_ipa_qmi=%u handshake complete; DPM/WDA/WDS may start", vayu_ipa_qmi_stage());
+		}
 	}
 	if (!data.dpm_there || !data.wda_there || !data.wds_there) {
 		say("vayu-cell-data: registered, waiting for DPM %s WDA %s WDS %s\n",
@@ -707,8 +788,10 @@ data_thread(void *argument __unused, wait_result_t wait __unused)
 	    data.dpm_there ? "there" : "MISSING", data.wda_there ? "there" : "MISSING",
 	    data.wds_there ? "there" : "MISSING");
 	for (;;) {
-		if ((data.stage == DATA_START || data.stage == DATA_SETTINGS) && !vayu_ipa_ready()) {
+		if ((data.stage == DATA_START || data.stage == DATA_SETTINGS) &&
+		    (!vayu_ipa_ready() || !vayu_ipa_data_ready())) {
 			say("vayu-cell-data: IPA readiness was lost during Start/Settings; stopping the client\n");
+			data_stage_line(7, "WDS START", "ERROR", "IPA readiness lost during Start/Settings");
 			data.stop = true;
 			data.cleanup = true;
 			data.cleanup_seq++;

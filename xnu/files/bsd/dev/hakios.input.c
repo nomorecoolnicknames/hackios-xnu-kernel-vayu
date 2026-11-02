@@ -23,6 +23,7 @@
 #include <sys/vayu_mdp.h>
 #include <sys/vayu_ir.h>
 #include <sys/vayu_usbnet.h>
+#include <sys/vayu_cell_net.h>
 #include <pexpert/pexpert.h>
 
 #define TOUCH_QUEUE     512             /* records; a power of two */
@@ -354,6 +355,7 @@ hakios_input_init(void)
 	hakios_battery_init();
 	hakios_ufs_init();
 	hakios_net_init();
+	vayu_cell_net_init();           /* boot-arg vayu_cell_net=1: en1 raw IPv4 over the IPA/QMAP path */
 	hakios_adreno_init();
 	vayu_adreno_init();             /* boot-args gpu=1 vayu_gpu=1: the Adreno 640 of vayu */
 	hakios_wifi_init();

@@ -22,6 +22,7 @@
 #include <sys/systm.h>
 #include <vm/memory_types.h>
 #include <sys/vayu_ipa.h>
+#include <sys/vayu_ipa_data.h>
 #include <sys/vayu_pas.h>
 
 #define IPA_SM_HOST_MODEM       1
@@ -30,6 +31,8 @@
 #define IPA_SMP2P_CLOCK_ON      (1u << 1)
 #define IPA_FILTER_TABLE_ITEM   497
 #define IPA_FILTER_TABLE_SIZE   0x2000   /* vayu default: no qcom,ipa-q6-smem-size in DT */
+#define IPA_SRAM_V41            0x1e47000u      /* 0x1e00000 + 0x40000 + IPA_SW_AREA_RAM_DIRECT_ACCESS_n v3.0..v4.2 */
+#define IPA_SRAM_OLD            0x1e50000u      /* + 0x10000: the IPA v4.5 offset */
 
 extern void loader_log_putc(char c);
 extern void loader_checkpoint(uint64_t n);      /* osfmk/arm64/loader_return.c: "xl run N" stops there */
@@ -47,6 +50,11 @@ static bool ipa_enabled, ipa_prepared, ipa_fw_ready, ipa_smp2p_ready;
 static bool ipa_modem_loader;           /* vayu_ipa_loader=1: no AP PAS; watch what MPSS does */
 static uint32_t ipa_filter_item, ipa_our_item, ipa_restricted;
 static vm_offset_t ipa_regs;
+/* vayu_ipa_bus: which bus BCMs get the IP0 word. vayu_ipa_post_auth_ms: after AUTH_AND_RESET(15)
+ * returns, wait this long and announce every later IPA access with a 2.5 s pause. vayu_ipa_sram=1:
+ * canaries in the IPA 4.1 SW SRAM window (wrapper + 0x40000 + 0x7000, ipahal_reg.c v3.0..v4.2)
+ * instead of 0x1e50000 (the v4.5 offset). Ported from 0029 (w23 line) to this tree. */
+static uint32_t ipa_bus_mask = 15, ipa_post_auth_ms, ipa_sram_fix;
 
 static int say(const char *format, ...) __printflike(1, 2);
 static int
@@ -128,6 +136,15 @@ vayu_ipa_restricted_bytes(void)
 	return ipa_restricted;
 }
 
+/* The IPA local (SW) SRAM window this boot uses: 0x1e47000 for IPA 4.1 (vayu_ipa_sram=1),
+ * 0x1e50000 for the v4.5 offset the older code used. Table offsets are relative to this window
+ * and include the restricted byte count. */
+uint32_t
+vayu_ipa_sram_base(void)
+{
+	return ipa_sram_fix == 1 ? IPA_SRAM_V41 : IPA_SRAM_OLD;
+}
+
 static bool
 ipa_registers_check(void)
 {
@@ -169,6 +186,12 @@ ipa_clock_on(void)
 		return false;
 	}
 	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+		/* vayu_ipa_bus=MASK (1 SN8, 2 SH0, 4 MC0, 8 ACV; absent = 15). SN8 and ACV hung the host
+		 * during the pause (runs 0941/0942/0943); SH0+MC0 (6) survived it twice (0940, 0940r). */
+		if (!(ipa_bus_mask & (1u << i))) {
+			say("vayu-ipa: bus %s not voted (vayu_ipa_bus=%u)\n", rails[i], ipa_bus_mask);
+			continue;
+		}
 		address = vayu_rpmh_address(rails[i]);
 		if (address != 0 && !vayu_rpmh_send(&address, &value, 1, "ipa bus")) {
 			say("vayu-ipa: bus %s vote failed; IP0 is confirmed, keeping this visible\n", rails[i]);
@@ -182,11 +205,72 @@ ipa_clock_on(void)
 #define RSRC(xmin, xmax, ymin, ymax) \
 	((uint32_t)(xmin) | (uint32_t)(xmax) << 8 | (uint32_t)(ymin) << 16 | (uint32_t)(ymax) << 24)
 
+#define GSI_BASE                0x1e04000u
+#define UC_RESPONSE_INIT_DONE   1u              /* IPA_HW_2_CPU_RESPONSE_INIT_COMPLETED, ipa_uc.c */
+
+/* Announce the next IPA access and give the loader (2 s snapshots) time to carry the line out. */
+static void
+ipa_step(const char *what)
+{
+	if (ipa_post_auth_ms == 0) return;
+	say("vayu-ipa: post-auth: about to %s\n", what);
+	delay_for_interval(2500, NSEC_PER_MSEC);
+}
+
+/* Read-only look after AUTH_AND_RESET(15): GSI enabled by TrustZone, uC INIT_COMPLETED in the
+ * shared area at SW SRAM offset 0 (struct IpaHwSharedMemCommonMapping_t: responseOp +0xc,
+ * responseParams +0x10, hwState +0x20, interfaceVersionCommon +0x24). */
+static void
+ipa_post_auth_look(void)
+{
+	vm_offset_t gsi, uc;
+	uint32_t cfg, status, response = 0, state = 0, iface = 0;
+	uint64_t waited = 0;
+
+	if (ipa_post_auth_ms == 0) return;
+	say("vayu-ipa: post-auth: AUTH_AND_RESET(15) RETURNED; holding %u ms before any IPA access\n", ipa_post_auth_ms);
+	delay_for_interval(ipa_post_auth_ms, NSEC_PER_MSEC);
+	ipa_step("read IPA_VERSION 0x1e40034");
+	say("vayu-ipa: post-auth: IPA_VERSION %#x\n", IPA_RD(0x34));
+	gsi = ml_io_map_unmappable(GSI_BASE, 0x20000, VM_WIMG_IO);
+	if (gsi == 0) {
+		say("vayu-ipa: post-auth: GSI window did not map\n");
+		return;
+	}
+	ipa_step("read GSI_CFG 0x1e04000 and GSI_EE0_STATUS 0x1e23000");
+	cfg = *(volatile uint32_t *)(gsi + 0x0);
+	status = *(volatile uint32_t *)(gsi + 0x1f000);
+	say("vayu-ipa: post-auth: GSI_CFG %#x (enable %u), GSI_EE0_STATUS %#x (enabled %u)\n",
+	    cfg, cfg & 1, status, status & 1);
+	uc = ml_io_map_unmappable(IPA_SRAM_V41, 0x1000, VM_WIMG_IO);
+	if (uc == 0) {
+		say("vayu-ipa: post-auth: uC shared area did not map\n");
+		return;
+	}
+	ipa_step("read the uC shared area at 0x1e47000");
+	for (;;) {
+		response = *(volatile uint32_t *)(uc + 0xc) & 0xff;
+		if (response == UC_RESPONSE_INIT_DONE || waited >= 2000) break;
+		delay_for_interval(10, NSEC_PER_MSEC);
+		waited += 10;
+	}
+	state = *(volatile uint32_t *)(uc + 0x20) & 0xff;
+	iface = *(volatile uint32_t *)(uc + 0x24) & 0xffff;
+	say("vayu-ipa: post-auth: uC responseOp %#x params %#x hwState %#x interface %#x after %llu ms: %s\n",
+	    response, *(volatile uint32_t *)(uc + 0x10), state, iface, waited,
+	    response == UC_RESPONSE_INIT_DONE ? "uC INIT_COMPLETED" : "uC NOT READY");
+	say("vayu-ipa: post-auth: GSI %s, uC %s\n", (status & 1) ? "READY" : "NOT ENABLED",
+	    response == UC_RESPONSE_INIT_DONE ? "READY" : "NOT READY");
+}
+
 static void
 ipa_hardware_init(void)
 {
 	/* vayu-r-oss ipa3_init_hw + resource groups + route for IPA 4.1. */
-	uint32_t v = IPA_RD(0x74);
+	uint32_t v;
+
+	ipa_step("write QSB/CLKON/BCR/COMP registers and resource groups (0x1e40000 + 0x3c..0x52c)");
+	v = IPA_RD(0x74);
 	IPA_WR(0x74, (v & ~0xfU) | 8);                 /* DDR QMB max writes 8 */
 	v = IPA_RD(0x78);
 	IPA_WR(0x78, (v & ~0x00ff000fU) | 12 | 120U << 16); /* DDR reads 12 of 120 */
@@ -222,11 +306,16 @@ ipa_hardware_init(void)
 	/* IPA local memory: zero the modem's table/proc-ctx areas, write canaries,
 	 * and tell the uC where modem processing contexts start. */
 	{
-		vm_offset_t sram = ml_io_map_unmappable(0x1e50000, 0x4000, VM_WIMG_IO);
+		uint32_t sram_pa = vayu_ipa_sram_base() + (ipa_sram_fix == 1 ? ipa_restricted : 0);
+		vm_offset_t sram;
 		static const uint16_t canaries[] = {
 			0x0288, 0x0308, 0x0388, 0x0408, 0x0488, 0x0508, 0x0588, 0x0608,
 			0x0688, 0x07d0, 0x0c30, 0x13d0, 0x13f0, 0x23fc,
 		};
+
+		ipa_step(ipa_sram_fix == 1 ? "write SRAM canaries at 0x1e47000 (vayu_ipa_sram=1)" :
+		    "write SRAM canaries at 0x1e50000 (old v4.5 offset)");
+		sram = ml_io_map_unmappable(sram_pa, 0x4000, VM_WIMG_IO);
 		if (sram == 0) {
 			say("vayu-ipa: IPA SRAM window did not map\n");
 			return;
@@ -240,8 +329,9 @@ ipa_hardware_init(void)
 			*(volatile uint32_t *)(sram + at - 4) = 0xdeadbeef;
 		}
 		IPA_WR(0x1e8, ipa_restricted + 0x7d0); /* LOCAL_PKT_PROC_CNTXT_BASE */
-		say("vayu-ipa: IPA SRAM zeroed/canaries written, proc-ctx base %#x\n", IPA_RD(0x1e8));
+		say("vayu-ipa: IPA SRAM zeroed/canaries written at %#x, proc-ctx base %#x\n", sram_pa, IPA_RD(0x1e8));
 	}
+	ipa_step("write the exception route 0x1e40048");
 	/* Exception route: LAN consumer endpoint 10, header table local, retain hdr. */
 	IPA_WR(0x48, 0x1120052);
 	say("vayu-ipa: hardware init: QSB %#x %#x, CLKON %#x, BCR %#x, COMP %#x, route %#x\n",
@@ -295,6 +385,40 @@ vayu_ipa_firmware_up(void)
 	return ipa_fw_ready;
 }
 
+/* The "ipa" entry of SMP2P item `item` (host 1), found by name; false: no item or no entry. */
+static bool
+ipa_smp2p_entry(uint32_t item, uint32_t *value)
+{
+	uint32_t size = 0, at = vayu_smem_item(IPA_SM_HOST_MODEM, item, &size), valid;
+
+	if (at == 0 || size < 20 || ipa_smem_word(at) != 0x504d5324) return false;
+	valid = ipa_smem_word(at + 12) >> 16;
+	for (uint32_t i = 0; i < valid && i < 16 && 20 + 20 * (i + 1) <= size; i++) {
+		if (ipa_smem_word(at + 20 + 20 * i) == 0x00617069 && ipa_smem_word(at + 24 + 20 * i) == 0) {
+			*value = ipa_smem_word(at + 36 + 20 * i);
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Ours (428, apps->modem: bit 0 response done, bit 1 clock on) and the modem's (435, its clock query,
+ * stock ipa3_smp2p_modem_clk_query_isr). The modem item may carry no "ipa" entry until it asks. */
+void
+vayu_ipa_smp2p_read(bool *ours_found, uint32_t *ours, bool *theirs_found, uint32_t *theirs)
+{
+	*ours = *theirs = 0;
+	*ours_found = ipa_smp2p_entry(IPA_SMP2P_OURS, ours);
+	*theirs_found = ipa_smp2p_entry(435, theirs);
+}
+
+/* True only after this boot's MPSS SMP2P verification (vayu_ipa_modem_probe), never from stale SMEM. */
+bool
+vayu_ipa_modem_started(void)
+{
+	return ipa_smp2p_ready;
+}
+
 bool
 vayu_ipa_firmware_ready(void)
 {
@@ -312,11 +436,15 @@ vayu_ipa_prepare(void)
 	}
 	if (ipa_prepared) return;
 	ipa_enabled = true;
+	PE_parse_boot_argn("vayu_ipa_bus", &ipa_bus_mask, sizeof(ipa_bus_mask));
+	PE_parse_boot_argn("vayu_ipa_post_auth_ms", &ipa_post_auth_ms, sizeof(ipa_post_auth_ms));
+	PE_parse_boot_argn("vayu_ipa_sram", &ipa_sram_fix, sizeof(ipa_sram_fix));
 	if (PE_parse_boot_argn("vayu_ipa_pas", &steps, sizeof(steps))) {
 		vayu_pas_set_steps(steps);
 	}
 	say("vayu-ipa: PAS steps %#x (bit 0 forced shutdown, 1 image, 2 AUTH, 3 hardware init)\n",
 	    vayu_pas_steps());
+	say("vayu-ipa: bus %#x, post_auth_ms %u, sram %u\n", ipa_bus_mask, ipa_post_auth_ms, ipa_sram_fix);
 	if ((vayu_pas_steps() & VAYU_PAS_STEP_AUTH) && !(vayu_pas_steps() & VAYU_PAS_STEP_IMAGE)) {
 		say("vayu-ipa: vayu_ipa_pas asks for AUTH without an image: refused\n");
 		return;
@@ -381,10 +509,16 @@ vayu_ipa_prepare(void)
 		vayu_pas_stop(&ipa_fw, "IPA did not come up");
 		return;
 	}
+	ipa_post_auth_look();
 	if (vayu_pas_steps() & VAYU_PAS_STEP_HW) {
 		ipa_hardware_init();
 	} else {
 		say("vayu-ipa: hardware/SRAM init skipped (vayu_ipa_pas bit 3 off)\n");
+	}
+	/* vayu_ipa_data=1: the four GSI channels, endpoints and the empty tables, still before MPSS
+	 * (stock ipa3_load_ipa_fw -> ipa3_post_init). The QMI handshake stays separate. */
+	if (!vayu_ipa_data_prepare()) {
+		say("vayu-ipa: data path preparation failed; IPA stays up, WDS Start will be blocked\n");
 	}
 	loader_checkpoint(112);
 	say("vayu-ipa: IPA firmware authenticated/reset (no own SMP2P item); modem item will carry \"ipa\"\n");
@@ -467,6 +601,11 @@ void
 vayu_ipa_prepare_stop(void)
 {
 	if (!ipa_enabled) return;
+	if (!vayu_ipa_data_stop()) {
+		/* A channel that will not stop leaves the IPA firmware up: never PAS-stop under it. */
+		say("vayu-ipa: data path did not stop; keeping IPA firmware up\n");
+		return;
+	}
 	if (ipa_fw.started) {
 		(void)vayu_pas_stop(&ipa_fw, "IPA prepare stop");
 	}

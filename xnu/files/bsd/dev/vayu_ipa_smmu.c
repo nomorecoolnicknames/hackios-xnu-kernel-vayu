@@ -12,6 +12,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
+#include <pexpert/pexpert.h>
 #include <stdbool.h>
 #include <sys/systm.h>
 #include <vm/memory_types.h>
@@ -53,6 +54,7 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, u
 extern uint64_t kvtophys(vm_offset_t va);
 extern void loader_log_putc(char c);
 extern lck_mtx_t hakios_smmu_lock;     /* QUP/Wi-Fi/audio/camera allocate the same SMRs/contexts */
+static uint32_t ipa_smmu_ttbrfix;      /* vayu_ipa_ttbrfix=1: TTBR0 from the tables after they exist */
 
 static int say(const char *format, ...) __printflike(1, 2);
 static int
@@ -134,28 +136,36 @@ ipa_smmu_find(struct ipa_smmu_stream *s, vm_offset_t base, uint32_t idr0, uint32
 static bool
 ipa_smmu_map(struct ipa_smmu_stream *s)
 {
-	uint64_t *root, *l1;
+	uint64_t *root, *ddr_l2, *low_l2;
 	uint32_t pa;
 
-	if (kmem_alloc(kernel_map, &s->tables, 2 * PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	/* root (one page), a low-VA L2 table (one page), and 1024 DDR L2
+	 * descriptors (two 4 KiB pages). Four pages total; the layout is correct
+	 * for either 4 KiB or 16 KiB kernel pages. Ported from the net1 line: the old
+	 * 2-page table wrote 1024 entries into one 4 KiB L2 page and covered only
+	 * the first GiB of DDR, while the IPA SMMU identity window is 2 GiB. */
+	if (kmem_alloc(kernel_map, &s->tables, 4 * PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || s->tables == 0) {
 		say("vayu-ipa: no page tables for SID %#x\n", s->sid);
 		return false;
 	}
 	root = (uint64_t *)s->tables;
-	l1 = (uint64_t *)(s->tables + PAGE_SIZE);
-	/* TCR 39-bit VA: root index = VA >> 30; a level-1 table has 2 MiB blocks.
-	 * root[2] points to that table and maps DDR at 0x80000000. The two DDR
-	 * windows below are 0x80000000..0xffffffff, not a 2 GiB low-memory alias. */
-	root[2] = kvtophys((vm_offset_t)l1) | 3;
+	low_l2 = (uint64_t *)(s->tables + PAGE_SIZE);
+	ddr_l2 = (uint64_t *)(s->tables + 2 * PAGE_SIZE);
+	/* TG0=4 KiB, T0SZ=25: root[2] and root[3] cover the whole 2 GiB DDR
+	 * window 0x80000000..0xffffffff with 2 MiB blocks. */
+	root[2] = kvtophys((vm_offset_t)ddr_l2) | 3;
+	root[3] = kvtophys((vm_offset_t)(ddr_l2 + 512)) | 3;
 	for (unsigned i = 0; i < 1024; i++) {
 		pa = 0x80000000U + i * 0x200000U;
-		l1[i] = (uint64_t)pa | PTE_BLOCK;
+		ddr_l2[i] = (uint64_t)pa | PTE_BLOCK;
 	}
-	/* Device mappings in the low VA aliases: SMEM and IMEM are at those PAs. */
-	root[0] = 0x86000000ULL | PTE_DEVICE;       /* SMEM, 1 GiB block */
-	root[1] = 0x14600000ULL | PTE_DEVICE;       /* IMEM, 1 GiB block */
-	for (vm_offset_t line = s->tables; line < s->tables + 2 * PAGE_SIZE; line += 64) {
+	/* SMEM is inside the DDR identity map above (normal non-cacheable MAIR0).
+	 * vayu DT's additional AP mapping is IMEM 0x146bd000/0x2000; cover its
+	 * aligned 2 MiB block as device memory at the same IOVA. */
+	root[0] = kvtophys((vm_offset_t)low_l2) | 3;
+	low_l2[(0x14600000U >> 21) & 0x1ff] = 0x14600000ULL | PTE_DEVICE;
+	for (vm_offset_t line = s->tables; line < s->tables + 4 * PAGE_SIZE; line += 64) {
 		__asm__ volatile("dc civac, %0" : : "r" (line));
 	}
 	return true;
@@ -169,6 +179,16 @@ ipa_smmu_on(struct ipa_smmu_stream *s)
 	vm_offset_t second = s->second, context = s->context_base;   /* kernel VAs: 32-bit locals truncated them */
 
 	if (!ipa_smmu_map(s)) return false;
+	if (ipa_smmu_ttbrfix == 1) {
+		/* root above may have been taken while s->tables was still 0: take it now that they exist. */
+		root = kvtophys(s->tables) | (uint64_t)s->context << 48;
+		say("vayu-ipa: ttbrfix: SID %#x TTBR0 %#llx (tables PA %#llx)\n", s->sid,
+		    (unsigned long long)root, (unsigned long long)kvtophys(s->tables));
+		if ((root & 0x0000fffffffff000ULL) == 0) {
+			say("vayu-ipa: ttbrfix: SID %#x tables PA is 0; context not programmed\n", s->sid);
+			return false;
+		}
+	}
 	wr(context + SMMU_CB_SCTLR, 0);
 	wr(second + SMMU_CBA2R(s->context), SMMU_CBA2R_64_BIT);
 	wr(second + SMMU_CBAR(s->context), SMMU_CBAR_STAGE_1);
@@ -218,6 +238,7 @@ vayu_ipa_smmu_enable(void)
 		say("vayu-ipa: application SMMU did not map\n");
 		return false;
 	}
+	PE_parse_boot_argn("vayu_ipa_ttbrfix", &ipa_smmu_ttbrfix, sizeof(ipa_smmu_ttbrfix));
 	idr0 = rd(base + SMMU_IDR0);
 	idr1 = rd(base + SMMU_IDR1);
 	if (rd(base + SMMU_SCR0) & (1U << 3)) {

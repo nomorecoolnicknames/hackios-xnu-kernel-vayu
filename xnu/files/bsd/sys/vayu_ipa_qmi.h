@@ -163,4 +163,18 @@ static const struct qmi_elem_info vayu_ipa_init_complete_ind_ei[] = {
 	{ .data_type = QMI_EOTI },
 };
 
+/* Stage 3 (vayu_ipa_qmi=3): one read-only WDS question. libqmi: Get Packet Service Status 0x0022,
+ * no input; output TLV 0x01 connection status (1 disconnected, 2 connected, 3 suspended, 4 authenticating). */
+#define VAYU_IPA_WDS_SERVICE            0x01
+#define VAYU_IPA_WDS_GET_PKT_SRVC_STATUS 0x0022
+struct vayu_ipa_wds_status_resp {
+	struct vayu_cell_result result;
+	uint8_t status;                         /* 0x01 */
+};
+static const struct qmi_elem_info vayu_ipa_wds_status_resp_ei[] = {
+	VAYU_IPA_RESULT(struct vayu_ipa_wds_status_resp),
+	VAYU_IPA_EI(QMI_UNSIGNED_1_BYTE, struct vayu_ipa_wds_status_resp, status, 0x01),
+	{ .data_type = QMI_EOTI },
+};
+
 #endif /* _SYS_VAYU_IPA_QMI_H_ */
