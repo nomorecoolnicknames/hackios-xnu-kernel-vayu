@@ -166,6 +166,9 @@
  *                             granted 2026-10-25).
  *   vayu_camera_af=1          step 6: the rear DW9800 lens motor (GPIO 24 VAF, 0x0c: 0x02, 0x03/0x04
  *                             only; amendment 3); frames report its position, FOCUS moves it.
+ *   vayu_camera_fps=N         steps 4/6 mode 0 (cam30): 0x0340's frame length for N frames a second
+ *                             (15..60), within the mode's row and the row's 4x one; default 0 = the 4x
+ *                             frames. The line time, the MIPI rate and the IFE's work per frame stay.
  *   vayu_camera_ae=1          step 4: the camera row's 0x0340 frame length (4x the mode's), 0x0202
  *                             exposure (frame - 48 lines) and 0x0204 gain (4x) before stream-on;
  *                             exposure/gain boot-args override the row's. Volatile registers: the
@@ -794,7 +797,8 @@ struct cam_stream_cfg {
 	uint16_t ae_gain;               /* 0x0204: 4x (Sony 1024 - 1024/4 = 0x300; Samsung 0x20 per 1x = 0x80: HYPOTHESIS) */
 };
 
-static const struct cam_stream_cfg cam_streams[] = {
+/* (not const: vayu_camera_fps rewrites ae_frame_lines/ae_lines once, at init, before any session) */
+static struct cam_stream_cfg cam_streams[] = {
 	{
 		.name = "imx582", .sensor = 0, .tab = "camera-imx582.tab",
 		.mode_count = 2,
@@ -4243,6 +4247,53 @@ static struct cam_abi_sensor cam_real_sensors[] = {
 #define CAM_REAL_SENSOR_COUNT   (sizeof(cam_real_sensors) / sizeof(cam_real_sensors[0]))
 
 /*
+ * cam30: vayu_camera_fps=N (15..60; 0/absent = the rows as they are: 4x frames, 15.02 rear / 30.10 front).
+ * Only 0x0340's frame length changes: the mode's line time, pixel clock, MIPI rate and the IFE's work per
+ * frame stay; the extra lines of the 4x frame are vertical blanking. frame = ceil(1e9 / (N * line_ns)),
+ * kept within [the mode's own frame (4x / 4), the row's 4x]; the exposure ceiling follows (frame - 48),
+ * the header's frame_lines_min/max say so, and mediaserverd's AE adds gain for the shorter exposure.
+ * Rear at 30: 2528 lines (29.99 fps, longest exposure 32.7 ms instead of 66.0); front at 30: 3980 > 3968,
+ * so it stays at 3968 (30.10 fps).
+ * Mode 1's rows (line_ns 0 here: cam_real_start() fills them from the vendor block) are left alone: that
+ * mode writes none of our registers and keeps the vendor's own 0x0340.
+ */
+static uint32_t g_cam_fps;              /* vayu_camera_fps */
+
+static void
+cam_fps_apply(void)
+{
+	if (g_cam_fps == 0) {
+		return;
+	}
+	if (g_cam_fps < 15 || g_cam_fps > 60) {
+		printf("vayu-camera: cam30: vayu_camera_fps=%u is not 15..60: the 4x frames stay\n", g_cam_fps);
+		g_cam_fps = 0;
+		return;
+	}
+	for (unsigned i = 0; i < CAM_REAL_SENSOR_COUNT; i++) {
+		struct cam_abi_sensor *s = &cam_real_sensors[i];
+		struct cam_stream_cfg *cfg = (struct cam_stream_cfg *)s->stream;
+		uint32_t longest, shortest, frame;
+		uint64_t want;
+
+		if (s->mode != 0 || cfg == NULL || s->line_ns == 0) {
+			continue;
+		}
+		longest = cfg->ae_frame_lines;
+		shortest = longest / 4;
+		want = (NSEC_PER_SEC + (uint64_t)g_cam_fps * s->line_ns - 1) / ((uint64_t)g_cam_fps * s->line_ns);
+		frame = want < shortest ? shortest : want > longest ? longest : (uint32_t)want;
+		cfg->ae_frame_lines = (uint16_t)frame;
+		cfg->ae_lines = (uint16_t)(frame - 48);
+		s->frame_lines_min = frame;
+		s->frame_lines_max = frame;
+		printf("vayu-camera: cam30: %s: frame %u lines (was %u), exposure up to %u lines, %u.%02u fps at %u ns a line\n",
+		    s->name, frame, longest, frame - 48, (uint32_t)(NSEC_PER_SEC / ((uint64_t)frame * s->line_ns)),
+		    (uint32_t)((100 * NSEC_PER_SEC / ((uint64_t)frame * s->line_ns)) % 100), s->line_ns);
+	}
+}
+
+/*
  * The frame source: step 5's synthetic chart or step 6's real sensor. The node, the ring, the
  * reads, the writes and the session loop around these hooks are one piece of code.
  * start() brings the source up and prints its own start line; frame() produces one frame into the
@@ -4503,6 +4554,26 @@ static uint32_t cam_real_timeout_ms, cam_real_timeouts;
 static int cam_real_writing, cam_real_next;     /* the place the frame in flight goes to / the one given for the next */
 static uint32_t cam_real_late;                  /* SOFs with no address waiting */
 /*
+ * cam30 timing, per window of 100 frames (printed with the every-100 line, then reset): SOFs seen by
+ * the poll, their spacing (min/avg/max, us), gaps longer than 1.5 nominal frames (a SOF the 1-2 ms poll
+ * missed, or the sensor slower), SOF -> WM0 done (the frame's readout), done -> the next frame() call
+ * (the session loop's own time: reads, AE/AF I2C, cache maintenance), and frames given to readers.
+ */
+static struct {
+	uint64_t t0, last_sof, last_done, sum, done_sum, idle_sum;
+	uint32_t sofs, gaps, min, max, done_max, idle_max, n, done_n;
+	uint64_t given0;
+} cam_real_tm;
+
+static uint64_t
+cam_real_us(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / NSEC_PER_USEC;
+}
+/*
  * AE (the maintainers' ruling 2026-10-25: 0x0202 / 0x0204 / 0x0340): the ISP in mediaserverd asks for an exposure in lines and a
  * LINEAR gain (gain_unity = 1x); the session thread writes it between frames. The frame length is
  * the mode's own -- 4x in mode 0, the vendor block's in mode 1 -- and AE never writes 0x0340.
@@ -4640,6 +4711,7 @@ cam_real_start(const struct cam_abi_sensor *s, uint32_t lines, uint32_t gain, ui
 	cam_real_writing = 0;
 	cam_real_next = 0;
 	cam_real_late = 0;
+	memset(&cam_real_tm, 0, sizeof(cam_real_tm));
 	cam_real_ask.pending = false;
 	cam_real_ae_writes = 0;
 	cam_af_up();
@@ -4740,12 +4812,41 @@ cam_real_frame(const struct cam_abi_sensor *s, int p, struct cam_frame_out *out)
 	 * to the previous place, so readers got stale or half-overwritten frames: a tester's "jittery".)
 	 */
 	start = cam_fake_ms();
+	{
+		uint64_t now = cam_real_us();
+
+		if (cam_real_tm.t0 == 0) {
+			cam_real_tm.t0 = now;
+			cam_real_tm.given0 = cam_fake_frames_given;
+			cam_real_tm.min = UINT32_MAX;
+		}
+		if (cam_real_tm.last_done != 0) {
+			uint32_t idle = (uint32_t)(now - cam_real_tm.last_done);
+
+			cam_real_tm.idle_sum += idle;
+			cam_real_tm.idle_max = MAX(cam_real_tm.idle_max, idle);
+		}
+	}
 	for (;;) {
 		uint32_t top = rd(g_ife_va + IFE_IRQ_STATUS0), bus = rd(g_ife_va + BUS_IRQ_STATUS1);
 
 		if (top & CAM_RDI0_SOF) {
 			int writing, next = -1;
+			uint64_t now = cam_real_us();
 
+			if (cam_real_tm.last_sof != 0) {
+				uint32_t d = (uint32_t)(now - cam_real_tm.last_sof);
+
+				cam_real_tm.sum += d;
+				cam_real_tm.n++;
+				cam_real_tm.min = MIN(cam_real_tm.min, d);
+				cam_real_tm.max = MAX(cam_real_tm.max, d);
+				if (2ull * d * NSEC_PER_USEC > 3ull * cam_real_frame_ns) {
+					cam_real_tm.gaps++;
+				}
+			}
+			cam_real_tm.last_sof = now;
+			cam_real_tm.sofs++;
 			wr(g_ife_va + IFE_IRQ_CLEAR0, CAM_RDI0_SOF);
 			wr(g_ife_va + IFE_IRQ_GLOBAL_CLEAR, 1);
 			lck_mtx_lock(&cam_fake_lock);
@@ -4772,8 +4873,18 @@ cam_real_frame(const struct cam_abi_sensor *s, int p, struct cam_frame_out *out)
 			}
 		}
 		if (bus & 1u) {
+			uint64_t now = cam_real_us();
+
 			wr(g_ife_va + BUS_IRQ_CLEAR1, 1);
 			wr(g_ife_va + BUS_IRQ_GLOBAL_CLEAR, 1);
+			if (cam_real_tm.last_sof != 0) {
+				uint32_t dd = (uint32_t)(now - cam_real_tm.last_sof);
+
+				cam_real_tm.done_sum += dd;
+				cam_real_tm.done_n++;
+				cam_real_tm.done_max = MAX(cam_real_tm.done_max, dd);
+			}
+			cam_real_tm.last_done = now;
 			break;
 		}
 		if (!cam_fake_open || cam_fake_switch_to != 0 || cam_fake_broken) {
@@ -4814,6 +4925,31 @@ cam_real_frame(const struct cam_abi_sensor *s, int p, struct cam_frame_out *out)
 		    "smmu faults %s\n", (unsigned long long)(cam_fake_frames_done + 1),
 		    (unsigned long long)cam_fake_frames_given, cam_real_late, rd(g_csid_va + CSID_CSI2_RX_PKTS),
 		    rd(g_csid_va + CSID_RDI0_BYTES_PING), g_smmu_bad ? "SEEN" : "none");
+		{
+			uint64_t now = cam_real_us(), el = now - cam_real_tm.t0;
+			uint64_t given = cam_fake_frames_given - cam_real_tm.given0;
+			uint32_t n = cam_real_tm.n ? cam_real_tm.n : 1, dn = cam_real_tm.done_n ? cam_real_tm.done_n : 1;
+
+			/* (rates x100: frames done/given and SOFs over the window's own time) */
+			printf("vayu-camera: cam30: window %llu us: done %llu.%02llu fps, sof %llu.%02llu fps, given %llu.%02llu fps; "
+			    "sof dt min/avg/max %u/%llu/%u us, %u gaps > 1.5 frame (nominal %llu us); sof->done avg/max %llu/%u us; "
+			    "done->next avg/max %llu/%u us\n", (unsigned long long)el,
+			    el ? 100ull * 100 * 1000000 / el / 100 : 0, el ? 100ull * 100 * 1000000 / el % 100 : 0,
+			    el ? (uint64_t)cam_real_tm.sofs * 100 * 1000000 / el / 100 : 0,
+			    el ? (uint64_t)cam_real_tm.sofs * 100 * 1000000 / el % 100 : 0,
+			    el ? given * 100 * 1000000 / el / 100 : 0, el ? given * 100 * 1000000 / el % 100 : 0,
+			    cam_real_tm.n ? cam_real_tm.min : 0, cam_real_tm.sum / n, cam_real_tm.max, cam_real_tm.gaps,
+			    (unsigned long long)(cam_real_frame_ns / NSEC_PER_USEC), cam_real_tm.done_sum / dn, cam_real_tm.done_max,
+			    cam_real_tm.idle_sum / 100, cam_real_tm.idle_max);
+			uint64_t keep_sof = cam_real_tm.last_sof;
+
+			memset(&cam_real_tm, 0, sizeof(cam_real_tm));
+			cam_real_tm.last_sof = keep_sof;
+			cam_real_tm.t0 = now;
+			cam_real_tm.min = UINT32_MAX;
+			cam_real_tm.given0 = cam_fake_frames_given;
+			cam_real_tm.last_done = now;
+		}
 	}
 	return CAM_FRAME_DONE;
 }
@@ -5630,6 +5766,8 @@ vayu_camera_init(void)
 	PE_parse_boot_argn("vayu_camera_gain", &g_gain, sizeof(g_gain));
 	PE_parse_boot_argn("vayu_camera_ae", &g_ae, sizeof(g_ae));
 	PE_parse_boot_argn("vayu_camera_af", &g_af, sizeof(g_af));
+	PE_parse_boot_argn("vayu_camera_fps", &g_cam_fps, sizeof(g_cam_fps));
+	cam_fps_apply();
 	g_exposure &= 0xffff;
 	g_gain &= 0xffff;
 	PE_parse_boot_argn("vayu_camera_fake_fps", &g_fake_fps, sizeof(g_fake_fps));
