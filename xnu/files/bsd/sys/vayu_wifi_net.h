@@ -15,8 +15,13 @@ void vayu_net_reset(int (*log)(const char *format, ...) __printflike(1, 2));
 /* The HTT TX function (bsd/dev/vayu_wifi_scan.c) and the log. */
 void vayu_net_set_tx(int (*tx80211)(const uint8_t *frame, uint32_t len, bool clear),
     int (*log)(const char *format, ...) __printflike(1, 2));
-/* After the keys are in: attach en0 on the link and bring it up. 0 = up. */
-int vayu_net_start(const uint8_t *mac, const uint8_t *bssid, const uint8_t *ssid, uint32_t ssid_len);
+/* W25o: the station boundary as soon as the MAC is known (before the scan): wifid then finds a
+ * powered station, and gets the power event. */
+void vayu_net_sta_attach(const uint8_t *mac);
+/* After the keys are in: attach en0 on the link and bring it up, tell Apple80211 the station
+ * joined. 0 = up.  chan/rssi are what the beacon of the join said. */
+int vayu_net_start(const uint8_t *mac, const uint8_t *bssid, const uint8_t *ssid, uint32_t ssid_len,
+    uint32_t chan, int32_t rssi);
 void vayu_net_stop(void);
 bool vayu_net_linked(void);
 /* boot-arg vayu_wifi_keep=1: stay joined after the handshake instead of tearing down. */

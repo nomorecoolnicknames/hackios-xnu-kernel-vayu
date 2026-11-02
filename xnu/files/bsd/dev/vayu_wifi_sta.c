@@ -937,6 +937,7 @@ vayu_sta_run(const struct vayu_scan_ops *o)
 	}
 	st.mac = o->mac;
 	vayu_net_set_tx(vayu_scan_tx_frame, o->log);
+	vayu_net_sta_attach(o->mac);                  /* W25o: Apple80211 sees a powered station early */
 	if (!st.have) {
 		o->log("vayu-wifi: W25 S2 join: ERROR no beacon from '%s' (ch %u) bssid ..%02x:%02x in the scan\n",
 		    target_ssid, TARGET_CHAN, TARGET_B4, TARGET_B5);
@@ -1050,7 +1051,8 @@ vayu_sta_run(const struct vayu_scan_ops *o)
 	}
 
 	/* W25 S4: en0 over the link */
-	if (vayu_net_start(st.mac, st.bssid, (const uint8_t *)target_ssid, TARGET_SSID_LEN) != 0) {
+	if (vayu_net_start(st.mac, st.bssid, (const uint8_t *)target_ssid, TARGET_SSID_LEN, st.chan,
+	    st.rssi) != 0) {
 		goto teardown;
 	}
 	up = true;

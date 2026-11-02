@@ -1253,6 +1253,7 @@ vayu_scan_run(const struct vayu_scan_ops *o)
 		return -1;
 	}
 	tx_ops = o;
+	vayu_net_sta_attach(o->mac);            /* W25o: Apple80211 has a station before the scan */
 	o->log("vayu-wifi: w22: scan stage: reg events %u (rules %u, country %s), freq_avoid events %u\n",
 	    sc.reg_events, sc.nrules, sc.reg_seen ? sc.alpha2 : "-", sc.avoid_events);
 	(void)htt_setup(o);

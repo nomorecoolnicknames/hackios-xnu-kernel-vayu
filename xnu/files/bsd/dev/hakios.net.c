@@ -419,6 +419,33 @@ hakios_net_attach(const struct hakios_net_link *link)
 	return true;
 }
 
+bool
+hakios_net_has_ipv4(unsigned unit)
+{
+	struct net_if *n = net_if_unit(unit);
+	ifaddr_t *list = NULL;
+	bool found = false;
+
+	if (n == NULL || n->ifp == NULL) {
+		return false;
+	}
+	if (ifnet_get_address_list(n->ifp, &list) != 0 || list == NULL) {
+		return false;
+	}
+	for (unsigned i = 0; list[i] != NULL && !found; i++) {
+		struct sockaddr_storage storage;
+		struct sockaddr_in *sin = (struct sockaddr_in *)(void *)&storage;
+
+		if (ifaddr_address(list[i], (struct sockaddr *)(void *)&storage, sizeof(storage)) == 0 &&
+		    storage.ss_family == AF_INET && sin->sin_addr.s_addr != 0 &&
+		    (ntohl(sin->sin_addr.s_addr) >> 16) != 0xa9fe) {         /* not 169.254/16 */
+			found = true;
+		}
+	}
+	ifnet_free_address_list(list);
+	return found;
+}
+
 void
 hakios_net_init(void)
 {

@@ -59,6 +59,8 @@ void hakios_net_link_state(bool up);
 void hakios_net_link_state_unit(unsigned unit, bool up);
 
 void hakios_net_init(void);            /* the links there are: each looks for its hardware (or its boot-arg) */
+/* W25o: does en<unit> have a usable IPv4 address (not 0.0.0.0, not 169.254/16)? */
+bool hakios_net_has_ipv4(unsigned unit);
 /* an Apple80211 request (SIOCGA80211, SIOCSA80211) for the interface of a radio: hakios.apple80211.c */
 errno_t hakios_apple80211_ioctl(u_long command, void *data);
 void hakios_virtio_net_init(void);     /* boot-arg virtio_net=1: QEMU's virtio network device */

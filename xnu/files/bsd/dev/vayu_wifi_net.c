@@ -1,6 +1,9 @@
 /*
- * W25: the data path after the handshake — en0 on the Wi-Fi link, and (behind
- * vayu_wifi_dhcp=1) a minimal DHCP client with an ARP/ICMP proof that the network is reachable.
+ * W25: the data path after the handshake — en0 on the Wi-Fi link, and (behind vayu_wifi_dhcp)
+ * a minimal DHCP client with an ARP/ICMP proof that the network is reachable.  vayu_wifi_dhcp=1
+ * starts it at once (a run without userland), vayu_wifi_dhcp=2 only as a fallback: if iOS's
+ * configd has not put an IPv4 address on en0 within 30 s of the link coming up, the kernel asks
+ * for a lease itself and gives en0 the address and default route (W25o).
  *
  * Frames cross here in Ethernet form: the driver converts to and from the native-wifi shape the
  * firmware's HTT data path carries (24-byte header, to/from DS, LLC/SNAP), and hands what arrives
@@ -21,8 +24,13 @@
 #include <mach/mach_types.h>
 #include <kern/clock.h>
 #include <libkern/libkern.h>
+#include <net/if.h>
+#include <net/route.h>
+#include <netinet/in.h>
 #include <pexpert/pexpert.h>
+#include <sys/kpi_socket.h>
 #include <sys/random.h>
+#include <sys/sockio.h>
 #include <sys/errno.h>
 #include <sys/systm.h>
 #include <sys/hakios.net.h>
@@ -45,7 +53,12 @@
 enum dhcp_state { DHCP_OFF, DHCP_INIT, DHCP_SELECTING, DHCP_REQUESTING, DHCP_BOUND, DHCP_FAILED };
 
 static struct {
-	bool started, linked, dhcp_on, keep;
+	bool started, linked, sta_attached, dhcp_on, keep;
+	uint32_t dhcp_mode;             /* 0 off, 1 at once, 2 fallback after 30 s */
+	bool fallback_armed, fallback_said, fallback_bound;
+	uint64_t link_ms;
+	uint32_t chan;                  /* the channel and rssi of the join, for Apple80211's state */
+	int32_t rssi;
 	uint32_t dhcp_state, dhcp_tries, arp_tries, icmp_tries, probe_stage;
 	uint32_t xid;
 	/* W25n: addresses stay in the packet's byte order, as four bytes.  They used to be read
@@ -209,6 +222,93 @@ dhcp_send(uint8_t type)
 	return send_eth(e, ETH_HLEN + total);
 }
 
+
+/* ---- W25o: give the lease to en0 (the kernel's fallback when iOS's configd never got one) ------ */
+
+/* The same bytes as net/if.h's ifaliasreq, which in_control() casts SIOCAIFADDR to (vayu_usbnet_ecm.c). */
+struct in_aliasreq {
+	char ifra_name[IFNAMSIZ];
+	struct sockaddr_in ifra_addr;
+	struct sockaddr_in ifra_broadaddr;
+	struct sockaddr_in ifra_mask;
+};
+
+static uint32_t
+ip4_host(const uint8_t a[4])
+{
+	return (uint32_t)a[0] << 24 | (uint32_t)a[1] << 16 | (uint32_t)a[2] << 8 | a[3];
+}
+
+static void
+net_assign_address(void)
+{
+	struct in_aliasreq ifra;
+	struct sockaddr_in dst, rtmask, gateway;
+	struct ifreq ifr;
+	struct sockaddr_in *sin;
+	socket_t so = NULL;
+	uint32_t ip = ip4_host(net.lease_ip), mask = ip4_host(net.mask);
+	errno_t error;
+
+	if (ip == 0) {
+		return;
+	}
+	if (mask == 0) {
+		mask = 0xffffff00U;
+	}
+	error = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
+	if (error != 0) {
+		net.log("vayu-wifi: W25 S5 dhcp: ERROR no socket to give en0 its address: %d\n", error);
+		return;
+	}
+	memset(&ifr, 0, sizeof(ifr));
+	strlcpy(ifr.ifr_name, "en0", sizeof(ifr.ifr_name));
+	(void)sock_ioctl(so, SIOCPROTOATTACH, &ifr);
+
+	memset(&ifra, 0, sizeof(ifra));
+	strlcpy(ifra.ifra_name, "en0", sizeof(ifra.ifra_name));
+	sin = &ifra.ifra_addr;
+	sin->sin_len = sizeof(*sin);
+	sin->sin_family = AF_INET;
+	sin->sin_addr.s_addr = htonl(ip);
+	sin = &ifra.ifra_mask;
+	sin->sin_len = sizeof(*sin);
+	sin->sin_family = AF_INET;
+	sin->sin_addr.s_addr = htonl(mask);
+	sin = &ifra.ifra_broadaddr;
+	sin->sin_len = sizeof(*sin);
+	sin->sin_family = AF_INET;
+	sin->sin_addr.s_addr = htonl(ip | ~mask);
+	error = sock_ioctl(so, SIOCAIFADDR, &ifra);
+	net.log("vayu-wifi: W25 S5 dhcp: %s en0 %u.%u.%u.%u/%u.%u.%u.%u: %d\n",
+	    error == 0 ? "OK address" : "ERROR address", IP4(net.lease_ip), IP4(net.mask), error);
+
+	memset(&ifr, 0, sizeof(ifr));
+	strlcpy(ifr.ifr_name, "en0", sizeof(ifr.ifr_name));
+	if (sock_ioctl(so, SIOCGIFFLAGS, &ifr) == 0) {
+		ifr.ifr_flags |= IFF_UP;
+		(void)sock_ioctl(so, SIOCSIFFLAGS, &ifr);
+	}
+	sock_close(so);
+
+	if (ip4_host(net.router) != 0) {
+		memset(&dst, 0, sizeof(dst));
+		dst.sin_len = sizeof(dst);
+		dst.sin_family = AF_INET;
+		memset(&rtmask, 0, sizeof(rtmask));
+		rtmask.sin_len = sizeof(rtmask);
+		rtmask.sin_family = AF_INET;
+		memset(&gateway, 0, sizeof(gateway));
+		gateway.sin_len = sizeof(gateway);
+		gateway.sin_family = AF_INET;
+		gateway.sin_addr.s_addr = htonl(ip4_host(net.router));
+		error = rtrequest(RTM_ADD, (struct sockaddr *)(void *)&dst, (struct sockaddr *)(void *)&gateway,
+		    (struct sockaddr *)(void *)&rtmask, RTF_UP | RTF_GATEWAY | RTF_STATIC, NULL);
+		net.log("vayu-wifi: W25 S5 dhcp: %s default route via %u.%u.%u.%u: %d\n",
+		    error == 0 ? "OK" : "ERROR", IP4(net.router), error);
+	}
+}
+
 /* a DHCP message for our xid, from the server's port to ours */
 static void
 dhcp_rx(const uint8_t *e, uint32_t len)
@@ -278,8 +378,12 @@ dhcp_rx(const uint8_t *e, uint32_t len)
 		net.probe_stage = 1;
 		net.arp_tries = 0;
 		net.next_send_ms = now_ms();
-		net.log("vayu-wifi: W25 S5 dhcp: OK bound %u.%u.%u.%u mask %u.%u.%u.%u gw %u.%u.%u.%u dns %u.%u.%u.%u\n",
-		    IP4(net.lease_ip), IP4(net.mask), IP4(net.router), IP4(net.dns));
+		net.log("vayu-wifi: W25 S5 dhcp: OK bound %u.%u.%u.%u mask %u.%u.%u.%u gw %u.%u.%u.%u dns %u.%u.%u.%u%s\n",
+		    IP4(net.lease_ip), IP4(net.mask), IP4(net.router), IP4(net.dns),
+		    net.fallback_bound ? " (fallback)" : "");
+		if (net.fallback_bound || net.dhcp_mode == 1) {
+			net_assign_address();
+		}
 	} else if (type == 6) {                 /* NAK */
 		net.dhcp_state = DHCP_FAILED;
 		net.log("vayu-wifi: W25 S5 dhcp: ERROR nak from the server\n");
@@ -499,10 +603,14 @@ sta_state(struct hakios_sta_state *state)
 		return;
 	}
 	memset(state, 0, sizeof(*state));
-	state->phase = net.linked ? HAKIOS_STA_JOINED : (net.started ? HAKIOS_STA_IDLE : HAKIOS_STA_OFF);
+	state->phase = net.linked ? HAKIOS_STA_JOINED :
+	    (net.sta_attached || net.started ? HAKIOS_STA_IDLE : HAKIOS_STA_OFF);
 	memcpy(state->bss.bssid, net.bssid, 6);
 	memcpy(state->bss.ssid, net.ssid, net.ssid_len);
 	state->bss.ssid_length = (uint8_t)net.ssid_len;
+	state->bss.frequency = (uint16_t)(net.chan <= 13 ? 2407 + net.chan * 5 :
+	    net.chan == 14 ? 2484 : 5000 + net.chan * 5);
+	state->bss.rssi = (int16_t)net.rssi;
 }
 
 static unsigned
@@ -526,7 +634,8 @@ vayu_net_reset(int (*log)(const char *format, ...) __printflike(1, 2))
 	memset(&net, 0, sizeof(net));
 	net.log = log != NULL ? log : printf;
 	PE_parse_boot_argn("vayu_wifi_dhcp", &v, sizeof(v));
-	net.dhcp_on = v != 0;
+	net.dhcp_mode = v <= 2 ? v : 2;         /* (an unknown value behaves as the fallback) */
+	net.dhcp_on = net.dhcp_mode != 0;
 	v = 0;
 	PE_parse_boot_argn("vayu_wifi_keep", &v, sizeof(v));
 	net.keep = v != 0;
@@ -548,9 +657,35 @@ vayu_net_set_tx(int (*tx80211)(const uint8_t *frame, uint32_t len, bool clear),
 	}
 }
 
+/* W25o: the radio is there as soon as the MAC is known (before the scan and the join), so
+ * wifid finds a powered station instead of an interface with nothing behind it. */
+void
+vayu_net_sta_attach(const uint8_t *mac)
+{
+	if (net.mac[0] != 0 && mac != NULL) {
+		return;                         /* (already attached) */
+	}
+	if (mac != NULL) {
+		memcpy(net.mac, mac, 6);
+	}
+	memset(&net_sta_ops, 0, sizeof(net_sta_ops));
+	net_sta_ops.power = sta_power;
+	net_sta_ops.scan = sta_scan;
+	net_sta_ops.heard = sta_heard;
+	net_sta_ops.join = sta_join;
+	net_sta_ops.leave = sta_leave;
+	net_sta_ops.state = sta_state;
+	net_sta_ops.channels = sta_channels;
+	memcpy(net_sta_ops.address, net.mac, 6);
+	hakios_sta_attach(&net_sta_ops);
+	net.sta_attached = true;
+	hakios_apple80211_event(HAKIOS_STA_POWER, 1);
+}
+
 /* Called after the keys are in: en0 comes up and the data path is open. */
 int
-vayu_net_start(const uint8_t *mac, const uint8_t *bssid, const uint8_t *ssid, uint32_t ssid_len)
+vayu_net_start(const uint8_t *mac, const uint8_t *bssid, const uint8_t *ssid, uint32_t ssid_len,
+    uint32_t chan, int32_t rssi)
 {
 	static struct hakios_net_link wifi_link;
 	int error;
@@ -562,6 +697,8 @@ vayu_net_start(const uint8_t *mac, const uint8_t *bssid, const uint8_t *ssid, ui
 	memcpy(net.bssid, bssid, 6);
 	net.ssid_len = ssid_len > sizeof(net.ssid) ? (uint32_t)sizeof(net.ssid) : ssid_len;
 	memcpy(net.ssid, ssid, net.ssid_len);
+	net.chan = chan;
+	net.rssi = rssi;
 
 	memset(&wifi_link, 0, sizeof(wifi_link));
 	wifi_link.name = "vayu-wifi";
@@ -576,28 +713,26 @@ vayu_net_start(const uint8_t *mac, const uint8_t *bssid, const uint8_t *ssid, ui
 		net.log("vayu-wifi: W25 S4 link: ERROR en0 not attached\n");
 		return -1;
 	}
-	memset(&net_sta_ops, 0, sizeof(net_sta_ops));
-	net_sta_ops.power = sta_power;
-	net_sta_ops.scan = sta_scan;
-	net_sta_ops.heard = sta_heard;
-	net_sta_ops.join = sta_join;
-	net_sta_ops.leave = sta_leave;
-	net_sta_ops.state = sta_state;
-	net_sta_ops.channels = sta_channels;
-	memcpy(net_sta_ops.address, net.mac, 6);
-	hakios_sta_attach(&net_sta_ops);
-
 	net.started = true;
 	net.linked = true;
 	hakios_net_link_state(true);
 	net.log("vayu-wifi: W25 S4 link: OK en0 up, MAC xx:xx:xx:xx:%02x:%02x, 802.11 to xx:xx:xx:xx:%02x:%02x\n",
 	    net.mac[4], net.mac[5], net.bssid[4], net.bssid[5]);
-	if (net.dhcp_on) {
+	/* W25o: wifid learns that the station joined from these events as well as from the state
+	 * request; without them the interface is "up" but nothing tells iOS's Wi-Fi side that a
+	 * network is associated. */
+	hakios_apple80211_event(HAKIOS_STA_JOIN_DONE, 0);
+	hakios_apple80211_event(HAKIOS_STA_LINK, 1);
+	net.link_ms = now_ms();
+	if (net.dhcp_mode == 1) {
 		net.dhcp_state = DHCP_INIT;
 		net.dhcp_tries = 0;
 		read_random(&net.xid, sizeof(net.xid));
 		net.next_send_ms = now_ms();
 		net.log("vayu-wifi: W25 S5 dhcp: OK client on (xid %#x)\n", net.xid);
+	} else if (net.dhcp_mode == 2) {
+		net.fallback_armed = true;
+		net.log("vayu-wifi: W25 S5 dhcp: OK fallback armed: iOS has 30 s, then the kernel asks\n");
 	}
 	return 0;
 }
@@ -622,8 +757,29 @@ vayu_net_linked(void)
 int
 vayu_net_poll(void)
 {
-	uint64_t now;
+	uint64_t now = now_ms();
 
+	/* W25o: the fallback (vayu_wifi_dhcp=2): give iOS's configd 30 s, then ask ourselves --
+	 * but only if en0 really has no IPv4 address by then. */
+	if (net.dhcp_mode == 2 && net.dhcp_state == DHCP_OFF && net.fallback_armed &&
+	    now - net.link_ms >= 30000) {
+		net.fallback_armed = false;
+		if (hakios_net_has_ipv4(0)) {
+			if (!net.fallback_said) {
+				net.fallback_said = true;
+				net.log("vayu-wifi: W25 S5 dhcp: OK iOS has an IPv4 address on en0, no fallback\n");
+			}
+		} else {
+			net.fallback_said = true;
+			net.fallback_bound = true;
+			net.dhcp_state = DHCP_INIT;
+			net.dhcp_tries = 0;
+			read_random(&net.xid, sizeof(net.xid));
+			net.next_send_ms = now;
+			net.log("vayu-wifi: W25 S5 dhcp: ERROR no IPv4 on en0 after 30 s, fallback client on (xid %#x)\n",
+			    net.xid);
+		}
+	}
 	if (!net.dhcp_on || net.dhcp_state == DHCP_OFF || net.dhcp_state == DHCP_FAILED) {
 		return net.dhcp_state == DHCP_BOUND ? 0 : (net.dhcp_state == DHCP_FAILED ? -1 : 1);
 	}
