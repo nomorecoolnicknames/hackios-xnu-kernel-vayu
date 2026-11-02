@@ -1,0 +1,324 @@
+Subject: [PATCH] vayu_wifi W25n: the HTT TX slot was freed before its busy bit was set (pool leaked
+ all 64 slots after ~90 frames); kernel DHCP off by default; addresses kept in wire order
+
+Base: /mnt/ramdisk/ds-wifi2 as run 143839 (kernel mach-wifi25m).  WPA2 completes and the link
+holds; iOS configd itself gets 10.1.30.41 over DHCP, then TX dies: "frames tx 92 ... 52/285/371
+dropped" while rx keeps growing, and the counters read "94 sent, 94 completed by the firmware;
+status 0:89 1:3 2:2".
+
+The bug: vayu_scan_tx_frame() set the slot's bit in tx_busy only AFTER tx_ops->htt_send()
+returned.  tx_frame() runs on the interface's thread; the completions are processed by the poll
+thread, and htt_send waits for the CE doorbell (the log's "done after 1 ms").  A completion could
+therefore be processed for a frame whose bit was not up yet: the handler cleared nothing, the
+sender then set the bit, and the slot stayed busy for good.  Roughly one slot leaked per burst
+until all 64 were gone -- after 92 frames every new frame found id == TX_SLOTS and was dropped in
+our code (net.tx_drop), which is exactly the 52 -> 285 -> 371 growth while tx stayed at 92.
+
+Changes:
+ - bsd/dev/vayu_wifi_scan.c: the busy bit goes up before the send (and comes off again if the send
+   fails); the completion handler and the allocator both take tx_lock, so a free cannot be lost
+   between them.  Drops are counted by reason (no slot, send, length, pool).
+ - a line every 10 s (bsd/dev/vayu_wifi_sta.c, keep mode): sent, completed, the completion status
+   histogram, slots in flight / free of 64, the four drop counters, and the WMI endpoint's HTC
+   credits (vayu_htcc_credits(); the HTT endpoint has no credit flow).
+ - bsd/dev/vayu_wifi_net.c: the kernel DHCP client is off unless vayu_wifi_dhcp=1 (iOS configd is
+   the one that should hold the lease; ours raced it and NAKed).  When it is on, addresses are
+   kept as the four bytes of the packet: option 50 was built from a host-order u32, so the
+   REQUEST asked for 41.30.1.10 instead of 10.1.30.41 and the server NAKed; the offer/bound lines
+   printed the same way.  Options 50/54, ARP and ICMP now use the bytes as received.
+ - job 1011 no longer passes vayu_wifi_dhcp=1.
+
+Expected on the next run: no growth of "drops: no slot" after the first bursts, "slots in flight"
+staying small (single digits), tx climbing with iOS traffic, and no "nak from the server" (our
+client stays off; configd keeps its lease).
+
+Artifact: /mnt/ramdisk/ds-wifi-out/mach-wifi25n.bin 16461472 B
+sha256 a940d1631c49c85f4ad7ee31f0a3bb522b04dad4896f7a891b9cc03c83c78523
+
+--- a/bsd/dev/vayu_wifi_scan.c
++++ b/bsd/dev/vayu_wifi_scan.c
+@@ -195,6 +195,8 @@
+ static uint64_t tx_busy;
+ static uint32_t tx_sent, tx_done, tx_fail;
+ static uint32_t tx_status[8];           /* completions by the firmware's status nibble */
++/* W25n: why a frame was not sent (the numbers the 10 s line prints). */
++static uint32_t tx_drop_noslot, tx_drop_send, tx_drop_len, tx_drop_pool;
+ /* W25j: every data frame gets a fresh 802.11 sequence number.  The AP's duplicate cache holds
+  * the last sequence number per TID and address for a second or two and drops a frame that
+  * repeats it: W25i sent 2/4 and 4/4 (and then every data frame) as sequence 0, so the AP took
+@@ -1094,6 +1096,7 @@
+ 	int rc;
+ 
+ 	if (tx_ops == NULL || sc.htt_va == 0 || f == NULL || len == 0 || len > TX_SLOT_SIZE) {
++		tx_drop_len++;
+ 		return -1;
+ 	}
+ 	if (tx_pool_pa == 0) {
+@@ -1103,6 +1106,7 @@
+ 
+ 		if (pool == 0) {
+ 			tx_ops->log("vayu-wifi: W25 S4 tx: ERROR no HTT tx pool\n");
++			tx_drop_pool++;
+ 			return -1;
+ 		}
+ 		tx_pool_va = ml_io_map_unmappable((vm_offset_t)pool, TX_SLOTS * TX_SLOT_SIZE, VM_WIMG_WCOMB);
+@@ -1119,9 +1123,16 @@
+ 		;
+ 	}
+ 	if (id == TX_SLOTS) {
++		tx_drop_noslot++;
+ 		lck_mtx_unlock(&tx_lock);
+ 		return -1;
+ 	}
++	/* W25n: the bit goes up before the frame does.  tx_frame() runs on the interface's thread
++	 * while the completion is processed by the poll thread; the send waits for the CE doorbell
++	 * (about a millisecond), so a completion could clear a bit that was not set yet and the
++	 * slot stayed busy for good.  After ~64 such races every new frame found the pool full --
++	 * the log's "frames tx 92 ... 371 dropped". */
++	tx_busy |= 1ULL << id;
+ 	pa = tx_pool_pa + (uint64_t)id * TX_SLOT_SIZE;
+ 	{
+ 		uint8_t *dst = (uint8_t *)(tx_pool_va + (vm_offset_t)(pa - tx_pool_pa));
+@@ -1172,10 +1183,11 @@
+ 	memcpy(p, (const void *)(tx_pool_va + (vm_offset_t)(pa - tx_pool_pa)), pf);
+ 	rc = tx_ops->htt_send(m, 20 + pf);
+ 	if (rc != 0) {
++		tx_busy &= ~(1ULL << id);
++		tx_drop_send++;
+ 		lck_mtx_unlock(&tx_lock);
+ 		return -1;
+ 	}
+-	tx_busy |= 1ULL << id;
+ 	tx_sent++;
+ 	lck_mtx_unlock(&tx_lock);
+ 	return 0;
+@@ -1186,6 +1198,7 @@
+ {
+ 	uint32_t n = p[2], st = p[1] & 7U, i;
+ 
++	lck_mtx_lock(&tx_lock);
+ 	for (i = 0; i < n && 4 + 2 * (i + 1) <= len; i++) {
+ 		uint32_t id = rd16(p + 4 + 2 * i);
+ 
+@@ -1193,6 +1206,7 @@
+ 			tx_busy &= ~(1ULL << id);
+ 		}
+ 	}
++	lck_mtx_unlock(&tx_lock);
+ 	tx_done += n;
+ 	if (st < 8) {
+ 		tx_status[st] += n;
+@@ -1207,14 +1221,21 @@
+ 
+ 
+ void
+-vayu_scan_tx_summary(void)
+-{
+-	if (slog == NULL || tx_sent == 0) {
+-		return;
+-	}
+-	slog("vayu-wifi: W25 tx: %u sent, %u completed by the firmware; status 0:%u 1:%u 2:%u 3:%u 4:%u "
+-	    "5:%u 6:%u 7:%u\n", tx_sent, tx_done, tx_status[0], tx_status[1], tx_status[2], tx_status[3],
+-	    tx_status[4], tx_status[5], tx_status[6], tx_status[7]);
++vayu_scan_tx_stats(uint32_t credits)
++{
++	uint32_t busy;
++
++	if (slog == NULL) {
++		return;
++	}
++	lck_mtx_lock(&tx_lock);
++	busy = (uint32_t)__builtin_popcountll(tx_busy);
++	lck_mtx_unlock(&tx_lock);
++	slog("vayu-wifi: W25 tx: %u sent, %u completed (status 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7:%u); "
++	    "slots in flight %u, free %u of %u; drops: no slot %u, send %u, length %u, pool %u; wmi credits %u\n",
++	    tx_sent, tx_done, tx_status[0], tx_status[1], tx_status[2], tx_status[3], tx_status[4],
++	    tx_status[5], tx_status[6], tx_status[7], busy, TX_SLOTS - busy, TX_SLOTS, tx_drop_noslot,
++	    tx_drop_send, tx_drop_len, tx_drop_pool, credits);
+ }
+ 
+ int
+--- a/bsd/sys/vayu_wifi_scan.h
++++ b/bsd/sys/vayu_wifi_scan.h
+@@ -69,7 +69,7 @@
+ int vayu_scan_run(const struct vayu_scan_ops *ops);
+ /* W25: one native-wifi data frame on the HTT endpoint (clear = unencrypted, for EAPOL). 0 = sent. */
+ int vayu_scan_tx_frame(const uint8_t *frame, uint32_t len, bool clear);
+-/* W25j: the TX counters, one line: sent, completed, completions by firmware status. */
+-void vayu_scan_tx_summary(void);
++/* W25n: the TX counters, one line: sent, completed, status, slots in flight/free, drops, credits. */
++void vayu_scan_tx_stats(uint32_t wmi_credits);
+ 
+ #endif /* _SYS_VAYU_WIFI_SCAN_H_ */
+--- a/bsd/dev/vayu_wifi_net.c
++++ b/bsd/dev/vayu_wifi_net.c
+@@ -40,6 +40,7 @@
+ #define DHCP_CLIENT_PORT        68U
+ #define DHCP_SERVER_PORT        67U
+ #define DHCP_MAGIC              0x63825363U
++#define IP4(a)                  (a)[0], (a)[1], (a)[2], (a)[3]
+ 
+ enum dhcp_state { DHCP_OFF, DHCP_INIT, DHCP_SELECTING, DHCP_REQUESTING, DHCP_BOUND, DHCP_FAILED };
+ 
+@@ -47,7 +48,11 @@
+ 	bool started, linked, dhcp_on, keep;
+ 	uint32_t dhcp_state, dhcp_tries, arp_tries, icmp_tries, probe_stage;
+ 	uint32_t xid;
+-	uint32_t offered_ip, server_ip, lease_ip, mask, router, dns;
++	/* W25n: addresses stay in the packet's byte order, as four bytes.  They used to be read
++	 * with memcpy into a u32 and written back the same way, but the requested-address option
++	 * (50) was built from a host-order value, so the REQUEST asked for 41.30.1.10 instead of
++	 * 10.1.30.41 and the server NAKed us.  Printing was swapped for the same reason. */
++	uint8_t offered_ip[4], server_ip[4], lease_ip[4], mask[4], router[4], dns[4];
+ 	uint32_t dhcp_seen;
+ 	uint64_t next_send_ms, deadline_ms;
+ 	uint32_t tx_frames, tx_bytes, tx_drop, rx_frames, rx_bytes, rx_drop;
+@@ -179,8 +184,8 @@
+ 	*p++ = 0x63;
+ 	p = dhcp_options(p, 53, 1, &type);
+ 	if (type == 3) {                        /* REQUEST */
+-		p = dhcp_options(p, 50, 4, (const uint8_t *)&net.offered_ip);
+-		p = dhcp_options(p, 54, 4, (const uint8_t *)&net.server_ip);
++		p = dhcp_options(p, 50, 4, net.offered_ip);
++		p = dhcp_options(p, 54, 4, net.server_ip);
+ 	}
+ 	static const uint8_t want[4] = { 1, 3, 6, 15 };
+ 	p = dhcp_options(p, 55, sizeof(want), want);
+@@ -247,41 +252,34 @@
+ 		if (p[0] == 53 && p[1] >= 1) {
+ 			type = p[2];
+ 		} else if (p[0] == 1 && p[1] == 4) {
+-			memcpy(&net.mask, p + 2, 4);
++			memcpy(net.mask, p + 2, 4);
+ 		} else if (p[0] == 3 && p[1] >= 4) {
+-			memcpy(&net.router, p + 2, 4);
++			memcpy(net.router, p + 2, 4);
+ 		} else if (p[0] == 6 && p[1] >= 4) {
+-			memcpy(&net.dns, p + 2, 4);
+-		}
+-	}
+-	msg = (uint32_t)b[16] << 24 | (uint32_t)b[17] << 16 | (uint32_t)b[18] << 8 | b[19];
++			memcpy(net.dns, p + 2, 4);
++		}
++	}
+ 	if (type == 2 && net.dhcp_state == DHCP_SELECTING) {     /* OFFER */
+-		net.offered_ip = msg;
++		memcpy(net.offered_ip, b + 16, 4);
++		memset(net.server_ip, 0, 4);                    /* server id is an option */
+ 		for (p = b + 240; p + 2 <= end && *p != 255 && p + 2 + p[1] <= end; p += 2 + p[1]) {
+ 			if (p[0] == 54 && p[1] >= 4) {
+-				memcpy(&net.server_ip, p + 2, 4);
++				memcpy(net.server_ip, p + 2, 4);
+ 			}
+ 		}
+ 		net.dhcp_state = DHCP_REQUESTING;
+ 		net.dhcp_tries = 0;
+ 		net.next_send_ms = now_ms();
+ 		net.log("vayu-wifi: W25 S5 dhcp: OK offer %u.%u.%u.%u from %u.%u.%u.%u\n",
+-		    (net.offered_ip >> 24) & 0xff, (net.offered_ip >> 16) & 0xff,
+-		    (net.offered_ip >> 8) & 0xff, net.offered_ip & 0xff,
+-		    (net.server_ip >> 24) & 0xff, (net.server_ip >> 16) & 0xff,
+-		    (net.server_ip >> 8) & 0xff, net.server_ip & 0xff);
++		    IP4(net.offered_ip), IP4(net.server_ip));
+ 	} else if (type == 5 && (net.dhcp_state == DHCP_REQUESTING || net.dhcp_state == DHCP_SELECTING)) {  /* ACK */
+-		net.lease_ip = msg;
++		memcpy(net.lease_ip, b + 16, 4);
+ 		net.dhcp_state = DHCP_BOUND;
+ 		net.probe_stage = 1;
+ 		net.arp_tries = 0;
+ 		net.next_send_ms = now_ms();
+ 		net.log("vayu-wifi: W25 S5 dhcp: OK bound %u.%u.%u.%u mask %u.%u.%u.%u gw %u.%u.%u.%u dns %u.%u.%u.%u\n",
+-		    (net.lease_ip >> 24) & 0xff, (net.lease_ip >> 16) & 0xff, (net.lease_ip >> 8) & 0xff,
+-		    net.lease_ip & 0xff, (net.mask >> 24) & 0xff, (net.mask >> 16) & 0xff,
+-		    (net.mask >> 8) & 0xff, net.mask & 0xff, (net.router >> 24) & 0xff,
+-		    (net.router >> 16) & 0xff, (net.router >> 8) & 0xff, net.router & 0xff,
+-		    (net.dns >> 24) & 0xff, (net.dns >> 16) & 0xff, (net.dns >> 8) & 0xff, net.dns & 0xff);
++		    IP4(net.lease_ip), IP4(net.mask), IP4(net.router), IP4(net.dns));
+ 	} else if (type == 6) {                 /* NAK */
+ 		net.dhcp_state = DHCP_FAILED;
+ 		net.log("vayu-wifi: W25 S5 dhcp: ERROR nak from the server\n");
+@@ -308,9 +306,9 @@
+ 	e[20] = 0x00;
+ 	e[21] = 0x01;                           /* request */
+ 	memcpy(e + 22, net.mac, 6);
+-	memcpy(e + 28, &net.lease_ip, 4);
++	memcpy(e + 28, net.lease_ip, 4);
+ 	memset(e + 32, 0, 6);
+-	memcpy(e + 38, &net.router, 4);
++	memcpy(e + 38, net.router, 4);
+ 	return send_eth(e, sizeof(e));
+ }
+ 
+@@ -320,14 +318,12 @@
+ 	if (len < 42 || e[20] != 0 || e[21] != 2) {
+ 		return;
+ 	}
+-	if (memcmp(e + 38, &net.lease_ip, 4) == 0 && net.probe_stage == 1) {
++	if (memcmp(e + 38, net.lease_ip, 4) == 0 && net.probe_stage == 1) {
+ 		memcpy(net.router_mac, e + 22, 6);
+ 		net.probe_stage = 2;
+ 		net.icmp_tries = 0;
+ 		net.next_send_ms = now_ms();
+-		net.log("vayu-wifi: W25 S6 probe: OK arp reply from the router %u.%u.%u.%u\n",
+-		    (net.router >> 24) & 0xff, (net.router >> 16) & 0xff, (net.router >> 8) & 0xff,
+-		    net.router & 0xff);
++		net.log("vayu-wifi: W25 S6 probe: OK arp reply from the router %u.%u.%u.%u\n", IP4(net.router));
+ 	}
+ }
+ 
+@@ -351,8 +347,8 @@
+ 	ip[3] = (uint8_t)total;
+ 	ip[8] = 64;
+ 	ip[9] = (uint8_t)IP_PROTO_ICMP;
+-	memcpy(ip + 12, &net.lease_ip, 4);
+-	memcpy(ip + 16, &net.router, 4);
++	memcpy(ip + 12, net.lease_ip, 4);
++	memcpy(ip + 16, net.router, 4);
+ 	{
+ 		uint16_t sum = fold(sum16(ip, 20, 0));
+ 
+--- a/bsd/dev/vayu_wifi_htc_connect.c
++++ b/bsd/dev/vayu_wifi_htc_connect.c
+@@ -88,6 +88,12 @@
+ 
+ static int htcc_send_init(void);
+ 
++uint32_t
++vayu_htcc_credits(void)
++{
++	return htcc.wmi_credits;
++}
++
+ static uint16_t
+ htcc_le16(const uint8_t *p)
+ {
+--- a/bsd/sys/vayu_wifi_htc_connect.h
++++ b/bsd/sys/vayu_wifi_htc_connect.h
+@@ -70,5 +70,7 @@
+ 
+ /* CONNECT x2, SETUP_COMPLETE_EX, 3 s RX dump.  0 = everything sent and both services connected. */
+ int vayu_htcc_run(const struct vayu_htcc_ops *ops);
++/* W25n: the WMI endpoint's HTC credits, as last seen (HTT has none). */
++uint32_t vayu_htcc_credits(void);
+ 
+ #endif /* _SYS_VAYU_WIFI_HTC_CONNECT_H_ */
+--- a/bsd/dev/vayu_wifi_sta.c
++++ b/bsd/dev/vayu_wifi_sta.c
+@@ -42,6 +42,7 @@
+ #include <vm/memory_types.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <sys/vayu_wifi_htc_connect.h>
+ #include <sys/vayu_wifi_net.h>
+ #include <sys/vayu_wifi_rsn.h>
+ #include <sys/vayu_wifi_scan.h>
+@@ -1073,6 +1074,9 @@
+ 			if (waited >= KEEP_SECS * 1000U) {
+ 				break;
+ 			}
++			if (waited % 10000U == 0) {
++				vayu_scan_tx_stats(vayu_htcc_credits());   /* W25n: slots, drops, credits */
++			}
+ 			if (waited % 30000U == 0) {
+ 				vayu_net_summary();
+ 			}

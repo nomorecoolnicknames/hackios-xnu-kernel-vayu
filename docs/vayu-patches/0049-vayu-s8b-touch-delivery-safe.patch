@@ -1,0 +1,644 @@
+--- a/userland/src/inject.c
++++ b/userland/src/inject.c
+@@ -44,6 +44,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/sysctl.h>
++#include <sys/mman.h>
++#include <libkern/OSCacheControl.h>
+ #include <signal.h>
+ #include <sys/ucontext.h>
+ #include <unistd.h>
+@@ -1452,6 +1454,175 @@
+ 	});
+ }
+ 
++/*
++ * S8b: 120 Hz touch delivery, the safe half of S8's hook (boot-arg s8_touch=1; off by default).
++ *
++ * S8 (TEST26) walked every class of the process in this library's constructor
++ * (objc_getClassList(), then class_getInstanceMethod()/class_getClassMethod() on each) to find
++ * -[<class> _shouldGenerate120HzEvents]. In backboardd the walk never came back: the window server
++ * stopped right after "s8: no _MobileGestalt_get_touchDelivery120Hz in this process" and the
++ * display was never opened, so the loader's splash stayed on the panel. A constructor must not pay
++ * for a runtime-wide sweep: realizing every class takes the Objective-C lock for as long as it
++ * likes, in a process whose other threads are already running.
++ *
++ * This version asks nothing of the process as a whole: the MobileGestalt getter is asked and, if it
++ * answers 0, patched to answer 1 (this process's copy of the page only), and the same question is
++ * put to the few classes that can own the selector, looked up by name. Every answer is logged. Off
++ * by default: the F12 boot (kernel test26, root without this hook) already showed 120 Hz to the
++ * owner, so this is an experiment, not a default.
++ */
++/*
++ * S8b: 120 Hz touch delivery, the safe half of S8's hook. Off by default; `s8_touch=1` asks the
++ * classes by name, `s8_touch=2` also sweeps the registered classes whose names begin with UI/_UI
++ * (a snapshot of the class list and a name test, no method lookup on anything else).
++ *
++ * S8 (TEST26) walked every class of the process in this library's constructor
++ * (objc_getClassList(), then class_getInstanceMethod()/class_getClassMethod() on each) to find
++ * -[<class> _shouldGenerate120HzEvents]. In backboardd and SpringBoard the walk never came back: no
++ * result line followed it, while the small containermanagerd printed one, and the window server
++ * never drew a frame (run 050024: 0 "hakios-gl", 0 frame windows). A constructor must not realize
++ * every class of a process: that is a runtime-wide sweep under the Objective-C lock.
++ *
++ * What is left: the MobileGestalt getter is asked and, if it answers 0, patched to answer 1 (this
++ * process's copy of the page only), and -_shouldGenerate120HzEvents is answered YES where it is
++ * found -- on nine classes by name, and in mode 2 on the UI* classes of the class list, whose names
++ * are read without realizing them. Every answer is logged. Off by default: the F12 boot (kernel
++ * test26, root without this hook) already showed 120 Hz to the owner, so this is an experiment.
++ */
++typedef bool (*s8_bool_answer)(void);
++
++static BOOL
++s8_yes(id self, SEL selector)
++{
++	(void)self;
++	(void)selector;
++	return YES;
++}
++
++/* 0: off; 1: the named classes; 2: and the UI* classes of the list. */
++static int
++s8_touch_wanted(void)
++{
++	static int mode = -1;
++
++	if (mode < 0) {
++		char arguments[4096] = "";
++		size_t size = sizeof(arguments) - 1;
++		const char *at = NULL;
++
++		mode = 0;
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
++			at = strstr(arguments, "s8_touch=");
++		}
++		if (at != NULL && (at == arguments || at[-1] == ' ') && at[10] >= '1' && at[10] <= '2') {
++			mode = at[10] - '0';
++		}
++	}
++	return mode;
++}
++
++/* Answer YES to -[cls _shouldGenerate120HzEvents] when it has that method and it returns a BOOL.
++ * Returns 1 when the class answers YES afterwards. */
++static unsigned
++s8_touch_class(Class cls, SEL selector, const char *name)
++{
++	Method method;
++	const char *types;
++	IMP old;
++
++	if (cls == NULL) {
++		return 0;
++	}
++	method = class_getInstanceMethod(cls, selector);
++	if (method == NULL) {
++		method = class_getClassMethod(cls, selector);
++	}
++	if (method == NULL) {
++		return 0;
++	}
++	types = method_getTypeEncoding(method);
++	old = method_getImplementation(method);
++	if (types == NULL || (types[0] != 'B' && types[0] != 'c')) {
++		say("hakios: %s: s8_touch: -[%s _shouldGenerate120HzEvents] has type %s: left alone\n", getprogname(), name,
++		    types != NULL ? types : "?");
++		return 0;
++	}
++	if (old != (IMP)s8_yes) {
++		method_setImplementation(method, (IMP)s8_yes);
++	}
++	say("hakios: %s: s8_touch: -[%s _shouldGenerate120HzEvents] answers YES (was %p)\n", getprogname(), name, old);
++	return 1;
++}
++
++static void
++s8_touch_delivery(void)
++{
++	static const char *const owners[] = {
++		"UIApplication", "UIResponder", "UIWindow", "UIScene", "UIWindowScene", "UIView", "UIViewController",
++		"UIScrollView", "UIPanGestureRecognizer",
++	};
++	const unsigned total = sizeof(owners) / sizeof(owners[0]);
++	int mode = s8_touch_wanted();
++	void *getter;
++	SEL selector;
++	unsigned replaced = 0;
++
++	if (mode <= 0) {
++		return;
++	}
++	say("hakios: %s: s8_touch=%d: 120 Hz touch delivery is to be asked for\n", getprogname(), mode);
++	getter = dlsym(RTLD_DEFAULT, "_MobileGestalt_get_touchDelivery120Hz");
++	selector = sel_registerName("_shouldGenerate120HzEvents");
++	if (getter == NULL) {
++		say("hakios: %s: s8_touch: no _MobileGestalt_get_touchDelivery120Hz in this process\n", getprogname());
++	} else {
++		bool answer = ((s8_bool_answer)getter)();
++
++		say("hakios: %s: s8_touch: _MobileGestalt_get_touchDelivery120Hz at %p answers %d\n", getprogname(), getter,
++		    answer ? 1 : 0);
++		if (!answer) {
++			/* mov w0, #1 ; ret -- a bool comes back in w0; the page is the shared cache's, copied privately */
++			static const uint32_t answer_yes[2] = { 0x52800020u, 0xd65f03c0u };
++			uintptr_t page = (uintptr_t)getter & ~(uintptr_t)0x3fffu;
++
++			if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
++				memcpy(getter, answer_yes, sizeof(answer_yes));
++				sys_icache_invalidate(getter, sizeof(answer_yes));
++				say("hakios: %s: s8_touch: patched it to answer 1\n", getprogname());
++			} else {
++				say("hakios: %s: s8_touch: mprotect(%p): %s\n", getprogname(), (void *)page, strerror(errno));
++			}
++		}
++	}
++	for (unsigned i = 0; i < total; i++) {
++		replaced += s8_touch_class(objc_getClass(owners[i]), selector, owners[i]);
++	}
++	say("hakios: %s: s8_touch=%d: %u of %u named class(es) answer YES\n", getprogname(), mode, replaced, total);
++	if (mode >= 2) {
++		int count = objc_getClassList(NULL, 0);
++		Class *classes = count > 0 ? malloc(sizeof(Class) * (size_t)count) : NULL;
++		unsigned swept = 0;
++
++		if (classes != NULL) {
++			int registered = count;
++
++			count = objc_getClassList(classes, count);
++			for (int i = 0; i < count; i++) {
++				const char *name = class_getName(classes[i]);
++
++				if (name == NULL || (strncmp(name, "UI", 2) != 0 && strncmp(name, "_UI", 3) != 0)) {
++					continue;
++				}
++				swept++;
++				replaced += s8_touch_class(classes[i], selector, name);
++			}
++			say("hakios: %s: s8_touch=2: %d classes registered, %u with a UI name, %u answer YES in all\n", getprogname(),
++			    registered, swept, replaced);
++			free(classes);
++		}
++	}
++}
++
+ __attribute__((constructor))
+ static void
+ hakios_init(void)
+@@ -1465,6 +1636,7 @@
+ 	}
+ 	slide = (uintptr_t)cache - CACHE_BASE;
+ 	t120_setup();
++	s8_touch_delivery();
+ 	if (strcmp(name, "backboardd") == 0) {
+ 		char arguments[4096] = "";
+ 		size_t size = sizeof(arguments) - 1;
+--- a/userland/src/inject_sb.c
++++ b/userland/src/inject_sb.c
+@@ -47,9 +47,12 @@
+ #include <sys/stat.h>
+ #include <stdbool.h>
+ #include <stdio.h>
++#include <errno.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/mman.h>
+ #include <sys/sysctl.h>
++#include <libkern/OSCacheControl.h>
+ #include <unistd.h>
+ 
+ /* where what is said goes: the standard error, which is the console's for SpringBoard (an application's is nowhere) */
+@@ -1249,6 +1252,175 @@
+ }
+ 
+ /*
++ * S8b: 120 Hz touch delivery, the safe half of S8's hook (boot-arg s8_touch=1; off by default).
++ *
++ * S8 (TEST26) walked every class of the process in this library's constructor
++ * (objc_getClassList(), then class_getInstanceMethod()/class_getClassMethod() on each) to find
++ * -[<class> _shouldGenerate120HzEvents]. In backboardd and SpringBoard the walk never came back (no
++ * "no _shouldGenerate120HzEvents" line after it, while the small containermanagerd printed one):
++ * the window server stopped and the loader's splash stayed on the panel. A constructor must not pay
++ * for a runtime-wide sweep: realizing every class takes the Objective-C lock for as long as it
++ * likes, in a process whose other threads are already running.
++ *
++ * This version asks nothing of the process as a whole: the MobileGestalt getter is asked and, if it
++ * answers 0, patched to answer 1 (this process's copy of the page only), and the same question is
++ * put to the few classes that can own the selector, looked up by name. Every answer is logged. Off
++ * by default: the F12 boot (kernel test26, root without this hook) already showed 120 Hz to the
++ * owner, so this is an experiment, not a default.
++ */
++/*
++ * S8b: 120 Hz touch delivery, the safe half of S8's hook. Off by default; `s8_touch=1` asks the
++ * classes by name, `s8_touch=2` also sweeps the registered classes whose names begin with UI/_UI
++ * (a snapshot of the class list and a name test, no method lookup on anything else).
++ *
++ * S8 (TEST26) walked every class of the process in this library's constructor
++ * (objc_getClassList(), then class_getInstanceMethod()/class_getClassMethod() on each) to find
++ * -[<class> _shouldGenerate120HzEvents]. In backboardd and SpringBoard the walk never came back: no
++ * result line followed it, while the small containermanagerd printed one, and the window server
++ * never drew a frame (run 050024: 0 "hakios-gl", 0 frame windows). A constructor must not realize
++ * every class of a process: that is a runtime-wide sweep under the Objective-C lock.
++ *
++ * What is left: the MobileGestalt getter is asked and, if it answers 0, patched to answer 1 (this
++ * process's copy of the page only), and -_shouldGenerate120HzEvents is answered YES where it is
++ * found -- on nine classes by name, and in mode 2 on the UI* classes of the class list, whose names
++ * are read without realizing them. Every answer is logged. Off by default: the F12 boot (kernel
++ * test26, root without this hook) already showed 120 Hz to the owner, so this is an experiment.
++ */
++typedef bool (*s8_bool_answer)(void);
++
++static BOOL
++s8_yes(id self, SEL selector)
++{
++	(void)self;
++	(void)selector;
++	return YES;
++}
++
++/* 0: off; 1: the named classes; 2: and the UI* classes of the list. */
++static int
++s8_touch_wanted(void)
++{
++	static int mode = -1;
++
++	if (mode < 0) {
++		char arguments[4096] = "";
++		size_t size = sizeof(arguments) - 1;
++		const char *at = NULL;
++
++		mode = 0;
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
++			at = strstr(arguments, "s8_touch=");
++		}
++		if (at != NULL && (at == arguments || at[-1] == ' ') && at[10] >= '1' && at[10] <= '2') {
++			mode = at[10] - '0';
++		}
++	}
++	return mode;
++}
++
++/* Answer YES to -[cls _shouldGenerate120HzEvents] when it has that method and it returns a BOOL.
++ * Returns 1 when the class answers YES afterwards. */
++static unsigned
++s8_touch_class(Class cls, SEL selector, const char *name)
++{
++	Method method;
++	const char *types;
++	IMP old;
++
++	if (cls == NULL) {
++		return 0;
++	}
++	method = class_getInstanceMethod(cls, selector);
++	if (method == NULL) {
++		method = class_getClassMethod(cls, selector);
++	}
++	if (method == NULL) {
++		return 0;
++	}
++	types = method_getTypeEncoding(method);
++	old = method_getImplementation(method);
++	if (types == NULL || (types[0] != 'B' && types[0] != 'c')) {
++		say("hakios: %s: s8_touch: -[%s _shouldGenerate120HzEvents] has type %s: left alone\n", getprogname(), name,
++		    types != NULL ? types : "?");
++		return 0;
++	}
++	if (old != (IMP)s8_yes) {
++		method_setImplementation(method, (IMP)s8_yes);
++	}
++	say("hakios: %s: s8_touch: -[%s _shouldGenerate120HzEvents] answers YES (was %p)\n", getprogname(), name, old);
++	return 1;
++}
++
++static void
++s8_touch_delivery(void)
++{
++	static const char *const owners[] = {
++		"UIApplication", "UIResponder", "UIWindow", "UIScene", "UIWindowScene", "UIView", "UIViewController",
++		"UIScrollView", "UIPanGestureRecognizer",
++	};
++	const unsigned total = sizeof(owners) / sizeof(owners[0]);
++	int mode = s8_touch_wanted();
++	void *getter;
++	SEL selector;
++	unsigned replaced = 0;
++
++	if (mode <= 0) {
++		return;
++	}
++	say("hakios: %s: s8_touch=%d: 120 Hz touch delivery is to be asked for\n", getprogname(), mode);
++	getter = dlsym(RTLD_DEFAULT, "_MobileGestalt_get_touchDelivery120Hz");
++	selector = sel_registerName("_shouldGenerate120HzEvents");
++	if (getter == NULL) {
++		say("hakios: %s: s8_touch: no _MobileGestalt_get_touchDelivery120Hz in this process\n", getprogname());
++	} else {
++		bool answer = ((s8_bool_answer)getter)();
++
++		say("hakios: %s: s8_touch: _MobileGestalt_get_touchDelivery120Hz at %p answers %d\n", getprogname(), getter,
++		    answer ? 1 : 0);
++		if (!answer) {
++			/* mov w0, #1 ; ret -- a bool comes back in w0; the page is the shared cache's, copied privately */
++			static const uint32_t answer_yes[2] = { 0x52800020u, 0xd65f03c0u };
++			uintptr_t page = (uintptr_t)getter & ~(uintptr_t)0x3fffu;
++
++			if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
++				memcpy(getter, answer_yes, sizeof(answer_yes));
++				sys_icache_invalidate(getter, sizeof(answer_yes));
++				say("hakios: %s: s8_touch: patched it to answer 1\n", getprogname());
++			} else {
++				say("hakios: %s: s8_touch: mprotect(%p): %s\n", getprogname(), (void *)page, strerror(errno));
++			}
++		}
++	}
++	for (unsigned i = 0; i < total; i++) {
++		replaced += s8_touch_class(objc_getClass(owners[i]), selector, owners[i]);
++	}
++	say("hakios: %s: s8_touch=%d: %u of %u named class(es) answer YES\n", getprogname(), mode, replaced, total);
++	if (mode >= 2) {
++		int count = objc_getClassList(NULL, 0);
++		Class *classes = count > 0 ? malloc(sizeof(Class) * (size_t)count) : NULL;
++		unsigned swept = 0;
++
++		if (classes != NULL) {
++			int registered = count;
++
++			count = objc_getClassList(classes, count);
++			for (int i = 0; i < count; i++) {
++				const char *name = class_getName(classes[i]);
++
++				if (name == NULL || (strncmp(name, "UI", 2) != 0 && strncmp(name, "_UI", 3) != 0)) {
++					continue;
++				}
++				swept++;
++				replaced += s8_touch_class(classes[i], selector, name);
++			}
++			say("hakios: %s: s8_touch=2: %d classes registered, %u with a UI name, %u answer YES in all\n", getprogname(),
++			    registered, swept, replaced);
++			free(classes);
++		}
++	}
++}
++
++/*
+  * Boot-arg fb_120=1: CoreAnimation's 16.7 ms minimum frame duration, off for this process too.
+  * QuartzCore reads the switch as an Info.plist key (CADeviceInfo, 20F66: the CFString at
+  * 0x1d5b6b1b8 passed to CFBundleGetValueForInfoDictionaryKey at 0x1884c2e2c; the spelling without
+@@ -1508,6 +1680,45 @@
+ }
+ 
+ 
++/*
++ * S8b: the activation alert of the fake SIM kept off the screen (S7's essential hook, minimal).
++ *
++ * S7 found the thing that actually ate the touches: with vayu_cell=1 the provisioning status never
++ * says "activated", so -[SBTelephonyManager _setCurrentActivationAlertItem:] presents an
++ * SBActivationFailedAlertItem as a modal SBAlertItemWindow from boot on. That window takes every
++ * touch (backboardd's touchstats named its context) and leaves the application's scene
++ * foreground-inactive, so a scroll draws a frame a second. This root is built from the tree before
++ * S7, so its one essential piece is here: the item is logged and dropped (the original is called
++ * with nil, which is how the method deactivates what is up). Boot-arg s7=1 turns it on, s7=0 off;
++ * without it a boot with no cell driver has no alert either way.
++ */
++static void (*original_activation_alert)(id, SEL, id);
++
++static void
++dropped_activation_alert(id self, SEL cmd, id item)
++{
++	if (item != NULL) {
++		say("hakios: s7=1: dropping the activation alert %s\n", object_getClassName(item));
++	}
++	if (original_activation_alert != NULL) {
++		original_activation_alert(self, cmd, nil);
++	}
++}
++
++static int
++s7_wanted(void)
++{
++	static int wanted = -1;
++
++	if (wanted < 0) {
++		char arguments[4096] = "";
++		size_t size = sizeof(arguments) - 1;
++
++		wanted = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "s7=1") != NULL;
++	}
++	return wanted;
++}
++
+ __attribute__((constructor))
+ static void
+ hakios_springboard_init(void)
+@@ -1521,6 +1732,13 @@
+ 		return;
+ 	}
+ 	t120_setup();
++	s8_touch_delivery();
++	if (s7_wanted()) {
++		original_activation_alert = (void (*)(id, SEL, id))replace_method("SBTelephonyManager",
++		    "_setCurrentActivationAlertItem:", 0x1c4b29e50UL, (IMP)dropped_activation_alert);
++		say("hakios: s7=1: -[SBTelephonyManager _setCurrentActivationAlertItem:] %s\n",
++		    original_activation_alert != NULL ? "replaced (activation alerts are dropped)" : "NOT replaced");
++	}
+ 	if (strcmp(name, "SpringBoard") != 0) {
+ 		static char who[64];
+ 
+--- a/userland/src/inject_app.c
++++ b/userland/src/inject_app.c
+@@ -10,8 +10,11 @@
+  */
+ #include <dispatch/dispatch.h>
+ #include <spawn.h>
++#include <errno.h>
++#include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <sys/sysctl.h>
++#include <libkern/OSCacheControl.h>
+ #include <objc/message.h>
+ #include <objc/runtime.h>
+ #include <execinfo.h>
+@@ -1098,6 +1101,175 @@
+ 	});
+ }
+ 
++/*
++ * S8b: 120 Hz touch delivery, the safe half of S8's hook (boot-arg s8_touch=1; off by default).
++ *
++ * S8 (TEST26) walked every class of the process in this library's constructor
++ * (objc_getClassList(), then class_getInstanceMethod()/class_getClassMethod() on each) to find
++ * -[<class> _shouldGenerate120HzEvents]. In backboardd, SpringBoard and the applications the walk
++ * never came back; today it stops the window server right after its "s8: no
++ * _MobileGestalt_get_touchDelivery120Hz in this process" line and the display is never opened. A
++ * constructor must not pay for a runtime-wide sweep: realizing every class takes the Objective-C
++ * lock for as long as it likes, in a process whose other threads are already running.
++ *
++ * This version asks nothing of the process as a whole: the MobileGestalt getter is asked and, if it
++ * answers 0, patched to answer 1 (this process's copy of the page only), and the same question is
++ * put to the few classes that can own the selector, looked up by name. Every answer is logged. Off
++ * by default: the F12 boot (kernel test26, root without this hook) already showed 120 Hz to the
++ * owner, so this is an experiment, not a default.
++ */
++/*
++ * S8b: 120 Hz touch delivery, the safe half of S8's hook. Off by default; `s8_touch=1` asks the
++ * classes by name, `s8_touch=2` also sweeps the registered classes whose names begin with UI/_UI
++ * (a snapshot of the class list and a name test, no method lookup on anything else).
++ *
++ * S8 (TEST26) walked every class of the process in this library's constructor
++ * (objc_getClassList(), then class_getInstanceMethod()/class_getClassMethod() on each) to find
++ * -[<class> _shouldGenerate120HzEvents]. In backboardd and SpringBoard the walk never came back: no
++ * result line followed it, while the small containermanagerd printed one, and the window server
++ * never drew a frame (run 050024: 0 "hakios-gl", 0 frame windows). A constructor must not realize
++ * every class of a process: that is a runtime-wide sweep under the Objective-C lock.
++ *
++ * What is left: the MobileGestalt getter is asked and, if it answers 0, patched to answer 1 (this
++ * process's copy of the page only), and -_shouldGenerate120HzEvents is answered YES where it is
++ * found -- on nine classes by name, and in mode 2 on the UI* classes of the class list, whose names
++ * are read without realizing them. Every answer is logged. Off by default: the F12 boot (kernel
++ * test26, root without this hook) already showed 120 Hz to the owner, so this is an experiment.
++ */
++typedef bool (*s8_bool_answer)(void);
++
++static BOOL
++s8_yes(id self, SEL selector)
++{
++	(void)self;
++	(void)selector;
++	return YES;
++}
++
++/* 0: off; 1: the named classes; 2: and the UI* classes of the list. */
++static int
++s8_touch_wanted(void)
++{
++	static int mode = -1;
++
++	if (mode < 0) {
++		char arguments[4096] = "";
++		size_t size = sizeof(arguments) - 1;
++		const char *at = NULL;
++
++		mode = 0;
++		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
++			at = strstr(arguments, "s8_touch=");
++		}
++		if (at != NULL && (at == arguments || at[-1] == ' ') && at[10] >= '1' && at[10] <= '2') {
++			mode = at[10] - '0';
++		}
++	}
++	return mode;
++}
++
++/* Answer YES to -[cls _shouldGenerate120HzEvents] when it has that method and it returns a BOOL.
++ * Returns 1 when the class answers YES afterwards. */
++static unsigned
++s8_touch_class(Class cls, SEL selector, const char *name)
++{
++	Method method;
++	const char *types;
++	IMP old;
++
++	if (cls == NULL) {
++		return 0;
++	}
++	method = class_getInstanceMethod(cls, selector);
++	if (method == NULL) {
++		method = class_getClassMethod(cls, selector);
++	}
++	if (method == NULL) {
++		return 0;
++	}
++	types = method_getTypeEncoding(method);
++	old = method_getImplementation(method);
++	if (types == NULL || (types[0] != 'B' && types[0] != 'c')) {
++		sayf("hakios: %s: s8_touch: -[%s _shouldGenerate120HzEvents] has type %s: left alone\n", who, name,
++		    types != NULL ? types : "?");
++		return 0;
++	}
++	if (old != (IMP)s8_yes) {
++		method_setImplementation(method, (IMP)s8_yes);
++	}
++	sayf("hakios: %s: s8_touch: -[%s _shouldGenerate120HzEvents] answers YES (was %p)\n", who, name, old);
++	return 1;
++}
++
++static void
++s8_touch_delivery(void)
++{
++	static const char *const owners[] = {
++		"UIApplication", "UIResponder", "UIWindow", "UIScene", "UIWindowScene", "UIView", "UIViewController",
++		"UIScrollView", "UIPanGestureRecognizer",
++	};
++	const unsigned total = sizeof(owners) / sizeof(owners[0]);
++	int mode = s8_touch_wanted();
++	void *getter;
++	SEL selector;
++	unsigned replaced = 0;
++
++	if (mode <= 0) {
++		return;
++	}
++	sayf("hakios: %s: s8_touch=%d: 120 Hz touch delivery is to be asked for\n", who, mode);
++	getter = dlsym(RTLD_DEFAULT, "_MobileGestalt_get_touchDelivery120Hz");
++	selector = sel_registerName("_shouldGenerate120HzEvents");
++	if (getter == NULL) {
++		sayf("hakios: %s: s8_touch: no _MobileGestalt_get_touchDelivery120Hz in this process\n", who);
++	} else {
++		bool answer = ((s8_bool_answer)getter)();
++
++		sayf("hakios: %s: s8_touch: _MobileGestalt_get_touchDelivery120Hz at %p answers %d\n", who, getter,
++		    answer ? 1 : 0);
++		if (!answer) {
++			/* mov w0, #1 ; ret -- a bool comes back in w0; the page is the shared cache's, copied privately */
++			static const uint32_t answer_yes[2] = { 0x52800020u, 0xd65f03c0u };
++			uintptr_t page = (uintptr_t)getter & ~(uintptr_t)0x3fffu;
++
++			if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
++				memcpy(getter, answer_yes, sizeof(answer_yes));
++				sys_icache_invalidate(getter, sizeof(answer_yes));
++				sayf("hakios: %s: s8_touch: patched it to answer 1\n", who);
++			} else {
++				sayf("hakios: %s: s8_touch: mprotect(%p): %s\n", who, (void *)page, strerror(errno));
++			}
++		}
++	}
++	for (unsigned i = 0; i < total; i++) {
++		replaced += s8_touch_class(objc_getClass(owners[i]), selector, owners[i]);
++	}
++	sayf("hakios: %s: s8_touch=%d: %u of %u named class(es) answer YES\n", who, mode, replaced, total);
++	if (mode >= 2) {
++		int count = objc_getClassList(NULL, 0);
++		Class *classes = count > 0 ? malloc(sizeof(Class) * (size_t)count) : NULL;
++		unsigned swept = 0;
++
++		if (classes != NULL) {
++			int registered = count;
++
++			count = objc_getClassList(classes, count);
++			for (int i = 0; i < count; i++) {
++				const char *name = class_getName(classes[i]);
++
++				if (name == NULL || (strncmp(name, "UI", 2) != 0 && strncmp(name, "_UI", 3) != 0)) {
++					continue;
++				}
++				swept++;
++				replaced += s8_touch_class(classes[i], selector, name);
++			}
++			sayf("hakios: %s: s8_touch=2: %d classes registered, %u with a UI name, %u answer YES in all\n", who,
++			    registered, swept, replaced);
++			free(classes);
++		}
++	}
++}
++
+ __attribute__((constructor))
+ static void
+ hakios_app_init(void)
+@@ -1115,6 +1287,7 @@
+ 	who = name;
+ 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+ 	t120_setup();
++	s8_touch_delivery();
+ 	if (s5_wanted()) {
+ 		/*
+ 		 * The self-test's swipe (boot-arg s5_swipe=1) with or without t120=1: what is asked of a

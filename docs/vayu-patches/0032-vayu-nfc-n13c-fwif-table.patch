@@ -1,0 +1,102 @@
+N13c = N13b (0007-vayu-nfc-n13b.patch) + corrected 2F 19 (FW interface version) table.
+Base: hackios-vayu branch vayu-test26 (d15caf0; MiniAppleStockholm.cpp 1f4fe6e8...) + 0007. Apply: patch -p1 in a tree with xnu/files/.
+Why: TEST 152455 (hwbyte 0x06, 2F 19 -> 0x0015) logged "phLibNfc_MwFwCompatibilityChkProcess : FW IS TOO NEW".
+libNFC_Comet (system-test22 dyld subcache .33): phLibNfc_GetNfccFeatures 0x1f4592adc maps hw 6..8 to ctx[0xaf8],
+and 0x1f458f1ec expects version 1 for it (N13 had 0x22, which belongs to hw 0xa2..0xa4).
+Default changes: the 2F 19 answer follows the hw byte shown to nfcd; vayu_nfc_fwif=0x15 restores N13b.
+Built 2026-11-02 -> /mnt/ramdisk/nfc-out/kernel-n13c.bin sha256 756064a31681e7e2d612708776f35490c02d3e2ef28d24f079633921c26c45c1. Not run on hardware.
+
+--- a/xnu/files/iokit/Kernel/MiniAppleStockholm.cpp	2026-11-02 02:14:40.347678251 +0300
++++ b/xnu/files/iokit/Kernel/MiniAppleStockholm.cpp	2026-11-02 02:18:07.230574257 +0300
+@@ -438,8 +438,9 @@
+  * answer instead of any local one. propfwd wins over synth.
+  */
+ static uint32_t gNfcPreamble = 1;       /* vayu_nfc_preamble=0: old desync on ff ff (TEST26) */
+-static uint32_t gNfcSynth;              /* vayu_nfc_synth: 1 = 2F 21 local ok, 2 = 2F 19 per hw byte, 4 = 2F 06 2-byte */
++static uint32_t gNfcSynth;              /* vayu_nfc_synth: 1 = 2F 21 local ok, 2 = unused since N13c (2F 19 always per hw byte), 4 = 2F 06 2-byte */
+ static uint32_t gNfcPropFwd;            /* vayu_nfc_propfwd: 1 = 2F 19, 2 = 2F 06, 4 = 2F 00 forwarded to the chip */
++static uint32_t gNfcFwIf;               /* N13c: vayu_nfc_fwif=0xNNNN forces the 2F 19 version; 0 = per platform group */
+ #define NFC_SYNTH_FLUSH         0x1u
+ #define NFC_SYNTH_FWIF          0x2u
+ #define NFC_SYNTH_FWTYPE        0x4u
+@@ -1126,6 +1127,21 @@
+ 		 *   ctx[2810] (hw 29 = 0x1d)                  -> 9
+ 		 * With hwbyte 0x06 the old 0x0015 would be "FW IS TOO OLD" (status 128 at 0x1f458f348),
+ 		 * and _NFDriverLoadMW would fail with "Incompatible firmware !". Hence the switch.
++		 *
++		 * N13c: the N13 table above is wrong for hw 6..8, and TEST 152455 (hwbyte 0x06, answer
++		 * 0x0015) got "FW IS TOO NEW", not "too old". Read again from the dyld cache of
++		 * system-test22 (subcache .33, libNFC_Comet): phLibNfc_GetNfccFeatures 0x1f4592adc
++		 * does "w11 = hw - 6; if (w11 < 3) strb 1, [ctx + 0xaf8]" - hw 6..8 set ctx[2808], and
++		 * only hw 0xa2..0xa4 set ctx[2812] (0x1f4592b00). In 0x1f458f1ec ctx[2808] == 1 branches
++		 * to the compare with w9 still holding the flag byte, so the expected version is 1:
++		 *   ctx[2809] hw 0x0d -> 5      ctx[2808] hw 6..8 -> 1     ctx[2810] hw 0x1d -> 9
++		 *   ctx[2811] hw 0x42 -> 0x15   ctx[2812] hw 0xa2..0xa4 -> 0x22
++		 *   ctx[2813] hw 0xb1/0xb2/0xba -> 0x26   ctx[2819] hw 0xd0..0xd2 -> 3, or 0x0c when
++		 *   ctx[2820] (hw 0xd1/0xd2) is also set; anything else -> "Invalid platform" (0xff).
++		 * The real PN553 byte 0x41 is in none of the groups, so the chip's own 2F 19 answer
++		 * cannot pass this check without hwspoof anyway. The answer now follows the byte nfcd is
++		 * shown (gNfcHwByte with hwspoof on, 0x42 otherwise); vayu_nfc_fwif=0xNNNN forces a
++		 * value (vayu_nfc_fwif=0x15 is the N13b answer).
+ 		 */
+ 		if (oid == 0x19 && (gNfcPropFwd & NFC_PROPFWD_FWIF) != 0 && length == 3) {
+ 			forwardPacket(packet, length, packet, length, "forward (vayu_nfc_propfwd&1: chip answers 2F 19)");
+@@ -1136,11 +1152,19 @@
+ 			char decision[48];
+ 			unsigned fw_version;
+ 
+-			switch ((gNfcSynth & NFC_SYNTH_FWIF) != 0 ? gNfcHwByte : 0x42u) {
++			switch (gHwSpoof != 0 ? gNfcHwByte : 0x42u) {
+ 			case 0x06: case 0x07: case 0x08:
++				fw_version = 0x01;
++				break;
+ 			case 0xa2: case 0xa3: case 0xa4:
+ 				fw_version = 0x22;
+ 				break;
++			case 0xd0:
++				fw_version = 0x03;
++				break;
++			case 0xd1: case 0xd2:
++				fw_version = 0x0c;
++				break;
+ 			case 0x0d:
+ 				fw_version = 0x05;
+ 				break;
+@@ -1154,13 +1178,18 @@
+ 				fw_version = 0x15;
+ 				break;
+ 			}
++			if (gNfcFwIf != 0) {
++				fw_version = gNfcFwIf & 0xffff;
++			}
+ 			fw_interface_ok[4] = (uint8_t)(fw_version >> 8);
+ 			fw_interface_ok[5] = (uint8_t)(fw_version & 0xff);
+-			snprintf(decision, sizeof(decision), "answer 4f 19 03 00 00 %02x (SYNTHETIC)", fw_version);
++			snprintf(decision, sizeof(decision), "answer 4f 19 03 00 %02x %02x (SYNTHETIC)",
++			    fw_version >> 8, fw_version & 0xff);
+ 			filterLog(packet, length, decision);
+ 			stockholmLog("MiniAppleStockholm: mwfw: 2F 19 FW interface version 0x%04x for hw byte "
+-			    "0x%02x (phLibNfc_MwFwCompatibilityChkProcess expects this platform group)\n",
+-			    fw_version, gNfcHwByte);
++			    "0x%02x (%s; N13c table: phLibNfc_MwFwCompatibilityChkProcess 0x1f458f1ec)\n",
++			    fw_version, gHwSpoof != 0 ? gNfcHwByte : 0x42u,
++			    gNfcFwIf != 0 ? "forced by vayu_nfc_fwif" : "per platform group");
+ 			answerNfcd(fw_interface_ok, sizeof(fw_interface_ok));
+ 			return;
+ 		}
+@@ -1763,11 +1792,14 @@
+ 	(void)PE_parse_boot_argn("vayu_nfc_preamble", &gNfcPreamble, sizeof(gNfcPreamble));
+ 	(void)PE_parse_boot_argn("vayu_nfc_synth", &gNfcSynth, sizeof(gNfcSynth));
+ 	(void)PE_parse_boot_argn("vayu_nfc_propfwd", &gNfcPropFwd, sizeof(gNfcPropFwd));
++	(void)PE_parse_boot_argn("vayu_nfc_fwif", &gNfcFwIf, sizeof(gNfcFwIf));
++	stockholmLog("MiniAppleStockholm: n13c: 2F 19 version %s 0x%x\n",
++	    gNfcFwIf != 0 ? "forced to" : "per platform group (N13c table), fwif", gNfcFwIf);
+ 	stockholmLog("MiniAppleStockholm: n13b: preamble %s, synth 0x%x (2F 21 %s, 2F 19 %s, 2F 06 %s), "
+ 	    "propfwd 0x%x (2F 19 %s, 2F 06 %s, 2F 00 %s)\n",
+ 	    gNfcPreamble != 0 ? "strip ff ff" : "off (desync)", gNfcSynth,
+ 	    (gNfcSynth & NFC_SYNTH_FLUSH) != 0 ? "local ok" : "refused",
+-	    (gNfcSynth & NFC_SYNTH_FWIF) != 0 ? "per hw byte" : "0x0015",
++	    "per hw byte (N13c)",
+ 	    (gNfcSynth & NFC_SYNTH_FWTYPE) != 0 ? "2-byte" : "1-byte",
+ 	    gNfcPropFwd,
+ 	    (gNfcPropFwd & NFC_PROPFWD_FWIF) != 0 ? "chip" : "local",

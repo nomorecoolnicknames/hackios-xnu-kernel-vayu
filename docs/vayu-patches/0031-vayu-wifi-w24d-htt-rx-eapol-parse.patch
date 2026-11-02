@@ -1,0 +1,441 @@
+Subject: [PATCH] vayu_wifi W24d: parse the HTT in-order rx msdu (desc + native wifi), EAPOL-Key diagnostics
+
+Base: W24K source (/mnt/ramdisk/w23/src at 2026-11-01 20:53, kernel mach-wifi-w24k.bin sha256
+ab440b26e2051c4f1cf1f900a18b134b09f8b87460bd74f05537abfc0066375c). W24a..W24k have NO patch file in
+this directory (0027, 0029, 0030 are missing); this diff is relative to W24K, not to W23b (0026).
+
+Evidence (gunwest ~/ws-qup-hwcg/logs/193128-run.log, W24C): the "00 00 00 00 43 00 30 82 ..." dumps
+were taken at buf+0 (len 2048), i.e. the rx descriptor, not the payload:
+  word1 attention 0x82300043 = MSDU_DONE|DIRECTED|DA/SA_IDX_INVALID|NON_QOS|LAST|FIRST (no errors)
+  word4 mpdu_start 0x70NN0866: peer 0x66, FROM_DS, seq NN = 2,3,4,5 (the changing bytes 18-19), enc 7 = none
+  word7 msdu_start 0x00080083: msdu length 131, ip offset 32; word9 0x100: decap 1 = native wifi
+131 = 24 (802.11, no QoS) + 8 (LLC/SNAP) + 99 (EAPOL-Key without key data); 4 frames 1 s apart.
+W24H/I/K (202928, 204304, 210106) print nothing: at buf+360 the LLC/SNAP 88 8e is found, then
+eapol_note() returns silently on "f[off] != 2" (EAPOL version 1 is legal) - the only silent path left.
+
+Changes (one file, bsd/dev/vayu_wifi_scan.c; diagnostics only, nothing is transmitted):
+ - htt_rx_msdu(): check attention MSDU_DONE, length from the in-order descriptor (flame htt_rx),
+   decap from msdu_start, 802.11 header length from FC, LLC/SNAP exactly at the header end;
+   rx_in_ord_ind offload bit handled (7-byte header, no descriptor).
+ - eapol_key(): version 1/2/3 accepted, big-endian key_info/key_len/replay/key data length,
+   message number from Pairwise/Ack/MIC/Secure; log `w24: eapol 1/4 ...`.  Nonce never printed.
+ - rx_dump(): first msdu and first EAPOL msdu, 96 bytes hex; MAC bytes 0-3 and the nonce masked.
+ - one parser per message: vayu_scan_htt_rx parses before the repost; vayu_scan_note_htt only
+   when vayu_scan_htt_rx did not (W24K parsed every buffer twice, the second time after the repost).
+
+--- a/bsd/dev/vayu_wifi_scan.c
++++ b/bsd/dev/vayu_wifi_scan.c
+@@ -167,6 +167,9 @@
+ 	vm_offset_t htt_va;
+ 	uint32_t eapol_seen;
+ 	uint32_t dumps, notes_off;
++	/* W24d */
++	bool in_ord_parsed, rx_dumped_first, rx_dumped_eapol;
++	uint32_t rx_msdus, rx_not_done, rx_offload;
+ } sc;
+ 
+ static uint32_t
+@@ -514,104 +517,240 @@
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+-/* W24a: a data frame from the target; EAPOL-Key is the WPA2 4-way handshake (owner's AP only) */
+-static void
+-eapol_note(const uint8_t *f, uint32_t len)
++/*
++ * W24d: one in-order rx msdu buffer (ath10k htt.h struct htt_rx_desc, rx_desc.h; flame htt_rx()):
++ *   word 0  fw_desc pad              word 1  attention, bit 31 MSDU_DONE
++ *   word 4  mpdu_start info0: peer 10:0, FROM_DS 11, seq 27:16, encrypt type 31:28 (7 = none)
++ *   word 7  msdu_start info0: length 13:0, ip offset 19:14;  word 9 info1: decap 9:8 (1 = native wifi)
++ *   word 90 payload (OFF_MSDU_PAYLOAD, the offset this driver gives the target in RX_RING_CFG).
++ * The W23/W24 runs (193128-run.log) show that layout: attention 0x82300043, seq 2..5, encrypt 7,
++ * msdu length 131 = 24 (802.11 without QoS) + 8 (LLC/SNAP) + 99 (EAPOL-Key, no key data), decap 1.
++ * W24a-k found the LLC/SNAP at +360 but dropped the frame on "EAPOL version != 2" without a word;
++ * the version is 1 or 2 (802.1X-2001/2004), and every EAPOL-Key field is big-endian.
++ * The length now comes from the in-order descriptor, as in flame.  Nonces are never printed.
++ */
++#define ATTN_MSDU_DONE          0x80000000U
++#define IN_ORD_INFO_OFFLOAD     0x01U   /* ath10k HTT_RX_IN_ORD_IND_INFO_OFFLOAD_MASK */
++#define OFFLOAD_HDR_LEN         7U      /* ath10k struct htt_rx_offload_msdu */
++#define DECAP_RAW               0U
++#define DECAP_NWIFI             1U
++#define DECAP_ETH2              2U
++#define DECAP_8023              3U
++#define RX_DUMP_LEN             96U
++#define RX_DECODE_LOGS          8U
++#define KI_PAIRWISE             0x0008U
++#define KI_INSTALL              0x0040U
++#define KI_ACK                  0x0080U
++#define KI_MIC                  0x0100U
++#define KI_SECURE               0x0200U
++#define KI_ERROR                0x0400U
++#define KI_REQUEST              0x0800U
++#define KI_ENC_KD               0x1000U
++
++static const uint8_t llc_eapol[8] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e };
++
++static uint32_t
++be16(const uint8_t *p)
+ {
+-	const uint8_t *k = NULL;
+-	uint32_t info, klen, kd, msg, off = 0;
+-	uint64_t replay;
+-	bool nonce = false;
++	return (uint32_t)p[0] << 8 | (uint32_t)p[1];
++}
+ 
+-	if (len < 40) {
+-		return;
+-	}
+-	if (len >= 14 + 99 && f[12] == 0x88 && f[13] == 0x8e) {
+-		off = 14;               /* Ethernet (if the HTT path decapsulated) */
+-	} else {
+-		for (uint32_t i = 0; i + 8 < len && i < 48; i++) {
+-			if (f[i] == 0xaa && f[i + 1] == 0xaa && f[i + 2] == 0x03 &&
+-			    f[i + 3] == 0x00 && f[i + 4] == 0x00 && f[i + 5] == 0x00 &&
+-			    f[i + 6] == 0x88 && f[i + 7] == 0x8e) {
+-				off = i + 8;    /* 802.11 + LLC/SNAP */
+-				break;
+-			}
++static bool
++same(const uint8_t *a, const uint8_t *b, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		if (a[i] != b[i]) {
++			return false;
+ 		}
+ 	}
+-	if (off == 0 || len < off + 99) {
+-		if (sc.dumps < 4) {
+-			sc.dumps++;
+-			{
+-				printf("vayu-wifi: w24: msdu #%u len %u: %02x %02x %02x %02x %02x %02x "
+-				    "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+-				    "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+-				    "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-				    sc.dumps, len,
+-				    f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+-				    f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15],
+-				    f[16], f[17], f[18], f[19], f[20], f[21], f[22], f[23],
+-				    f[24], f[25], f[26], f[27], f[28], f[29], f[30], f[31],
+-				    f[32], f[33], f[34], f[35], f[36], f[37], f[38], f[39]);
+-			}
++	return true;
++}
++
++/* offset of the EAPOL header (version byte) in the payload, 0 when it is not EAPOL; *hdr = L2 header length */
++static uint32_t
++rx_eapol_off(const uint8_t *f, uint32_t len, uint32_t decap, uint32_t *hdr)
++{
++	uint32_t h;
++
++	*hdr = 0;
++	if (decap == DECAP_ETH2) {
++		*hdr = 14;
++		return len >= 18 && f[12] == 0x88 && f[13] == 0x8e ? 14U : 0U;
++	}
++	if (decap == DECAP_8023) {
++		*hdr = 14;
++		return len >= 26 && same(f + 14, llc_eapol, 8) ? 22U : 0U;
++	}
++	if (len < 24 || (f[0] & 0x0c) != 0x08) {
++		return 0;               /* not a data frame */
++	}
++	h = 24;
++	if ((f[1] & 0x03) == 0x03) {
++		h += 6;                 /* 4-address */
++	}
++	if (decap == DECAP_RAW && (f[0] & 0x80) != 0) {
++		h += 2;                 /* raw keeps QoS control; native wifi drops it */
++	}
++	*hdr = h;
++	return len >= h + 8 + 4 && same(f + h, llc_eapol, 8) ? h + 8 : 0U;
++}
++
++static bool
++rx_masked_mac(uint32_t i, uint32_t hdr)
++{
++	if (hdr == 14) {        /* Ethernet: DA 0-5, SA 6-11 */
++		return i < 4 || (i >= 6 && i < 10);
++	}
++	if (hdr >= 24) {        /* 802.11: addr1 4-9, addr2 10-15, addr3 16-21 */
++		return (i >= 4 && i < 8) || (i >= 10 && i < 14) || (i >= 16 && i < 20);
++	}
++	return false;
++}
++
++static void
++rx_dump(const char *what, const uint8_t *f, uint32_t len, uint32_t hdr, uint32_t eo)
++{
++	static const char hx[] = "0123456789abcdef";
++	char s[RX_DUMP_LEN * 3 + 1];
++	uint32_t n = len < RX_DUMP_LEN ? len : RX_DUMP_LEN, i, j = 0;
++
++	for (i = 0; i < n; i++) {
++		if (rx_masked_mac(i, hdr)) {
++			s[j++] = 'x';
++			s[j++] = 'x';
++		} else if (eo != 0 && i >= eo + 17 && i < eo + 49) {
++			s[j++] = '.';   /* key nonce */
++			s[j++] = '.';
++		} else {
++			s[j++] = hx[f[i] >> 4];
++			s[j++] = hx[f[i] & 15];
+ 		}
++		s[j++] = ' ';
++	}
++	if (j != 0) {
++		j--;
++	}
++	s[j] = 0;
++	printf("vayu-wifi: w24: rx %s frame %u bytes, hex %u (MAC bytes 0-3 xx, nonce ..): %s\n", what, len, n, s);
++}
++
++/* e = EAPOL header (version, type, body length), len = bytes from e to the end of the msdu */
++static void
++eapol_key(const uint8_t *e, uint32_t len, uint32_t mlen)
++{
++	const uint8_t *k = e + 4;
++	uint32_t ver = e[0], type = e[1], body = be16(e + 2), info, klen, kd, msg;
++	uint64_t replay = 0;
++	bool nonzero = false;
++	const char *grp = "";
++
++	if (type != 3) {
++		printf("vayu-wifi: w24: eapol ver %u type %u body %u: not EAPOL-Key\n", ver, type, body);
++		return;
++	}
++	if (len < 4 + 95) {
++		printf("vayu-wifi: w24: eapol-key short: %u bytes (body %u)\n", len, body);
+ 		return;
+ 	}
+-	if (f[off] != 2 || f[off + 1] != 3) {
+-		return;                 /* EAPOL version 2, type Key */
++	info = be16(k + 1);
++	klen = be16(k + 3);
++	for (unsigned i = 0; i < 8; i++) {
++		replay = replay << 8 | k[5 + i];
+ 	}
+-	k = f + off + 4;
+-	info = rd16(k + 1);
+-	klen = rd16(k + 3);
+-	replay = (uint64_t)rd32(k + 5) | ((uint64_t)rd32(k + 9) << 32);
+ 	for (unsigned i = 0; i < 32; i++) {
+-		if (k[13 + i] != 0) {
+-			nonce = true;
+-			break;
+-		}
++		nonzero |= k[13 + i] != 0;
+ 	}
+-	kd = rd16(k + 93);
++	kd = be16(k + 93);
+ 	msg = 0;
+-	if ((info & 0x0080U) != 0 && (info & 0x0100U) == 0) {
+-		msg = 1;
+-	} else if ((info & 0x0080U) == 0 && (info & 0x0100U) != 0 && (info & 0x0200U) == 0) {
+-		msg = 2;
+-	} else if ((info & 0x0080U) != 0 && (info & 0x0100U) != 0) {
+-		msg = (info & 0x0200U) != 0 ? 4 : 3;
+-	} else if ((info & 0x0080U) == 0 && (info & 0x0100U) != 0) {
+-		msg = 4;
++	if ((info & KI_PAIRWISE) == 0) {
++		grp = "group ";
++		msg = (info & KI_ACK) != 0 ? 1 : 2;
++	} else if ((info & KI_ACK) != 0) {
++		msg = (info & KI_MIC) != 0 ? 3 : 1;
++	} else if ((info & KI_MIC) != 0) {
++		msg = (info & KI_SECURE) != 0 ? 4 : 2;
+ 	}
+ 	sc.eapol_seen++;
+-	printf("vayu-wifi: w24: eapol %u/4 key_info 0x%04x keylen %u replay %llu anonce %s kd %u desc %u\n",
+-	    msg, info, klen, (unsigned long long)replay, nonce ? "present" : "absent", kd, k[0]);
++	printf("vayu-wifi: w24: eapol %s%u/%u ver %u desc %u key_info 0x%04x (kver %u pairwise %u install %u "
++	    "ack %u mic %u secure %u err %u req %u enc_kd %u) key_len %u replay %llu key data length %u "
++	    "body %u msdu %u nonce %s (#%u)\n",
++	    grp, msg, grp[0] != 0 ? 2U : 4U, ver, k[0], info, info & 7U, (info & KI_PAIRWISE) != 0,
++	    (info & KI_INSTALL) != 0, (info & KI_ACK) != 0, (info & KI_MIC) != 0, (info & KI_SECURE) != 0,
++	    (info & KI_ERROR) != 0, (info & KI_REQUEST) != 0, (info & KI_ENC_KD) != 0, klen,
++	    (unsigned long long)replay, kd, body, mlen, nonzero ? "set" : "zero", sc.eapol_seen);
+ }
+ 
+-/* W24: the join path takes the HTT frames (vayu_sta_htt_rx), so it calls this to look for EAPOL */
+-void
+-vayu_scan_note_htt(const uint8_t *p, uint32_t len)
++static void
++htt_rx_msdu(const uint8_t *buf, uint32_t mlen, uint32_t fw_desc, uint32_t info)
+ {
+-	uint32_t n, i;
+-	const uint8_t *d;
+-
+-	if (p == NULL || len < 8) {
+-		return;
+-	}
+-	if (sc.htt_va == 0 || sc.ring_n == 0) {
+-		if (sc.notes_off++ < 2) {
+-			printf("vayu-wifi: w24: note_htt: ring not up (va %#llx ring_n %u mode %u slog %d)\n",
+-			    (unsigned long long)sc.htt_va, sc.ring_n, vayu_scan_mode, slog != NULL);
++	uint32_t attn = rd32(buf + 4 * OFF_ATTENTION);
++	uint32_t mpdu0 = rd32(buf + 4 * OFF_MPDU_START);
++	uint32_t msdu0 = rd32(buf + 4 * OFF_MSDU_START);
++	uint32_t msdu1 = rd32(buf + 4 * (OFF_MSDU_START + 2));
++	uint32_t dlen = msdu0 & 0x3fffU, decap = (msdu1 >> 8) & 3U;
++	uint32_t room = HTT_BUF_SIZE - 4 * OFF_MSDU_PAYLOAD, len, hdr = 0, eo = 0, n;
++	const uint8_t *f = buf + 4 * OFF_MSDU_PAYLOAD;
++
++	n = ++sc.rx_msdus;
++	if ((info & IN_ORD_INFO_OFFLOAD) != 0) {
++		/* no rx descriptor: a 7-byte header (len, peer, vdev, tid, fw_desc), then an 802.11 frame */
++		sc.rx_offload++;
++		f = buf + OFFLOAD_HDR_LEN;
++		room = HTT_BUF_SIZE - OFFLOAD_HDR_LEN;
++		len = rd16(buf);
++		len = len < room ? len : room;
++		eo = rx_eapol_off(f, len, DECAP_RAW, &hdr);
++		if (n <= RX_DECODE_LOGS) {
++			printf("vayu-wifi: w24: rx msdu #%u offload: len %u peer %u vdev %u tid %u fw_desc %#x eapol_off %u\n",
++			    n, len, rd16(buf + 2), buf[4], buf[5], buf[6], eo);
++		}
++	} else {
++		len = mlen != 0 ? mlen : dlen;
++		len = len < room ? len : room;
++		if ((attn & ATTN_MSDU_DONE) != 0) {
++			eo = rx_eapol_off(f, len, decap, &hdr);
++		}
++		if (n <= RX_DECODE_LOGS) {
++			printf("vayu-wifi: w24: rx msdu #%u in-ord len %u fw_desc %#x info %#x | attn %#010x done %u | "
++			    "mpdu seq %u enc %u from_ds %u peer %u | msdu len %u ip_off %u decap %u | fc %02x %02x eapol_off %u\n",
++			    n, mlen, fw_desc, info, attn, (attn & ATTN_MSDU_DONE) != 0, (mpdu0 >> 16) & 0xfffU,
++			    mpdu0 >> 28, (mpdu0 >> 11) & 1U, mpdu0 & 0x7ffU, dlen, (msdu0 >> 14) & 0x3fU, decap,
++			    f[0], f[1], eo);
++		}
++		if ((attn & ATTN_MSDU_DONE) == 0) {
++			sc.rx_not_done++;
++			return;
+ 		}
+-		return;
+ 	}
+-	if (p[0] != T2H_RX_IN_ORD_PADDR_IND) {
+-		return;
++	if (!sc.rx_dumped_first || (eo != 0 && !sc.rx_dumped_eapol)) {
++		rx_dump(sc.rx_dumped_first ? "eapol" : "first", f, len, hdr, eo);
++		sc.rx_dumped_first = true;
++		sc.rx_dumped_eapol |= eo != 0;
++	}
++	if (eo != 0) {
++		eapol_key(f + eo, len - eo, len);
+ 	}
+-	n = rd16(p + 6);
+-	d = p + 8;
++}
++
++static bool
++htt_pa_ok(uint64_t pa)
++{
++	return pa >= sc.htt_buf_pa && pa < sc.htt_buf_pa + (uint64_t)HTT_RING_SIZE * HTT_BUF_SIZE &&
++	       (pa - sc.htt_buf_pa) % HTT_BUF_SIZE == 0;
++}
++
++/* ath10k struct htt_rx_in_ord_ind: type, info, peer_id, vdev_id, reserved, msdu_count, then
++ * htt_rx_in_ord_msdu_desc_ext { le64 paddr; le16 msdu_len; u8 fw_desc; u8 reserved; } */
++static void
++htt_in_ord(const uint8_t *p, uint32_t len, bool repost)
++{
++	uint32_t n = rd16(p + 6), i;
++	const uint8_t *d = p + 8;
++
+ 	for (i = 0; i < n && 8 + (i + 1) * 12 <= len; i++, d += 12) {
+ 		uint64_t pa = (uint64_t)rd32(d) | (uint64_t)rd32(d + 4) << 32;
+ 
+-		if (pa < sc.htt_buf_pa || pa >= sc.htt_buf_pa + (uint64_t)HTT_RING_SIZE * HTT_BUF_SIZE ||
+-		    (pa - sc.htt_buf_pa) % HTT_BUF_SIZE != 0) {
++		if (!htt_pa_ok(pa)) {
+ 			if (sc.notes_off++ < 4) {
+ 				printf("vayu-wifi: w24: pa %#llx outside pool %#llx..%#llx ring %u va %#llx\n",
+ 				    (unsigned long long)pa, (unsigned long long)sc.htt_buf_pa,
+@@ -620,20 +759,46 @@
+ 			}
+ 			continue;
+ 		}
+-		{
+-			const uint8_t *buf = (const uint8_t *)(sc.htt_va + (vm_offset_t)(pa - sc.htt_pa));
+-			uint32_t pf = OFF_MSDU_PAYLOAD * 4U;
++		sc.htt_msdus++;
++		htt_rx_msdu((const uint8_t *)(sc.htt_va + (vm_offset_t)(pa - sc.htt_pa)), rd16(d + 8), d[10], p[1]);
++		if (repost) {
++			htt_post(pa);   /* flame: recycle the same buffer, after it has been read */
++			sc.htt_reposts++;
++		}
++	}
++	if (repost) {
++		htt_publish();
++	}
++}
+ 
+-			if (pf < HTT_BUF_SIZE) {
+-				eapol_note(buf + pf, HTT_BUF_SIZE - pf);
+-			}
++/* W24: the join path also gets every HTT message (vayu_sta_htt_rx); it parses only those
++ * vayu_scan_htt_rx did not (W24d: before, both parsed the same buffer, the second after the repost) */
++void
++vayu_scan_note_htt(const uint8_t *p, uint32_t len)
++{
++	if (sc.in_ord_parsed) {
++		sc.in_ord_parsed = false;
++		return;
++	}
++	if (p == NULL || len < 8) {
++		return;
++	}
++	if (sc.htt_va == 0 || sc.ring_n == 0) {
++		if (sc.notes_off++ < 2) {
++			printf("vayu-wifi: w24: note_htt: ring not up (va %#llx ring_n %u mode %u slog %d)\n",
++			    (unsigned long long)sc.htt_va, sc.ring_n, vayu_scan_mode, slog != NULL);
+ 		}
++		return;
++	}
++	if (p[0] == T2H_RX_IN_ORD_PADDR_IND) {
++		htt_in_ord(p, len, false);
+ 	}
+ }
+ 
+ void
+ vayu_scan_htt_rx(const uint8_t *p, uint32_t len)
+ {
++	sc.in_ord_parsed = false;
+ 	if (slog == NULL || vayu_scan_mode == 0 || len == 0) {
+ 		return;
+ 	}
+@@ -645,31 +810,8 @@
+ 		return;
+ 	}
+ 	if (p[0] == T2H_RX_IN_ORD_PADDR_IND && len >= 8 && sc.htt_va != 0 && sc.ring_n != 0) {
+-		uint32_t n = rd16(p + 6), i;
+-		const uint8_t *d = p + 8;
+-
+-		/* flame recycles each buffer; payloads (data frames) are not parsed in W22 */
+-		for (i = 0; i < n && 8 + (i + 1) * 12 <= len; i++, d += 12) {
+-			uint64_t pa = (uint64_t)rd32(d) | (uint64_t)rd32(d + 4) << 32;
+-
+-			if (pa < sc.htt_buf_pa || pa >= sc.htt_buf_pa + (uint64_t)HTT_RING_SIZE * HTT_BUF_SIZE ||
+-			    (pa - sc.htt_buf_pa) % HTT_BUF_SIZE != 0) {
+-				continue;
+-			}
+-			sc.htt_msdus++;
+-			{
+-				const uint8_t *buf = (const uint8_t *)(sc.htt_va +
+-				    (vm_offset_t)(pa - sc.htt_pa));
+-				uint32_t pf = OFF_MSDU_PAYLOAD * 4U;
+-
+-				if (pf < HTT_BUF_SIZE) {
+-					eapol_note(buf + pf, HTT_BUF_SIZE - pf);
+-				}
+-			}
+-			htt_post(pa);           /* flame: recycle the same buffer */
+-			sc.htt_reposts++;
+-		}
+-		htt_publish();
++		htt_in_ord(p, len, true);
++		sc.in_ord_parsed = true;
+ 	}
+ }
+ 

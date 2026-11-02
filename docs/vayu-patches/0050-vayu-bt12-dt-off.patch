@@ -1,0 +1,68 @@
+--- a/bsd/dev/vayu_bt.c	2026-11-02 10:45:00.000000000 +0300
++++ b/bsd/dev/vayu_bt.c	2026-11-02 10:50:00.000000000 +0300
+@@ -198,6 +198,17 @@
+  *                     controller status is passed through. Status 0: mode 1 answers 0xfd48 with
+  *                     0x01 as before (multi-adv unavailable: an empty status-0 CC asserts in
+  *                     bluetoothd's parser, bcm_vsc.c:642), mode 2 with status 0 + instance 0.
++ *   vayu_bt_dt=0|1    default 0: 1 publishes the "marconi-bt" and "bluetooth" services under the
++ *                     platform with local-mac-address/transport-encoding/transport-speed (S10).
++ *                     0 publishes nothing. Measured 2026-11-02 (BT10/BT11 runs vs the 214653 run of
++ *                     the ufs line): with the service present bluetoothd takes the Apple bring-up
++ *                     path -- it opens the com.apple.BlueTool XPC right after the POSIX driver is
++ *                     made and only opens the HCI transport after that boot script answers; the
++ *                     script cannot run on this root yet (the S10 runs answered "permission
++ *                     denied" / timed out), so no transport and no LE reports. Without the service
++ *                     bluetoothd opens com.vayu.bt.uart at once (214653: kctl connect by pid 22,
++ *                     real LE reports). 0 keeps the proven path and the address from
++ *                     wlan.debug.generate-mac / BT_DEVICE_ADDRESS / the BTServer plist.
+  *   vayu_bt_vsc=0|1|2 default 0: the outbound vendor-command shim in step 9. 0 leaves every
+  *                     byte alone; 1 answers the host commands (type 0x01) in bt_vsc_rules and
+  *                     passes every other vendor opcode (OGF 0x3f) to the controller; 2 passes
+@@ -4760,6 +4771,8 @@
+ 
+ static uint8_t g_dt_addr[6];            /* what the services carry now (HCI order) */
+ static bool g_dt_done;
++static bool g_dt = false;               /* vayu_bt_dt=1: publish "marconi-bt"/"bluetooth"; 0 (default) none */
++static bool g_dt_said;
+ 
+ #define BT_DT_TRANSPORT_H4      1       /* bluetoothd's transport-encoding: H4 over the POSIX driver */
+ 
+@@ -4843,6 +4856,16 @@
+ {
+ 	bool same;
+ 
++	if (!g_dt) {
++		if (!g_dt_said) {
++			g_dt_said = true;
++			printf("vayu-bt: S10 dt: off (vayu_bt_dt=0, the default): no \"marconi-bt\"/"
++			    "\"bluetooth\" service, so bluetoothd keeps the boot-arg/plist address and "
++			    "opens the POSIX transport (com.vayu.bt.uart) before any boot script; "
++			    "vayu_bt_dt=1 restores the S10 path\n");
++		}
++		return;
++	}
+ 	if (!bt_addr_valid(addr)) {
+ 		printf("vayu-bt: S10 dt: %s gives %02x:%02x:%02x:%02x:%02x:%02x: not an address, "
+ 		    "nothing published\n", source, (unsigned)addr[0], (unsigned)addr[1],
+@@ -4874,6 +4897,10 @@
+ 	static const char *const names[] = { "crnv21.bin", "crnv20.bin", "crnv01.bin" };
+ 	uint8_t addr[6];
+ 
++	if (!g_dt) {
++		bt_dt_publish(NULL, "vayu_bt_dt=0");    /* the one line, then nothing */
++		return;
++	}
+ 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+ 		uint64_t size = 0;
+ 		const uint8_t *nvm = hakios_image_file("fw", names[i], &size, NULL);
+@@ -5031,6 +5058,10 @@
+ 	if (PE_parse_boot_argn("vayu_bt_randaddr", &value, sizeof(value))) {
+ 		g_randaddr_mode = value > 2 ? 2 : value;
+ 	}
++	value = 0;
++	if (PE_parse_boot_argn("vayu_bt_dt", &value, sizeof(value))) {
++		g_dt = value != 0;
++	}
+ 	if (g_lelegacy_enabled && g_leanswer_enabled) {
+ 		printf("vayu-bt: lelegacy: vayu_bt_leanswer=1 ignored (this test needs the real answers)\n");
+ 		g_leanswer_enabled = false;

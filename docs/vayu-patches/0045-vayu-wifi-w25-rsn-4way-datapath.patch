@@ -1,0 +1,2269 @@
+Subject: [PATCH] vayu_wifi W25: WPA2-PSK 4-way handshake, WMI key install, HTT data path, en0 (PMK from a file)
+
+Base: the W24G research source (/mnt/ramdisk/wifi-work2, 2026-11-02 04:59): the eight W22..W24
+files (vayu_wifi_smmu/ce_wire/htc/ce/htc_connect/wmi/scan/sta.c + their sys/ headers) were copied
+into the test26 tree unchanged and this diff is relative to them.  bsd/conf/files is relative to
+the test26 base (/mnt/ramdisk/n13c/src, branch vayu-test26 d15caf0).
+
+What W24 left: passive scan OK (54 beacons, 41 BSSIDs), auth status 0, assoc status 0 aid 2,
+HTT in-order RX delivering the EAPOL-Key 1/4 frames (len 131 = 24+8+99, decap 1, from DS), and a
+panic in __doprnt from eapol_key() when the line still used %s (fixed in W24G).
+
+The PMK never travels in a boot argument (boot arguments are logged by the loader, the kernel,
+launchd's kern.bootargs and a panic buffer).  It is read from the root volume:
+/private/etc/vayu-wifi/gunwest.pmk, 64 hex digits and one line, mode 0600, when the handshake arms
+(vnode_lookup + vnode_getattr + vn_rdwr, as vayu_pas.c reads /fw), and only with the boot argument
+vayu_wifi_pmk_file=1.  The buffer is wiped after the parse; the only line is
+"vayu-wifi: W25 S0 pmk: OK file (len 32)" (or ERROR with no secret).  PMK/PTK/KCK/KEK/TK/GTK and
+nonces never reach the log.  To put the file into an existing root image:
+/tmp/opencode/ds-wifi-addfile.sh IN.apfs OUT.apfs gunwest.pmk /private/etc/vayu-wifi/gunwest.pmk
+(tools/apfs/apfs.py takes the image apart, tools/apfs/mkapfs.py lays it out again; the file is read
+back out and compared before it exits 0).
+
+Changes:
+ - bsd/dev/vayu_wifi_rsn.c/.h (new): the 4-way handshake.  Crypto through libkern's provider
+   (osfmk/minicrypto registers at EARLY_BOOT): g_crypto_funcs->cchmac_fn + ccsha1_di for HMAC-SHA1,
+   ccaes_ecb_decrypt for RFC 3394 unwrap; one self-test (RFC 2202 HMAC-SHA1, RFC 3394 vector)
+   before any use.  PRF-SHA1 for the 384-bit PTK, message 2/4 with the assoc RSN IE and MIC under
+   the KCK, message 3/4 MIC checked + GTK KDE unwrapped, message 4/4 in the clear, then
+   WMI_VDEV_INSTALL_KEY (0x5009, TLV 0x60) pairwise index 0 and group (KDE index), and
+   WMI_PEER_SET_PARAM (0x6004) AUTHORIZE.
+ - bsd/dev/vayu_wifi_net.c/.h (new): Ethernet <-> native wifi, en0 attached with the BSD interface
+   KPI through hakios_net_attach() (wireless link, up only after the keys), RX MSDUs to
+   hakios_net_input(), TX from the interface's thread to HTT; a minimal DHCP client plus ARP and
+   one ICMP echo to the router behind vayu_wifi_dhcp=1; the station boundary (hakios_sta_ops) is
+   filled so Apple80211 requests have answers.
+ - bsd/dev/vayu_wifi_scan.c: HTT data TX (H2T_TX_FRM, 20+52-byte message, frame in a 64x2048 TX
+   pool, frag-bank entry per slot, TX_COMPL_IND 0x07 frees slots), EAPOL and data frames handed to
+   the handshake/net paths, EAPOL diagnostic limited to the first 8 frames.
+ - bsd/dev/vayu_wifi_sta.c: PEER_ASSOC (PEER_FLAG_AUTH|NEED_PTK_4WAY, assoc RSN IE) and VDEV_UP
+   after the association, the handshake window, en0 up, a 20 s data window (or 180 s with
+   vayu_wifi_keep=1), then VDEV_DOWN/PEER_DELETE/VDEV_STOP.  Stage lines: "vayu-wifi: W25 S<n> ...".
+ - bsd/dev/vayu_wifi_htc_connect.c: the HTT TX buffer is 128 bytes (the TX message is 72), stage
+   line S1 after the scan.
+ - bsd/dev/vayu_wifi_smmu.c: redwood_smmu_lock -> hakios_smmu_lock (the name in the test26 tree).
+
+Verification done on the host: build rc=2 (the usual export-check/symbolset failure, the kernel
+links), the W25 strings are in the kernel, host test of the exact aes_unwrap/prf_sha1 code against
+RFC 3394 and RFC 2202 vectors (after fixing the A^t half-word offset), and the add-file tool
+round-trips the 4 MiB work/hackios-vayu/userland/root.apfs (the added file reads back mode 0600
+uid 0).  Not yet run on the phone.
+
+Artifact: /mnt/ramdisk/ds-wifi-out/mach-wifi25b.bin 16458752 B
+sha256 46081e3607d1a449878e7aac2a121c629b5455554caeb70bf5f06e80b4b258d4
+
+--- a/bsd/dev/vayu_wifi_smmu.c
++++ b/bsd/dev/vayu_wifi_smmu.c
+@@ -75,7 +75,7 @@
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+ extern uint64_t kvtophys(vm_offset_t va);
+ extern void loader_log_putc(char c);
+-extern lck_mtx_t redwood_smmu_lock;
++extern lck_mtx_t hakios_smmu_lock;
+ 
+ static int say(const char *format, ...) __printflike(1, 2);
+ static int
+@@ -376,14 +376,14 @@
+ 	idr1 = rd(wlan.base + SMMU_IDR1);
+ 	say("vayu-wifi: smmu: TBU on (%#x), scr0 %#x idr0 %#x idr1 %#x\n",
+ 	    tbu, rd(wlan.base + SMMU_SCR0), idr0, idr1);
+-	lck_mtx_lock(&redwood_smmu_lock);
++	lck_mtx_lock(&hakios_smmu_lock);
+ 	found = wlan_find(idr0, idr1);
+ 	if (found == 2 || (found == 1 && wlan_on())) ok = true;
+ 	if (!ok) {
+ 		vayu_wifi_smmu_fault("enable");
+ 		wlan_restore();
+ 	}
+-	lck_mtx_unlock(&redwood_smmu_lock);
++	lck_mtx_unlock(&hakios_smmu_lock);
+ 	return ok;
+ }
+ 
+@@ -649,7 +649,7 @@
+ 			return false;
+ 		}
+ 	}
+-	lck_mtx_lock(&redwood_smmu_lock);
++	lck_mtx_lock(&hakios_smmu_lock);
+ 	for (at = 0; at < size; at += 4096) {
+ 		if (!pt_install(pa + at)) {
+ 			say("vayu-wifi: smmu: %s: installing %#llx failed (table budget %u pages)\n",
+@@ -679,7 +679,7 @@
+ 		pt_flush_tables();
+ 		(void)pt_tlbi();
+ 	}
+-	lck_mtx_unlock(&redwood_smmu_lock);
++	lck_mtx_unlock(&hakios_smmu_lock);
+ 	if (!ok) {
+ 		return false;
+ 	}
+@@ -702,7 +702,7 @@
+ 		    (unsigned long long)pa, (unsigned long long)size);
+ 		return false;
+ 	}
+-	lck_mtx_lock(&redwood_smmu_lock);
++	lck_mtx_lock(&hakios_smmu_lock);
+ 	for (at = 0; at < size; at += 4096) {
+ 		pages++;
+ 		if (!pt_verify(pa + at)) {
+@@ -711,7 +711,7 @@
+ 			}
+ 		}
+ 	}
+-	lck_mtx_unlock(&redwood_smmu_lock);
++	lck_mtx_unlock(&hakios_smmu_lock);
+ 	say("vayu-wifi: smmu: %s %#llx+%#llx: %u/%u pages identity-mapped in context %u (SID %#x)%s%#llx\n",
+ 	    what, (unsigned long long)pa, (unsigned long long)size, pages - missing, pages,
+ 	    wlan.context_id, WLAN_STREAM, missing ? "; first missing " : "; ok ",
+--- a/bsd/dev/vayu_wifi_htc_connect.c
++++ b/bsd/dev/vayu_wifi_htc_connect.c
+@@ -304,7 +304,7 @@
+ static int
+ htcc_send_htt(const uint8_t *payload, uint32_t len)
+ {
+-	uint8_t b[HTCC_HDR + 64];
++	uint8_t b[HTCC_HDR + 128];      /* W25: data TX messages are 20 + 52 bytes */
+ 	uint32_t i;
+ 
+ 	if (htcc.htt_eid >= 8 || len > sizeof(b) - HTCC_HDR) {
+@@ -625,7 +625,11 @@
+ 	sops.htt_send = htcc_send_htt;
+ 	sops.dma_alloc = htcc_ops->dma_alloc;
+ 	sops.mac = vayu_wmi_mac();
+-	(void)vayu_scan_run(&sops);
++	if (vayu_scan_run(&sops) == 0) {
++		sops.log("vayu-wifi: W25 S1 scan: OK passive scan completed\n");
++	} else {
++		sops.log("vayu-wifi: W25 S1 scan: ERROR (scan did not complete; see the w22 lines)\n");
++	}
+ 	(void)vayu_sta_run(&sops);
+ }
+ 
+--- a/bsd/dev/vayu_wifi_scan.c
++++ b/bsd/dev/vayu_wifi_scan.c
+@@ -43,6 +43,9 @@
+ #include <vm/memory_types.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <kern/locks.h>
++#include <sys/vayu_wifi_net.h>
++#include <sys/vayu_wifi_rsn.h>
+ #include <sys/vayu_wifi_scan.h>
+ #include <sys/vayu_wifi_smmu.h>
+ 
+@@ -100,6 +103,17 @@
+ #define H2T_RX_RING_CFG         2U
+ #define H2T_AGGR_CFG            5U
+ #define H2T_FRAG_DESC_BANK_CFG  6U
++#define H2T_TX_FRM              1U
++/* W25: HTT data TX (ath10k_htt_tx_64, flame radio.c) */
++#define TX_SLOTS                64U
++#define TX_SLOT_SIZE            2048U
++#define TXF0_MAC_HDR            0x01U
++#define TXF0_NO_ENCRYPT         0x04U
++#define TXF0_NATIVE             0x20U
++#define TXF1_TID_NONQOS         (16U << 6)
++#define TXF1_POSTPONED          (1U << 11)
++#define PREFETCH_LEN            50U
++#define T2H_TX_COMPL_IND        0x07U
+ #define T2H_VERSION_CONF        0x00U
+ #define T2H_RX_IN_ORD_PADDR_IND 0x12U
+ #define HTT_RING_MAX            256U    /* flame HTT_RING_SIZE */
+@@ -172,6 +186,18 @@
+ 	uint32_t rx_msdus, rx_not_done, rx_offload;
+ } sc;
+ 
++/* W25: the HTT TX pool and the bank slots it uses (ids 0..TX_SLOTS-1 of the frag bank). */
++static LCK_GRP_DECLARE(tx_lck_grp, "vayu-wifi-tx");
++static LCK_MTX_DECLARE(tx_lock, &tx_lck_grp);
++static const struct vayu_scan_ops *tx_ops;
++static uint64_t tx_pool_pa;
++static vm_offset_t tx_pool_va;
++static uint64_t tx_busy;
++static uint32_t tx_sent, tx_done, tx_fail;
++
++static void vayu_scan_htt_tx_compl(const uint8_t *p, uint32_t len);
++int vayu_scan_tx_frame(const uint8_t *f, uint32_t len, bool clear);
++
+ static uint32_t
+ rd16(const uint8_t *p)
+ {
+@@ -688,6 +714,7 @@
+ 	sc.eapol_seen++;
+ 	/* W24G: no %s in this line. The W24D/F kernels died in __doprnt reading address 1
+ 	 * (esr 0x96000005, far 0x1) right after this call, so the line is all-numeric now. */
++	if (sc.eapol_seen <= 8) {
+ 	printf("vayu-wifi: w24: eapol group %u %u/%u ver %u desc %u key_info 0x%04x (kver %u "
+ 	    "pairwise %u install %u ack %u mic %u secure %u err %u req %u enc_kd %u) key_len %u "
+ 	    "replay %llu key data length %u body %u msdu %u nonce_set %u (#%u)\n",
+@@ -696,6 +723,7 @@
+ 	    (info & KI_MIC) != 0, (info & KI_SECURE) != 0, (info & KI_ERROR) != 0,
+ 	    (info & KI_REQUEST) != 0, (info & KI_ENC_KD) != 0, klen,
+ 	    (unsigned long long)replay, kd, body, mlen, nonzero != 0, sc.eapol_seen);
++	}
+ }
+ 
+ static void
+@@ -717,6 +745,7 @@
+ 		room = HTT_BUF_SIZE - OFFLOAD_HDR_LEN;
+ 		len = rd16(buf);
+ 		len = len < room ? len : room;
++		decap = DECAP_RAW;
+ 		eo = rx_eapol_off(f, len, DECAP_RAW, &hdr);
+ 		if (n <= RX_DECODE_LOGS && rx_logging()) {
+ 			printf("vayu-wifi: w24: rx msdu #%u offload: len %u peer %u vdev %u tid %u fw_desc %#x eapol_off %u\n",
+@@ -747,6 +776,9 @@
+ 	}
+ 	if (eo != 0) {
+ 		eapol_key(f + eo, len - eo, len);
++		vayu_rsn_eapol_rx(f + eo, len - eo);
++	} else {
++		vayu_net_rx_80211(f, len, decap, hdr);
+ 	}
+ }
+ 
+@@ -816,6 +848,12 @@
+ 		return;
+ 	}
+ 	sc.htt_msgs++;
++	if (p[0] == T2H_TX_COMPL_IND) {
++		if (len >= 4) {
++			vayu_scan_htt_tx_compl(p, len);
++		}
++		return;
++	}
+ 	if (p[0] == T2H_VERSION_CONF && len >= 3) {
+ 		sc.htt_major = p[2];
+ 		sc.htt_minor = p[1];
+@@ -1017,6 +1055,113 @@
+ 	return sc.started || sc.done;
+ }
+ 
++/* ---- W25: HTT data TX ------------------------------------------------------------------------- */
++
++/* One native-wifi data frame (see radio.c htt_tx_frame): the message carries the first 50 bytes,
++ * the whole frame is in the TX pool and the bank entry points at it. 0 = sent. */
++int
++vayu_scan_tx_frame(const uint8_t *f, uint32_t len, bool clear)
++{
++	uint8_t m[20 + 52], *p, *ext;
++	uint32_t id, pf, lo;
++	uint16_t hi, l16;
++	uint64_t pa;
++	int rc;
++
++	if (tx_ops == NULL || sc.htt_va == 0 || f == NULL || len == 0 || len > TX_SLOT_SIZE) {
++		return -1;
++	}
++	if (tx_pool_pa == 0) {
++		uint64_t pool = tx_ops->dma_alloc(TX_SLOTS * TX_SLOT_SIZE);
++
++		if (pool == 0) {
++			tx_ops->log("vayu-wifi: W25 S4 tx: ERROR no HTT tx pool\n");
++			return -1;
++		}
++		tx_pool_va = ml_io_map_unmappable((vm_offset_t)pool, TX_SLOTS * TX_SLOT_SIZE, VM_WIMG_WCOMB);
++		if (tx_pool_va == 0) {
++			tx_ops->log("vayu-wifi: W25 S4 tx: ERROR cannot map the HTT tx pool\n");
++			return -1;
++		}
++		tx_pool_pa = pool;
++		tx_ops->log("vayu-wifi: W25 S4 tx: OK HTT tx pool %u x %u at PA %#llx\n", TX_SLOTS, TX_SLOT_SIZE,
++		    (unsigned long long)pool);
++	}
++	lck_mtx_lock(&tx_lock);
++	for (id = 0; id < TX_SLOTS && (tx_busy & (1ULL << id)) != 0; id++) {
++		;
++	}
++	if (id == TX_SLOTS) {
++		lck_mtx_unlock(&tx_lock);
++		return -1;
++	}
++	pa = tx_pool_pa + (uint64_t)id * TX_SLOT_SIZE;
++	memcpy((void *)(tx_pool_va + (vm_offset_t)(pa - tx_pool_pa)), f, len);
++	__asm__ volatile("dsb sy" ::: "memory");
++	ext = (uint8_t *)(sc.htt_va + (vm_offset_t)(sc.htt_bank_pa - sc.htt_pa) + (vm_offset_t)id * HTT_EXT_DESC_SIZE);
++	memset(ext, 0, HTT_EXT_DESC_SIZE);
++	lo = (uint32_t)pa;
++	hi = (uint16_t)(pa >> 32);
++	l16 = (uint16_t)len;
++	memcpy(ext + 24, &lo, 4);
++	memcpy(ext + 28, &hi, 2);
++	memcpy(ext + 30, &l16, 2);
++	__asm__ volatile("dsb sy" ::: "memory");
++	pf = (len < PREFETCH_LEN ? len : PREFETCH_LEN) + 3U & ~3U;
++	memset(m, 0, sizeof(m));
++	p = m;
++	*p++ = H2T_TX_FRM;
++	*p++ = (uint8_t)(TXF0_MAC_HDR | TXF0_NATIVE | (clear ? TXF0_NO_ENCRYPT : 0));
++	*p++ = (uint8_t)(TXF1_TID_NONQOS | TXF1_POSTPONED);
++	*p++ = (uint8_t)((TXF1_TID_NONQOS | TXF1_POSTPONED) >> 8);
++	*p++ = (uint8_t)len;
++	*p++ = (uint8_t)(len >> 8);
++	*p++ = (uint8_t)id;
++	*p++ = (uint8_t)(id >> 8);
++	{
++		uint64_t bank = sc.htt_bank_pa + (uint64_t)id * HTT_EXT_DESC_SIZE;   /* this slot's ext descriptor */
++
++		memcpy(p, &bank, 8);
++		p += 8;
++	}
++	*p++ = 0xff;
++	*p++ = 0xff;                                    /* peer id: invalid, the firmware resolves it */
++	*p++ = 0;
++	*p++ = 0;
++	memcpy(p, f, pf);
++	rc = tx_ops->htt_send(m, 20 + pf);
++	if (rc != 0) {
++		lck_mtx_unlock(&tx_lock);
++		return -1;
++	}
++	tx_busy |= 1ULL << id;
++	tx_sent++;
++	lck_mtx_unlock(&tx_lock);
++	return 0;
++}
++
++static void
++vayu_scan_htt_tx_compl(const uint8_t *p, uint32_t len)
++{
++	uint32_t n = p[2], st = p[1] & 7U, i;
++
++	for (i = 0; i < n && 4 + 2 * (i + 1) <= len; i++) {
++		uint32_t id = rd16(p + 4 + 2 * i);
++
++		if (id < TX_SLOTS) {
++			tx_busy &= ~(1ULL << id);
++		}
++	}
++	tx_done += n;
++	if (st != 0) {
++		tx_fail += n;
++		if (tx_fail <= 4 && slog != NULL) {
++			slog("vayu-wifi: W25 tx: ERROR %u completion(s) status %u\n", n, st);
++		}
++	}
++}
++
++
+ int
+ vayu_scan_run(const struct vayu_scan_ops *o)
+ {
+@@ -1031,6 +1176,7 @@
+ 	if (o == NULL || vayu_scan_mode == 0) {
+ 		return -1;
+ 	}
++	tx_ops = o;
+ 	o->log("vayu-wifi: w22: scan stage: reg events %u (rules %u, country %s), freq_avoid events %u\n",
+ 	    sc.reg_events, sc.nrules, sc.reg_seen ? sc.alpha2 : "-", sc.avoid_events);
+ 	(void)htt_setup(o);
+--- a/bsd/dev/vayu_wifi_sta.c
++++ b/bsd/dev/vayu_wifi_sta.c
+@@ -42,8 +42,10 @@
+ #include <vm/memory_types.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
+-#include <sys/vayu_wifi_sta.h>
++#include <sys/vayu_wifi_net.h>
++#include <sys/vayu_wifi_rsn.h>
+ #include <sys/vayu_wifi_scan.h>
++#include <sys/vayu_wifi_sta.h>
+ #include <sys/vayu_wifi_smmu.h>
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+@@ -57,7 +59,11 @@
+ #define EV_MGMT_TX_COMPL        0x7006U
+ #define CMD_VDEV_START          0x5003U
+ #define CMD_VDEV_STOP           0x5006U
++#define CMD_VDEV_UP             0x5005U
++#define CMD_VDEV_DOWN           0x5007U
+ #define CMD_PEER_CREATE         0x6001U
++#define CMD_PEER_SET_PARAM      0x6004U
++#define CMD_PEER_ASSOC          0x6005U
+ #define CMD_PEER_DELETE         0x6002U
+ #define CMD_MGMT_TX_SEND        0x7008U
+ #define CMD_STA_PS_MODE         0x9001U
+@@ -66,7 +72,12 @@
+ #define TAG_MGMT_RX_HDR         0x2cU
+ #define TAG_CHANNEL             0x50U
+ #define TAG_VDEV_START          0x58U
++#define TAG_VDEV_UP             0x5cU
+ #define TAG_VDEV_STOP           0x5dU
++#define TAG_VDEV_DOWN           0x5eU
++#define TAG_PEER_SET_PARAM      0x64U
++#define TAG_PEER_ASSOC          0x65U
++#define TAG_VHT_RATE_SET        0x66U
+ #define TAG_PEER_CREATE         0x61U
+ #define TAG_PEER_DELETE         0x62U
+ #define TAG_STA_PS_MODE         0x6cU
+@@ -87,6 +98,11 @@
+ #define REPLY_WAIT_MS           400U
+ #define TRIES                   4U
+ #define WINDOW_MS               3000U
++#define PEER_FLAG_AUTH          0x1U
++#define PEER_FLAG_NEED_PTK_4WAY 0x4U
++#define RSN_WAIT_MS             8000U   /* the AP's 1/4 retries are ~1 s apart (W24) */
++#define NET_WINDOW_MS           20000U  /* the link stays up this long for iOS/configd */
++#define KEEP_SECS               180U    /* vayu_wifi_keep=1: teardown after this */
+ #define TX_LOG_MAX              16U
+ #define RX_LOG_MAX              8U
+ #define IE_MAX                  768U
+@@ -224,6 +240,8 @@
+ 		return;
+ 	}
+ 	vayu_sta_mode = (mode == 1 && vayu_scan_mode != 0) ? 1 : 0;
++	vayu_rsn_reset(log);
++	vayu_net_reset(log);
+ 	tlog("vayu-wifi: w23: vayu_wifi_join=%u%s: open auth + assoc to '%s' 5 GHz (any ch, was %u) bssid xx:xx:xx:xx:%02x:%02x "
+ 	    "after the scan, %u ms rx count, deauth; no EAPOL/keys\n", mode,
+ 	    vayu_sta_mode != 0 ? "" : (mode != 1 ? " (unknown, off)" : " (needs vayu_wifi_scan=1, off)"),
+@@ -809,6 +827,54 @@
+ 	return wmi_cmd(o, m, cmd, sizeof(m));
+ }
+ 
++
++/* W25: PEER_ASSOC with the RSN IE and the 4-way flag (ath10k wmi-tlv, flame radio.c w_peer_assoc) */
++static int
++peer_assoc(const struct vayu_scan_ops *o, uint32_t caps)
++{
++	uint8_t m[200], rates[16];
++	uint32_t n = ap_rates(rates), rl = ((n < 16 ? n : 16) + 3U) & ~3U, i;
++	uint8_t *p, *r;
++
++	zero(m, sizeof(m));
++	p = put_tlv(m + 4, TAG_PEER_ASSOC, 76);
++	p = put_mac(p, st.bssid);
++	p = put32(p, 0);                        /* peer type */
++	p = put32(p, 1);                        /* new association */
++	p = put32(p, st.aid);
++	p = put32(p, PEER_FLAG_AUTH | (st.rsn ? PEER_FLAG_NEED_PTK_4WAY : 0));
++	p = put32(p, caps);
++	p = put32(p, 10);                       /* listen interval */
++	p += 16;                                /* ht caps, max mpdu, density, rate caps */
++	p = put32(p, 1);                        /* nss */
++	p = put32(p, 0);                        /* vht caps */
++	p = put32(p, join_freq() < 4000U ? 1U : 0U);
++	p += 8;
++	p = put32(p, n < 16 ? n : 16);
++	p = put32(p, 0);
++	r = put_tlv(p, TAG_ARRAY_BYTE, rl);
++	for (i = 0; i < n && i < 16; i++) {
++		uint8_t v = rates[i] & 0x7fU;
++
++		r[i] = (v == 2 || v == 4 || v == 11 || v == 22) ? (uint8_t)(v | 0x80U) : v;
++	}
++	p = r + rl;
++	p = put_tlv(p, TAG_ARRAY_BYTE, 0);
++	p = put_tlv(p, TAG_VHT_RATE_SET, 16);
++	return wmi_cmd(o, m, CMD_PEER_ASSOC, (uint32_t)(p - m));
++}
++
++static int
++vdev_up(const struct vayu_scan_ops *o)
++{
++	uint8_t m[4 + 4 + 16], *p = put_tlv(m + 4, TAG_VDEV_UP, 16);
++
++	p = put32(p, 0);
++	p = put32(p, st.aid);
++	(void)put_mac(p, st.bssid);
++	return wmi_cmd(o, m, CMD_VDEV_UP, sizeof(m));
++}
++
+ static int
+ peer(const struct vayu_scan_ops *o, bool create)
+ {
+@@ -838,30 +904,32 @@
+ vayu_sta_run(const struct vayu_scan_ops *o)
+ {
+ 	static uint8_t assoc[256];
+-	uint32_t alen = 0, tries, t0;
+-	bool started = false, peered = false, authed = false, associated = false;
++	uint32_t alen = 0, tries, waited;
++	bool started = false, peered = false, authed = false, associated = false, up = false;
+ 	int w = 0, rc = -1;
+ 
+ 	if (o == NULL || vayu_sta_mode == 0) {
+ 		return -1;
+ 	}
+ 	st.mac = o->mac;
++	vayu_net_set_tx(vayu_scan_tx_frame, o->log);
+ 	if (!st.have) {
+-		o->log("vayu-wifi: w23: no 5 GHz beacon from '%s' (was ch %u) bssid ..%02x:%02x in the scan; nothing sent, stop\n",
++		o->log("vayu-wifi: W25 S2 join: ERROR no beacon from '%s' (ch %u) bssid ..%02x:%02x in the scan\n",
+ 		    target_ssid, TARGET_CHAN, TARGET_B4, TARGET_B5);
+ 		return -1;
+ 	}
+-	o->log("vayu-wifi: w23: target '%s' bssid xx:xx:xx:xx:%02x:%02x ch %u rssi %d bcn %u cap %#x ies %u "
++	o->log("vayu-wifi: W25 S2 join: OK target '%s' bssid xx:xx:xx:xx:%02x:%02x ch %u rssi %d bcn %u cap %#x ies %u "
+ 	    "(%u beacons)\n", target_ssid, st.bssid[4], st.bssid[5], st.chan, st.rssi, st.bintval, st.capab,
+ 	    st.ie_len, st.beacons);
+ 	if (rsn_parse(o) != 0 || !mgmt_pool(o)) {
++		o->log("vayu-wifi: W25 S2 join: ERROR rsn/mgmt pool\n");
+ 		return -1;
+ 	}
+ 	alen = build_assoc(assoc);
+ 	(void)ps_off(o);
+ 	st.state = ST_START;
+ 	if (vdev_start(o) != 0) {
+-		o->log("vayu-wifi: w23: VDEV_START send FAILED, stop\n");
++		o->log("vayu-wifi: W25 S2 join: ERROR VDEV_START not sent\n");
+ 		st.state = ST_DONE;
+ 		return -1;
+ 	}
+@@ -871,14 +939,13 @@
+ 		goto stopped;
+ 	}
+ 	if (!st.start_resp || st.start_status != 0) {
+-		o->log("vayu-wifi: w23: vdev start %s (status %d), stop\n", st.start_resp ? "refused" : "no response",
+-		    st.start_status);
++		o->log("vayu-wifi: W25 S2 join: ERROR vdev start %s (status %d)\n",
++		    st.start_resp ? "refused" : "no response", st.start_status);
+ 		goto teardown;
+ 	}
+ 	peered = peer(o, true) == 0;
+-	o->log("vayu-wifi: w23: PEER_CREATE xx:xx:xx:xx:%02x:%02x %s\n", st.bssid[4], st.bssid[5],
+-	    peered ? "ok" : "FAILED");
+ 	if (!peered) {
++		o->log("vayu-wifi: W25 S2 join: ERROR PEER_CREATE\n");
+ 		goto teardown;
+ 	}
+ 	st.state = ST_AUTH;
+@@ -889,11 +956,9 @@
+ 			goto stopped;
+ 		}
+ 	}
+-	if (!st.auth_reply) {
+-		o->log("vayu-wifi: w23: auth: no response after %u tries\n", TRIES);
+-		goto teardown;
+-	}
+-	if (st.auth_status != 0) {
++	if (!st.auth_reply || st.auth_status != 0) {
++		o->log("vayu-wifi: W25 S2 join: ERROR auth %s status %u\n", st.auth_reply ? "reply" : "none",
++		    st.auth_status);
+ 		goto teardown;
+ 	}
+ 	authed = true;
+@@ -905,49 +970,128 @@
+ 			goto stopped;
+ 		}
+ 	}
+-	if (!st.assoc_reply) {
+-		o->log("vayu-wifi: w23: assoc: no response after %u tries\n", TRIES);
++	if (!st.assoc_reply || st.assoc_status != 0) {
++		o->log("vayu-wifi: W25 S2 join: ERROR assoc %s status %u\n", st.assoc_reply ? "reply" : "none",
++		    st.assoc_status);
+ 		goto teardown;
+ 	}
+-	if (st.assoc_status != 0) {
++	associated = true;
++	o->log("vayu-wifi: W25 S2 join: OK assoc status 0 aid %u (auth 0)\n", st.aid);
++	if (peer_assoc(o, st.assoc_cap) != 0) {
++		o->log("vayu-wifi: W25 S2 join: ERROR PEER_ASSOC not sent\n");
+ 		goto teardown;
+ 	}
+-	associated = true;
++	if (vdev_up(o) != 0) {
++		o->log("vayu-wifi: W25 S2 join: ERROR VDEV_UP not sent\n");
++		goto teardown;
++	}
++	o->log("vayu-wifi: W25 S2 join: OK PEER_ASSOC (%s) + VDEV_UP sent\n", st.rsn ? "rsn, 4way" : "open");
++
++	/* W25 S3: the 4-way handshake, driven by the EAPOL frames the HTT rx path hands to vayu_wifi_rsn.c */
++	if (st.rsn) {
++		struct vayu_rsn_ops rops;
++
++		if (!vayu_rsn_armed()) {
++			o->log("vayu-wifi: W25 S3 4way: ERROR no usable PMK (vayu_wifi_pmk_file)\n");
++			goto teardown;
++		}
++		zero(&rops, (uint32_t)sizeof(rops));
++		rops.log = o->log;
++		rops.wmi_send = o->wmi_send;
++		rops.tx_data = vayu_scan_tx_frame;
++		rops.mac = st.mac;
++		rops.bssid = st.bssid;
++		rops.rsn_ie = st.rsn_ie;
++		rops.rsn_ie_len = (uint32_t)sizeof(st.rsn_ie);
++		rops.group_cipher = st.rsn_ie[7] == 2 ? 2U : 4U;
++		vayu_rsn_start(&rops);
++		waited = 0;
++		while (waited < RSN_WAIT_MS) {
++			int r = vayu_rsn_poll();
++
++			if (r <= 0) {
++				break;
++			}
++			if (o->wait(NULL, 100) < 0) {
++				goto stopped;
++			}
++			waited += 100;
++		}
++		if (!vayu_rsn_keyed()) {
++			o->log("vayu-wifi: W25 S3 4way: ERROR no keys in %u ms\n", RSN_WAIT_MS);
++			goto teardown;
++		}
++	} else {
++		o->log("vayu-wifi: W25 S3 4way: OK not needed (open network)\n");
++	}
++
++	/* W25 S4: en0 over the link */
++	if (vayu_net_start(st.mac, st.bssid, (const uint8_t *)target_ssid, TARGET_SSID_LEN) != 0) {
++		goto teardown;
++	}
++	up = true;
+ 	rc = 0;
+-	o->log("vayu-wifi: w23: associated (aid %u); counting rx for %u ms, no EAPOL\n", st.aid, WINDOW_MS);
+-	st.state = ST_WINDOW;
+-	t0 = st.w_mgmt;
+-	w = o->wait(NULL, WINDOW_MS);
+-	o->log("vayu-wifi: w23: rx window %u ms: mgmt %u (beacons %u, other %u), htt msgs %u msdus %u, "
+-	    "kickout %u, AP left %u%s\n", WINDOW_MS, st.w_mgmt - t0, st.w_beacons, st.w_other, st.w_htt_msgs,
+-	    st.w_htt_msdus, st.w_kickout, st.ap_left ? 1 : 0, w < 0 ? " (stopped)" : "");
+-	if (w < 0) {
+-		goto stopped;
++
++	/* W25 S5/S6: let iOS see the link, and prove the path with our own DHCP when asked */
++	waited = 0;
++	for (;;) {
++		bool stopped_now = false;
++		int d = vayu_net_poll();
++
++		(void)d;
++		if (o->wait(NULL, 100) < 0) {
++			stopped_now = true;
++		}
++		waited += 100;
++		if (stopped_now) {
++			break;
++		}
++		if (vayu_net_keep()) {
++			if (waited >= KEEP_SECS * 1000U) {
++				break;
++			}
++			if (waited % 30000U == 0) {
++				vayu_net_summary();
++			}
++		} else if (waited >= NET_WINDOW_MS) {
++			break;
++		}
+ 	}
++	vayu_net_summary();
++
+ teardown:
+ 	st.state = ST_DONE;
++	if (up) {
++		vayu_net_stop();
++	}
++	vayu_rsn_stop();
+ 	if ((authed || associated) && !st.ap_left) {
+ 		(void)send_deauth(o);
+ 		if (o->wait(NULL, 200) < 0) {
+ 			goto stopped;
+ 		}
+ 	}
++	if (associated) {
++		(void)vdev_simple(o, CMD_VDEV_DOWN, TAG_VDEV_DOWN);
++		(void)o->wait(NULL, 50);
++	}
+ 	if (peered) {
+-		o->log("vayu-wifi: w23: PEER_DELETE %s\n", peer(o, false) == 0 ? "ok" : "FAILED");
++		o->log("vayu-wifi: W25 S2 join: PEER_DELETE %s\n", peer(o, false) == 0 ? "ok" : "FAILED");
+ 	}
+ 	if (started) {
+-		o->log("vayu-wifi: w23: VDEV_STOP %s\n", vdev_simple(o, CMD_VDEV_STOP, TAG_VDEV_STOP) == 0 ?
+-		    "sent" : "FAILED");
++		o->log("vayu-wifi: W25 S2 join: VDEV_STOP %s\n",
++		    vdev_simple(o, CMD_VDEV_STOP, TAG_VDEV_STOP) == 0 ? "sent" : "FAILED");
+ 		if (o->wait(stop_done, 1000) < 0) {
+ 			goto stopped;
+ 		}
+ 	}
+-	o->log("vayu-wifi: w23: join done: rc %d auth %s status %u, assoc %s status %u aid %u, mgmt tx %u "
+-	    "completions %u, vdev stopped %u\n", rc, st.auth_reply ? "reply" : "none", st.auth_status,
+-	    st.assoc_reply ? "reply" : "none", st.assoc_status, st.aid, st.desc, st.tx_compl, st.stopped ? 1 : 0);
++	if (rc == 0) {
++		o->log("vayu-wifi: W25 S2 join: OK done (auth %u, assoc %u aid %u, mgmt tx %u completions %u)\n",
++		    st.auth_status, st.assoc_status, st.aid, st.desc, st.tx_compl);
++	}
+ 	return rc;
+ stopped:
+ 	st.state = ST_DONE;
+-	o->log("vayu-wifi: w23: stopped (CE stage abort); no teardown possible\n");
++	o->log("vayu-wifi: W25 join: ERROR stopped (CE stage abort)\n");
+ 	return -1;
+ }
+--- a/bsd/dev/vayu_wifi_rsn.c
++++ b/bsd/dev/vayu_wifi_rsn.c
+@@ -0,0 +1,757 @@
++/*
++ * W25: the WPA2-PSK 4-way handshake of the vayu station (see sys/vayu_wifi_rsn.h).
++ *
++ * The PMK is read from /private/etc/vayu-wifi/gunwest.pmk (boot-arg vayu_wifi_pmk_file=1), never
++ * from a boot argument: boot arguments are logged by the loader, the kernel, launchd and panics.
++ *
++ * Flow: message 1/4 (pairwise, ack, no MIC) -> SNonce random, PTK = PRF-384(PMK, "Pairwise key
++ * expansion", AA|SPA|ANonce|SNonce ordered the standard's way) -> 2/4 with the RSN IE of our
++ * assoc request and a HMAC-SHA1-128 MIC under the KCK.  Message 3/4 -> MIC checked, GTK
++ * unwrapped with the KEK (RFC 3394), 4/4 sent in the clear, WMI_VDEV_INSTALL_KEY for the
++ * pairwise TK (index 0) and the group key, then WMI_PEER_SET_PARAM AUTHORIZE.
++ *
++ * Layouts are ath10k's wmi-tlv (wmi.h: struct wmi_vdev_install_key_cmd, wmi_peer_set_param_cmd)
++ * and EAPOL-Key as IEEE 802.1X-2004 7.6 / 8.5.  Nothing secret is printed: no PMK, PTK, KCK,
++ * KEK, TK, GTK or nonce ever reaches the log; the addresses are masked the way the rest of the
++ * Wi-Fi lines mask them.
++ *
++ * MIT License.  Copyright (c) 2026 The Redwood Project (W25 adaptation).
++ */
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include <mach/mach_types.h>
++#include <kern/clock.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include <sys/kauth.h>
++#include <sys/random.h>
++#include <sys/systm.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/vayu_wifi_rsn.h>
++#include <libkern/crypto/crypto_internal.h>
++#include <corecrypto/ccmode.h>
++
++/* ---- EAPOL-Key (802.1X-2004) ------------------------------------------------------------------ */
++
++#define EAPOL_TYPE_KEY          3U
++#define KI_PAIRWISE             0x0008U
++#define KI_INSTALL              0x0040U
++#define KI_ACK                  0x0080U
++#define KI_MIC                  0x0100U
++#define KI_SECURE               0x0200U
++#define KI_ENC_KD               0x1000U
++#define EAPOL_KEY_FIXED         95U     /* the Key Descriptor body without key data */
++#define EAPOL_HDR               4U
++
++/* ---- WMI -------------------------------------------------------------------------------------- */
++
++#define CMD_VDEV_INSTALL_KEY    0x5009U
++#define CMD_PEER_SET_PARAM      0x6004U
++#define TAG_VDEV_INSTALL_KEY    0x60U
++#define TAG_PEER_SET_PARAM      0x64U
++#define PEER_PARAM_AUTHORIZE    3U
++#define WMI_CIPHER_TKIP         2U
++#define WMI_CIPHER_CCMP         4U
++
++#define PMK_PATH                "/private/etc/vayu-wifi/gunwest.pmk"
++#define PMK_LEN                 32U
++#define PTK_LEN                 48U
++#define KCK_LEN                 16U
++#define KEK_LEN                 16U
++#define TK_LEN                  16U
++#define NONCE_LEN               32U
++#define MIC_LEN                 16U
++#define GTK_MAX                 32U
++
++enum rsn_state { RSN_OFF, RSN_WAIT_M1, RSN_WAIT_M3, RSN_KEYED, RSN_FAILED };
++
++static struct {
++	bool pmk_set, pmk_file, tested, armed, started;
++	uint32_t state;
++	uint8_t pmk[PMK_LEN];
++	uint8_t ptk[PTK_LEN], snonce[NONCE_LEN], anonce[NONCE_LEN];
++	uint8_t gtk[GTK_MAX];
++	uint32_t gtk_len, gtk_idx;
++	uint64_t replay, anonce_replay;
++	uint32_t eapol_ver, key_ver;
++	uint32_t msg1s, msg3s, bad_mic, ignored;
++	uint32_t group_cipher;
++	const struct vayu_rsn_ops *ops;
++	int (*log)(const char *format, ...) __printflike(1, 2);
++} rsn;
++
++/* ---- crypto through libkern's provider -------------------------------------------------------- */
++
++static bool
++sha1_hmac(const uint8_t *key, uint32_t key_len, const uint8_t *data, uint32_t data_len, uint8_t out[20])
++{
++	if (g_crypto_funcs == NULL || g_crypto_funcs->cchmac_fn == NULL || g_crypto_funcs->ccsha1_di == NULL) {
++		return false;
++	}
++	g_crypto_funcs->cchmac_fn(g_crypto_funcs->ccsha1_di, key_len, key, data_len, data, out);
++	return true;
++}
++
++/* AES-ECB decrypt, one block at a time: the whole of RFC 3394 needs of the cipher. */
++static bool
++aes_ecb_decrypt(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
++{
++	const struct ccmode_ecb *ecb;
++	uint8_t ctx[512] __attribute__((aligned(16)));
++
++	if (g_crypto_funcs == NULL || (ecb = g_crypto_funcs->ccaes_ecb_decrypt) == NULL ||
++	    ecb->size > sizeof(ctx) || ecb->init == NULL || ecb->ecb == NULL) {
++		return false;
++	}
++	if (ecb->init(ecb, (ccecb_ctx *)ctx, 16, key) != 0) {
++		return false;
++	}
++	ecb->ecb((ccecb_ctx *)ctx, 1, in, out);
++	memset(ctx, 0, sizeof(ctx));
++	return true;
++}
++
++/* RFC 3394 §2.2.2, n = 1..; plain = len - 8 bytes, len must be a multiple of 8 and >= 24. */
++static bool
++aes_unwrap(const uint8_t kek[KEK_LEN], const uint8_t *in, uint32_t len, uint8_t *out)
++{
++	uint8_t a[8], b[16], r[256];
++	uint32_t n, i, j, t;
++
++	if (len < 24 || (len & 7U) != 0 || len - 8 > sizeof(r)) {
++		return false;
++	}
++	n = (len - 8) / 8;
++	memcpy(a, in, 8);
++	memcpy(r, in + 8, len - 8);
++	for (j = 6; j-- > 0;) {
++		for (i = n; i-- > 0;) {
++			t = n * j + (i + 1);
++			memcpy(b, a, 8);
++			b[4] ^= (uint8_t)(t >> 24);     /* A ^= t, the 32-bit counter in the low half */
++			b[5] ^= (uint8_t)(t >> 16);
++			b[6] ^= (uint8_t)(t >> 8);
++			b[7] ^= (uint8_t)t;
++			memcpy(b + 8, r + 8 * i, 8);
++			if (!aes_ecb_decrypt(kek, b, b)) {
++				return false;
++			}
++			memcpy(a, b, 8);
++			memcpy(r + 8 * i, b + 8, 8);
++		}
++	}
++	static const uint8_t iv[8] = { 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6 };
++
++	if (memcmp(a, iv, 8) != 0) {
++		return false;
++	}
++	memcpy(out, r, len - 8);
++	memset(r, 0, sizeof(r));
++	memset(b, 0, sizeof(b));
++	return true;
++}
++
++/* IEEE 802.11i PRF-SHA1 (802.11-2016 12.7.1.2): HMAC-SHA1(PMK, label|0|data|i), i from 0. */
++static bool
++prf_sha1(const uint8_t *key, uint32_t key_len, const char *label, const uint8_t *data, uint32_t data_len,
++    uint8_t *out, uint32_t out_len)
++{
++	uint8_t buf[128], digest[20], counter = 0;
++	uint32_t label_len = (uint32_t)strlen(label);
++
++	if (label_len + 1 + data_len + 1 > sizeof(buf)) {
++		return false;
++	}
++	memcpy(buf, label, label_len);
++	buf[label_len] = 0;
++	memcpy(buf + label_len + 1, data, data_len);
++	while (out_len != 0) {
++		uint32_t take;
++
++		buf[label_len + 1 + data_len] = counter++;
++		if (!sha1_hmac(key, key_len, buf, label_len + 2 + data_len, digest)) {
++			return false;
++		}
++		take = out_len < sizeof(digest) ? out_len : sizeof(digest);
++		memcpy(out, digest, take);
++		out += take;
++		out_len -= take;
++	}
++	memset(buf, 0, sizeof(buf));
++	memset(digest, 0, sizeof(digest));
++	return true;
++}
++
++/* Runs once: a wrong provider is better found here than in a key on the air. */
++static bool
++crypto_selftest(void)
++{
++	/* RFC 2202 test case 1: key 0x0b * 20, "Hi There" -> b617318655057264e28bc0b6fb378c8ef146be00 */
++	static const uint8_t key[20] = { 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
++		                         0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b };
++	static const uint8_t text[8] = { 'H', 'i', ' ', 'T', 'h', 'e', 'r', 'e' };
++	static const uint8_t mac[20] = { 0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xe2, 0x8b,
++		                         0xc0, 0xb6, 0xfb, 0x37, 0x8c, 0x8e, 0xf1, 0x46, 0xbe, 0x00 };
++	/* RFC 3394 §4.1: KEK 000102..0f, 128-bit key 00112233..ff, wrapped 1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5 */
++	static const uint8_t kek[16] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
++	static const uint8_t wrapped[24] = { 0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8,
++		                             0xfb, 0x5a, 0x7b, 0x82, 0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5 };
++	static const uint8_t plain[16] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
++		                           0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
++	uint8_t out[20], unwrapped[16];
++	bool hmac_ok, unwrap_ok;
++
++	hmac_ok = sha1_hmac(key, sizeof(key), text, sizeof(text), out) && memcmp(out, mac, sizeof(mac)) == 0;
++	unwrap_ok = aes_unwrap(kek, wrapped, sizeof(wrapped), unwrapped) && memcmp(unwrapped, plain, 16) == 0;
++	if (rsn.log != NULL) {
++		rsn.log("vayu-wifi: W25 S3 crypto: %s hmac-sha1 %u rfc3394 %u\n",
++		    hmac_ok && unwrap_ok ? "OK" : "ERROR", hmac_ok ? 1 : 0, unwrap_ok ? 1 : 0);
++	}
++	return hmac_ok && unwrap_ok;
++}
++
++/* ---- setup ------------------------------------------------------------------------------------- */
++
++/* The PMK is a file on the root volume, 64 hex digits: boot arguments end up in every log
++ * (the bootloader's cmdline, the kernel's boot-args, launchd's kern.bootargs, a panic buffer),
++ * so no secret goes there.  Reading it is deferred to the first arming, long after the root is
++ * mounted; the buffer is wiped before anything else happens to it. */
++static bool
++pmk_read_file(void)
++{
++	char text[160];
++	uint8_t pmk[PMK_LEN];
++	vfs_context_t context = vfs_context_kernel();
++	vnode_t vnode = NULLVP;
++	struct vnode_attr attributes;
++	uint32_t len, i;
++	int left = 0, error;
++	bool ok = true;
++
++	if (rootvnode == NULLVP) {
++		rsn.log("vayu-wifi: W25 S0 pmk: ERROR no root volume\n");
++		return false;
++	}
++	if (vnode_lookup(PMK_PATH, 0, &vnode, context) != 0) {
++		rsn.log("vayu-wifi: W25 S0 pmk: ERROR " PMK_PATH " not found\n");
++		return false;
++	}
++	VATTR_INIT(&attributes);
++	VATTR_WANTED(&attributes, va_data_size);
++	if (vnode_getattr(vnode, &attributes, context) != 0 || attributes.va_data_size < 64 ||
++	    attributes.va_data_size > (off_t)sizeof(text)) {
++		vnode_put(vnode);
++		rsn.log("vayu-wifi: W25 S0 pmk: ERROR size %lld (want 64 hex digits)\n",
++		    (long long)attributes.va_data_size);
++		return false;
++	}
++	len = (uint32_t)attributes.va_data_size;
++	memset(text, 0, sizeof(text));
++	error = vn_rdwr(UIO_READ, vnode, (caddr_t)text, (int)len, 0, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(context), &left, vfs_context_proc(context));
++	vnode_put(vnode);
++	if (error != 0 || left != 0) {
++		memset(text, 0, sizeof(text));
++		rsn.log("vayu-wifi: W25 S0 pmk: ERROR read %d, %d bytes left\n", error, left);
++		return false;
++	}
++	while (len > 0 && (text[len - 1] == '\n' || text[len - 1] == '\r' || text[len - 1] == ' ')) {
++		len--;
++	}
++	if (len != 2 * PMK_LEN) {
++		ok = false;
++	}
++	for (i = 0; ok && i < PMK_LEN; i++) {
++		uint32_t hi = (uint8_t)text[2 * i], lo = (uint8_t)text[2 * i + 1];
++		uint32_t vh = (hi >= '0' && hi <= '9') ? hi - '0' :
++		    ((hi | 0x20) >= 'a' && (hi | 0x20) <= 'f') ? (hi | 0x20) - 'a' + 10 : 0xff;
++		uint32_t vl = (lo >= '0' && lo <= '9') ? lo - '0' :
++		    ((lo | 0x20) >= 'a' && (lo | 0x20) <= 'f') ? (lo | 0x20) - 'a' + 10 : 0xff;
++
++		if (vh == 0xff || vl == 0xff) {
++			ok = false;
++		} else {
++			pmk[i] = (uint8_t)(vh << 4 | vl);
++		}
++	}
++	memset(text, 0, sizeof(text));
++	if (!ok) {
++		memset(pmk, 0, sizeof(pmk));
++		rsn.log("vayu-wifi: W25 S0 pmk: ERROR not 64 hex digits\n");
++		return false;
++	}
++	memcpy(rsn.pmk, pmk, sizeof(pmk));
++	memset(pmk, 0, sizeof(pmk));
++	rsn.pmk_set = true;
++	rsn.log("vayu-wifi: W25 S0 pmk: OK file (len %u)\n", PMK_LEN);
++	return true;
++}
++
++void
++vayu_rsn_reset(int (*log)(const char *format, ...) __printflike(1, 2))
++{
++	uint32_t enabled = 0;
++
++	memset(&rsn, 0, sizeof(rsn));
++	rsn.log = log;
++	rsn.state = RSN_OFF;
++	if (log == NULL) {
++		return;
++	}
++	PE_parse_boot_argn("vayu_wifi_pmk_file", &enabled, sizeof(enabled));
++	rsn.pmk_file = enabled != 0;
++	if (!rsn.pmk_file) {
++		rsn.log("vayu-wifi: W25 S0 pmk: ERROR not set (vayu_wifi_pmk_file=1 needed for RSN)\n");
++	}
++}
++
++bool
++vayu_rsn_armed(void)
++{
++	if (!rsn.pmk_set && rsn.pmk_file && !pmk_read_file()) {
++		return false;
++	}
++	if (!rsn.pmk_set) {
++		return false;
++	}
++	if (!rsn.tested) {
++		rsn.tested = true;
++		rsn.armed = crypto_selftest();
++	}
++	return rsn.armed;
++}
++
++void
++vayu_rsn_stop(void)
++{
++	if (rsn.gtk_len != 0) {
++		memset(rsn.gtk, 0, sizeof(rsn.gtk));
++	}
++	memset(rsn.ptk, 0, sizeof(rsn.ptk));
++	memset(rsn.snonce, 0, sizeof(rsn.snonce));
++	memset(rsn.anonce, 0, sizeof(rsn.anonce));
++	rsn.gtk_len = 0;
++	rsn.replay = rsn.anonce_replay = 0;
++	rsn.msg1s = rsn.msg3s = rsn.bad_mic = rsn.ignored = 0;
++	rsn.started = false;
++	rsn.state = RSN_OFF;
++}
++
++void
++vayu_rsn_start(const struct vayu_rsn_ops *ops)
++{
++	if (ops == NULL || !vayu_rsn_armed()) {
++		return;
++	}
++	rsn.ops = ops;
++	rsn.group_cipher = ops->group_cipher != 0 ? ops->group_cipher : WMI_CIPHER_CCMP;
++	rsn.started = true;
++	rsn.state = RSN_WAIT_M1;
++	rsn.eapol_ver = 0;
++	rsn.key_ver = 0;
++	rsn.log("vayu-wifi: W25 S3 4way: OK waiting for message 1/4 (pairwise CCMP, AKM PSK)\n");
++}
++
++int
++vayu_rsn_poll(void)
++{
++	if (!rsn.started) {
++		return -1;
++	}
++	if (rsn.state == RSN_KEYED) {
++		return 0;
++	}
++	if (rsn.state == RSN_FAILED) {
++		return -1;
++	}
++	return 1;
++}
++
++bool
++vayu_rsn_keyed(void)
++{
++	return rsn.state == RSN_KEYED;
++}
++
++/* ---- the frames -------------------------------------------------------------------------------- */
++
++static uint32_t
++be16(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 8 | (uint32_t)p[1];
++}
++
++static uint64_t
++be64(const uint8_t *p)
++{
++	uint64_t v = 0;
++
++	for (uint32_t i = 0; i < 8; i++) {
++		v = v << 8 | p[i];
++	}
++	return v;
++}
++
++static uint8_t *
++put16be(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v >> 8);
++	p[1] = (uint8_t)v;
++	return p + 2;
++}
++
++static uint8_t *
++put_tlv(uint8_t *p, uint32_t tag, uint32_t len)
++{
++	p[0] = (uint8_t)len;
++	p[1] = (uint8_t)(len >> 8);
++	p[2] = (uint8_t)tag;
++	p[3] = (uint8_t)(tag >> 8);
++	return p + 4;
++}
++
++static uint8_t *
++put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++	return p + 4;
++}
++
++static uint8_t *
++put_mac8(uint8_t *p, const uint8_t *mac)
++{
++	memset(p, 0, 8);
++	memcpy(p, mac, 6);
++	return p + 8;
++}
++
++/* An EAPOL-Key frame over the 802.11 data path: 24-byte header (to DS), LLC/SNAP 88 8e, EAPOL. */
++static int
++send_eapol(uint16_t key_info, const uint8_t *nonce, const uint8_t *kd, uint16_t kd_len)
++{
++	static uint8_t f[24 + 8 + EAPOL_HDR + EAPOL_KEY_FIXED + 64];
++	uint8_t mic[20];
++	uint8_t *e = f + 24 + 8, *k;
++	uint32_t eapol_len, flen;
++	uint16_t version = rsn.eapol_ver != 0 ? (uint16_t)rsn.eapol_ver : 1;
++	uint8_t desc = rsn.key_ver != 0 ? (uint8_t)rsn.key_ver : 2;
++
++	if (rsn.ops == NULL || rsn.ops->tx_data == NULL || kd_len > 64) {
++		return -1;
++	}
++	memset(f, 0, 24);
++	f[0] = 0x08;                            /* data */
++	f[1] = 0x01;                            /* to DS */
++	memcpy(f + 4, rsn.ops->bssid, 6);       /* addr1: the AP */
++	memcpy(f + 10, rsn.ops->mac, 6);        /* addr2: us */
++	memcpy(f + 16, rsn.ops->bssid, 6);      /* addr3: the AP */
++	f[24] = 0xaa;
++	f[25] = 0xaa;
++	f[26] = 0x03;
++	f[27] = 0x00;
++	f[28] = 0x00;
++	f[29] = 0x00;
++	f[30] = 0x88;
++	f[31] = 0x8e;
++	e[0] = (uint8_t)version;
++	e[1] = EAPOL_TYPE_KEY;
++	(void)put16be(e + 2, EAPOL_KEY_FIXED + (uint32_t)kd_len);
++	k = e + EAPOL_HDR;
++	k[0] = desc;
++	(void)put16be(k + 1, key_info);
++	k[3] = 0;                               /* key length, informational */
++	k[4] = 0;
++	for (uint32_t i = 0; i < 8; i++) {
++		k[5 + i] = (uint8_t)(rsn.replay >> (56 - 8 * i));
++	}
++	if (nonce != NULL) {
++		memcpy(k + 13, nonce, NONCE_LEN);
++	}
++	(void)put16be(k + 93, kd_len);
++	if (kd_len != 0) {
++		memcpy(k + EAPOL_KEY_FIXED, kd, kd_len);
++	}
++	eapol_len = EAPOL_HDR + EAPOL_KEY_FIXED + kd_len;
++	if ((key_info & KI_MIC) != 0) {
++		if (!sha1_hmac(rsn.ptk, KCK_LEN, e, eapol_len, mic)) {
++			return -1;
++		}
++		memcpy(k + 77, mic, MIC_LEN);
++		memset(mic, 0, sizeof(mic));
++	}
++	flen = 24 + 8 + eapol_len;
++	return rsn.ops->tx_data(f, flen, true);
++}
++
++static int
++wmi_install_key(bool group, uint32_t idx, uint32_t cipher, const uint8_t *key, uint32_t key_len)
++{
++	static uint8_t m[4 + 4 + 92 + 4 + 40];
++	uint8_t *p;
++	uint32_t padded = (key_len + 3) & ~3U;
++
++	if (rsn.ops == NULL || rsn.ops->wmi_send == NULL || key_len > 40) {
++		return -1;
++	}
++	memset(m, 0, sizeof(m));
++	p = put_tlv(m + 4, TAG_VDEV_INSTALL_KEY, 92);
++	p = put32(p, 0);                        /* vdev 0 */
++	p = put_mac8(p, rsn.ops->bssid);
++	p = put32(p, idx);
++	p = put32(p, group ? 1 : 0);            /* key_flags */
++	p = put32(p, cipher);
++	p += 3 * 8 + 16 + 16;                   /* rsc/global/tsc/wpi counters: zero */
++	p = put32(p, key_len);
++	p = put32(p, 0);                        /* tx mic length */
++	p = put32(p, 0);                        /* rx mic length */
++	p = put_tlv(p, 0x11U, padded);          /* WMI_TLV_TAG_ARRAY_BYTE */
++	memcpy(p, key, key_len);
++	put32(m, CMD_VDEV_INSTALL_KEY);
++	return rsn.ops->wmi_send(m, (uint32_t)(4 + 4 + 92 + 4 + padded), 1000);
++}
++
++static int
++wmi_peer_authorize(void)
++{
++	static uint8_t m[4 + 4 + 20];
++	uint8_t *p;
++
++	memset(m, 0, sizeof(m));
++	p = put_tlv(m + 4, TAG_PEER_SET_PARAM, 20);
++	p = put32(p, 0);                        /* vdev 0 */
++	p = put_mac8(p, rsn.ops->bssid);
++	p = put32(p, PEER_PARAM_AUTHORIZE);
++	(void)put32(p, 1);
++	put32(m, CMD_PEER_SET_PARAM);
++	return rsn.ops->wmi_send(m, sizeof(m), 1000);
++}
++
++/* message 2/4: SNonce, the RSN IE of our assoc request, MIC under the KCK */
++static int
++send_msg2(void)
++{
++	return send_eapol(0x010a, rsn.snonce, rsn.ops->rsn_ie, (uint16_t)rsn.ops->rsn_ie_len);
++}
++
++/* message 4/4: no nonce, no key data, MIC under the KCK */
++static int
++send_msg4(void)
++{
++	return send_eapol(0x030a, NULL, NULL, 0);
++}
++
++/* ---- message 1/4 ------------------------------------------------------------------------------- */
++
++static void
++handle_msg1(const uint8_t *k, const uint8_t *eapol, uint32_t len, uint64_t replay)
++{
++	uint8_t data[6 + 6 + NONCE_LEN + NONCE_LEN];
++	const uint8_t *aa = rsn.ops->bssid, *spa = rsn.ops->mac, *first_mac, *second_mac;
++	const uint8_t *first_nonce, *second_nonce;
++
++	rsn.eapol_ver = eapol[0];
++	rsn.key_ver = k[0];
++	rsn.replay = replay;
++	rsn.anonce_replay = replay;
++	memcpy(rsn.anonce, k + 13, NONCE_LEN);
++	read_random(rsn.snonce, NONCE_LEN);
++
++	if (memcmp(aa, spa, 6) < 0) {
++		first_mac = aa;
++		second_mac = spa;
++	} else {
++		first_mac = spa;
++		second_mac = aa;
++	}
++	if (memcmp(rsn.anonce, rsn.snonce, NONCE_LEN) < 0) {
++		first_nonce = rsn.anonce;
++		second_nonce = rsn.snonce;
++	} else {
++		first_nonce = rsn.snonce;
++		second_nonce = rsn.anonce;
++	}
++	memcpy(data, first_mac, 6);
++	memcpy(data + 6, second_mac, 6);
++	memcpy(data + 12, first_nonce, NONCE_LEN);
++	memcpy(data + 44, second_nonce, NONCE_LEN);
++	if (!prf_sha1(rsn.pmk, PMK_LEN, "Pairwise key expansion", data, sizeof(data), rsn.ptk, PTK_LEN)) {
++		rsn.log("vayu-wifi: W25 S3 4way: ERROR PRF (no crypto provider)\n");
++		rsn.state = RSN_FAILED;
++		return;
++	}
++	memset(data, 0, sizeof(data));
++	rsn.state = RSN_WAIT_M3;
++	rsn.msg1s++;
++	if (send_msg2() != 0) {
++		rsn.log("vayu-wifi: W25 S3 4way: ERROR message 2 not sent\n");
++		rsn.state = RSN_FAILED;
++		return;
++	}
++	rsn.log("vayu-wifi: W25 S3 4way: OK message 1/4 (ver %u desc %u replay %llu) -> 2/4 sent\n",
++	    rsn.eapol_ver, rsn.key_ver, (unsigned long long)replay);
++}
++
++/* ---- message 3/4 ------------------------------------------------------------------------------- */
++
++static bool
++mic_ok(const uint8_t *eapol, uint32_t len, const uint8_t *k)
++{
++	uint8_t want[MIC_LEN], got[20], saved[MIC_LEN];
++
++	memcpy(want, k + 77, MIC_LEN);
++	memcpy(saved, k + 77, MIC_LEN);
++	memset((uint8_t *)(k + 77), 0, MIC_LEN);
++	/* (the frame is ours to change: the RX buffer is reused and the parse below keeps no MIC) */
++	bool ok = sha1_hmac(rsn.ptk, KCK_LEN, eapol, len, got) && memcmp(want, got, MIC_LEN) == 0;
++
++	memcpy((uint8_t *)(k + 77), saved, MIC_LEN);
++	memset(got, 0, sizeof(got));
++	memset(saved, 0, sizeof(saved));
++	return ok;
++}
++
++/* the GTK KDE (00-0F-AC:1) in the unwrapped key data; RSC follows the key inside the KDE */
++static bool
++gtk_from_kde(const uint8_t *plain, uint32_t len)
++{
++	uint32_t o;
++
++	for (o = 0; o + 2 <= len && o + 2 + plain[o + 1] <= len; o += 2 + plain[o + 1]) {
++		uint32_t klen;
++
++		if (plain[o] != 0xdd || plain[o + 1] < 6 || plain[o + 2] != 0x00 || plain[o + 3] != 0x0f ||
++		    plain[o + 4] != 0xac || plain[o + 5] != 0x01) {
++			continue;
++		}
++		rsn.gtk_idx = plain[o + 6] & 3U;
++		klen = plain[o + 1] - 6;
++		if (klen > 32) {
++			klen = 32;
++		}
++		if (klen < 16) {
++			return false;
++		}
++		memcpy(rsn.gtk, plain + o + 8, klen);
++		rsn.gtk_len = klen;
++		return true;
++	}
++	return false;
++}
++
++static void
++handle_msg3(const uint8_t *k, const uint8_t *eapol, uint32_t len, uint64_t replay)
++{
++	uint16_t info = (uint16_t)be16(k + 1), kd_len = (uint16_t)be16(k + 93);
++	uint8_t plain[256];
++	bool have_gtk = false;
++
++	rsn.msg3s++;
++	if (replay < rsn.replay) {
++		rsn.ignored++;
++		return;
++	}
++	if (memcmp(k + 13, rsn.anonce, NONCE_LEN) != 0) {
++		rsn.log("vayu-wifi: W25 S3 4way: ERROR 3/4 ANonce differs from 1/4\n");
++		rsn.state = RSN_FAILED;
++		return;
++	}
++	if (!mic_ok(eapol, len, k)) {
++		rsn.bad_mic++;
++		rsn.log("vayu-wifi: W25 S3 4way: ERROR 3/4 MIC wrong (%u)\n", rsn.bad_mic);
++		rsn.state = RSN_FAILED;
++		return;
++	}
++	rsn.replay = replay;
++	if ((info & KI_ENC_KD) != 0 && kd_len >= 24 && kd_len <= sizeof(plain) + 8) {
++		if (!aes_unwrap(rsn.ptk + KCK_LEN, k + EAPOL_KEY_FIXED, kd_len, plain)) {
++			rsn.log("vayu-wifi: W25 S3 4way: ERROR GTK unwrap failed (kd %u)\n", kd_len);
++		} else {
++			have_gtk = gtk_from_kde(plain, kd_len - 8);
++			memset(plain, 0, sizeof(plain));
++		}
++	} else if (kd_len != 0) {
++		rsn.log("vayu-wifi: W25 S3 4way: ERROR key data %u without ENC_KD\n", kd_len);
++	}
++	if (send_msg4() != 0) {
++		rsn.log("vayu-wifi: W25 S3 4way: ERROR message 4 not sent\n");
++		rsn.state = RSN_FAILED;
++		return;
++	}
++	/* 4/4 goes out in the clear: the keys are installed after it */
++	delay_for_interval(5, NSEC_PER_MSEC);
++	if (wmi_install_key(false, 0, WMI_CIPHER_CCMP, rsn.ptk + KCK_LEN + KEK_LEN, TK_LEN) != 0) {
++		rsn.log("vayu-wifi: W25 S3 4way: ERROR pairwise key install refused\n");
++		rsn.state = RSN_FAILED;
++		return;
++	}
++	if (have_gtk && wmi_install_key(true, rsn.gtk_idx, rsn.group_cipher, rsn.gtk, rsn.gtk_len) != 0) {
++		rsn.log("vayu-wifi: W25 S3 4way: ERROR group key install refused\n");
++	}
++	if (wmi_peer_authorize() != 0) {
++		rsn.log("vayu-wifi: W25 S3 4way: ERROR PEER_AUTHORIZE refused\n");
++		rsn.state = RSN_FAILED;
++		return;
++	}
++	rsn.state = RSN_KEYED;
++	rsn.log("vayu-wifi: W25 S3 4way: OK 3/4 verified, 4/4 sent, pairwise+group keys installed (gtk %u idx %u, cipher %u)\n",
++	    have_gtk ? 1 : 0, rsn.gtk_idx, rsn.group_cipher);
++}
++
++/* ---- the received EAPOL frame ------------------------------------------------------------------ */
++
++void
++vayu_rsn_eapol_rx(const uint8_t *eapol, uint32_t len)
++{
++	const uint8_t *k;
++	uint16_t info;
++	uint32_t body, kd_len;
++	uint64_t replay;
++
++	if (!rsn.started || rsn.ops == NULL || rsn.state == RSN_KEYED || rsn.state == RSN_FAILED) {
++		return;
++	}
++	if (len < EAPOL_HDR + EAPOL_KEY_FIXED || eapol[1] != EAPOL_TYPE_KEY) {
++		return;
++	}
++	body = be16(eapol + 2);
++	if (body < EAPOL_KEY_FIXED || EAPOL_HDR + body > len) {
++		return;
++	}
++	k = eapol + EAPOL_HDR;
++	if (k[0] != 2) {
++		return;                         /* only the RSN key descriptor (WPA2) */
++	}
++	info = (uint16_t)be16(k + 1);
++	kd_len = (uint16_t)be16(k + 93);
++	if (EAPOL_KEY_FIXED + kd_len > body) {
++		return;
++	}
++	replay = be64(k + 5);
++	if ((info & KI_PAIRWISE) != 0 && (info & KI_ACK) != 0 && (info & KI_MIC) == 0) {
++		if (rsn.state != RSN_WAIT_M1) {
++			rsn.ignored++;          /* a retransmitted 1/4 after our 2/4: answer again, same PTK */
++			if (rsn.state == RSN_WAIT_M3 && replay == rsn.anonce_replay) {
++				(void)send_msg2();
++			}
++			return;
++		}
++		if (rsn.msg1s >= 3) {
++			rsn.log("vayu-wifi: W25 S3 4way: ERROR the AP keeps sending message 1 (wrong PMK?)\n");
++			rsn.state = RSN_FAILED;
++			return;
++		}
++		handle_msg1(k, eapol, EAPOL_HDR + body, replay);
++		return;
++	}
++	if (rsn.state == RSN_WAIT_M3 && (info & KI_PAIRWISE) != 0 && (info & KI_ACK) != 0 &&
++	    (info & KI_MIC) != 0 && (info & KI_INSTALL) != 0) {
++		handle_msg3(k, eapol, EAPOL_HDR + body, replay);
++		return;
++	}
++	rsn.ignored++;
++}
+--- a/bsd/dev/vayu_wifi_net.c
++++ b/bsd/dev/vayu_wifi_net.c
+@@ -0,0 +1,692 @@
++/*
++ * W25: the data path after the handshake — en0 on the Wi-Fi link, and (behind
++ * vayu_wifi_dhcp=1) a minimal DHCP client with an ARP/ICMP proof that the network is reachable.
++ *
++ * Frames cross here in Ethernet form: the driver converts to and from the native-wifi shape the
++ * firmware's HTT data path carries (24-byte header, to/from DS, LLC/SNAP), and hands what arrives
++ * to hakios_net_input() (bsd/dev/hakios.net.c), which is the interface iOS and configd see as en0.
++ * With vayu_wifi_dhcp=1 the kernel also asks for a lease itself, so a run without userland still
++ * proves the path end to end: DISCOVER/OFFER/REQUEST/ACK, then ARP for the router and one ICMP
++ * echo to it.  iOS's configd stays free to do its own DHCP; the two do not interfere (different
++ * xids, one lease).
++ *
++ * Nothing secret is logged: no passphrase, no keys, no addresses beyond what the rest of the
++ * Wi-Fi lines already say.
++ *
++ * MIT License.  Copyright (c) 2026 The Redwood Project (W25 adaptation).
++ */
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include <mach/mach_types.h>
++#include <kern/clock.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include <sys/random.h>
++#include <sys/errno.h>
++#include <sys/systm.h>
++#include <sys/hakios.net.h>
++#include <sys/hakios.sta.h>
++#include <sys/vayu_wifi_net.h>
++#include <sys/vayu_wifi_rsn.h>
++
++#define ETH_HLEN                14U
++#define ETH_TYPE_IP             0x0800U
++#define ETH_TYPE_ARP            0x0806U
++#define ETH_TYPE_EAPOL          0x888eU
++#define IP_PROTO_ICMP           1U
++#define IP_PROTO_UDP            17U
++#define DHCP_CLIENT_PORT        68U
++#define DHCP_SERVER_PORT        67U
++#define DHCP_MAGIC              0x63825363U
++
++enum dhcp_state { DHCP_OFF, DHCP_INIT, DHCP_SELECTING, DHCP_REQUESTING, DHCP_BOUND, DHCP_FAILED };
++
++static struct {
++	bool started, linked, dhcp_on, keep;
++	uint32_t dhcp_state, dhcp_tries, arp_tries, icmp_tries, probe_stage;
++	uint32_t xid;
++	uint32_t offered_ip, server_ip, lease_ip, mask, router, dns;
++	uint64_t next_send_ms, deadline_ms;
++	uint32_t tx_frames, tx_bytes, tx_drop, rx_frames, rx_bytes, rx_drop;
++	uint8_t mac[6], bssid[6], router_mac[6], ssid[32];
++	uint32_t ssid_len;
++	int (*tx80211)(const uint8_t *frame, uint32_t len, bool clear);
++	int (*log)(const char *format, ...) __printflike(1, 2);
++} net;
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ULL;
++}
++
++/* ---- checksums --------------------------------------------------------------------------------- */
++
++static uint32_t
++sum16(const uint8_t *p, uint32_t len, uint32_t sum)
++{
++	while (len > 1) {
++		sum += (uint32_t)p[0] << 8 | p[1];
++		p += 2;
++		len -= 2;
++	}
++	if (len != 0) {
++		sum += (uint32_t)p[0] << 8;
++	}
++	return sum;
++}
++
++static uint16_t
++fold(uint32_t sum)
++{
++	while ((sum >> 16) != 0) {
++		sum = (sum & 0xffffU) + (sum >> 16);
++	}
++	return (uint16_t)~sum;
++}
++
++/* ---- sending ----------------------------------------------------------------------------------- */
++
++static bool
++send_eth(const uint8_t *frame, uint32_t len)
++{
++	uint8_t f[1600];
++	uint32_t flen;
++
++	if (!net.started || net.tx80211 == NULL || len < ETH_HLEN || len - ETH_HLEN + 32 > sizeof(f)) {
++		return false;
++	}
++	/* Ethernet -> native wifi: 24-byte data header, to DS, LLC/SNAP, then the payload */
++	memset(f, 0, 24);
++	f[0] = 0x08;
++	f[1] = 0x41;                            /* to DS + protected (the pairwise key is in) */
++	memcpy(f + 4, net.bssid, 6);            /* addr1: the AP */
++	memcpy(f + 10, net.mac, 6);             /* addr2: us */
++	memcpy(f + 16, frame, 6);               /* addr3: the destination */
++	f[24] = 0xaa;
++	f[25] = 0xaa;
++	f[26] = 0x03;
++	f[27] = 0x00;
++	f[28] = 0x00;
++	f[29] = 0x00;
++	f[30] = frame[12];
++	f[31] = frame[13];
++	memcpy(f + 32, frame + ETH_HLEN, len - ETH_HLEN);
++	flen = len - ETH_HLEN + 32;
++	if (net.tx80211(f, flen, false) != 0) {
++		net.tx_drop++;
++		return false;
++	}
++	net.tx_frames++;
++	net.tx_bytes += len;
++	return true;
++}
++
++/* ---- DHCP -------------------------------------------------------------------------------------- */
++
++static uint8_t *
++dhcp_options(uint8_t *p, uint8_t code, uint8_t len, const uint8_t *data)
++{
++	*p++ = code;
++	*p++ = len;
++	if (data != NULL) {
++		memcpy(p, data, len);
++	} else {
++		memset(p, 0, len);
++	}
++	return p + len;
++}
++
++static bool
++dhcp_send(uint8_t type)
++{
++	static uint8_t e[300 + 40], *b, *p;
++	uint32_t total;
++	uint16_t udp_len;
++	uint8_t *ip;
++
++	memset(e, 0, sizeof(e));
++	memset(e, 0xff, 6);                     /* broadcast */
++	memcpy(e + 6, net.mac, 6);
++	e[12] = 0x08;
++	e[13] = 0x00;
++	ip = e + ETH_HLEN;
++	ip[0] = 0x45;
++	ip[8] = 64;                             /* ttl */
++	ip[9] = (uint8_t)IP_PROTO_UDP;
++	/* 0.0.0.0 -> 255.255.255.255 */
++	memset(ip + 16, 0xff, 4);
++	b = ip + 20 + 8;                        /* BOOTP */
++	b[0] = 1;                               /* BOOTREQUEST */
++	b[1] = 1;                               /* Ethernet */
++	b[2] = 6;
++	b[4] = (uint8_t)(net.xid >> 24);
++	b[5] = (uint8_t)(net.xid >> 16);
++	b[6] = (uint8_t)(net.xid >> 8);
++	b[7] = (uint8_t)net.xid;
++	b[10] = 0x80;                           /* broadcast flag */
++	memcpy(b + 28, net.mac, 6);
++	p = b + 236;
++	*p++ = 0x63;
++	*p++ = 0x82;
++	*p++ = 0x53;
++	*p++ = 0x63;
++	p = dhcp_options(p, 53, 1, &type);
++	if (type == 3) {                        /* REQUEST */
++		p = dhcp_options(p, 50, 4, (const uint8_t *)&net.offered_ip);
++		p = dhcp_options(p, 54, 4, (const uint8_t *)&net.server_ip);
++	}
++	static const uint8_t want[4] = { 1, 3, 6, 15 };
++	p = dhcp_options(p, 55, sizeof(want), want);
++	*p++ = 255;
++	total = (uint32_t)(p - ip);             /* IP total length */
++	ip[2] = (uint8_t)(total >> 8);
++	ip[3] = (uint8_t)total;
++	{
++		uint16_t sum = fold(sum16(ip, 20, 0));
++
++		ip[10] = (uint8_t)(sum >> 8);
++		ip[11] = (uint8_t)sum;
++	}
++	udp_len = (uint16_t)(total - 20);
++	ip[20] = 0;
++	ip[21] = (uint8_t)DHCP_CLIENT_PORT;
++	ip[22] = 0;
++	ip[23] = (uint8_t)DHCP_SERVER_PORT;
++	ip[24] = (uint8_t)(udp_len >> 8);
++	ip[25] = (uint8_t)udp_len;
++	return send_eth(e, ETH_HLEN + total);
++}
++
++/* a DHCP message for our xid, from the server's port to ours */
++static void
++dhcp_rx(const uint8_t *e, uint32_t len)
++{
++	const uint8_t *ip = e + ETH_HLEN, *udp, *b, *p, *end;
++	uint32_t ihl, msg, xid;
++	uint8_t type = 0;
++
++	if (len < ETH_HLEN + 20 + 8 + 240 || e[12] != 0x08 || e[13] != 0x00) {
++		return;
++	}
++	ihl = (uint32_t)(ip[0] & 0x0f) * 4;
++	if (ip[0] >> 4 != 4 || ihl < 20 || ip[9] != IP_PROTO_UDP) {
++		return;
++	}
++	udp = ip + ihl;
++	if (((udp[0] << 8 | udp[1]) != DHCP_SERVER_PORT) || ((udp[2] << 8 | udp[3]) != DHCP_CLIENT_PORT)) {
++		return;
++	}
++	b = udp + 8;
++	if (len < (uint32_t)(b - e) + 240 || b[0] != 2) {
++		return;
++	}
++	xid = (uint32_t)b[4] << 24 | (uint32_t)b[5] << 16 | (uint32_t)b[6] << 8 | b[7];
++	if (xid != net.xid) {
++		return;
++	}
++	p = b + 236;                            /* magic cookie */
++	if (p[0] != 0x63 || p[1] != 0x82 || p[2] != 0x53 || p[3] != 0x63) {
++		return;
++	}
++	p = b + 240;
++	end = e + len;                         /* every option has to lie inside the frame */
++	for (; p + 2 <= end && *p != 255 && p + 2 + p[1] <= end; p += 2 + p[1]) {
++		if (p[0] == 53 && p[1] >= 1) {
++			type = p[2];
++		} else if (p[0] == 1 && p[1] == 4) {
++			memcpy(&net.mask, p + 2, 4);
++		} else if (p[0] == 3 && p[1] >= 4) {
++			memcpy(&net.router, p + 2, 4);
++		} else if (p[0] == 6 && p[1] >= 4) {
++			memcpy(&net.dns, p + 2, 4);
++		}
++	}
++	msg = (uint32_t)b[16] << 24 | (uint32_t)b[17] << 16 | (uint32_t)b[18] << 8 | b[19];
++	if (type == 2 && net.dhcp_state == DHCP_SELECTING) {     /* OFFER */
++		net.offered_ip = msg;
++		net.server_ip = 0;                              /* server id is an option */
++		for (p = b + 240; p + 2 <= end && *p != 255 && p + 2 + p[1] <= end; p += 2 + p[1]) {
++			if (p[0] == 54 && p[1] >= 4) {
++				memcpy(&net.server_ip, p + 2, 4);
++			}
++		}
++		net.dhcp_state = DHCP_REQUESTING;
++		net.dhcp_tries = 0;
++		net.next_send_ms = now_ms();
++		net.log("vayu-wifi: W25 S5 dhcp: OK offer %u.%u.%u.%u from %u.%u.%u.%u\n",
++		    (net.offered_ip >> 24) & 0xff, (net.offered_ip >> 16) & 0xff,
++		    (net.offered_ip >> 8) & 0xff, net.offered_ip & 0xff,
++		    (net.server_ip >> 24) & 0xff, (net.server_ip >> 16) & 0xff,
++		    (net.server_ip >> 8) & 0xff, net.server_ip & 0xff);
++	} else if (type == 5 && (net.dhcp_state == DHCP_REQUESTING || net.dhcp_state == DHCP_SELECTING)) {  /* ACK */
++		net.lease_ip = msg;
++		net.dhcp_state = DHCP_BOUND;
++		net.probe_stage = 1;
++		net.arp_tries = 0;
++		net.next_send_ms = now_ms();
++		net.log("vayu-wifi: W25 S5 dhcp: OK bound %u.%u.%u.%u mask %u.%u.%u.%u gw %u.%u.%u.%u dns %u.%u.%u.%u\n",
++		    (net.lease_ip >> 24) & 0xff, (net.lease_ip >> 16) & 0xff, (net.lease_ip >> 8) & 0xff,
++		    net.lease_ip & 0xff, (net.mask >> 24) & 0xff, (net.mask >> 16) & 0xff,
++		    (net.mask >> 8) & 0xff, net.mask & 0xff, (net.router >> 24) & 0xff,
++		    (net.router >> 16) & 0xff, (net.router >> 8) & 0xff, net.router & 0xff,
++		    (net.dns >> 24) & 0xff, (net.dns >> 16) & 0xff, (net.dns >> 8) & 0xff, net.dns & 0xff);
++	} else if (type == 6) {                 /* NAK */
++		net.dhcp_state = DHCP_FAILED;
++		net.log("vayu-wifi: W25 S5 dhcp: ERROR nak from the server\n");
++	}
++}
++
++/* ---- ARP and ICMP to the router ---------------------------------------------------------------- */
++
++static bool
++send_arp(void)
++{
++	uint8_t e[42];
++
++	memset(e, 0xff, 6);
++	memcpy(e + 6, net.mac, 6);
++	e[12] = 0x08;
++	e[13] = 0x06;
++	e[14] = 0x00;
++	e[15] = 0x01;                           /* Ethernet */
++	e[16] = 0x08;
++	e[17] = 0x00;                           /* IPv4 */
++	e[18] = 6;
++	e[19] = 4;
++	e[20] = 0x00;
++	e[21] = 0x01;                           /* request */
++	memcpy(e + 22, net.mac, 6);
++	memcpy(e + 28, &net.lease_ip, 4);
++	memset(e + 32, 0, 6);
++	memcpy(e + 38, &net.router, 4);
++	return send_eth(e, sizeof(e));
++}
++
++static void
++arp_rx(const uint8_t *e, uint32_t len)
++{
++	if (len < 42 || e[20] != 0 || e[21] != 2) {
++		return;
++	}
++	if (memcmp(e + 38, &net.lease_ip, 4) == 0 && net.probe_stage == 1) {
++		memcpy(net.router_mac, e + 22, 6);
++		net.probe_stage = 2;
++		net.icmp_tries = 0;
++		net.next_send_ms = now_ms();
++		net.log("vayu-wifi: W25 S6 probe: OK arp reply from the router %u.%u.%u.%u\n",
++		    (net.router >> 24) & 0xff, (net.router >> 16) & 0xff, (net.router >> 8) & 0xff,
++		    net.router & 0xff);
++	}
++}
++
++static bool
++send_icmp(void)
++{
++	uint8_t e[14 + 20 + 8 + 32];
++	uint8_t *ip = e + ETH_HLEN, *icmp = ip + 20;
++	uint16_t sum;
++	uint32_t total = 20 + 8 + 32;
++
++	memset(e, 0, sizeof(e));
++	/* the router's MAC from its ARP reply; if that never came, the AP's address (a home router is
++	 * usually the access point here) */
++	memcpy(e, net.probe_stage >= 2 ? net.router_mac : net.bssid, 6);
++	memcpy(e + 6, net.mac, 6);
++	e[12] = 0x08;
++	e[13] = 0x00;
++	ip[0] = 0x45;
++	ip[2] = (uint8_t)(total >> 8);
++	ip[3] = (uint8_t)total;
++	ip[8] = 64;
++	ip[9] = (uint8_t)IP_PROTO_ICMP;
++	memcpy(ip + 12, &net.lease_ip, 4);
++	memcpy(ip + 16, &net.router, 4);
++	{
++		uint16_t sum = fold(sum16(ip, 20, 0));
++
++		ip[10] = (uint8_t)(sum >> 8);
++		ip[11] = (uint8_t)sum;
++	}
++	icmp[0] = 8;
++	icmp[4] = 0x25;
++	icmp[5] = 0x25;
++	icmp[6] = 0;
++	icmp[7] = 1;
++	for (uint32_t i = 0; i < 32; i++) {
++		icmp[8 + i] = (uint8_t)i;
++	}
++	sum = fold(sum16(icmp, 8 + 32, 0));
++	icmp[2] = (uint8_t)(sum >> 8);
++	icmp[3] = (uint8_t)sum;
++	return send_eth(e, sizeof(e));
++}
++
++static void
++icmp_rx(const uint8_t *e, uint32_t len)
++{
++	const uint8_t *ip = e + ETH_HLEN, *icmp;
++	uint32_t ihl;
++
++	if (len < ETH_HLEN + 20 + 8 || e[12] != 0x08 || e[13] != 0x00 || ip[9] != IP_PROTO_ICMP) {
++		return;
++	}
++	ihl = (uint32_t)(ip[0] & 0x0f) * 4;
++	icmp = ip + ihl;
++	if (icmp[0] == 0 && net.probe_stage == 2) {      /* echo reply */
++		net.probe_stage = 3;
++		net.log("vayu-wifi: W25 S6 probe: OK icmp echo reply from the router\n");
++	}
++}
++
++/* ---- RX from the HTT ring ---------------------------------------------------------------------- */
++
++void
++vayu_net_rx_80211(const uint8_t *f, uint32_t len, uint32_t decap, uint32_t hdr)
++{
++	static uint8_t e[1600];
++	const uint8_t *da, *sa, *llc;
++	uint32_t elen;
++
++	if (!net.started || len < 16) {
++		net.rx_drop++;
++		return;
++	}
++	if (decap == 2 || decap == 3) {         /* the firmware already gave us Ethernet */
++		if (len > sizeof(e)) {
++			net.rx_drop++;
++			return;
++		}
++		memcpy(e, f, len);
++		elen = len;
++	} else {
++		if (hdr < 24 || len < hdr + 8 || (f[0] & 0x0c) != 0x08) {
++			return;                 /* not a data frame (management, control) */
++		}
++		da = f + 4;
++		sa = (f[1] & 0x02) != 0 ? f + 16 : f + 10;      /* from DS: addr3 is the source */
++		llc = f + hdr;
++		if (llc[0] != 0xaa || llc[1] != 0xaa || llc[2] != 0x03 || len - hdr - 8 > sizeof(e) - ETH_HLEN) {
++			net.rx_drop++;
++			return;
++		}
++		memcpy(e, da, 6);
++		memcpy(e + 6, sa, 6);
++		e[12] = llc[6];
++		e[13] = llc[7];
++		memcpy(e + ETH_HLEN, llc + 8, len - hdr - 8);
++		elen = len - hdr - 8 + ETH_HLEN;
++	}
++	net.rx_frames++;
++	net.rx_bytes += elen;
++	if (elen >= ETH_HLEN && e[12] == 0x88 && e[13] == 0x8e) {
++		return;                         /* EAPOL goes to the handshake, not to the stack */
++	}
++	hakios_net_input(e, elen);
++	if (e[12] == 0x08 && e[13] == 0x00) {
++		dhcp_rx(e, elen);
++		icmp_rx(e, elen);
++	} else if (e[12] == 0x08 && e[13] == 0x06) {
++		arp_rx(e, elen);
++	}
++}
++
++/* ---- the interface's transmit callback --------------------------------------------------------- */
++
++static bool
++net_transmit(mbuf_t packet, size_t length)
++{
++	static uint8_t e[1600];
++
++	if (length < ETH_HLEN || length > sizeof(e)) {
++		return false;
++	}
++	if (mbuf_copydata(packet, 0, length, e) != 0) {
++		return false;
++	}
++	return send_eth(e, (uint32_t)length);
++}
++
++/* ---- the station boundary (what wifid's Apple80211 requests are answered from) ------------------ */
++
++static int
++sta_power(bool on)
++{
++	net.log("vayu-wifi: W25 sta: power %u (taken; the radio is up)\n", on ? 1 : 0);
++	return 0;
++}
++
++static int
++sta_scan(const struct hakios_sta_scan *what)
++{
++	(void)what;
++	return EOPNOTSUPP;              /* the scan is the boot-arg one; wifid is told so */
++}
++
++static void
++sta_heard(void (*each)(const struct hakios_sta_bss *bss, void *context), void *context)
++{
++	(void)each;
++	(void)context;
++}
++
++static int
++sta_join(const struct hakios_sta_join *what)
++{
++	if (what == NULL || what->ssid_length != net.ssid_len || memcmp(what->ssid, net.ssid, net.ssid_len) != 0) {
++		return ENOENT;
++	}
++	return net.linked ? 0 : EAGAIN;
++}
++
++static int
++sta_leave(void)
++{
++	return 0;
++}
++
++static void
++sta_state(struct hakios_sta_state *state)
++{
++	if (state == NULL) {
++		return;
++	}
++	memset(state, 0, sizeof(*state));
++	state->phase = net.linked ? HAKIOS_STA_JOINED : (net.started ? HAKIOS_STA_IDLE : HAKIOS_STA_OFF);
++	memcpy(state->bss.bssid, net.bssid, 6);
++	memcpy(state->bss.ssid, net.ssid, net.ssid_len);
++	state->bss.ssid_length = (uint8_t)net.ssid_len;
++}
++
++static unsigned
++sta_channels(struct hakios_sta_channel *channels, unsigned most)
++{
++	(void)channels;
++	(void)most;
++	return 0;
++}
++
++/* version of the station ops: the address is a copy, filled at attach */
++static struct hakios_sta_ops net_sta_ops;
++
++/* ---- start / stop ------------------------------------------------------------------------------- */
++
++void
++vayu_net_reset(int (*log)(const char *format, ...) __printflike(1, 2))
++{
++	uint32_t v = 0;
++
++	memset(&net, 0, sizeof(net));
++	net.log = log != NULL ? log : printf;
++	PE_parse_boot_argn("vayu_wifi_dhcp", &v, sizeof(v));
++	net.dhcp_on = v != 0;
++	v = 0;
++	PE_parse_boot_argn("vayu_wifi_keep", &v, sizeof(v));
++	net.keep = v != 0;
++}
++
++bool
++vayu_net_keep(void)
++{
++	return net.keep;
++}
++
++void
++vayu_net_set_tx(int (*tx80211)(const uint8_t *frame, uint32_t len, bool clear),
++    int (*log)(const char *format, ...) __printflike(1, 2))
++{
++	net.tx80211 = tx80211;
++	if (log != NULL) {
++		net.log = log;
++	}
++}
++
++/* Called after the keys are in: en0 comes up and the data path is open. */
++int
++vayu_net_start(const uint8_t *mac, const uint8_t *bssid, const uint8_t *ssid, uint32_t ssid_len)
++{
++	static struct hakios_net_link wifi_link;
++	int error;
++
++	if (net.started) {
++		return 0;
++	}
++	memcpy(net.mac, mac, 6);
++	memcpy(net.bssid, bssid, 6);
++	net.ssid_len = ssid_len > sizeof(net.ssid) ? (uint32_t)sizeof(net.ssid) : ssid_len;
++	memcpy(net.ssid, ssid, net.ssid_len);
++
++	memset(&wifi_link, 0, sizeof(wifi_link));
++	wifi_link.name = "vayu-wifi";
++	wifi_link.unit = 0;
++	memcpy(wifi_link.address, net.mac, 6);
++	wifi_link.wireless = true;
++	wifi_link.up = false;
++	wifi_link.transmit = net_transmit;
++	wifi_link.poll = NULL;
++
++	if (!hakios_net_attach(&wifi_link)) {
++		net.log("vayu-wifi: W25 S4 link: ERROR en0 not attached\n");
++		return -1;
++	}
++	memset(&net_sta_ops, 0, sizeof(net_sta_ops));
++	net_sta_ops.power = sta_power;
++	net_sta_ops.scan = sta_scan;
++	net_sta_ops.heard = sta_heard;
++	net_sta_ops.join = sta_join;
++	net_sta_ops.leave = sta_leave;
++	net_sta_ops.state = sta_state;
++	net_sta_ops.channels = sta_channels;
++	memcpy(net_sta_ops.address, net.mac, 6);
++	hakios_sta_attach(&net_sta_ops);
++
++	net.started = true;
++	net.linked = true;
++	hakios_net_link_state(true);
++	net.log("vayu-wifi: W25 S4 link: OK en0 up, MAC xx:xx:xx:xx:%02x:%02x, 802.11 to xx:xx:xx:xx:%02x:%02x\n",
++	    net.mac[4], net.mac[5], net.bssid[4], net.bssid[5]);
++	if (net.dhcp_on) {
++		net.dhcp_state = DHCP_INIT;
++		net.dhcp_tries = 0;
++		read_random(&net.xid, sizeof(net.xid));
++		net.next_send_ms = now_ms();
++		net.log("vayu-wifi: W25 S5 dhcp: OK client on (xid %#x)\n", net.xid);
++	}
++	return 0;
++}
++
++void
++vayu_net_stop(void)
++{
++	if (net.linked) {
++		net.linked = false;
++		hakios_net_link_state(false);
++	}
++}
++
++bool
++vayu_net_linked(void)
++{
++	return net.linked;
++}
++
++/* ---- the 100 ms tick of the station loop -------------------------------------------------------- */
++
++int
++vayu_net_poll(void)
++{
++	uint64_t now;
++
++	if (!net.dhcp_on || net.dhcp_state == DHCP_OFF || net.dhcp_state == DHCP_FAILED) {
++		return net.dhcp_state == DHCP_BOUND ? 0 : (net.dhcp_state == DHCP_FAILED ? -1 : 1);
++	}
++	now = now_ms();
++	if (net.dhcp_state == DHCP_BOUND) {
++		if (net.probe_stage < 3 && now >= net.next_send_ms) {
++			if (net.probe_stage == 1) {
++				if (net.arp_tries++ < 3) {
++					(void)send_arp();
++				} else {
++					net.log("vayu-wifi: W25 S6 probe: ERROR no arp reply from the router\n");
++				}
++				net.next_send_ms = now + 1000;
++			} else if (net.probe_stage == 2) {
++				if (net.icmp_tries++ < 3) {
++					(void)send_icmp();
++				} else {
++					net.log("vayu-wifi: W25 S6 probe: ERROR no icmp reply from the router\n");
++				}
++				net.next_send_ms = now + 1000;
++			}
++		}
++		return net.probe_stage >= 3 ? 0 : 1;
++	}
++	if (now < net.next_send_ms) {
++		return 1;
++	}
++	if (net.dhcp_state == DHCP_INIT) {
++		if (net.dhcp_tries++ >= 5) {
++			net.dhcp_state = DHCP_FAILED;
++			net.log("vayu-wifi: W25 S5 dhcp: ERROR no offer in %u tries\n", net.dhcp_tries);
++			return -1;
++		}
++		(void)dhcp_send(1);             /* DISCOVER */
++		net.dhcp_state = DHCP_SELECTING;
++		net.next_send_ms = now + 2000;
++		return 1;
++	}
++	if (net.dhcp_state == DHCP_SELECTING) {
++		if (net.dhcp_tries++ >= 5) {
++			net.dhcp_state = DHCP_FAILED;
++			net.log("vayu-wifi: W25 S5 dhcp: ERROR no offer in %u tries\n", net.dhcp_tries);
++			return -1;
++		}
++		(void)dhcp_send(1);
++		net.next_send_ms = now + 2000;
++		return 1;
++	}
++	if (net.dhcp_state == DHCP_REQUESTING) {
++		if (net.dhcp_tries++ >= 5) {
++			net.dhcp_state = DHCP_FAILED;
++			net.log("vayu-wifi: W25 S5 dhcp: ERROR no ack in %u tries\n", net.dhcp_tries);
++			return -1;
++		}
++		(void)dhcp_send(3);             /* REQUEST */
++		net.next_send_ms = now + 2000;
++		return 1;
++	}
++	return 1;
++}
++
++void
++vayu_net_summary(void)
++{
++	net.log("vayu-wifi: W25 data: frames tx %u (%u bytes, %u dropped), rx %u (%u bytes, %u dropped); "
++	    "dhcp %s, probe %s\n", net.tx_frames, net.tx_bytes, net.tx_drop, net.rx_frames, net.rx_bytes,
++	    net.rx_drop, net.dhcp_state == DHCP_BOUND ? "bound" : (net.dhcp_on ? "no lease" : "off"),
++	    net.probe_stage >= 3 ? "ok" : "no");
++}
+--- a/bsd/sys/vayu_wifi_scan.h
++++ b/bsd/sys/vayu_wifi_scan.h
+@@ -67,5 +67,7 @@
+ void vayu_scan_note_htt(const uint8_t *p, uint32_t len);
+ /* After WMI READY: HTT rx ring, channel list, vdev, passive scan, summary.  0 = scan completed. */
+ int vayu_scan_run(const struct vayu_scan_ops *ops);
++/* W25: one native-wifi data frame on the HTT endpoint (clear = unencrypted, for EAPOL). 0 = sent. */
++int vayu_scan_tx_frame(const uint8_t *frame, uint32_t len, bool clear);
+ 
+ #endif /* _SYS_VAYU_WIFI_SCAN_H_ */
+--- a/bsd/sys/vayu_wifi_rsn.h
++++ b/bsd/sys/vayu_wifi_rsn.h
+@@ -0,0 +1,53 @@
++/*
++ * W25: WPA2-PSK (RSN) 4-way handshake for the vayu station, and the data path that follows it.
++ *
++ * The PMK comes from /private/etc/vayu-wifi/gunwest.pmk (64 hex digits, one line), read when the
++ * handshake arms and only with the boot argument vayu_wifi_pmk_file=1: boot arguments are logged by
++ * the loader, the kernel, launchd and a panic buffer, so no secret may travel in one.  The handshake is IEEE 802.11i / 802.1X-2004 with key descriptor
++ * version 2: PRF-SHA1 for the PTK, HMAC-SHA1-128 for the MIC, RFC 3394 AES key unwrap for the
++ * GTK.  Crypto goes through libkern's registered provider (osfmk/minicrypto in this kernel):
++ * g_crypto_funcs->cchmac_fn + ccsha1_di, and g_crypto_funcs->ccaes_ecb_decrypt.  A self-test
++ * (RFC 2202 HMAC-SHA1, RFC 3394 unwrap) runs once before anything is used; a failure stops the
++ * handshake instead of installing a wrong key.
++ *
++ * EAPOL frames reach this file from the HTT rx path (bsd/dev/vayu_wifi_scan.c), frames of the
++ * data path from vayu_wifi_net.c.
++ */
++#ifndef _SYS_VAYU_WIFI_RSN_H_
++#define _SYS_VAYU_WIFI_RSN_H_
++
++#include <sys/cdefs.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++/* What the station (bsd/dev/vayu_wifi_sta.c) and the HTC/HTT layer provide. */
++struct vayu_rsn_ops {
++	int (*log)(const char *format, ...) __printflike(1, 2);
++	/* One WMI message (cmd id + TLVs) on the WMI endpoint. */
++	int (*wmi_send)(const uint8_t *msg, uint32_t len, uint32_t wait_ms);
++	/* One native-wifi data frame on the HTT endpoint; clear = send unencrypted (EAPOL). */
++	int (*tx_data)(const uint8_t *frame, uint32_t len, bool clear);
++	const uint8_t *mac;             /* our address, from WMI READY (6 bytes) */
++	const uint8_t *bssid;           /* the AP's (6 bytes) */
++	const uint8_t *rsn_ie;          /* the RSN IE of our assoc request */
++	uint32_t rsn_ie_len;
++	uint32_t group_cipher;          /* WMI_CIPHER_*: 2 TKIP, 4 CCMP */
++};
++
++/* Reads vayu_wifi_pmk_file and clears the state; call after vayu_sta_reset(). */
++void vayu_rsn_reset(int (*log)(const char *format, ...) __printflike(1, 2));
++/* True when a PMK is set and the crypto self-test passed: the handshake can run. */
++bool vayu_rsn_armed(void);
++/* Wipe the keys (VDEV_STOP, a failed join, the end of the run). */
++void vayu_rsn_stop(void);
++
++/* Start waiting for message 1/4 of the handshake. */
++void vayu_rsn_start(const struct vayu_rsn_ops *ops);
++/* One EAPOL frame (starting at the EAPOL version byte), only while started. */
++void vayu_rsn_eapol_rx(const uint8_t *eapol, uint32_t len);
++/* 0 = keys installed, 1 = still waiting, -1 = failed. */
++int vayu_rsn_poll(void);
++/* The pairwise key is installed (frames may pass). */
++bool vayu_rsn_keyed(void);
++
++#endif /* _SYS_VAYU_WIFI_RSN_H_ */
+--- a/bsd/sys/vayu_wifi_net.h
++++ b/bsd/sys/vayu_wifi_net.h
+@@ -0,0 +1,30 @@
++/*
++ * W25: the Wi-Fi data path for vayu — en0 over the HTT data path, DHCP/ARP/ICMP proof (see
++ * bsd/dev/vayu_wifi_net.c).  The frame conversion and the interface live there; this is what the
++ * station (bsd/dev/vayu_wifi_sta.c) and the scan/HTT layer (bsd/dev/vayu_wifi_scan.c) know of it.
++ */
++#ifndef _SYS_VAYU_WIFI_NET_H_
++#define _SYS_VAYU_WIFI_NET_H_
++
++#include <sys/cdefs.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++/* Reads vayu_wifi_dhcp and vayu_wifi_keep, clears the state; call after vayu_sta_reset(). */
++void vayu_net_reset(int (*log)(const char *format, ...) __printflike(1, 2));
++/* The HTT TX function (bsd/dev/vayu_wifi_scan.c) and the log. */
++void vayu_net_set_tx(int (*tx80211)(const uint8_t *frame, uint32_t len, bool clear),
++    int (*log)(const char *format, ...) __printflike(1, 2));
++/* After the keys are in: attach en0 on the link and bring it up. 0 = up. */
++int vayu_net_start(const uint8_t *mac, const uint8_t *bssid, const uint8_t *ssid, uint32_t ssid_len);
++void vayu_net_stop(void);
++bool vayu_net_linked(void);
++/* boot-arg vayu_wifi_keep=1: stay joined after the handshake instead of tearing down. */
++bool vayu_net_keep(void);
++/* One tick of the DHCP/probe state machine: 0 = done (or off), 1 = waiting, -1 = failed. */
++int vayu_net_poll(void);
++/* One received MSDU from the HTT ring (native wifi or Ethernet, as the firmware decaps it). */
++void vayu_net_rx_80211(const uint8_t *frame, uint32_t len, uint32_t decap, uint32_t hdr_len);
++void vayu_net_summary(void);
++
++#endif /* _SYS_VAYU_WIFI_NET_H_ */
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -167,6 +167,16 @@
+ bsd/dev/vayu_wled.c		standard
+ bsd/dev/vayu_mdp.c		standard
+ bsd/dev/vayu_wifi.c		standard
++bsd/dev/vayu_wifi_smmu.c	standard
++bsd/dev/vayu_wifi_ce_wire.c	standard
++bsd/dev/vayu_wifi_htc.c		standard
++bsd/dev/vayu_wifi_ce.c		standard
++bsd/dev/vayu_wifi_htc_connect.c	standard
++bsd/dev/vayu_wifi_wmi.c	standard
++bsd/dev/vayu_wifi_scan.c	standard
++bsd/dev/vayu_wifi_sta.c	standard
++bsd/dev/vayu_wifi_rsn.c	standard
++bsd/dev/vayu_wifi_net.c	standard
+ bsd/dev/vayu_jack.c		standard
+ bsd/dev/vayu_nfc.c		standard
+ bsd/dev/vayu_usbnet.c		standard

@@ -1,0 +1,245 @@
+Subject: [PATCH] vayu_wifi W25j: a fresh 802.11 sequence number for every data frame (the 4/4 was
+ being dropped as a duplicate), and the diagnostics that show it
+
+Base: /mnt/ramdisk/ds-wifi2 as run 132300 (kernel mach-wifi25i).  W25i got the whole 4-way through
+-- 1/4 -> 2/4, 3/4 verified, 4/4 sent, keys installed, en0 up -- yet DHCP never got a lease and
+the AP deauthenticated us 3.3 s after its 3/4 with reason 15 (4WAY_HANDSHAKE_TIMEOUT).
+
+What the 132300 log says, byte by byte:
+ - our 4/4 is well formed: 08 01 | bssid | us | bssid | seq 00 00 | aa aa 03 00 00 00 88 8e |
+   01 03 00 5f | desc 2 | key_info 0x030a | replay 2 | nonce 0 | key data 0, and its TX
+   completion was status 0 (sent and ACKed).
+ - but every data frame we built carried sequence control 00 00: the 2/4, the 4/4, and all six
+   DHCP DISCOVERs (and everything iOS sent) -- we never assigned a sequence number, mac80211 does
+   that in Linux and nothing does it here.
+ - the AP takes the first data frame with a sequence number (the 2/4), and its duplicate cache
+   then drops the next one from the same address and TID with the same number: the 4/4.  It
+   retransmits 3/4 (we are already KEYED and ignored it), the 4-way timer expires: DEAUTH reason
+   15.  From then on the port is closed, every data frame goes unacknowledged, which is the
+   firmware's HTT TX status 5 the log shows four times (the first DISCOVER was already sent after
+   the 4/4, inside the duplicate window).
+
+Changes:
+ - bsd/dev/vayu_wifi_scan.c, vayu_scan_tx_frame(): the frame is written to the HTT TX pool and
+   gets seq = ++tx_seq & 0xfff in its sequence control field (bytes 22-23, seq << 4); the 50-byte
+   prefetch is copied from the pool copy, so the head the firmware reads has the same number.
+   One counter for all data: everything we send is non-QoS (the assoc request has no WMM IE).
+ - diagnostics, no secrets: first 8 data TX (length, clear/encrypted, multicast, seq), first 16
+   data RX (length, decap, attention, DECRYPT_ERR bit 29, MPDU encrypted bit 13, encrypt type,
+   Protected bit, MPDU_END decrypt error, ethertype, UDP ports), a completion status histogram
+   (0..7) in vayu_scan_tx_summary() called from vayu_net_summary(), every DHCP frame to port 68
+   with its xid, EAPOL arriving after the keys (the AP retransmitting 3/4 = it did not take the
+   4/4), and the raw four words of VDEV_INSTALL_KEY_COMPLETE (0x5003, tag 0x2a).
+
+Expected on the next run: txdata #0..#3 with seq 1,2,3,4 (not 0), no "eapol after the keys",
+no DEAUTH reason 15, TX status histogram all 0, and then "W25 S5 dhcp: OK offer ..." and
+"OK bound ..." followed by the ARP/ICMP probe lines.
+
+Artifact: /mnt/ramdisk/ds-wifi-out/mach-wifi25j.bin 16461280 B
+sha256 a1c2ce92295a3d0e9ca9d6b8b4675454bd0fb50b3ae9eb02228877b2de46eab3
+
+--- a/bsd/dev/vayu_wifi_scan.c
++++ b/bsd/dev/vayu_wifi_scan.c
+@@ -194,6 +194,13 @@
+ static vm_offset_t tx_pool_va;
+ static uint64_t tx_busy;
+ static uint32_t tx_sent, tx_done, tx_fail;
++static uint32_t tx_status[8];           /* completions by the firmware's status nibble */
++/* W25j: every data frame gets a fresh 802.11 sequence number.  The AP's duplicate cache holds
++ * the last sequence number per TID and address for a second or two and drops a frame that
++ * repeats it: W25i sent 2/4 and 4/4 (and then every data frame) as sequence 0, so the AP took
++ * the 2/4 and dropped the 4/4 as a duplicate, timed the 4-way out (deauth reason 15) and never
++ * accepted the DHCP frames. */
++static uint32_t tx_seq;
+ 
+ static void vayu_scan_htt_tx_compl(const uint8_t *p, uint32_t len);
+ int vayu_scan_tx_frame(const uint8_t *f, uint32_t len, bool clear);
+@@ -768,6 +775,24 @@
+ 			sc.rx_not_done++;
+ 			return;
+ 		}
++	}
++	if (n <= 16 && eo == 0 && hdr >= 24 && len >= hdr + 8) {
++		uint32_t etype = (uint32_t)f[hdr + 6] << 8 | f[hdr + 7], sp = 0, dp = 0;
++		uint32_t mde = rd32(buf + 4 * OFF_MPDU_END);
++
++		if (etype == 0x0800 && len >= hdr + 8 + 20 && (f[hdr + 8] >> 4) == 4 &&
++		    f[hdr + 8 + 9] == 17) {
++			uint32_t ihl = (uint32_t)(f[hdr + 8] & 0x0f) * 4;
++
++			if (ihl >= 20 && len >= hdr + 8 + ihl + 4) {
++				sp = (uint32_t)f[hdr + 8 + ihl] << 8 | f[hdr + 8 + ihl + 1];
++				dp = (uint32_t)f[hdr + 8 + ihl + 2] << 8 | f[hdr + 8 + ihl + 3];
++			}
++		}
++		printf("vayu-wifi: W25 rxdata #%u len %u decap %u attn %#010x dec_err %u mpdu_enc %u "
++		    "enctype %u prot %u mde %#x type %#x sport %u dport %u\n", n, len, decap, attn,
++		    (attn & (1U << 29)) != 0, (mpdu0 >> 13) & 1U, mpdu0 >> 28, (f[1] & 0x40) != 0, mde,
++		    etype, sp, dp);
+ 	}
+ 	if (rx_logging() && (!sc.rx_dumped_first || (eo != 0 && !sc.rx_dumped_eapol))) {
+ 		rx_dump(sc.rx_dumped_first ? "eapol" : "first", f, len, hdr, eo);
+@@ -1098,7 +1123,20 @@
+ 		return -1;
+ 	}
+ 	pa = tx_pool_pa + (uint64_t)id * TX_SLOT_SIZE;
+-	memcpy((void *)(tx_pool_va + (vm_offset_t)(pa - tx_pool_pa)), f, len);
++	{
++		uint8_t *dst = (uint8_t *)(tx_pool_va + (vm_offset_t)(pa - tx_pool_pa));
++
++		memcpy(dst, f, len);
++		if (len >= 24) {
++			tx_seq = (tx_seq + 1) & 0xfffU;
++			dst[22] = (uint8_t)(tx_seq << 4);       /* sequence control, little-endian: seq << 4 */
++			dst[23] = (uint8_t)(tx_seq >> 4);
++		}
++		if (tx_sent < 8 && slog != NULL) {
++			slog("vayu-wifi: W25 txdata #%u len %u clear %u mcast %u seq %u\n", tx_sent, len,
++			    clear ? 1 : 0, len >= 22 && (f[16] & 1) != 0, tx_seq);
++		}
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	ext = (uint8_t *)(sc.htt_va + (vm_offset_t)(sc.htt_bank_pa - sc.htt_pa) + (vm_offset_t)id * HTT_EXT_DESC_SIZE);
+ 	memset(ext, 0, HTT_EXT_DESC_SIZE);
+@@ -1130,7 +1168,8 @@
+ 	*p++ = 0xff;                                    /* peer id: invalid, the firmware resolves it */
+ 	*p++ = 0;
+ 	*p++ = 0;
+-	memcpy(p, f, pf);
++	/* the prefetch is the frame's head as the firmware will read it (sequence number included) */
++	memcpy(p, (const void *)(tx_pool_va + (vm_offset_t)(pa - tx_pool_pa)), pf);
+ 	rc = tx_ops->htt_send(m, 20 + pf);
+ 	if (rc != 0) {
+ 		lck_mtx_unlock(&tx_lock);
+@@ -1155,6 +1194,9 @@
+ 		}
+ 	}
+ 	tx_done += n;
++	if (st < 8) {
++		tx_status[st] += n;
++	}
+ 	if (st != 0) {
+ 		tx_fail += n;
+ 		if (tx_fail <= 4 && slog != NULL) {
+@@ -1163,6 +1205,17 @@
+ 	}
+ }
+ 
++
++void
++vayu_scan_tx_summary(void)
++{
++	if (slog == NULL || tx_sent == 0) {
++		return;
++	}
++	slog("vayu-wifi: W25 tx: %u sent, %u completed by the firmware; status 0:%u 1:%u 2:%u 3:%u 4:%u "
++	    "5:%u 6:%u 7:%u\n", tx_sent, tx_done, tx_status[0], tx_status[1], tx_status[2], tx_status[3],
++	    tx_status[4], tx_status[5], tx_status[6], tx_status[7]);
++}
+ 
+ int
+ vayu_scan_run(const struct vayu_scan_ops *o)
+--- a/bsd/sys/vayu_wifi_scan.h
++++ b/bsd/sys/vayu_wifi_scan.h
+@@ -69,5 +69,7 @@
+ int vayu_scan_run(const struct vayu_scan_ops *ops);
+ /* W25: one native-wifi data frame on the HTT endpoint (clear = unencrypted, for EAPOL). 0 = sent. */
+ int vayu_scan_tx_frame(const uint8_t *frame, uint32_t len, bool clear);
++/* W25j: the TX counters, one line: sent, completed, completions by firmware status. */
++void vayu_scan_tx_summary(void);
+ 
+ #endif /* _SYS_VAYU_WIFI_SCAN_H_ */
+--- a/bsd/dev/vayu_wifi_rsn.c
++++ b/bsd/dev/vayu_wifi_rsn.c
+@@ -76,7 +76,7 @@
+ 	uint32_t gtk_len, gtk_idx;
+ 	uint64_t replay, anonce_replay;
+ 	uint32_t eapol_ver, key_ver;
+-	uint32_t msg1s, msg3s, bad_mic, ignored;
++	uint32_t msg1s, msg3s, bad_mic, ignored, late;
+ 	uint32_t group_cipher;
+ 	const struct vayu_rsn_ops *ops;
+ 	int (*log)(const char *format, ...) __printflike(1, 2);
+@@ -712,7 +712,7 @@
+ 	uint32_t body, kd_len;
+ 	uint64_t replay;
+ 
+-	if (!rsn.started || rsn.ops == NULL || rsn.state == RSN_KEYED || rsn.state == RSN_FAILED) {
++	if (!rsn.started || rsn.ops == NULL || rsn.state == RSN_FAILED) {
+ 		return;
+ 	}
+ 	if (len < EAPOL_HDR + EAPOL_KEY_FIXED || eapol[1] != EAPOL_TYPE_KEY) {
+@@ -732,6 +732,16 @@
+ 		return;
+ 	}
+ 	replay = be64(k + 5);
++	if (rsn.state == RSN_KEYED) {
++		/* The AP resending 3/4 after our 4/4 means it did not take the 4/4 (wrong replay or
++		 * MIC, or a duplicate the AP dropped): the 4-way will time out and the port stays shut. */
++		if (rsn.late < 4) {
++			rsn.late++;
++			rsn.log("vayu-wifi: W25 S3 4way: WARNING eapol after the keys (info %#x replay %llu): "
++			    "the AP did not take the 4/4\n", info, (unsigned long long)replay);
++		}
++		return;
++	}
+ 	if ((info & KI_PAIRWISE) != 0 && (info & KI_ACK) != 0 && (info & KI_MIC) == 0) {
+ 		if (rsn.state != RSN_WAIT_M1) {
+ 			rsn.ignored++;          /* a retransmitted 1/4 after our 2/4: answer again, same PTK */
+--- a/bsd/dev/vayu_wifi_net.c
++++ b/bsd/dev/vayu_wifi_net.c
+@@ -29,6 +29,7 @@
+ #include <sys/hakios.sta.h>
+ #include <sys/vayu_wifi_net.h>
+ #include <sys/vayu_wifi_rsn.h>
++#include <sys/vayu_wifi_scan.h>
+ 
+ #define ETH_HLEN                14U
+ #define ETH_TYPE_IP             0x0800U
+@@ -47,6 +48,7 @@
+ 	uint32_t dhcp_state, dhcp_tries, arp_tries, icmp_tries, probe_stage;
+ 	uint32_t xid;
+ 	uint32_t offered_ip, server_ip, lease_ip, mask, router, dns;
++	uint32_t dhcp_seen;
+ 	uint64_t next_send_ms, deadline_ms;
+ 	uint32_t tx_frames, tx_bytes, tx_drop, rx_frames, rx_bytes, rx_drop;
+ 	uint8_t mac[6], bssid[6], router_mac[6], ssid[32];
+@@ -226,6 +228,12 @@
+ 		return;
+ 	}
+ 	xid = (uint32_t)b[4] << 24 | (uint32_t)b[5] << 16 | (uint32_t)b[6] << 8 | b[7];
++	if (net.dhcp_seen < 8) {
++		net.dhcp_seen++;
++		net.log("vayu-wifi: W25 S5 dhcp: frame from %u.%u.%u.%u:%u to :%u xid %s\n",
++		    ip[12], ip[13], ip[14], ip[15], (uint32_t)udp[0] << 8 | udp[1],
++		    (uint32_t)udp[2] << 8 | udp[3], xid == net.xid ? "ours" : "other");
++	}
+ 	if (xid != net.xid) {
+ 		return;
+ 	}
+@@ -685,6 +693,7 @@
+ void
+ vayu_net_summary(void)
+ {
++	vayu_scan_tx_summary();
+ 	net.log("vayu-wifi: W25 data: frames tx %u (%u bytes, %u dropped), rx %u (%u bytes, %u dropped); "
+ 	    "dhcp %s, probe %s\n", net.tx_frames, net.tx_bytes, net.tx_drop, net.rx_frames, net.rx_bytes,
+ 	    net.rx_drop, net.dhcp_state == DHCP_BOUND ? "bound" : (net.dhcp_on ? "no lease" : "off"),
+--- a/bsd/dev/vayu_wifi_sta.c
++++ b/bsd/dev/vayu_wifi_sta.c
+@@ -439,6 +439,15 @@
+ 			    "3 no ack) ack_rssi %u\n", v[0], v[1], v[4]);
+ 		}
+ 		break;
++	case 0x5003U: {               /* VDEV_INSTALL_KEY_COMPLETE: {vdev, key_idx, key_flags, status[, mac]} */
++		uint32_t n = first_tlv(p, len, v, 4);
++
++		if (n >= 16) {
++			tlog("vayu-wifi: W25 wmi: install-key-complete v0 %u v1 %u v2 %u v3 %u (vdev, key idx, "
++			    "flags, status as far as the layout is known)\n", v[0], v[1], v[2], v[3]);
++		}
++		break;
++	}
+ 	case EV_PEER_STA_KICKOUT:
+ 		st.w_kickout++;
+ 		tlog("vayu-wifi: w23: PEER_STA_KICKOUT (state %u)\n", st.state);

@@ -1,0 +1,3420 @@
+Subject: [PATCH] vayu: test26 IPA data path - 0029 post-auth/SRAM/ttbrfix, 0041 QMI stages, GSI 4.1 channels + QMAP + en1
+
+Base: vayu-test26 d15caf0 (/mnt/ramdisk/n13c/src). Applies with -p1.
+Kernel: mach-data1.bin sha256 271855dc69e96b48cc31fa2b56f6c37da0b9a224abc3554e817886664cdc041b.
+
+What:
+- 0029 (ported by hand to this tree): vayu_ipa_bus mask, vayu_ipa_post_auth_ms with read-only
+  GSI/uC look, vayu_ipa_sram=1 canaries at 0x1e47000, vayu_ipa_ttbrfix, and the 4-page SMMU
+  identity map for the whole 2 GiB DDR window. vayu_pas already had the opt-in forced shutdown
+  (vayu_ipa_pas bit 0), so that part of 0029 is not duplicated.
+- 0041 (ported with the hakios.qmi/hakios.qrtr names of this tree): vayu_ipa_qmi=0..4 stages,
+  one INIT_MODEM_DRIVER, INDICATION_REGISTER, INIT_COMPLETE_IND from the published 0x31/1 port,
+  read-only WDS Get Packet Service Status at stage 3, WDS Start allowed only at stage 4.
+- New data files from the net1 line: vayu_ipa_data.c (GSI 2.0 ch4/EP5 cmd, ch5/EP10 LAN,
+  ch3/EP2 WAN TX, ch6/EP11 WAN RX; endpoints, empty filter/route/header/proc tables, SRAM
+  readback, polling thread, QMAP encode/decode), vayu_cell_net.c (en1, IFNET_FAMILY_CELLULAR,
+  IFT_CELLULAR, raw IPv4, SIOCPROTOATTACH + SIOCAIFADDR + IFF_UP/RUNNING, optional default route)
+  and vayu_cell_qmap.h. vayu_ipa_data_prepare() runs before MPSS after ipa_fws; WDS Start is
+  refused unless the IPA QMI handshake, all four GSI channels/tables and en1 are ready.
+- vayu_cell_data.c wires WDS Start (APN: vayu_cell_apn, default SIM profile; IPv4), WDS Get
+  Current Settings (address/gateway/mask/DNS/MTU) into vayu_cell_net_session().
+- One index line per stage, greppable:
+    vayu-data: S1 IPA QMI READY / S2 GSI CHANNELS / S3 DPM OPEN PORT / S4 WDA SET DATA FORMAT /
+    S5 WDS BIND MUX / S6 WDS IP FAMILY / S7 WDS START / S8 WDS GET SETTINGS /
+    S9 EN1 IFNET / S10 FIRST PACKET   -> OK|ERROR|TIMEOUT ...
+
+Boot-args: vayu_ipa=1 vayu_ipa_data=1 vayu_ipa_qmi=4 vayu_cell_data=1 vayu_cell_net=1
+  (+ vayu_ipa_ttbrfix=1 vayu_ipa_bus=6 vayu_ipa_post_auth_ms=8000 vayu_ipa_sram=1,
+   vayu_cell_net_default=1 only if a default route is wanted).
+
+Known limits (fail closed, no claim): no CommCenter/configd and no DNS publication (en1 only,
+kern.vayu.cellular_* for the settings); the modem's runtime filter installation is not implemented,
+so an INSTALL_FILTER_RULE request clears data_ready and blocks Start; uC NOT READY after AUTH is
+still only observed, stock ipa3_post_init's command pipe is approximated by the four channels and
+the immediate table commands. vayu_ipa_sram=1 moves the SRAM window to 0x1e47000, and both the
+canary writes and the table readback use that same window (vayu_ipa_sram_base()).
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -668,5 +668,7 @@
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
+ bsd/dev/vayu_ipa.c	standard
++bsd/dev/vayu_ipa_data.c	standard
+ bsd/dev/vayu_ipa_qmi.c	standard
+ bsd/dev/vayu_ipa_smmu.c	standard
++bsd/dev/vayu_cell_net.c	standard
+--- a/bsd/dev/hakios.input.c
++++ b/bsd/dev/hakios.input.c
+@@ -23,6 +23,7 @@
+ #include <sys/vayu_mdp.h>
+ #include <sys/vayu_ir.h>
+ #include <sys/vayu_usbnet.h>
++#include <sys/vayu_cell_net.h>
+ #include <pexpert/pexpert.h>
+ 
+ #define TOUCH_QUEUE     512             /* records; a power of two */
+@@ -354,6 +355,7 @@
+ 	hakios_battery_init();
+ 	hakios_ufs_init();
+ 	hakios_net_init();
++	vayu_cell_net_init();           /* boot-arg vayu_cell_net=1: en1 raw IPv4 over the IPA/QMAP path */
+ 	hakios_adreno_init();
+ 	vayu_adreno_init();             /* boot-args gpu=1 vayu_gpu=1: the Adreno 640 of vayu */
+ 	hakios_wifi_init();
+--- a/bsd/dev/vayu_cell_data.c
++++ b/bsd/dev/vayu_cell_data.c
+@@ -32,7 +32,9 @@
+ #include <sys/systm.h>
+ #include <sys/vayu_cell_data.h>
+ #include <sys/vayu_cell_data_qmi.h>
++#include <sys/vayu_cell_net.h>
+ #include <sys/vayu_ipa.h>
++#include <sys/vayu_ipa_data.h>
+ #include <sys/vayu_pas.h>
+ 
+ #define DATA_REPLY_MS           5000
+@@ -63,6 +65,25 @@
+ 	return length;
+ }
+ 
++/*
++ * One summary line per bring-up stage, the shape the reports grep:
++ *   vayu-data: S<n> <step>: OK|ERROR|TIMEOUT <detail>
++ * The detailed vayu-cell-data/vayu-ipa-data lines stay as they are; this is the index.
++ */
++static void
++data_stage_line(uint32_t stage, const char *step, const char *result, const char *format, ...)
++{
++	char detail[180], line[260];
++	va_list list;
++
++	va_start(list, format);
++	vsnprintf(detail, sizeof(detail), format, list);
++	va_end(list);
++	snprintf(line, sizeof(line), "vayu-data: S%u %s: %s %s\n", stage, step, result, detail);
++	for (const char *c = line; *c != 0; c++) loader_log_putc(*c);
++	printf("%s", line);
++}
++
+ static uint64_t
+ now_ms(void)
+ {
+@@ -248,6 +269,9 @@
+ static void
+ data_clear_sysctls(void)
+ {
++	if (cellular_data != 0) {
++		vayu_cell_net_session(false, 0, 0, 0, 0, 0, 0);
++	}
+ 	cellular_data = 0;
+ 	cellular_mtu = 0;
+ 	cellular_ip[0] = 0;
+@@ -403,6 +427,8 @@
+ 	    vayu_cell_dpm_open_port_req_ei, &req, vayu_cell_result_resp_ei, &resp, &resp.result);
+ 	if (data_idempotent_ok(ret, &resp)) {
+ 		say("vayu-cell-data: DPM embedded data port is open\n");
++		data_stage_line(3, "DPM OPEN PORT", "OK", "embedded interface %u, modem RX EP %u, TX EP %u",
++		    VAYU_CELL_ENDPOINT_INTERFACE, req.ports[0].rx_endpoint_number, req.ports[0].tx_endpoint_number);
+ 		data_advance(DATA_WDA);
+ 	} else {
+ 		data_retry("DPM Open Port", resp.result.error);
+@@ -429,6 +455,8 @@
+ 	    vayu_cell_wda_set_format_req_ei, &req, vayu_cell_result_resp_ei, &resp, &resp.result);
+ 	if (data_idempotent_ok(ret, &resp)) {
+ 		say("vayu-cell-data: WDA data format accepted\n");
++		data_stage_line(4, "WDA SET DATA FORMAT", "OK", "raw IP in QMAP, downlink max %u x %#x",
++		    req.downlink_max_datagrams, req.downlink_max_size);
+ 		data_advance(DATA_BIND);
+ 	} else {
+ 		data_retry("WDA Set Data Format", resp.result.error);
+@@ -451,6 +479,8 @@
+ 	    vayu_cell_wds_bind_req_ei, &req, vayu_cell_result_resp_ei, &resp, &resp.result);
+ 	if (data_idempotent_ok(ret, &resp)) {
+ 		say("vayu-cell-data: WDS client bound to mux %u\n", VAYU_CELL_DATA_MUX);
++		data_stage_line(5, "WDS BIND MUX", "OK", "embedded interface %u mux %u", VAYU_CELL_ENDPOINT_INTERFACE,
++		    VAYU_CELL_DATA_MUX);
+ 		data_advance(DATA_FAMILY);
+ 	} else {
+ 		data_retry("WDS Bind Mux Data Port", resp.result.error);
+@@ -469,6 +499,7 @@
+ 	    vayu_cell_wds_ip_family_req_ei, &req, vayu_cell_result_resp_ei, &resp, &resp.result);
+ 	if (data_idempotent_ok(ret, &resp)) {
+ 		say("vayu-cell-data: WDS IP family is IPv4\n");
++		data_stage_line(6, "WDS IP FAMILY", "OK", "IPv4");
+ 		data_advance(DATA_START);
+ 	} else {
+ 		data_retry("WDS Set IP Family IPv4", resp.result.error);
+@@ -492,6 +523,30 @@
+ 	if (!data.registered || data.stop || data.cleanup || data.session_uncertain) {
+ 		return;
+ 	}
++	/* 0041 stage 4: a Start is only legal after the whole chain is up. */
++	if (!vayu_ipa_ready() || !vayu_ipa_data_ready() || !vayu_cell_net_ready()) {
++		static uint64_t last_blocked;
++		if (now_ms() - last_blocked > 5000) {
++			last_blocked = now_ms();
++			data_stage_line(7, "WDS START", "ERROR", "blocked: IPA handshake %s, GSI %s, en1 %s",
++			    vayu_ipa_ready() ? "ready" : "NOT READY", vayu_ipa_data_ready() ? "ready" : "NOT READY",
++			    vayu_cell_net_ready() ? "ready" : "NOT READY (need vayu_cell_net=1)");
++		}
++		return;
++	}
++	{
++		uint32_t qmi_stage = vayu_ipa_qmi_stage();
++
++		if (qmi_stage < 4) {
++			static uint64_t last_refused;
++			if (now_ms() - last_refused > 5000) {
++				last_refused = now_ms();
++				data_stage_line(7, "WDS START", "ERROR",
++				    "vayu_ipa_qmi=%u: stage 4 is not enabled; no data session", qmi_stage);
++			}
++			return;
++		}
++	}
+ 	data.stage_attempts++;
+ 	say("vayu-cell-data: WDS Start Network Interface: IPv4, %s\n",
+ 	    data.apn[0] != 0 ? "boot-arg APN" : "SIM default profile");
+@@ -518,6 +573,7 @@
+ 	if (ret == -ETIMEDOUT) {
+ 		/* Start is not idempotent: a lost reply cannot be followed by another Start. */
+ 		say("vayu-cell-data: Start timed out; no duplicate Start is sent (possible session needs modem reset)\n");
++		data_stage_line(7, "WDS START", "TIMEOUT", "no reply in %u ms; no duplicate Start", DATA_START_REPLY_MS);
+ 		data.session_uncertain = true;
+ 		data.stage = DATA_FAILED;
+ 		data.cleanup = true;
+@@ -527,6 +583,8 @@
+ 	if (ret == 0 && resp.handle_valid) {
+ 		data.wds_handle = resp.handle;
+ 		say("vayu-cell-data: WDS data session accepted, handle %#x; asking for settings\n", data.wds_handle);
++		data_stage_line(7, "WDS START", "OK", "IPv4 %s, handle %#x",
++		    data.apn[0] != 0 ? "boot-arg APN" : "SIM default profile", data.wds_handle);
+ 		data_advance(DATA_SETTINGS);
+ 	} else {
+ 		if (ret == 0) {
+@@ -580,6 +638,8 @@
+ 	    VAYU_CELL_WDS_GET_CURRENT_SETTINGS, vayu_cell_wds_settings_req_ei, &req,
+ 	    vayu_cell_wds_settings_resp_ei, &resp, &resp.result);
+ 	if (ret != 0) {
++		data_stage_line(8, "WDS GET SETTINGS", ret == -ETIMEDOUT ? "TIMEOUT" : "ERROR", "result %u error %u",
++		    (unsigned)resp.result.result, (unsigned)resp.result.error);
+ 		data_retry("WDS Get Current Settings", resp.result.error);
+ 		return;
+ 	}
+@@ -621,8 +681,14 @@
+ 	}
+ 	cellular_data = 1;
+ 	data.stage = DATA_UP;
+-	say("vayu-cell-data: CONTROL PLANE UP: IPv4 session and settings accepted; "
+-	    "kern.vayu.cellular_* are set. IPA/GSI/en1 is NOT up: no packets or internet yet\n");
++	vayu_cell_net_session(true, resp.address, resp.mask_valid ? resp.mask : 0,
++	    resp.gateway_valid ? resp.gateway : 0, resp.dns1_valid ? resp.dns1 : 0,
++	    resp.dns2_valid ? resp.dns2 : 0, resp.mtu_valid ? resp.mtu : 0);
++	data_stage_line(8, "WDS GET SETTINGS", "OK", "address %s gateway %s mask %s DNS %s %s MTU %u",
++	    ip, gw, mask, dns1, dns2, resp.mtu_valid ? resp.mtu : 0);
++	data_stage_line(9, "EN1 SESSION", "OK", "configuration queued (vayu_cell_net=1): address %s peer %s", ip, gw);
++	say("vayu-cell-data: CONTROL PLANE UP: IPv4 session/settings accepted; en1 configuration queued. "
++	    "IPA/GSI packet counters, not this line, prove transport\n");
+ }
+ 
+ static void
+@@ -637,16 +703,31 @@
+ 	if (!data.registered || data.stage == DATA_UP || data.stage == DATA_FAILED || now_ms() < data.next_ms) {
+ 		return;
+ 	}
+-	if (!vayu_ipa_ready()) {
++	if (!vayu_ipa_ready() || !vayu_ipa_data_ready() || !vayu_cell_net_ready()) {
+ 		static uint64_t last_gate_log;
+ 		if (now_ms() - last_gate_log > 5000) {
+ 			last_gate_log = now_ms();
+-			say("vayu-cell-data: WDS/DPM blocked: vayu IPA 4.1 is not ready%s%s\n",
+-			    vayu_ipa_pending() ? " (vayu_ipa=1 pending INIT_MODEM_DRIVER)" :
+-			    " (enable vayu_ipa=1 first; no Start is sent)", "");
++			say("vayu-cell-data: WDS/DPM blocked: IPA handshake %s, GSI/tables %s, en1 %s; no Start is sent\n",
++			    vayu_ipa_ready() ? "ready" : "NOT READY", vayu_ipa_data_ready() ? "ready" : "NOT READY",
++			    vayu_cell_net_ready() ? "ready" : "NOT READY (need vayu_cell_net=1)");
++			data_stage_line(1, "IPA QMI READY", vayu_ipa_ready() ? "OK" : "TIMEOUT",
++			    "vayu_ipa_qmi=%u; handshake %s", vayu_ipa_qmi_stage(),
++			    vayu_ipa_ready() ? "done" : "not complete");
++			data_stage_line(2, "GSI CHANNELS", vayu_ipa_data_ready() ? "OK" : "ERROR",
++			    "vayu_ipa_data=%s; %s", vayu_ipa_data_ready() ? "1" : "off/not ready",
++			    vayu_ipa_data_ready() ? "4 channels, endpoints and tables ready" : "data path not ready");
+ 		}
+ 		return;
+ 	}
++	{
++		static bool announced;
++
++		if (!announced) {
++			announced = true;
++			data_stage_line(1, "IPA QMI READY", "OK",
++			    "vayu_ipa_qmi=%u handshake complete; DPM/WDA/WDS may start", vayu_ipa_qmi_stage());
++		}
++	}
+ 	if (!data.dpm_there || !data.wda_there || !data.wds_there) {
+ 		say("vayu-cell-data: registered, waiting for DPM %s WDA %s WDS %s\n",
+ 		    data.dpm_there ? "there" : "MISSING", data.wda_there ? "there" : "MISSING",
+@@ -707,8 +788,10 @@
+ 	    data.dpm_there ? "there" : "MISSING", data.wda_there ? "there" : "MISSING",
+ 	    data.wds_there ? "there" : "MISSING");
+ 	for (;;) {
+-		if ((data.stage == DATA_START || data.stage == DATA_SETTINGS) && !vayu_ipa_ready()) {
++		if ((data.stage == DATA_START || data.stage == DATA_SETTINGS) &&
++		    (!vayu_ipa_ready() || !vayu_ipa_data_ready())) {
+ 			say("vayu-cell-data: IPA readiness was lost during Start/Settings; stopping the client\n");
++			data_stage_line(7, "WDS START", "ERROR", "IPA readiness lost during Start/Settings");
+ 			data.stop = true;
+ 			data.cleanup = true;
+ 			data.cleanup_seq++;
+--- a/bsd/dev/vayu_ipa.c
++++ b/bsd/dev/vayu_ipa.c
+@@ -22,6 +22,7 @@
+ #include <sys/systm.h>
+ #include <vm/memory_types.h>
+ #include <sys/vayu_ipa.h>
++#include <sys/vayu_ipa_data.h>
+ #include <sys/vayu_pas.h>
+ 
+ #define IPA_SM_HOST_MODEM       1
+@@ -30,6 +31,8 @@
+ #define IPA_SMP2P_CLOCK_ON      (1u << 1)
+ #define IPA_FILTER_TABLE_ITEM   497
+ #define IPA_FILTER_TABLE_SIZE   0x2000   /* vayu default: no qcom,ipa-q6-smem-size in DT */
++#define IPA_SRAM_V41            0x1e47000u      /* 0x1e00000 + 0x40000 + IPA_SW_AREA_RAM_DIRECT_ACCESS_n v3.0..v4.2 */
++#define IPA_SRAM_OLD            0x1e50000u      /* + 0x10000: the IPA v4.5 offset */
+ 
+ extern void loader_log_putc(char c);
+ extern void loader_checkpoint(uint64_t n);      /* osfmk/arm64/loader_return.c: "xl run N" stops there */
+@@ -47,6 +50,11 @@
+ static bool ipa_modem_loader;           /* vayu_ipa_loader=1: no AP PAS; watch what MPSS does */
+ static uint32_t ipa_filter_item, ipa_our_item, ipa_restricted;
+ static vm_offset_t ipa_regs;
++/* vayu_ipa_bus: which bus BCMs get the IP0 word. vayu_ipa_post_auth_ms: after AUTH_AND_RESET(15)
++ * returns, wait this long and announce every later IPA access with a 2.5 s pause. vayu_ipa_sram=1:
++ * canaries in the IPA 4.1 SW SRAM window (wrapper + 0x40000 + 0x7000, ipahal_reg.c v3.0..v4.2)
++ * instead of 0x1e50000 (the v4.5 offset). Ported from 0029 (w23 line) to this tree. */
++static uint32_t ipa_bus_mask = 15, ipa_post_auth_ms, ipa_sram_fix;
+ 
+ static int say(const char *format, ...) __printflike(1, 2);
+ static int
+@@ -128,6 +136,15 @@
+ 	return ipa_restricted;
+ }
+ 
++/* The IPA local (SW) SRAM window this boot uses: 0x1e47000 for IPA 4.1 (vayu_ipa_sram=1),
++ * 0x1e50000 for the v4.5 offset the older code used. Table offsets are relative to this window
++ * and include the restricted byte count. */
++uint32_t
++vayu_ipa_sram_base(void)
++{
++	return ipa_sram_fix == 1 ? IPA_SRAM_V41 : IPA_SRAM_OLD;
++}
++
+ static bool
+ ipa_registers_check(void)
+ {
+@@ -169,6 +186,12 @@
+ 		return false;
+ 	}
+ 	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		/* vayu_ipa_bus=MASK (1 SN8, 2 SH0, 4 MC0, 8 ACV; absent = 15). SN8 and ACV hung the host
++		 * during the pause (runs 0941/0942/0943); SH0+MC0 (6) survived it twice (0940, 0940r). */
++		if (!(ipa_bus_mask & (1u << i))) {
++			say("vayu-ipa: bus %s not voted (vayu_ipa_bus=%u)\n", rails[i], ipa_bus_mask);
++			continue;
++		}
+ 		address = vayu_rpmh_address(rails[i]);
+ 		if (address != 0 && !vayu_rpmh_send(&address, &value, 1, "ipa bus")) {
+ 			say("vayu-ipa: bus %s vote failed; IP0 is confirmed, keeping this visible\n", rails[i]);
+@@ -182,11 +205,72 @@
+ #define RSRC(xmin, xmax, ymin, ymax) \
+ 	((uint32_t)(xmin) | (uint32_t)(xmax) << 8 | (uint32_t)(ymin) << 16 | (uint32_t)(ymax) << 24)
+ 
++#define GSI_BASE                0x1e04000u
++#define UC_RESPONSE_INIT_DONE   1u              /* IPA_HW_2_CPU_RESPONSE_INIT_COMPLETED, ipa_uc.c */
++
++/* Announce the next IPA access and give the loader (2 s snapshots) time to carry the line out. */
++static void
++ipa_step(const char *what)
++{
++	if (ipa_post_auth_ms == 0) return;
++	say("vayu-ipa: post-auth: about to %s\n", what);
++	delay_for_interval(2500, NSEC_PER_MSEC);
++}
++
++/* Read-only look after AUTH_AND_RESET(15): GSI enabled by TrustZone, uC INIT_COMPLETED in the
++ * shared area at SW SRAM offset 0 (struct IpaHwSharedMemCommonMapping_t: responseOp +0xc,
++ * responseParams +0x10, hwState +0x20, interfaceVersionCommon +0x24). */
++static void
++ipa_post_auth_look(void)
++{
++	vm_offset_t gsi, uc;
++	uint32_t cfg, status, response = 0, state = 0, iface = 0;
++	uint64_t waited = 0;
++
++	if (ipa_post_auth_ms == 0) return;
++	say("vayu-ipa: post-auth: AUTH_AND_RESET(15) RETURNED; holding %u ms before any IPA access\n", ipa_post_auth_ms);
++	delay_for_interval(ipa_post_auth_ms, NSEC_PER_MSEC);
++	ipa_step("read IPA_VERSION 0x1e40034");
++	say("vayu-ipa: post-auth: IPA_VERSION %#x\n", IPA_RD(0x34));
++	gsi = ml_io_map_unmappable(GSI_BASE, 0x20000, VM_WIMG_IO);
++	if (gsi == 0) {
++		say("vayu-ipa: post-auth: GSI window did not map\n");
++		return;
++	}
++	ipa_step("read GSI_CFG 0x1e04000 and GSI_EE0_STATUS 0x1e23000");
++	cfg = *(volatile uint32_t *)(gsi + 0x0);
++	status = *(volatile uint32_t *)(gsi + 0x1f000);
++	say("vayu-ipa: post-auth: GSI_CFG %#x (enable %u), GSI_EE0_STATUS %#x (enabled %u)\n",
++	    cfg, cfg & 1, status, status & 1);
++	uc = ml_io_map_unmappable(IPA_SRAM_V41, 0x1000, VM_WIMG_IO);
++	if (uc == 0) {
++		say("vayu-ipa: post-auth: uC shared area did not map\n");
++		return;
++	}
++	ipa_step("read the uC shared area at 0x1e47000");
++	for (;;) {
++		response = *(volatile uint32_t *)(uc + 0xc) & 0xff;
++		if (response == UC_RESPONSE_INIT_DONE || waited >= 2000) break;
++		delay_for_interval(10, NSEC_PER_MSEC);
++		waited += 10;
++	}
++	state = *(volatile uint32_t *)(uc + 0x20) & 0xff;
++	iface = *(volatile uint32_t *)(uc + 0x24) & 0xffff;
++	say("vayu-ipa: post-auth: uC responseOp %#x params %#x hwState %#x interface %#x after %llu ms: %s\n",
++	    response, *(volatile uint32_t *)(uc + 0x10), state, iface, waited,
++	    response == UC_RESPONSE_INIT_DONE ? "uC INIT_COMPLETED" : "uC NOT READY");
++	say("vayu-ipa: post-auth: GSI %s, uC %s\n", (status & 1) ? "READY" : "NOT ENABLED",
++	    response == UC_RESPONSE_INIT_DONE ? "READY" : "NOT READY");
++}
++
+ static void
+ ipa_hardware_init(void)
+ {
+ 	/* vayu-r-oss ipa3_init_hw + resource groups + route for IPA 4.1. */
+-	uint32_t v = IPA_RD(0x74);
++	uint32_t v;
++
++	ipa_step("write QSB/CLKON/BCR/COMP registers and resource groups (0x1e40000 + 0x3c..0x52c)");
++	v = IPA_RD(0x74);
+ 	IPA_WR(0x74, (v & ~0xfU) | 8);                 /* DDR QMB max writes 8 */
+ 	v = IPA_RD(0x78);
+ 	IPA_WR(0x78, (v & ~0x00ff000fU) | 12 | 120U << 16); /* DDR reads 12 of 120 */
+@@ -222,11 +306,16 @@
+ 	/* IPA local memory: zero the modem's table/proc-ctx areas, write canaries,
+ 	 * and tell the uC where modem processing contexts start. */
+ 	{
+-		vm_offset_t sram = ml_io_map_unmappable(0x1e50000, 0x4000, VM_WIMG_IO);
++		uint32_t sram_pa = vayu_ipa_sram_base() + (ipa_sram_fix == 1 ? ipa_restricted : 0);
++		vm_offset_t sram;
+ 		static const uint16_t canaries[] = {
+ 			0x0288, 0x0308, 0x0388, 0x0408, 0x0488, 0x0508, 0x0588, 0x0608,
+ 			0x0688, 0x07d0, 0x0c30, 0x13d0, 0x13f0, 0x23fc,
+ 		};
++
++		ipa_step(ipa_sram_fix == 1 ? "write SRAM canaries at 0x1e47000 (vayu_ipa_sram=1)" :
++		    "write SRAM canaries at 0x1e50000 (old v4.5 offset)");
++		sram = ml_io_map_unmappable(sram_pa, 0x4000, VM_WIMG_IO);
+ 		if (sram == 0) {
+ 			say("vayu-ipa: IPA SRAM window did not map\n");
+ 			return;
+@@ -240,8 +329,9 @@
+ 			*(volatile uint32_t *)(sram + at - 4) = 0xdeadbeef;
+ 		}
+ 		IPA_WR(0x1e8, ipa_restricted + 0x7d0); /* LOCAL_PKT_PROC_CNTXT_BASE */
+-		say("vayu-ipa: IPA SRAM zeroed/canaries written, proc-ctx base %#x\n", IPA_RD(0x1e8));
++		say("vayu-ipa: IPA SRAM zeroed/canaries written at %#x, proc-ctx base %#x\n", sram_pa, IPA_RD(0x1e8));
+ 	}
++	ipa_step("write the exception route 0x1e40048");
+ 	/* Exception route: LAN consumer endpoint 10, header table local, retain hdr. */
+ 	IPA_WR(0x48, 0x1120052);
+ 	say("vayu-ipa: hardware init: QSB %#x %#x, CLKON %#x, BCR %#x, COMP %#x, route %#x\n",
+@@ -295,6 +385,40 @@
+ 	return ipa_fw_ready;
+ }
+ 
++/* The "ipa" entry of SMP2P item `item` (host 1), found by name; false: no item or no entry. */
++static bool
++ipa_smp2p_entry(uint32_t item, uint32_t *value)
++{
++	uint32_t size = 0, at = vayu_smem_item(IPA_SM_HOST_MODEM, item, &size), valid;
++
++	if (at == 0 || size < 20 || ipa_smem_word(at) != 0x504d5324) return false;
++	valid = ipa_smem_word(at + 12) >> 16;
++	for (uint32_t i = 0; i < valid && i < 16 && 20 + 20 * (i + 1) <= size; i++) {
++		if (ipa_smem_word(at + 20 + 20 * i) == 0x00617069 && ipa_smem_word(at + 24 + 20 * i) == 0) {
++			*value = ipa_smem_word(at + 36 + 20 * i);
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Ours (428, apps->modem: bit 0 response done, bit 1 clock on) and the modem's (435, its clock query,
++ * stock ipa3_smp2p_modem_clk_query_isr). The modem item may carry no "ipa" entry until it asks. */
++void
++vayu_ipa_smp2p_read(bool *ours_found, uint32_t *ours, bool *theirs_found, uint32_t *theirs)
++{
++	*ours = *theirs = 0;
++	*ours_found = ipa_smp2p_entry(IPA_SMP2P_OURS, ours);
++	*theirs_found = ipa_smp2p_entry(435, theirs);
++}
++
++/* True only after this boot's MPSS SMP2P verification (vayu_ipa_modem_probe), never from stale SMEM. */
++bool
++vayu_ipa_modem_started(void)
++{
++	return ipa_smp2p_ready;
++}
++
+ bool
+ vayu_ipa_firmware_ready(void)
+ {
+@@ -312,11 +436,15 @@
+ 	}
+ 	if (ipa_prepared) return;
+ 	ipa_enabled = true;
++	PE_parse_boot_argn("vayu_ipa_bus", &ipa_bus_mask, sizeof(ipa_bus_mask));
++	PE_parse_boot_argn("vayu_ipa_post_auth_ms", &ipa_post_auth_ms, sizeof(ipa_post_auth_ms));
++	PE_parse_boot_argn("vayu_ipa_sram", &ipa_sram_fix, sizeof(ipa_sram_fix));
+ 	if (PE_parse_boot_argn("vayu_ipa_pas", &steps, sizeof(steps))) {
+ 		vayu_pas_set_steps(steps);
+ 	}
+ 	say("vayu-ipa: PAS steps %#x (bit 0 forced shutdown, 1 image, 2 AUTH, 3 hardware init)\n",
+ 	    vayu_pas_steps());
++	say("vayu-ipa: bus %#x, post_auth_ms %u, sram %u\n", ipa_bus_mask, ipa_post_auth_ms, ipa_sram_fix);
+ 	if ((vayu_pas_steps() & VAYU_PAS_STEP_AUTH) && !(vayu_pas_steps() & VAYU_PAS_STEP_IMAGE)) {
+ 		say("vayu-ipa: vayu_ipa_pas asks for AUTH without an image: refused\n");
+ 		return;
+@@ -381,11 +509,17 @@
+ 		vayu_pas_stop(&ipa_fw, "IPA did not come up");
+ 		return;
+ 	}
++	ipa_post_auth_look();
+ 	if (vayu_pas_steps() & VAYU_PAS_STEP_HW) {
+ 		ipa_hardware_init();
+ 	} else {
+ 		say("vayu-ipa: hardware/SRAM init skipped (vayu_ipa_pas bit 3 off)\n");
+ 	}
++	/* vayu_ipa_data=1: the four GSI channels, endpoints and the empty tables, still before MPSS
++	 * (stock ipa3_load_ipa_fw -> ipa3_post_init). The QMI handshake stays separate. */
++	if (!vayu_ipa_data_prepare()) {
++		say("vayu-ipa: data path preparation failed; IPA stays up, WDS Start will be blocked\n");
++	}
+ 	loader_checkpoint(112);
+ 	say("vayu-ipa: IPA firmware authenticated/reset (no own SMP2P item); modem item will carry \"ipa\"\n");
+ 	/*
+@@ -467,6 +601,11 @@
+ vayu_ipa_prepare_stop(void)
+ {
+ 	if (!ipa_enabled) return;
++	if (!vayu_ipa_data_stop()) {
++		/* A channel that will not stop leaves the IPA firmware up: never PAS-stop under it. */
++		say("vayu-ipa: data path did not stop; keeping IPA firmware up\n");
++		return;
++	}
+ 	if (ipa_fw.started) {
+ 		(void)vayu_pas_stop(&ipa_fw, "IPA prepare stop");
+ 	}
+--- a/bsd/dev/vayu_ipa_qmi.c
++++ b/bsd/dev/vayu_ipa_qmi.c
+@@ -1,12 +1,25 @@
+ /*
+- * vayu IPA QMI service 0x31: the modem-facing IPA 4.1 handshake.
++ * vayu IPA QMI service 0x31: the modem-facing IPA 4.1 handshake, in stages.
+  *
+  * 0641 proved the ordering requirement: WDS Start crashes the modem at
+  * ipa_ipfltr.init_done when this handshake has not happened. This client sends the exact
+  * vayu-r-oss INIT_MODEM_DRIVER layout, waits for its answer and then sends INIT_COMPLETE.
+  * Only then vayu_ipa_ready() may become true (once the firmware/PAS stage is also ready).
+  *
+- * It does not configure GSI rings or carry packets. Those belong to vayu_ipa.c's later stages.
++ * vayu_ipa_qmi=N (absent: 2, the old behaviour) picks how far it goes; every stage prints one
++ * line "vayu-ipa-qmi: S<n> <step>: OK|ERROR|TIMEOUT ...":
++ *   0  nothing
++ *   1  SMP2P "ipa" (ours 428 = 3, the modem's 435 if it asked) + lookup of the modem's 0x31/2; no request
++ *   2  + host 0x31/1 published, INIT_MODEM_DRIVER, INDICATION_REGISTER, INIT_COMPLETE, 0x35
++ *   3  + read-only WDS Get Packet Service Status (0x22)
++ *   4  + WDS Start allowed in vayu_cell_data.c (needs vayu_cell_data=1 vayu_cell_net=1 vayu_ipa_data=1)
++ * vayu_ipa_qmi_wait=MS (60000) for the lookup, vayu_ipa_qmi_timeout=MS (30000) for INIT_MODEM_DRIVER.
++ *
++ * Stock (vayu-r-oss ipa_qmi_service.c): one INIT_MODEM_DRIVER, 60 s timeout (:39, :677);
++ * MASTER_DRIVER_INIT_COMPLETE_IND once both INIT_MODEM_DRIVER answered and INDICATION_REGISTER came
++ * (:132, :1621), sent from the A5 server handle; 0x35 (INIT_MODEM_DRIVER_CMPLT) is not waited for (:285).
++ *
++ * It does not configure GSI rings or carry packets. Those belong to vayu_ipa_data.c.
+  */
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+@@ -19,19 +32,21 @@
+ #include <sys/hakios.qrtr.h>
+ #include <sys/systm.h>
+ #include <sys/vayu_ipa.h>
++#include <sys/vayu_ipa_data.h>
+ #include <sys/vayu_ipa_qmi.h>
+ #include <sys/vayu_pas.h>
+ 
+ extern void loader_log_putc(char c);
+ extern bool vayu_ipa_firmware_ready(void);
+ 
+-static struct qmi_handle ipa_qmi;
+-static bool ipa_qmi_up, ipa_started, ipa_running;
+-static volatile bool ipa_stop, ipa_modem_there;
+-static uint32_t ipa_node, ipa_port;
++static struct qmi_handle ipa_qmi, wds_qmi;
++static bool ipa_qmi_up, wds_qmi_up, ipa_started, ipa_running;
++static volatile bool ipa_stop, ipa_modem_there, wds_there;
++static uint32_t ipa_node, ipa_port, ipa_version, wds_node, wds_port, wds_version;
+ static volatile bool indication_wanted, init_done, complete_sent, driver_complete;
+ static uint32_t client_node, client_port;
+ static struct hakios_qrtr_port *host_port;
++static uint32_t qmi_wait_ms = 60000, qmi_timeout_ms = 30000;
+ 
+ static int say(const char *format, ...) __printflike(1, 2);
+ static int
+@@ -48,6 +63,37 @@
+ 	return length;
+ }
+ 
++static uint64_t
++now_ms(void)
++{
++	uint64_t abs = mach_absolute_time(), ns = 0;
++
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++uint32_t
++vayu_ipa_qmi_stage(void)
++{
++	uint32_t stage = 2;
++
++	PE_parse_boot_argn("vayu_ipa_qmi", &stage, sizeof(stage));
++	return stage;
++}
++
++/* Wait until *flag or stop, at most ms; returns the time waited. */
++static uint64_t
++wait_for(volatile bool *flag, uint64_t ms)
++{
++	uint64_t waited = 0;
++
++	while (!*flag && !ipa_stop && waited < ms) {
++		delay_for_interval(50, NSEC_PER_MSEC);
++		waited += 50;
++	}
++	return waited;
++}
++
+ static int
+ ipa_result(const uint8_t *data, size_t length, uint16_t *result, uint16_t *error)
+ {
+@@ -65,133 +111,116 @@
+ 	return -1;
+ }
+ 
+-static int
+-ipa_qmi_request(uint16_t message, const struct qmi_elem_info *req_ei, const void *req,
+-    const struct qmi_elem_info *resp_ei, void *resp, struct vayu_cell_result *result)
+-{
+-	struct sockaddr_qrtr to = { .sq_family = AF_QIPCRTR, .sq_node = client_node, .sq_port = client_port };
+-	struct qmi_txn txn;
+-	int ret;
+-
+-	ret = qmi_txn_init(&ipa_qmi, &txn, resp_ei, resp);
+-	if (ret < 0) return ret;
+-	ret = qmi_send_request(&ipa_qmi, &to, &txn, message, 256, req_ei, req);
+-	if (ret < 0) {
+-		qmi_txn_cancel(&txn);
+-		return ret;
+-	}
+-	ret = hakios_qmi_txn_wait_ms(&txn, 10000);
+-	if (ret < 0) {
+-		say("vayu-ipa: INIT_MODEM_DRIVER no reply in 10000 ms (%d)\n", ret);
+-		return ret;
+-	}
+-	if (result->result != 0 || result->error != 0) {
+-		say("vayu-ipa: INIT_MODEM_DRIVER result %u error %u\n",
+-		    (unsigned int)result->result, (unsigned int)result->error);
+-		return -EIO;
+-	}
+-	return 0;
+-}
+-
+-/* INIT_MODEM_DRIVER, byte-for-byte the vayu IPA 4.1 memory layout from downstream. */
+-static int
++/* INIT_MODEM_DRIVER, byte-for-byte the vayu IPA 4.1 memory layout from downstream
++ * (ipa_utils.c ipa_4_1_mem_part, ipa_qmi_service.c ipa3_qmi_init_modem_send_sync_msg). */
++static void
+ ipa_init_modem_driver(void)
+ {
+ 	struct vayu_ipa_init_req req = { 0 };
+ 	struct vayu_ipa_init_resp resp = { 0 };
++	struct sockaddr_qrtr to = { .sq_family = AF_QIPCRTR, .sq_node = ipa_node, .sq_port = ipa_port };
++	struct qmi_txn txn;
++	uint32_t o = vayu_ipa_restricted_bytes();
++	uint64_t started;
++	int ret;
+ 
+ 	req.platform_type_valid = 1;
+ 	req.platform_type = VAYU_IPA_PLATFORM_MSM_ANDROID;
+ 	req.hdr_tbl_info_valid = 1;
+-	req.hdr_tbl_info.start = 0x688;
+-	req.hdr_tbl_info.end = 0x688 + 0x140 - 1;
++	req.hdr_tbl_info.start = 0x688 + o;
++	req.hdr_tbl_info.end = 0x688 + o + 0x140 - 1;
+ 	req.v4_route_tbl_info_valid = 1;
+-	req.v4_route_tbl_info.start = 0x508;
++	req.v4_route_tbl_info.start = 0x508 + o;
+ 	req.v4_route_tbl_info.num_indices = 7;
+ 	req.v6_route_tbl_info_valid = 1;
+-	req.v6_route_tbl_info.start = 0x608;
++	req.v6_route_tbl_info.start = 0x608 + o;
+ 	req.v6_route_tbl_info.num_indices = 7;
+ 	req.v4_filter_tbl_start_addr_valid = 1;
+-	req.v4_filter_tbl_start_addr = 0x308;
++	req.v4_filter_tbl_start_addr = 0x308 + o;
+ 	req.v6_filter_tbl_start_addr_valid = 1;
+-	req.v6_filter_tbl_start_addr = 0x408;
++	req.v6_filter_tbl_start_addr = 0x408 + o;
+ 	req.modem_mem_info_valid = 1;
+-	req.modem_mem_info.start = 0x13f0;
++	req.modem_mem_info.start = 0x13f0 + o;
+ 	req.modem_mem_info.size = 0x100c;
+ 	req.ctrl_comm_dest_end_pt_valid = 1;
+ 	req.ctrl_comm_dest_end_pt = 11;       /* IPA_CLIENT_APPS_WAN_CONS */
+-	/* is_ssr_bootup absent: first boot, not a modem-only SSR. */
++	/* is_ssr_bootup absent: first boot (stock: !ipa3_uc_loaded_check()). */
+ 	req.hdr_proc_ctx_tbl_info_valid = 1;
+-	req.hdr_proc_ctx_tbl_info.start = 0x7d0;
+-	req.hdr_proc_ctx_tbl_info.end = 0x7d0 + 0x200 - 1;
+-	/* vayu supports hashable filter/route tables. */
++	req.hdr_proc_ctx_tbl_info.start = 0x7d0 + o;
++	req.hdr_proc_ctx_tbl_info.end = 0x7d0 + o + 0x200 - 1;
+ 	req.v4_hash_route_tbl_info_valid = 1;
+-	req.v4_hash_route_tbl_info.start = 0x488;
++	req.v4_hash_route_tbl_info.start = 0x488 + o;
+ 	req.v4_hash_route_tbl_info.num_indices = 7;
+ 	req.v6_hash_route_tbl_info_valid = 1;
+-	req.v6_hash_route_tbl_info.start = 0x588;
++	req.v6_hash_route_tbl_info.start = 0x588 + o;
+ 	req.v6_hash_route_tbl_info.num_indices = 7;
+ 	req.v4_hash_filter_tbl_start_addr_valid = 1;
+-	req.v4_hash_filter_tbl_start_addr = 0x288;
++	req.v4_hash_filter_tbl_start_addr = 0x288 + o;
+ 	req.v6_hash_filter_tbl_start_addr_valid = 1;
+-	req.v6_hash_filter_tbl_start_addr = 0x388;
++	req.v6_hash_filter_tbl_start_addr = 0x388 + o;
+ 	req.hw_stats_quota_base_addr_valid = 1;
+-	req.hw_stats_quota_base_addr = 0xc30;
++	req.hw_stats_quota_base_addr = 0xc30 + o;
+ 	req.hw_stats_quota_size_valid = 1;
+ 	req.hw_stats_quota_size = 0x60;
+ 	req.hw_drop_stats_base_addr_valid = 1;
+-	req.hw_drop_stats_base_addr = 0x13d0;
++	req.hw_drop_stats_base_addr = 0x13d0 + o;
+ 	req.hw_drop_stats_table_size_valid = 1;
+ 	req.hw_drop_stats_table_size = 0x20;
+ 
+-	{
+-		uint32_t o = vayu_ipa_restricted_bytes();
+-		req.hdr_tbl_info.start += o;
+-		req.hdr_tbl_info.end += o;
+-		req.v4_route_tbl_info.start += o;
+-		req.v6_route_tbl_info.start += o;
+-		req.v4_filter_tbl_start_addr += o;
+-		req.v6_filter_tbl_start_addr += o;
+-		req.modem_mem_info.start += o;
+-		req.hdr_proc_ctx_tbl_info.start += o;
+-		req.hdr_proc_ctx_tbl_info.end += o;
+-		req.v4_hash_route_tbl_info.start += o;
+-		req.v6_hash_route_tbl_info.start += o;
+-		req.v4_hash_filter_tbl_start_addr += o;
+-		req.v6_hash_filter_tbl_start_addr += o;
+-		req.hw_stats_quota_base_addr += o;
+-		req.hw_drop_stats_base_addr += o;
+-		say("vayu-ipa: restricted byte offset %#x applied to table addresses\n", o);
+-	}
+-
+-	say("vayu-ipa: INIT_MODEM_DRIVER: MSM Android, routes 0..7, modem mem %#x/%#x, ctrl endpoint %u\n",
+-	    req.modem_mem_info.start, req.modem_mem_info.size, req.ctrl_comm_dest_end_pt);
+-	return ipa_qmi_request(VAYU_IPA_INIT_MODEM_DRIVER, vayu_ipa_init_req_ei, &req,
+-	    vayu_ipa_init_resp_ei, &resp, &resp.result);
++	ret = qmi_txn_init(&ipa_qmi, &txn, vayu_ipa_init_resp_ei, &resp);
++	if (ret < 0) {
++		say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: ERROR no transaction (%d)\n", ret);
++		return;
++	}
++	started = now_ms();
++	ret = qmi_send_request(&ipa_qmi, &to, &txn, VAYU_IPA_INIT_MODEM_DRIVER, 256, vayu_ipa_init_req_ei, &req);
++	if (ret < 0) {
++		qmi_txn_cancel(&txn);
++		say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: ERROR send %d\n", ret);
++		return;
++	}
++	ret = hakios_qmi_txn_wait_ms(&txn, qmi_timeout_ms);
++	if (ret == -ETIMEDOUT) {
++		say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: TIMEOUT no reply in %u ms (restricted %#x)\n", qmi_timeout_ms, o);
++		return;
++	}
++	if (ret < 0) {
++		say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: ERROR reply not decoded (%d)\n", ret);
++		return;
++	}
++	if (resp.result.result != 0 || resp.result.error != 0) {
++		say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: ERROR result %u error %u after %llu ms\n",
++		    (unsigned)resp.result.result, (unsigned)resp.result.error, now_ms() - started);
++		return;
++	}
++	init_done = true;
++	say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: OK after %llu ms (restricted %#x; ctrl ep %s%u, default ep %s%u, "
++	    "init pending %s%u)\n", now_ms() - started, o,
++	    resp.ctrl_comm_dest_end_pt_valid ? "" : "-", resp.ctrl_comm_dest_end_pt,
++	    resp.default_end_pt_valid ? "" : "-", resp.default_end_pt,
++	    resp.modem_driver_init_pending_valid ? "" : "-", resp.modem_driver_init_pending);
+ }
+ 
++/*
++ * MASTER_DRIVER_INIT_COMPLETE_IND (0x22), once INIT_MODEM_DRIVER succeeded and the modem's client
++ * registered for indications (stock :132/:1621; 0x35 is not a condition). Sent from our published
++ * server port, as stock sends it from the A5 server handle: the modem's client knows that address only.
++ */
+ static void
+ ipa_send_complete(void)
+ {
+-	struct vayu_ipa_init_complete_ind ind = { 0 };
+-	struct qmi_txn txn;
+-	struct sockaddr_qrtr to = { .sq_family = AF_QIPCRTR, .sq_node = ipa_node, .sq_port = ipa_port };
++	static const uint8_t ind[14] = { 4, 0, 0, VAYU_IPA_INIT_COMPLETE_IND & 0xff, VAYU_IPA_INIT_COMPLETE_IND >> 8,
++		                         7, 0, 0x02, 4, 0, 0, 0, 0, 0 };
+ 	int ret;
+ 
+-	if (!indication_wanted || !init_done || !driver_complete || complete_sent || ipa_stop) return;
+-	ret = qmi_txn_init(&ipa_qmi, &txn, NULL, NULL);
+-	if (ret < 0) {
+-		say("vayu-ipa: INIT_COMPLETE: no transaction (%d)\n", ret);
+-		return;
+-	}
+-	ret = qmi_send_indication(&ipa_qmi, &to, &txn, VAYU_IPA_INIT_COMPLETE_IND, 7,
+-	    vayu_ipa_init_complete_ind_ei, &ind);
+-	qmi_txn_cancel(&txn);
++	if (!indication_wanted || !init_done || complete_sent || ipa_stop || client_port == 0 || host_port == NULL) return;
++	ret = vayu_qrtr_ops.send(host_port, client_node, client_port, ind, sizeof(ind));
+ 	if (ret == 0) {
+ 		complete_sent = true;
+-		say("vayu-ipa: INIT_COMPLETE indication sent\n");
++		say("vayu-ipa-qmi: S2 INIT_COMPLETE_IND: OK sent to node %u port %u (0x35 %s)\n", client_node, client_port,
++		    driver_complete ? "seen" : "not yet");
+ 	} else {
+-		say("vayu-ipa: INIT_COMPLETE send failed: %d\n", ret);
++		say("vayu-ipa-qmi: S2 INIT_COMPLETE_IND: ERROR send %d\n", ret);
+ 	}
+ }
+ 
+@@ -204,30 +233,38 @@
+ 	if (length < 7 || node != ipa_node) return;
+ 	message = (uint16_t)(m[3] | m[4] << 8);
+ 	(void)ipa_result(m, length, &result, &error);
+-	say("vayu-ipa: modem message %#x type %u: result %u error %u\n", message, m[0], result, error);
+ 	if (m[0] == 0) {
+-		/* A request on our published host port. Answer with the same transaction id,
+-		 * result TLV 0x02 = success. The table rules themselves are a later stage. */
+-		uint8_t answer[14] = { 2, m[1], m[2], m[3], m[4], 7, 0, 2, 4, 0, 0, 0, 0, 0 };
++		/* A request on our published host port. Answer with the same transaction id.
++		 * Only the handshake requests are implemented. Claiming success for a filter or
++		 * configuration request without applying it would be a fake data-ready path. */
++		bool supported = message == VAYU_IPA_INDICATION_REGISTER ||
++		    message == VAYU_IPA_DRIVER_INIT_COMPLETE;
++		uint16_t result = supported ? 0 : 1;
++		uint16_t error = supported ? 0 : QMI_ERR_NOT_SUPPORTED_V01;
++		uint8_t answer[14] = { 2, m[1], m[2], m[3], m[4], 7, 0, 2, 4, 0,
++		    (uint8_t)result, (uint8_t)(result >> 8), (uint8_t)error, (uint8_t)(error >> 8) };
++
++		if (!supported) vayu_ipa_data_filter_error();
+ 		(void)vayu_qrtr_ops.send(host_port, node, from_port, answer, sizeof(answer));
+-		say("vayu-ipa: modem request %#x answered success\n", message);
++		if (!supported) {
++			say("vayu-ipa-qmi: modem request %#x (%zu bytes) answered NOT_SUPPORTED (nothing was changed)\n",
++			    message, length);
++		}
++	} else {
++		say("vayu-ipa-qmi: modem message %#x type %u on the host port: result %u error %u\n", message, m[0],
++		    result, error);
+ 	}
+ 	switch (message) {
+ 	case VAYU_IPA_INDICATION_REGISTER:
+ 		client_node = node;
+ 		client_port = from_port;
+ 		indication_wanted = true;
++		say("vayu-ipa-qmi: S2 INDICATION_REGISTER: OK from node %u port %u (answered success)\n", node, from_port);
+ 		ipa_send_complete();
+ 		break;
+ 	case VAYU_IPA_DRIVER_INIT_COMPLETE:
+ 		driver_complete = true;
+-		say("vayu-ipa: DRIVER_INIT_COMPLETE received\n");
+-		ipa_send_complete();
+-		break;
+-	case VAYU_IPA_CONFIG_REQ:
+-	case VAYU_IPA_INSTALL_FILTER_RULE:
+-	case VAYU_IPA_FILTER_INSTALLED_NOTIF:
+-		say("vayu-ipa: modem IPA request %#x seen (table command, not yet applied)\n", message);
++		say("vayu-ipa-qmi: S2 MODEM_INIT_CMPLT(0x35): OK (answered success)\n");
+ 		break;
+ 	default:
+ 		break;
+@@ -240,11 +277,11 @@
+ 	int ret;
+ 
+ 	if (service->instance != VAYU_IPA_MODEM_INSTANCE) return -1;
+-	say("vayu-ipa: modem IPA service at node %u port %u\n", service->node, service->port);
+ 	ret = hakios_qmi_connect(qmi->sock, service->node, service->port);
+ 	if (ret != 0) return ret;
+ 	ipa_node = service->node;
+ 	ipa_port = service->port;
++	ipa_version = service->version;
+ 	ipa_modem_there = true;
+ 	return 0;
+ }
+@@ -255,7 +292,7 @@
+ 	if (ipa_node == service->node && ipa_port == service->port) {
+ 		ipa_modem_there = false;
+ 		indication_wanted = init_done = complete_sent = driver_complete = false;
+-		say("vayu-ipa: modem IPA service went away\n");
++		say("vayu-ipa-qmi: modem IPA service went away\n");
+ 	}
+ }
+ 
+@@ -264,56 +301,173 @@
+ 	.del_server = ipa_del_server,
+ };
+ 
++static int
++wds_new_server(struct qmi_handle *qmi, struct qmi_service *service)
++{
++	if (wds_there) return -1;
++	if (hakios_qmi_connect(qmi->sock, service->node, service->port) != 0) return -1;
++	wds_node = service->node;
++	wds_port = service->port;
++	wds_version = service->version;
++	wds_there = true;
++	return 0;
++}
++
+ static void
+-ipa_thread(void *arg __unused, wait_result_t wr __unused)
++wds_del_server(struct qmi_handle *qmi __unused, struct qmi_service *service)
+ {
++	if (wds_node == service->node && wds_port == service->port) wds_there = false;
++}
++
++static const struct qmi_ops wds_qmi_ops = {
++	.new_server = wds_new_server,
++	.del_server = wds_del_server,
++};
++
++/* S1: our "ipa" entry must read 3 (response done + clock on); the modem's is logged as it is. */
++static void
++stage_smp2p(void)
++{
++	bool ours_found = false, theirs_found = false;
++	uint32_t ours = 0, theirs = 0;
+ 	uint64_t waited = 0;
++
++	for (;;) {
++		vayu_ipa_smp2p_read(&ours_found, &ours, &theirs_found, &theirs);
++		if ((ours_found && (ours & 3) == 3) || ipa_stop || waited >= 5000) break;
++		delay_for_interval(100, NSEC_PER_MSEC);
++		waited += 100;
++	}
++	say("vayu-ipa-qmi: S1 SMP2P: %s ours \"ipa\" %s%#x, modem \"ipa\" %s%#x, firmware %s (%llu ms)\n",
++	    ours_found && (ours & 3) == 3 ? "OK" : "ERROR", ours_found ? "" : "absent ", ours,
++	    theirs_found ? "" : "absent ", theirs, vayu_ipa_firmware_ready() ? "ready" : "NOT READY", waited);
++}
++
++/* S3: WDS answers a read-only question once IPA is initialised. */
++static void
++stage_wds(void)
++{
++	struct vayu_ipa_wds_status_resp resp = { 0 };
++	struct sockaddr_qrtr to;
++	struct qmi_txn txn;
++	uint64_t waited;
+ 	int ret;
+ 
++	ret = qmi_handle_init(&wds_qmi, 1024, &wds_qmi_ops, NULL);
++	if (ret < 0) {
++		say("vayu-ipa-qmi: S3 WDS LOOKUP: ERROR qmi_handle_init %d\n", ret);
++		return;
++	}
++	wds_qmi_up = true;
++	ret = qmi_add_lookup(&wds_qmi, VAYU_IPA_WDS_SERVICE, 1, 0);
++	if (ret < 0) {
++		say("vayu-ipa-qmi: S3 WDS LOOKUP: ERROR qmi_add_lookup %d\n", ret);
++		return;
++	}
++	waited = wait_for(&wds_there, 20000);
++	if (!wds_there) {
++		say("vayu-ipa-qmi: S3 WDS LOOKUP: TIMEOUT service 0x01 not seen in %llu ms\n", waited);
++		return;
++	}
++	say("vayu-ipa-qmi: S3 WDS LOOKUP: OK node %u port %u version %u\n", wds_node, wds_port, wds_version);
++	to = (struct sockaddr_qrtr){ .sq_family = AF_QIPCRTR, .sq_node = wds_node, .sq_port = wds_port };
++	ret = qmi_txn_init(&wds_qmi, &txn, vayu_ipa_wds_status_resp_ei, &resp);
++	if (ret < 0) {
++		say("vayu-ipa-qmi: S3 WDS GET_PKT_SRVC_STATUS: ERROR no transaction %d\n", ret);
++		return;
++	}
++	ret = qmi_send_request(&wds_qmi, &to, &txn, VAYU_IPA_WDS_GET_PKT_SRVC_STATUS, 64, NULL, NULL);
++	if (ret < 0) {
++		qmi_txn_cancel(&txn);
++		say("vayu-ipa-qmi: S3 WDS GET_PKT_SRVC_STATUS: ERROR send %d\n", ret);
++		return;
++	}
++	ret = hakios_qmi_txn_wait_ms(&txn, 5000);
++	if (ret == -ETIMEDOUT) {
++		say("vayu-ipa-qmi: S3 WDS GET_PKT_SRVC_STATUS: TIMEOUT 5000 ms\n");
++	} else if (ret < 0) {
++		say("vayu-ipa-qmi: S3 WDS GET_PKT_SRVC_STATUS: ERROR reply not decoded (%d)\n", ret);
++	} else if (resp.result.result != 0 || resp.result.error != 0) {
++		say("vayu-ipa-qmi: S3 WDS GET_PKT_SRVC_STATUS: ERROR result %u error %u\n",
++		    (unsigned)resp.result.result, (unsigned)resp.result.error);
++	} else {
++		say("vayu-ipa-qmi: S3 WDS GET_PKT_SRVC_STATUS: OK connection status %u (1 disconnected, 2 connected)\n",
++		    resp.status);
++	}
++}
++
++static void
++ipa_thread(void *arg, wait_result_t wr __unused)
++{
++	uint32_t stage = (uint32_t)(uintptr_t)arg;
++	uint64_t waited;
++	int ret;
++
++	stage_smp2p();
+ 	ret = qmi_handle_init(&ipa_qmi, 4096, &ipa_qmi_ops, NULL);
+ 	if (ret < 0) {
+-		say("vayu-ipa: qmi_handle_init: %d\n", ret);
++		say("vayu-ipa-qmi: S1 LOOKUP 0x31/2: ERROR qmi_handle_init %d\n", ret);
+ 		goto out;
+ 	}
+ 	ipa_qmi_up = true;
+ 	ret = qmi_add_lookup(&ipa_qmi, VAYU_IPA_QMI_SERVICE, VAYU_IPA_QMI_INSTANCE, VAYU_IPA_MODEM_INSTANCE);
+ 	if (ret < 0) {
+-		say("vayu-ipa: qmi_add_lookup: %d\n", ret);
++		say("vayu-ipa-qmi: S1 LOOKUP 0x31/2: ERROR qmi_add_lookup %d\n", ret);
+ 		goto out;
+ 	}
+-	while (!ipa_modem_there && !ipa_stop && waited < 120000) {
+-		delay_for_interval(100, NSEC_PER_MSEC);
+-		waited += 100;
+-	}
++	waited = wait_for(&ipa_modem_there, qmi_wait_ms);
+ 	if (!ipa_modem_there) {
+-		say("vayu-ipa: modem IPA service 0x31/2 did not appear\n");
++		say("vayu-ipa-qmi: S1 LOOKUP 0x31/2: TIMEOUT not announced in %llu ms\n", waited);
+ 		goto out;
+ 	}
++	say("vayu-ipa-qmi: S1 LOOKUP 0x31/2: OK node %u port %u version %u after %llu ms\n", ipa_node, ipa_port,
++	    ipa_version, waited);
++	if (stage < 2) goto idle;
++
+ 	if (!vayu_ipa_firmware_ready()) {
+-		say("vayu-ipa: IPA firmware/prerequisites are not ready; INIT_MODEM_DRIVER is not sent\n");
++		say("vayu-ipa-qmi: S2 PUBLISH 0x31/1: ERROR IPA firmware/SMP2P not ready; no INIT_MODEM_DRIVER\n");
+ 		goto out;
+ 	}
+-	for (unsigned attempt = 1; attempt <= 3 && !ipa_stop && !init_done; attempt++) {
+-		say("vayu-ipa: INIT_MODEM_DRIVER attempt %u/3\n", attempt);
+-		if (ipa_init_modem_driver() == 0) {
+-			init_done = true;
+-			break;
+-		}
+-		delay_for_interval(1000, NSEC_PER_MSEC);
++	host_port = vayu_qrtr_ops.open(ipa_receive, NULL, NULL);
++	ret = host_port == NULL ? -ENOMEM :
++	    vayu_qrtr_publish(host_port, VAYU_IPA_QMI_SERVICE, VAYU_IPA_QMI_INSTANCE, VAYU_IPA_QMI_INSTANCE);
++	if (ret != 0) {
++		say("vayu-ipa-qmi: S2 PUBLISH 0x31/1: ERROR %d\n", ret);
++		goto out;
+ 	}
++	say("vayu-ipa-qmi: S2 PUBLISH 0x31/1: OK\n");
++	ipa_init_modem_driver();
+ 	if (!init_done) {
+-		say("vayu-ipa: INIT_MODEM_DRIVER failed; WDS Start remains blocked\n");
+-		goto out;
++		say("vayu-ipa-qmi: S2 handshake stopped; WDS Start remains blocked\n");
++		goto idle;
++	}
++	waited = wait_for(&indication_wanted, 15000);
++	if (!indication_wanted) {
++		say("vayu-ipa-qmi: S2 INDICATION_REGISTER: TIMEOUT none in %llu ms after INIT_MODEM_DRIVER\n", waited);
+ 	}
+ 	ipa_send_complete();
++	(void)wait_for(&driver_complete, 10000);
++	say("vayu-ipa-qmi: S2 RESULT: %s (INIT_MODEM_DRIVER %s, INDICATION_REGISTER %s, INIT_COMPLETE %s, 0x35 %s)\n",
++	    vayu_ipa_ready() ? "OK IPA READY" : "ERROR not ready", init_done ? "ok" : "no",
++	    indication_wanted ? "ok" : "no", complete_sent ? "sent" : "NOT SENT", driver_complete ? "ok" : "TIMEOUT");
++	if (stage >= 3 && !ipa_stop) stage_wds();
++	if (stage >= 4) {
++		say("vayu-ipa-qmi: S4 WDS START: %s (vayu_cell_data=1 drives it)\n",
++		    vayu_ipa_ready() ? "allowed" : "ERROR blocked: IPA handshake not complete");
++	}
++idle:
+ 	while (!ipa_stop) delay_for_interval(100, NSEC_PER_MSEC);
+ out:
++	if (wds_qmi_up) {
++		qmi_handle_release(&wds_qmi);
++		wds_qmi_up = false;
++	}
+ 	if (ipa_qmi_up) {
+ 		qmi_handle_release(&ipa_qmi);
+ 		ipa_qmi_up = false;
+ 	}
+ 	ipa_running = false;
+-	say("vayu-ipa: QMI thread done\n");
++	say("vayu-ipa-qmi: thread done\n");
+ 	thread_terminate(current_thread());
+ }
+ 
+@@ -340,45 +494,29 @@
+ vayu_ipa_start(struct vayu_qrtr *q)
+ {
+ 	thread_t thread;
+-	uint32_t enabled = 0;
+-	int ret;
++	uint32_t enabled = 0, stage;
+ 
+-	(void)q;
+ 	if (!PE_parse_boot_argn("vayu_ipa", &enabled, sizeof(enabled)) || enabled != 1) {
+ 		if (enabled != 0) say("vayu-ipa: vayu_ipa=%u refused: only 1 enables the IPA path\n", enabled);
+ 		return;
+ 	}
+ 	if (ipa_started) return;
+-	ipa_started = true;
+-	ipa_running = true;
+-	ipa_stop = false;
++	stage = vayu_ipa_qmi_stage();
++	PE_parse_boot_argn("vayu_ipa_qmi_wait", &qmi_wait_ms, sizeof(qmi_wait_ms));
++	PE_parse_boot_argn("vayu_ipa_qmi_timeout", &qmi_timeout_ms, sizeof(qmi_timeout_ms));
++	if (qmi_timeout_ms < 1000 || qmi_timeout_ms > 60000) qmi_timeout_ms = 30000;
++	say("vayu-ipa-qmi: vayu_ipa_qmi=%u wait %u ms, INIT_MODEM_DRIVER timeout %u ms\n", stage, qmi_wait_ms,
++	    qmi_timeout_ms);
++	if (stage == 0) return;
+ 	if (q == NULL) {
+-		say("vayu-ipa: no QRTR transport\n");
+-		ipa_running = false;
+-		return;
+-	}
+-	if (!vayu_ipa_firmware_ready()) {
+-		say("vayu-ipa: not publishing host IPA service: firmware/prerequisites are not ready\n");
+-		ipa_running = false;
++		say("vayu-ipa-qmi: S1 SMP2P: ERROR no QRTR transport\n");
+ 		return;
+ 	}
+-	host_port = vayu_qrtr_ops.open(ipa_receive, NULL, NULL);
+-	if (host_port == NULL) {
+-		say("vayu-ipa: cannot open the host IPA port\n");
+-		ipa_running = false;
+-		return;
+-	}
+-	ret = vayu_qrtr_publish(host_port, VAYU_IPA_QMI_SERVICE, VAYU_IPA_QMI_INSTANCE, VAYU_IPA_QMI_INSTANCE);
+-	if (ret != 0) {
+-		say("vayu-ipa: cannot publish host IPA service: %d\n", ret);
+-		vayu_qrtr_ops.close(host_port);
+-		host_port = NULL;
+-		ipa_running = false;
+-		return;
+-	}
+-	say("vayu-ipa: host IPA service 0x31/1 published\n");
+-	if (kernel_thread_start(ipa_thread, NULL, &thread) != KERN_SUCCESS) {
+-		say("vayu-ipa: no QMI thread\n");
++	ipa_started = true;
++	ipa_running = true;
++	ipa_stop = false;
++	if (kernel_thread_start(ipa_thread, (void *)(uintptr_t)stage, &thread) != KERN_SUCCESS) {
++		say("vayu-ipa-qmi: S1 SMP2P: ERROR no thread\n");
+ 		ipa_running = false;
+ 		return;
+ 	}
+@@ -390,12 +528,16 @@
+ {
+ 	if (!ipa_started) return;
+ 	ipa_stop = true;
+-	for (uint32_t waited = 0; waited < 12000 && ipa_running; waited += 20) delay_for_interval(20, NSEC_PER_MSEC);
++	/* A pending INIT_MODEM_DRIVER wait is not interruptible: give it its whole timeout. */
++	for (uint32_t waited = 0; waited < qmi_timeout_ms + 12000 && ipa_running; waited += 20) {
++		delay_for_interval(20, NSEC_PER_MSEC);
++	}
+ 	if (host_port != NULL) {
+ 		vayu_qrtr_ops.close(host_port);
+ 		host_port = NULL;
+ 	}
+-	init_done = complete_sent = indication_wanted = false;
++	init_done = complete_sent = indication_wanted = driver_complete = false;
++	ipa_modem_there = wds_there = false;
+ 	ipa_started = false;
+ 	say("vayu-ipa: stopped\n");
+ }
+--- a/bsd/dev/vayu_ipa_smmu.c
++++ b/bsd/dev/vayu_ipa_smmu.c
+@@ -12,6 +12,7 @@
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
+ #include <mach/vm_param.h>
++#include <pexpert/pexpert.h>
+ #include <stdbool.h>
+ #include <sys/systm.h>
+ #include <vm/memory_types.h>
+@@ -53,6 +54,7 @@
+ extern uint64_t kvtophys(vm_offset_t va);
+ extern void loader_log_putc(char c);
+ extern lck_mtx_t hakios_smmu_lock;     /* QUP/Wi-Fi/audio/camera allocate the same SMRs/contexts */
++static uint32_t ipa_smmu_ttbrfix;      /* vayu_ipa_ttbrfix=1: TTBR0 from the tables after they exist */
+ 
+ static int say(const char *format, ...) __printflike(1, 2);
+ static int
+@@ -134,28 +136,36 @@
+ static bool
+ ipa_smmu_map(struct ipa_smmu_stream *s)
+ {
+-	uint64_t *root, *l1;
++	uint64_t *root, *ddr_l2, *low_l2;
+ 	uint32_t pa;
+ 
+-	if (kmem_alloc(kernel_map, &s->tables, 2 * PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	/* root (one page), a low-VA L2 table (one page), and 1024 DDR L2
++	 * descriptors (two 4 KiB pages). Four pages total; the layout is correct
++	 * for either 4 KiB or 16 KiB kernel pages. Ported from the net1 line: the old
++	 * 2-page table wrote 1024 entries into one 4 KiB L2 page and covered only
++	 * the first GiB of DDR, while the IPA SMMU identity window is 2 GiB. */
++	if (kmem_alloc(kernel_map, &s->tables, 4 * PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+ 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || s->tables == 0) {
+ 		say("vayu-ipa: no page tables for SID %#x\n", s->sid);
+ 		return false;
+ 	}
+ 	root = (uint64_t *)s->tables;
+-	l1 = (uint64_t *)(s->tables + PAGE_SIZE);
+-	/* TCR 39-bit VA: root index = VA >> 30; a level-1 table has 2 MiB blocks.
+-	 * root[2] points to that table and maps DDR at 0x80000000. The two DDR
+-	 * windows below are 0x80000000..0xffffffff, not a 2 GiB low-memory alias. */
+-	root[2] = kvtophys((vm_offset_t)l1) | 3;
++	low_l2 = (uint64_t *)(s->tables + PAGE_SIZE);
++	ddr_l2 = (uint64_t *)(s->tables + 2 * PAGE_SIZE);
++	/* TG0=4 KiB, T0SZ=25: root[2] and root[3] cover the whole 2 GiB DDR
++	 * window 0x80000000..0xffffffff with 2 MiB blocks. */
++	root[2] = kvtophys((vm_offset_t)ddr_l2) | 3;
++	root[3] = kvtophys((vm_offset_t)(ddr_l2 + 512)) | 3;
+ 	for (unsigned i = 0; i < 1024; i++) {
+ 		pa = 0x80000000U + i * 0x200000U;
+-		l1[i] = (uint64_t)pa | PTE_BLOCK;
++		ddr_l2[i] = (uint64_t)pa | PTE_BLOCK;
+ 	}
+-	/* Device mappings in the low VA aliases: SMEM and IMEM are at those PAs. */
+-	root[0] = 0x86000000ULL | PTE_DEVICE;       /* SMEM, 1 GiB block */
+-	root[1] = 0x14600000ULL | PTE_DEVICE;       /* IMEM, 1 GiB block */
+-	for (vm_offset_t line = s->tables; line < s->tables + 2 * PAGE_SIZE; line += 64) {
++	/* SMEM is inside the DDR identity map above (normal non-cacheable MAIR0).
++	 * vayu DT's additional AP mapping is IMEM 0x146bd000/0x2000; cover its
++	 * aligned 2 MiB block as device memory at the same IOVA. */
++	root[0] = kvtophys((vm_offset_t)low_l2) | 3;
++	low_l2[(0x14600000U >> 21) & 0x1ff] = 0x14600000ULL | PTE_DEVICE;
++	for (vm_offset_t line = s->tables; line < s->tables + 4 * PAGE_SIZE; line += 64) {
+ 		__asm__ volatile("dc civac, %0" : : "r" (line));
+ 	}
+ 	return true;
+@@ -169,6 +179,16 @@
+ 	vm_offset_t second = s->second, context = s->context_base;   /* kernel VAs: 32-bit locals truncated them */
+ 
+ 	if (!ipa_smmu_map(s)) return false;
++	if (ipa_smmu_ttbrfix == 1) {
++		/* root above may have been taken while s->tables was still 0: take it now that they exist. */
++		root = kvtophys(s->tables) | (uint64_t)s->context << 48;
++		say("vayu-ipa: ttbrfix: SID %#x TTBR0 %#llx (tables PA %#llx)\n", s->sid,
++		    (unsigned long long)root, (unsigned long long)kvtophys(s->tables));
++		if ((root & 0x0000fffffffff000ULL) == 0) {
++			say("vayu-ipa: ttbrfix: SID %#x tables PA is 0; context not programmed\n", s->sid);
++			return false;
++		}
++	}
+ 	wr(context + SMMU_CB_SCTLR, 0);
+ 	wr(second + SMMU_CBA2R(s->context), SMMU_CBA2R_64_BIT);
+ 	wr(second + SMMU_CBAR(s->context), SMMU_CBAR_STAGE_1);
+@@ -218,6 +238,7 @@
+ 		say("vayu-ipa: application SMMU did not map\n");
+ 		return false;
+ 	}
++	PE_parse_boot_argn("vayu_ipa_ttbrfix", &ipa_smmu_ttbrfix, sizeof(ipa_smmu_ttbrfix));
+ 	idr0 = rd(base + SMMU_IDR0);
+ 	idr1 = rd(base + SMMU_IDR1);
+ 	if (rd(base + SMMU_SCR0) & (1U << 3)) {
+--- a/bsd/sys/vayu_ipa.h
++++ b/bsd/sys/vayu_ipa.h
+@@ -18,6 +18,13 @@
+ void vayu_ipa_stop(void);
+ void vayu_ipa_prepare_stop(void);
+ bool vayu_ipa_smmu_enable(void);
++/* SMP2P "ipa" entries: ours (item 428) and the modem's (item 435), found by name. */
++void vayu_ipa_smp2p_read(bool *ours_found, uint32_t *ours, bool *theirs_found, uint32_t *theirs);
++/* True only after this boot's MPSS SMP2P verification, never from stale Android SMEM. */
++bool vayu_ipa_modem_started(void);
++/* vayu_ipa_qmi=N stage (absent: 2). 0 none, 1 SMP2P + lookup, 2 INIT_MODEM_DRIVER handshake,
++ * 3 + read-only WDS probe, 4 + WDS Start allowed (vayu_cell_data). */
++uint32_t vayu_ipa_qmi_stage(void);
+ /* Only true after the modem accepted INIT_MODEM_DRIVER and INIT_COMPLETE was sent. WDS Start must
+  * not run before this: 0641 showed ipa_ipfltr.init_done FATAL without it. */
+ bool vayu_ipa_ready(void);
+@@ -27,6 +34,8 @@
+ void vayu_ipa_modem_endpoints(uint32_t *to_modem, uint32_t *from_modem);
+ /* Read IPA_SHARED_MEM_SIZE-derived restricted bytes, required by INIT_MODEM_DRIVER. */
+ uint32_t vayu_ipa_restricted_bytes(void);
++/* Base of the IPA local SW SRAM this boot uses (0x1e47000 with vayu_ipa_sram=1, else 0x1e50000). */
++uint32_t vayu_ipa_sram_base(void);
+ #endif
+ 
+ #endif /* _SYS_VAYU_IPA_H_ */
+--- a/bsd/sys/vayu_ipa_qmi.h
++++ b/bsd/sys/vayu_ipa_qmi.h
+@@ -163,4 +163,18 @@
+ 	{ .data_type = QMI_EOTI },
+ };
+ 
++/* Stage 3 (vayu_ipa_qmi=3): one read-only WDS question. libqmi: Get Packet Service Status 0x0022,
++ * no input; output TLV 0x01 connection status (1 disconnected, 2 connected, 3 suspended, 4 authenticating). */
++#define VAYU_IPA_WDS_SERVICE            0x01
++#define VAYU_IPA_WDS_GET_PKT_SRVC_STATUS 0x0022
++struct vayu_ipa_wds_status_resp {
++	struct vayu_cell_result result;
++	uint8_t status;                         /* 0x01 */
++};
++static const struct qmi_elem_info vayu_ipa_wds_status_resp_ei[] = {
++	VAYU_IPA_RESULT(struct vayu_ipa_wds_status_resp),
++	VAYU_IPA_EI(QMI_UNSIGNED_1_BYTE, struct vayu_ipa_wds_status_resp, status, 0x01),
++	{ .data_type = QMI_EOTI },
++};
++
+ #endif /* _SYS_VAYU_IPA_QMI_H_ */
+--- a/bsd/dev/vayu_ipa_data.c
++++ b/bsd/dev/vayu_ipa_data.c
+@@ -0,0 +1,966 @@
++/*
++ * vayu IPA 4.1 / GSI 2.0 data transport, before MPSS and before WDS.
++ *
++ * Exact vayu-r-oss values (not the SM7325 driver): command EP5/ch4, LAN EP10/ch5,
++ * WAN TX EP2/ch3 and WAN RX EP11/ch6. The GSI EE0 offset is 0x1c000 (GSI 2.0),
++ * proven independently by vayu_qup_spi.c. Event rings are allocated dynamically.
++ *
++ * The four channels and the empty filter/route/header tables are real: every immediate
++ * command must complete and the resulting SRAM headers are read back. data_ready is
++ * never set by MMIO writes alone. A modem filter request not implemented yet clears it.
++ * No default route, call, internet or configd success is claimed here.
++ */
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <pexpert/pexpert.h>
++#include <stdbool.h>
++#include <sys/systm.h>
++#include <vm/memory_types.h>
++#include <sys/vayu_cell_net.h>
++#include <sys/vayu_cell_qmap.h>
++#include <sys/vayu_ipa.h>
++#include <sys/vayu_ipa_data.h>
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern uint64_t kvtophys(vm_offset_t va);
++extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++extern void loader_log_putc(char c);
++extern kern_return_t thread_terminate(thread_t thread);
++
++#define IPA_PHYS                0x1e40000UL
++#define IPA_SIZE                0x2000UL
++#define IPA_DEBUG_PHYS          0x1e42000UL
++#define IPA_DEBUG_SIZE          0x1000UL
++#define IPA_SRAM_PHYS           0x1e50000UL
++#define IPA_SRAM_SIZE           0x2800UL
++#define GSI_PHYS                0x1e04000UL
++#define GSI_SIZE                0x28000UL
++#define GSI_EE0                 0x1c000
++#define ELEMENT_SIZE            16
++#define IPA_POOL_SIZE           (1024 * 1024)
++#define IPA_POOL_ALIGN          16384
++
++#define CH_CNTXT(c, n)          (GSI_EE0 + 0x80 * (c) + 4 * (n))
++#define CH_QOS(c)               (GSI_EE0 + 0x5c + 0x80 * (c))
++#define CH_SCRATCH(c, n)        (GSI_EE0 + 0x60 + 0x80 * (c) + 4 * (n))
++#define EV_CNTXT(e, n)          (GSI_EE0 + 0x1000 + 0x80 * (e) + 4 * (n))
++#define CH_DOORBELL(c)          (GSI_EE0 + 0x2000 + 8 * (c))
++#define EV_DOORBELL(e)          (GSI_EE0 + 0x2100 + 8 * (e))
++#define GSI_STATUS              (GSI_EE0 + 0x3000)
++#define GSI_CH_CMD              (GSI_EE0 + 0x3008)
++#define GSI_EV_CMD              (GSI_EE0 + 0x3010)
++#define GSI_HW_PARAM_2          (GSI_EE0 + 0x3040)
++#define GSI_SW_VERSION          (GSI_EE0 + 0x3044)
++#define CNTXT_TYPE_IRQ_MSK      (GSI_EE0 + 0x3088)
++#define CNTXT_SRC_CH_IRQ        (GSI_EE0 + 0x3090)
++#define CNTXT_SRC_EV_IRQ        (GSI_EE0 + 0x3094)
++#define CNTXT_SRC_CH_IRQ_MSK    (GSI_EE0 + 0x3098)
++#define CNTXT_SRC_EV_IRQ_MSK    (GSI_EE0 + 0x309c)
++#define CNTXT_SRC_CH_IRQ_CLR    (GSI_EE0 + 0x30a0)
++#define CNTXT_SRC_EV_IRQ_CLR    (GSI_EE0 + 0x30a4)
++#define CNTXT_SRC_IEOB_IRQ_MSK  (GSI_EE0 + 0x30b8)
++#define CNTXT_SRC_IEOB_IRQ_CLR  (GSI_EE0 + 0x30c0)
++#define CNTXT_GLOB_IRQ_STTS     (GSI_EE0 + 0x3100)
++#define CNTXT_GLOB_IRQ_EN       (GSI_EE0 + 0x3108)
++#define CNTXT_GLOB_IRQ_CLR      (GSI_EE0 + 0x3110)
++#define CNTXT_GSI_IRQ_STTS      (GSI_EE0 + 0x3118)
++#define CNTXT_GSI_IRQ_EN        (GSI_EE0 + 0x3120)
++#define CNTXT_GSI_IRQ_CLR       (GSI_EE0 + 0x3128)
++#define CNTXT_INTSET            (GSI_EE0 + 0x3180)
++#define CNTXT_MSI_LSB           (GSI_EE0 + 0x3188)
++#define CNTXT_MSI_MSB           (GSI_EE0 + 0x318c)
++#define GSI_ERROR_LOG           (GSI_EE0 + 0x3200)
++#define GSI_ERROR_LOG_CLR       (GSI_EE0 + 0x3210)
++#define CNTXT_SCRATCH_0         (GSI_EE0 + 0x3400)
++#define CNTXT_SCRATCH_1         (GSI_EE0 + 0x3404)
++
++#define GSI_ALLOCATE            0
++#define GSI_START               1
++#define GSI_STOP                2
++#define GSI_RESET               9
++#define GSI_DEALLOCATE          10
++#define GSI_TYPE_GPI            2
++#define GSI_EVT_TYPE_GPI        2
++
++#define ENDP_CTRL(ep)           (0x800 + 0x70 * (ep))
++#define ENDP_CFG(ep)            (0x808 + 0x70 * (ep))
++#define ENDP_NAT(ep)            (0x80c + 0x70 * (ep))
++#define ENDP_HDR(ep)            (0x810 + 0x70 * (ep))
++#define ENDP_HDR_EXT(ep)        (0x814 + 0x70 * (ep))
++#define ENDP_METADATA_MASK(ep)  (0x818 + 0x70 * (ep))
++#define ENDP_MODE(ep)           (0x820 + 0x70 * (ep))
++#define ENDP_AGGR(ep)           (0x824 + 0x70 * (ep))
++#define ENDP_HOLB(ep)           (0x82c + 0x70 * (ep))
++#define ENDP_DEAGGR(ep)         (0x834 + 0x70 * (ep))
++#define ENDP_RSRC_GRP(ep)       (0x838 + 0x70 * (ep))
++#define ENDP_SEQ(ep)            (0x83c + 0x70 * (ep))
++#define ENDP_STATUS(ep)         (0x840 + 0x70 * (ep))
++#define ENDP_GSI_CFG1(ep)       (0x794 + 4 * (ep))
++#define IPA_ENABLED_PIPES       0x38
++#define IPA_LOCAL_PROC_BASE     0x1e8
++#define IPA_HASH_FLUSH          0x14c
++
++#define IPA_CMD_V4_FILTER       3
++#define IPA_CMD_V6_FILTER       4
++#define IPA_CMD_V4_ROUTE        7
++#define IPA_CMD_V6_ROUTE        8
++#define IPA_CMD_HDR_LOCAL       9
++#define IPA_CMD_DMA_SHARED      19
++#define TRE_CHAIN               (1u << 0)
++#define TRE_IEOT                (1u << 9)
++#define TRE_BEI                 (1u << 10)
++#define TRE_TYPE_XFER           (2u << 16)
++#define TRE_TYPE_COMMAND        (3u << 16)
++#define GSI_EVT_SUCCESS         1
++#define GSI_EVT_EOT             2
++#define GSI_EVT_EOB             4
++
++static int say(const char *format, ...) __printflike(1, 2);
++static int
++say(const char *format, ...)
++{
++	char line[320];
++	va_list list;
++	int length;
++	va_start(list, format);
++	length = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) loader_log_putc(*c);
++	printf("%s", line);
++	return length;
++}
++
++static vm_offset_t ipa_regs, ipa_debug, gsi_regs;
++static LCK_GRP_DECLARE(ipa_data_lock_group, "vayu-ipa-data");
++static LCK_MTX_DECLARE(ipa_data_lock, &ipa_data_lock_group);
++
++static inline uint32_t
++ipa_rd(uint32_t off) { return *(volatile uint32_t *)(ipa_regs + off); }
++static inline void
++ipa_wr(uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(ipa_regs + off) = value;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++static inline uint32_t
++debug_rd(uint32_t off) { return *(volatile uint32_t *)(ipa_debug + off); }
++static inline uint32_t
++gsi_rd(uint32_t off) { return *(volatile uint32_t *)(gsi_regs + off); }
++static inline void
++gsi_wr(uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(gsi_regs + off) = value;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++static inline uint64_t
++sram_rd64(vm_offset_t sram, uint32_t off) { return *(volatile uint64_t *)(sram + off); }
++
++struct dma {
++	vm_offset_t virt;
++	uint64_t phys;
++};
++
++static uint8_t ipa_pool[IPA_POOL_SIZE] __attribute__((aligned(IPA_POOL_ALIGN)));
++static uint64_t pool_phys;
++static size_t pool_used;
++
++static bool
++pool_init(void)
++{
++	pool_phys = kvtophys((vm_offset_t)ipa_pool);
++	if (pool_phys < 0x80000000ULL || pool_phys + sizeof(ipa_pool) - 1 > 0xffffffffULL ||
++	    (pool_phys & 0xfff)) {
++		say("vayu-ipa-data: pool phys %#llx is outside the IPA SMMU DDR identity window\n",
++		    (unsigned long long)pool_phys);
++		return false;
++	}
++	for (size_t at = 0; at < sizeof(ipa_pool); at += PAGE_SIZE) {
++		if (kvtophys((vm_offset_t)ipa_pool + at) != pool_phys + at) {
++			say("vayu-ipa-data: pool is not contiguous at %#zx\n", at);
++			return false;
++		}
++	}
++	pool_used = 0;                       /* a failed/stopped prepare may be retried */
++	memset(ipa_pool, 0, sizeof(ipa_pool));
++	say("vayu-ipa-data: DMA pool %#llx..%#llx, physically contiguous, IOVA=PA\n",
++	    (unsigned long long)pool_phys, (unsigned long long)(pool_phys + sizeof(ipa_pool) - 1));
++	return true;
++}
++
++static bool
++pool_take(struct dma *d, size_t size, size_t align)
++{
++	size_t at = (pool_used + align - 1) & ~(align - 1);
++
++	if (align == 0 || (align & (align - 1)) || at > sizeof(ipa_pool) || size > sizeof(ipa_pool) - at) {
++		say("vayu-ipa-data: pool exhausted: used %#zx need %#zx align %#zx\n", pool_used, size, align);
++		return false;
++	}
++	d->virt = (vm_offset_t)ipa_pool + at;
++	d->phys = pool_phys + at;
++	pool_used = at + size;
++	memset((void *)d->virt, 0, size);
++	return true;
++}
++
++static void
++dma_sync(vm_offset_t virt, size_t size)
++{
++	vm_offset_t from = virt & ~63ul;
++
++	FlushPoC_DcacheRegion(from, ((virt + size + 63) & ~63ul) - from);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++struct tre {
++	uint64_t addr;
++	uint16_t len_opcode;
++	uint16_t reserved;
++	uint32_t flags;
++};
++struct event {
++	uint64_t xfer;
++	uint16_t len;
++	uint8_t reserved1;
++	uint8_t code;
++	uint16_t reserved2;
++	uint8_t type;
++	uint8_t chid;
++};
++static_assert(sizeof(struct tre) == 16, "GSI TRE is 16 bytes");
++static_assert(sizeof(struct event) == 16, "GSI event is 16 bytes");
++
++struct channel {
++	const char *name;
++	uint8_t id, endpoint;
++	uint32_t event_id;
++	bool to_ipa, command, qmap, aggregate, close_eof;
++	uint32_t slots, buffer_size, low_weight;
++	struct dma tre_ring, event_ring, data;
++	uint32_t next, done, events;
++	bool event_allocated, allocated, started;
++	uint64_t packets, bytes, dropped, errors;
++};
++
++static struct channel channels[] = {
++	{ .name = "cmd", .id = 4, .endpoint = 5, .event_id = ~0u, .to_ipa = true,
++	  .command = true, .slots = 16, .buffer_size = 256, .low_weight = 15 },
++	{ .name = "lan-rx", .id = 5, .endpoint = 10, .event_id = ~0u,
++	  .aggregate = true, .slots = 8, .buffer_size = 8192, .low_weight = 1 },
++	{ .name = "wan-tx", .id = 3, .endpoint = 2, .event_id = ~0u, .to_ipa = true,
++	  .qmap = true, .slots = 64, .buffer_size = 2048, .low_weight = 1 },
++	{ .name = "wan-rx", .id = 6, .endpoint = 11, .event_id = ~0u,
++	  .qmap = true, .aggregate = true, .close_eof = true, .slots = 16,
++	  .buffer_size = 16384, .low_weight = 1 },
++};
++#define NCHANNELS (sizeof(channels) / sizeof(channels[0]))
++#define COMMAND (&channels[0])
++#define LAN_RX (&channels[1])
++#define WAN_TX (&channels[2])
++#define WAN_RX (&channels[3])
++static uint32_t max_event_rings;
++static bool prepared, ready, filter_failed, stopping, thread_running;
++static uint32_t trace;
++static bool first_packet_seen;
++
++/* vayu-data: S10: the first packet either way, once. The counters in vayu_cell_net_get_status()
++ * carry the rest. */
++static void
++first_packet(const char *way, const char *channel, uint32_t bytes)
++{
++	if (first_packet_seen) return;
++	first_packet_seen = true;
++	say("vayu-data: S10 FIRST PACKET: OK %s via %s, %u bytes\n", way, channel, bytes);
++}
++
++static inline vm_offset_t
++slot_virt(const struct channel *ch, uint32_t slot)
++{
++	return ch->data.virt + (vm_offset_t)slot * ch->buffer_size;
++}
++static inline uint64_t
++slot_phys(const struct channel *ch, uint32_t slot)
++{
++	return ch->data.phys + (uint64_t)slot * ch->buffer_size;
++}
++static inline struct tre *
++tre_at(struct channel *ch, uint32_t index)
++{
++	return (struct tre *)(ch->tre_ring.virt + (index % ch->slots) * ELEMENT_SIZE);
++}
++
++static void
++gsi_error(const char *what)
++{
++	uint32_t log = gsi_rd(GSI_ERROR_LOG);
++
++	say("vayu-ipa-data: %s: GSI status %#x error %#x (code %u type %u EE %u index %u), global %#x general %#x\n",
++	    what, gsi_rd(GSI_STATUS), log, (log >> 12) & 0xf, (log >> 24) & 0xf,
++	    log >> 28, (log >> 19) & 0x1f, gsi_rd(CNTXT_GLOB_IRQ_STTS), gsi_rd(CNTXT_GSI_IRQ_STTS));
++}
++
++static uint32_t
++channel_state(const struct channel *ch, bool event)
++{
++	return (gsi_rd(event ? EV_CNTXT(ch->event_id, 0) : CH_CNTXT(ch->id, 0)) >> 20) & 0xf;
++}
++
++static bool
++gsi_command(struct channel *ch, bool event, uint32_t opcode, uint32_t wanted)
++{
++	uint32_t number = event ? ch->event_id : ch->id, state = 0;
++
++	gsi_wr(event ? GSI_EV_CMD : GSI_CH_CMD, number | opcode << 24);
++	for (unsigned us = 0; us < 250000; us += 100) {
++		state = channel_state(ch, event);
++		if (state == wanted) break;
++		delay_for_interval(100, NSEC_PER_USEC);
++	}
++	gsi_wr(event ? CNTXT_SRC_EV_IRQ_CLR : CNTXT_SRC_CH_IRQ_CLR, 1u << number);
++	if (state != wanted) {
++		say("vayu-ipa-data: %s command %#x on %s %u: state %u, expected %u\n",
++		    ch->name, opcode, event ? "event" : "channel", number, state, wanted);
++		gsi_error(ch->name);
++		return false;
++	}
++	return true;
++}
++
++static void
++gsi_interrupts_off(void)
++{
++	gsi_wr(CNTXT_INTSET, 1);               /* IRQ mode, but every source is polled/masked */
++	gsi_wr(CNTXT_MSI_LSB, 0);
++	gsi_wr(CNTXT_MSI_MSB, 0);
++	gsi_wr(GSI_ERROR_LOG, 0);
++	gsi_wr(CNTXT_TYPE_IRQ_MSK, 0);
++	gsi_wr(CNTXT_SRC_CH_IRQ_MSK, 0);
++	gsi_wr(CNTXT_SRC_EV_IRQ_MSK, 0);
++	gsi_wr(CNTXT_SRC_IEOB_IRQ_MSK, 0);
++	gsi_wr(CNTXT_GLOB_IRQ_EN, 0);
++	gsi_wr(CNTXT_GSI_IRQ_EN, 0);
++	gsi_wr(CNTXT_SRC_CH_IRQ_CLR, ~0u);
++	gsi_wr(CNTXT_SRC_EV_IRQ_CLR, ~0u);
++	gsi_wr(CNTXT_SRC_IEOB_IRQ_CLR, ~0u);
++	gsi_wr(CNTXT_GLOB_IRQ_CLR, ~0u);
++	gsi_wr(CNTXT_GSI_IRQ_CLR, ~0u);
++	gsi_wr(GSI_ERROR_LOG_CLR, ~0u);
++	gsi_wr(CNTXT_SCRATCH_0, 0);
++	gsi_wr(CNTXT_SCRATCH_1, 0);
++}
++
++static bool
++event_claim(struct channel *ch)
++{
++	for (uint32_t e = 0; e < max_event_rings; e++) {
++		bool used = false;
++		for (unsigned i = 0; i < NCHANNELS; i++) {
++			if (channels[i].event_allocated && channels[i].event_id == e) used = true;
++		}
++		if (!used && ((gsi_rd(EV_CNTXT(e, 0)) >> 20) & 0xf) == 0) {
++			ch->event_id = e;
++			return true;
++		}
++	}
++	say("vayu-ipa-data: %s: no free event ring\n", ch->name);
++	return false;
++}
++
++static bool
++endpoint_check(const struct channel *ch)
++{
++	uint32_t expected = 1u << 16 | (uint32_t)ch->id << 8, cfg = 0;
++
++	/* TZ/FW owns this binding. It may still be finishing ipa_fws startup; never
++	 * write the register, but allow a bounded 100 ms for it to appear. */
++	for (unsigned ms = 0; ms < 100; ms++) {
++		cfg = debug_rd(ENDP_GSI_CFG1(ch->endpoint));
++		if ((cfg & 0x11f0f) == expected) return true;
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	say("vayu-ipa-data: EP%u GSI_CFG1 %#x, expected %#x after 100 ms (TZ owns binding); refusing\n",
++	    ch->endpoint, cfg, expected);
++	return false;
++}
++
++static void
++endpoint_program(const struct channel *ch)
++{
++	uint32_t ep = ch->endpoint, value;
++
++	ipa_wr(ENDP_CTRL(ep), 0);
++	ipa_wr(ENDP_CFG(ep), 0);                    /* no checksum offload */
++	ipa_wr(ENDP_NAT(ep), 0);
++	value = 0;
++	if (ch->qmap) {
++		value = 4 | 1u << 6 | 2u << 20;
++		if (!ch->to_ipa) {
++			/* RX: metadata in header byte 1 and packet size at bytes 2..3 is valid. */
++			value |= 1u << 7 | 1u << 19;
++		}
++	}
++	/* LAN exceptions have no header at this stage: IPA_ROUTE does not retain one. */
++	ipa_wr(ENDP_HDR(ep), value);
++	value = 0;
++	if (ch->qmap) {
++		value = 1 | 1u << 1 | 1u << 3;        /* big endian, pad valid, length includes pad */
++		if (ch->to_ipa) value |= 2u << 10;    /* 4-byte alignment */
++	} else if (!ch->to_ipa) {
++		value = 1 | 1u << 1 | 2u << 10;       /* LAN header padding */
++	}
++	ipa_wr(ENDP_HDR_EXT(ep), value);
++	ipa_wr(ENDP_METADATA_MASK(ep), !ch->to_ipa && ch->qmap ? 0xff000000 : 0);
++	if (ch->to_ipa) ipa_wr(ENDP_MODE(ep), ch->command ? 3 | LAN_RX->endpoint << 4 : 0);
++	value = 0;
++	if (!ch->to_ipa && ch->aggregate) {
++		uint32_t kb = ch->qmap ? 14 : 6;       /* WDA 0x3800 = 14 KiB; stock LAN = 6 */
++		uint32_t packets = ch->qmap ? 16 : 0;
++		value = 1 | 4u << 2 | kb << 5 | 1u << 10 | packets << 15 |
++		    (ch->close_eof ? 1u << 21 : 0);  /* generic, 0.5 ms tick */
++	} else if (ch->to_ipa && ch->qmap) {
++		value = 2 | 6u << 2;                  /* deaggregate QCMAP */
++	}
++	ipa_wr(ENDP_AGGR(ep), value);
++	if (ch->to_ipa) ipa_wr(ENDP_DEAGGR(ep), 0);
++	else ipa_wr(ENDP_HOLB(ep), 0);
++	ipa_wr(ENDP_RSRC_GRP(ep), 1);              /* IPA_v4_0_GROUP_UL_DL */
++	if (ch->to_ipa) ipa_wr(ENDP_SEQ(ep), ch->command ? 0 : 0x804);
++	ipa_wr(ENDP_STATUS(ep), 0);
++}
++
++static bool
++channel_setup(struct channel *ch)
++{
++	uint32_t c = ch->id;
++
++	if (!event_claim(ch) || !endpoint_check(ch)) return false;
++	if (((gsi_rd(CH_CNTXT(c, 0)) >> 20) & 0xf) != 0) {
++		say("vayu-ipa-data: %s channel %u is already in use\n", ch->name, c);
++		return false;
++	}
++	if (!gsi_command(ch, true, GSI_ALLOCATE, 1)) return false;
++	ch->event_allocated = true;
++	uint32_t e = ch->event_id;
++	gsi_wr(EV_CNTXT(e, 0), GSI_EVT_TYPE_GPI | 1u << 16 | ELEMENT_SIZE << 24);
++	gsi_wr(EV_CNTXT(e, 1), ch->slots * ELEMENT_SIZE);
++	gsi_wr(EV_CNTXT(e, 2), (uint32_t)ch->event_ring.phys);
++	gsi_wr(EV_CNTXT(e, 3), (uint32_t)(ch->event_ring.phys >> 32));
++	for (unsigned n = 8; n <= 13; n++) gsi_wr(EV_CNTXT(e, n), 0);
++	gsi_wr(EV_DOORBELL(e) + 4, (uint32_t)(ch->event_ring.phys >> 32));
++	gsi_wr(EV_DOORBELL(e), (uint32_t)(ch->event_ring.phys + (ch->slots - 1) * ELEMENT_SIZE));
++
++	if (!gsi_command(ch, false, GSI_ALLOCATE, 1)) return false;
++	ch->allocated = true;
++	gsi_wr(CH_CNTXT(c, 0), GSI_TYPE_GPI | (ch->to_ipa ? 1u << 3 : 0) |
++	    e << 14 | ELEMENT_SIZE << 24);
++	gsi_wr(CH_CNTXT(c, 1), ch->slots * ELEMENT_SIZE);
++	gsi_wr(CH_CNTXT(c, 2), (uint32_t)ch->tre_ring.phys);
++	gsi_wr(CH_CNTXT(c, 3), (uint32_t)(ch->tre_ring.phys >> 32));
++	gsi_wr(CH_QOS(c), ch->low_weight);         /* direct mode, one prefetch, no escape-only */
++	for (unsigned n = 0; n < 4; n++) gsi_wr(CH_SCRATCH(c, n), 0); /* v4.0+: no MCS smart prefetch */
++	gsi_wr(CH_DOORBELL(c) + 4, (uint32_t)(ch->tre_ring.phys >> 32));
++	endpoint_program(ch);
++	return true;
++}
++
++static void
++tre_fill(struct channel *ch, uint32_t index, uint64_t addr, uint16_t len_opcode, uint32_t flags)
++{
++	struct tre *t = tre_at(ch, index);
++	t->addr = addr;
++	t->len_opcode = len_opcode;
++	t->reserved = 0;
++	t->flags = flags;
++	dma_sync((vm_offset_t)t, sizeof(*t));
++}
++
++static void
++channel_doorbell(struct channel *ch)
++{
++	gsi_wr(CH_DOORBELL(ch->id), (uint32_t)(ch->tre_ring.phys + (ch->next % ch->slots) * ELEMENT_SIZE));
++}
++
++static void
++receive_post(struct channel *ch)
++{
++	tre_fill(ch, ch->next, slot_phys(ch, ch->next % ch->slots),
++	    (uint16_t)ch->buffer_size, TRE_TYPE_XFER | TRE_IEOT | TRE_BEI);
++	ch->next++;
++}
++
++static bool
++channel_start(struct channel *ch)
++{
++	if (!gsi_command(ch, false, GSI_START, 2)) return false;
++	ch->started = true;
++	if (!ch->to_ipa) {
++		for (uint32_t slot = 0; slot + 1 < ch->slots; slot++) receive_post(ch);
++		channel_doorbell(ch);                 /* slots-1: write==read means empty */
++	}
++	say("vayu-ipa-data: %s started: EP%u ch%u event %u, %u slots, buffers %u bytes\n",
++	    ch->name, ch->endpoint, ch->id, ch->event_id, ch->slots, ch->buffer_size);
++	return true;
++}
++
++static unsigned
++channel_events(struct channel *ch, void (*each)(struct channel *, const struct event *, void *), void *context)
++{
++	uint32_t base = (uint32_t)ch->event_ring.phys, wp = gsi_rd(EV_CNTXT(ch->event_id, 4));
++	unsigned count = 0;
++
++	if (wp < base || wp >= base + ch->slots * ELEMENT_SIZE || ((wp - base) & 0xf)) {
++		if (ch->errors++ < 4) say("vayu-ipa-data: %s event WP %#x outside ring %#x\n", ch->name, wp, base);
++		return 0;
++	}
++	uint32_t target = (wp - base) / ELEMENT_SIZE;
++	while (ch->events % ch->slots != target) {
++		struct event *e = (struct event *)(ch->event_ring.virt + (ch->events % ch->slots) * ELEMENT_SIZE);
++		dma_sync((vm_offset_t)e, sizeof(*e));
++		each(ch, e, context);
++		ch->events++;
++		count++;
++		/* vayu_qup_spi and vendor gsi.c: after advancing the software index,
++	 * the doorbell points at that next position in the event ring. */
++		gsi_wr(EV_DOORBELL(ch->event_id), (uint32_t)(ch->event_ring.phys + (ch->events % ch->slots) * ELEMENT_SIZE));
++	}
++	return count;
++}
++
++static bool
++event_slot(const struct channel *ch, const struct event *e, uint32_t *slot)
++{
++	if (e->xfer < ch->tre_ring.phys || e->xfer >= ch->tre_ring.phys + ch->slots * ELEMENT_SIZE ||
++	    ((e->xfer - ch->tre_ring.phys) & 0xf)) return false;
++	*slot = (uint32_t)((e->xfer - ch->tre_ring.phys) / ELEMENT_SIZE);
++	return true;
++}
++
++static bool
++event_ok(const struct event *e)
++{
++	return e->code == GSI_EVT_SUCCESS || e->code == GSI_EVT_EOT || e->code == GSI_EVT_EOB;
++}
++
++struct command_done {
++	uint64_t tre;
++	bool done;
++	uint8_t code;
++};
++static void
++command_event(struct channel *ch, const struct event *e, void *context)
++{
++	struct command_done *waiting = context;
++	if (e->xfer == waiting->tre) {
++		waiting->done = true;
++		waiting->code = e->code;
++	}
++	ch->done++;
++}
++
++static bool
++ipa_command(const char *what, uint8_t opcode, const void *payload, size_t size)
++{
++	struct channel *ch = COMMAND;
++	uint32_t slot = ch->next % ch->slots;
++	struct command_done waiting = { .tre = ch->tre_ring.phys + slot * ELEMENT_SIZE };
++
++	if (size > ch->buffer_size || ch->next - ch->done >= ch->slots - 1) return false;
++	memcpy((void *)slot_virt(ch, slot), payload, size);
++	dma_sync(slot_virt(ch, slot), size);
++	tre_fill(ch, ch->next, slot_phys(ch, slot), opcode, TRE_TYPE_COMMAND | TRE_IEOT);
++	ch->next++;
++	channel_doorbell(ch);
++	for (unsigned us = 0; us < 250000 && !waiting.done; us += 100) {
++		channel_events(ch, command_event, &waiting);
++		if (!waiting.done) delay_for_interval(100, NSEC_PER_USEC);
++	}
++	if (!waiting.done || !event_ok(&(struct event){ .code = waiting.code })) {
++		say("vayu-ipa-data: immediate command %s (%#x) failed: done %u code %#x state %u\n",
++		    what, opcode, waiting.done, waiting.code, channel_state(ch, false));
++		gsi_error(what);
++		ch->errors++;
++		return false;
++	}
++	say("vayu-ipa-data: immediate command %s completed (code %u)\n", what, waiting.code);
++	return true;
++}
++
++static struct dma zero_rule, route_image, filter_image, header_image, proc_image;
++
++static bool
++table_images(void)
++{
++	uint64_t *route, *filter;
++	uint32_t restricted = vayu_ipa_restricted_bytes();
++
++	if (!pool_take(&zero_rule, 8, 128) || !pool_take(&route_image, 15 * 8, 128) ||
++	    !pool_take(&filter_image, 9 * 8, 128) || !pool_take(&header_image, 0x140, 128) ||
++	    !pool_take(&proc_image, 0x400, 128)) return false;
++	route = (uint64_t *)route_image.virt;
++	filter = (uint64_t *)filter_image.virt;
++	for (unsigned i = 0; i < 15; i++) route[i] = zero_rule.phys;
++	filter[0] = 0x3cfULL << 1;                /* vayu EP 0,1,2,3,6,7,8,9: eight filters */
++	for (unsigned i = 1; i <= 8; i++) filter[i] = zero_rule.phys;
++	for (unsigned i = 0; i < 5; i++) {
++		struct dma *images[] = { &zero_rule, &route_image, &filter_image, &header_image, &proc_image };
++		dma_sync(images[i]->virt, i == 0 ? 8 : i == 1 ? 15 * 8 : i == 2 ? 9 * 8 : i == 3 ? 0x140 : 0x400);
++	}
++	say("vayu-ipa-data: table images: zero rule %#llx, filter bitmap %#llx, restricted %#x\n",
++	    (unsigned long long)zero_rule.phys, (unsigned long long)filter[0], restricted);
++	return true;
++}
++
++static bool
++table_init(const char *what, uint8_t opcode, bool filter, uint32_t hash_off, uint32_t nhash_off)
++{
++	struct { uint64_t hash, flags, nhash; } payload;
++	struct dma *image = filter ? &filter_image : &route_image;
++	uint32_t size = filter ? 9 * 8 : 15 * 8;
++	uint32_t o = vayu_ipa_restricted_bytes();
++
++	payload.hash = image->phys;
++	payload.nhash = image->phys;
++	payload.flags = (uint64_t)size | (uint64_t)(o + hash_off) << 12 |
++	    (uint64_t)size << 28 | (uint64_t)(o + nhash_off) << 40;
++	return ipa_command(what, opcode, &payload, sizeof(payload));
++}
++
++static bool
++tables_setup(void)
++{
++	uint32_t o = vayu_ipa_restricted_bytes();
++	struct { uint64_t source, flags; } header = {
++		.source = header_image.phys,
++		.flags = 0x140 | (uint64_t)(o + 0x688) << 12,
++	};
++	struct { uint64_t flags, source; } proc = {
++		.flags = (uint64_t)0x400 << 16 | (uint64_t)(o + 0x7d0) << 32,
++		.source = proc_image.phys,
++	};
++
++	if (!ipa_command("header table init", IPA_CMD_HDR_LOCAL, &header, sizeof(header)) ||
++	    !ipa_command("header processing contexts", IPA_CMD_DMA_SHARED, &proc, sizeof(proc)) ||
++	    !table_init("IPv4 route table init", IPA_CMD_V4_ROUTE, false, 0x488, 0x508) ||
++	    !table_init("IPv6 route table init", IPA_CMD_V6_ROUTE, false, 0x588, 0x608) ||
++	    !table_init("IPv4 filter table init", IPA_CMD_V4_FILTER, true, 0x288, 0x308) ||
++	    !table_init("IPv6 filter table init", IPA_CMD_V6_FILTER, true, 0x388, 0x408)) return false;
++	ipa_wr(IPA_LOCAL_PROC_BASE, o + 0x7d0);
++	ipa_wr(IPA_HASH_FLUSH, 0x1111);
++	return true;
++}
++
++static bool
++tables_verify(void)
++{
++	/* The readback window must be the same SRAM the immediate commands targeted:
++	 * vayu_ipa_sram=1 moves it to 0x1e47000 (+restricted) for IPA 4.1. */
++	uint32_t base = vayu_ipa_sram_base();
++	vm_offset_t sram = ml_io_map_unmappable(base, IPA_SRAM_SIZE, VM_WIMG_IO);
++	uint32_t o = vayu_ipa_restricted_bytes();
++	bool ok = sram != 0;
++
++	if (!ok) {
++		say("vayu-ipa-data: SRAM readback window %#x did not map\n", base);
++		return false;
++	}
++#define EXPECT64(off, value) do { \
++	uint64_t got = sram_rd64(sram, (off)); \
++	if (got != (uint64_t)(value)) { \
++		say("vayu-ipa-data: SRAM %#x = %#llx, expected %#llx\n", (off), \
++		    (unsigned long long)got, (unsigned long long)(uint64_t)(value)); \
++		ok = false; \
++	} \
++} while (0)
++	EXPECT64(o + 0x488, zero_rule.phys);
++	EXPECT64(o + 0x508, zero_rule.phys);
++	EXPECT64(o + 0x288, 0x3cfULL << 1);
++	EXPECT64(o + 0x290, zero_rule.phys);
++	EXPECT64(o + 0x308, 0x3cfULL << 1);
++	EXPECT64(o + 0x310, zero_rule.phys);
++	EXPECT64(o + 0x688, 0);
++	EXPECT64(o + 0x7d0, 0);
++#undef EXPECT64
++	if (ok) say("vayu-ipa-data: SRAM route/filter/header/proc table readback PASSED\n");
++	return ok;
++}
++
++static void
++transmit_event(struct channel *ch, const struct event *e, void *context __unused)
++{
++	uint32_t slot;
++	if (!event_slot(ch, e, &slot)) {
++		ch->errors++;
++		return;
++	}
++	if (slot != ch->done % ch->slots || !event_ok(e)) ch->errors++;
++	ch->done++;
++}
++
++static void
++receive_event(struct channel *ch, const struct event *e, void *context __unused)
++{
++	uint32_t slot;
++	if (!event_slot(ch, e, &slot)) {
++		ch->errors++;
++		ch->done++;                            /* one bad event must not pin the ring forever */
++		return;
++	}
++	if (slot != ch->done % ch->slots || !event_ok(e)) ch->errors++;
++	ch->done++;
++	uint32_t length = e->len > ch->buffer_size ? ch->buffer_size : e->len;
++	const uint8_t *buffer = (const uint8_t *)slot_virt(ch, slot);
++	dma_sync((vm_offset_t)buffer, length);
++	ch->bytes += length;
++	if (trace) say("vayu-ipa-data: %s slot %u: %u bytes code %u\n", ch->name, slot, length, e->code);
++	if (ch->qmap) {
++		const uint8_t *cursor = buffer;
++		size_t remaining = length;
++		while (remaining) {
++			struct vayu_qmap_header header;
++			const uint8_t *packet;
++			size_t packet_length;
++			if (!vayu_qmap_next(&cursor, &remaining, &header, &packet, &packet_length)) {
++				ch->dropped++;
++				break;
++			}
++			if (header.command || header.next_header) {
++				ch->dropped++;
++				continue;
++			}
++			ch->packets++;
++			first_packet("received", ch->name, (uint32_t)packet_length);
++			/* ifnet_input may generate an ICMP/TCP reply and re-enter transmit. Do not
++			 * hold the IPA lock across it; only this thread consumes this RX channel. */
++			lck_mtx_unlock(&ipa_data_lock);
++			vayu_cell_net_input(header.mux_id, packet, packet_length);
++			lck_mtx_lock(&ipa_data_lock);
++		}
++	} else {
++		ch->packets++;                            /* LAN exceptions are deliberately dropped. */
++	}
++	receive_post(ch);
++	channel_doorbell(ch);
++}
++
++bool
++vayu_ipa_data_transmit(uint8_t mux, const void *packet, size_t length)
++{
++	struct channel *ch = WAN_TX;
++	struct vayu_qmap_header header = { .mux_id = mux };
++	uint32_t slot, pad;
++	uint8_t *buffer;
++	bool accepted = false;
++
++	if (!ready || packet == NULL || length == 0 || length > 1500) return false;
++	pad = (4 - (length & 3)) & 3;
++	header.pad_len = (uint8_t)pad;
++	header.length = (uint16_t)(length + pad);
++	if (length + pad + VAYU_QMAP_HEADER_LEN > ch->buffer_size) return false;
++	lck_mtx_lock(&ipa_data_lock);
++	channel_events(ch, transmit_event, NULL);
++	if (!ready || ch->next - ch->done >= ch->slots - 1) {
++		ch->dropped++;
++		goto out;
++	}
++	slot = ch->next % ch->slots;
++	buffer = (uint8_t *)slot_virt(ch, slot);
++	if (!vayu_qmap_header_encode(buffer, &header)) goto out;
++	memcpy(buffer + VAYU_QMAP_HEADER_LEN, packet, length);
++	memset(buffer + VAYU_QMAP_HEADER_LEN + length, 0, pad);
++	dma_sync((vm_offset_t)buffer, VAYU_QMAP_HEADER_LEN + length + pad);
++	tre_fill(ch, ch->next, slot_phys(ch, slot), (uint16_t)(VAYU_QMAP_HEADER_LEN + length + pad),
++	    TRE_TYPE_XFER | TRE_IEOT | TRE_BEI);
++	ch->next++;
++	channel_doorbell(ch);
++	ch->packets++;
++	ch->bytes += length;
++	first_packet("sent", ch->name, (uint32_t)length);
++	accepted = true;
++out:
++	lck_mtx_unlock(&ipa_data_lock);
++	return accepted;
++}
++
++static void
++ipa_data_thread(void *argument __unused, wait_result_t wait __unused)
++{
++	while (!stopping) {
++		if (ready) {
++			lck_mtx_lock(&ipa_data_lock);
++			channel_events(WAN_RX, receive_event, NULL);
++			channel_events(LAN_RX, receive_event, NULL);
++			channel_events(WAN_TX, transmit_event, NULL);
++			lck_mtx_unlock(&ipa_data_lock);
++		}
++		delay_for_interval(2, NSEC_PER_MSEC);
++	}
++	thread_running = false;
++	thread_terminate(current_thread());
++}
++
++static bool
++channel_memory(void)
++{
++	for (unsigned i = 0; i < NCHANNELS; i++) {
++		struct channel *ch = &channels[i];
++		ch->next = ch->done = ch->events = 0;
++		ch->event_allocated = ch->allocated = ch->started = false;
++		ch->packets = ch->bytes = ch->dropped = ch->errors = 0;
++		if (!pool_take(&ch->tre_ring, ch->slots * ELEMENT_SIZE, ch->slots * ELEMENT_SIZE) ||
++		    !pool_take(&ch->event_ring, ch->slots * ELEMENT_SIZE, ch->slots * ELEMENT_SIZE) ||
++		    !pool_take(&ch->data, ch->slots * ch->buffer_size, PAGE_SIZE)) return false;
++	}
++	return true;
++}
++
++static bool
++registers_map_and_check(void)
++{
++	ipa_regs = ml_io_map_unmappable(IPA_PHYS, IPA_SIZE, VM_WIMG_IO);
++	ipa_debug = ml_io_map_unmappable(IPA_DEBUG_PHYS, IPA_DEBUG_SIZE, VM_WIMG_IO);
++	gsi_regs = ml_io_map_unmappable(GSI_PHYS, GSI_SIZE, VM_WIMG_IO);
++	if (!ipa_regs || !ipa_debug || !gsi_regs) {
++		say("vayu-ipa-data: cannot map IPA/debug/GSI windows\n");
++		return false;
++	}
++	uint32_t status = gsi_rd(GSI_STATUS), version = gsi_rd(GSI_SW_VERSION), params = gsi_rd(GSI_HW_PARAM_2);
++	uint32_t channels_hw = (params >> 3) & 0x1f;
++	max_event_rings = (params >> 8) & 0x1f;
++	uint32_t pipes = ipa_rd(IPA_ENABLED_PIPES);
++	say("vayu-ipa-data: GSI status %#x version %#x params %#x: %u channels %u events; IPA pipes %#x\n",
++	    status, version, params, channels_hw, max_event_rings, pipes);
++	if (!(status & 1) || version == 0 || version == ~0u || channels_hw <= 6 ||
++	    max_event_rings < NCHANNELS || (pipes & ((1u << 2) | (1u << 5) | (1u << 10) | (1u << 11))) !=
++	    ((1u << 2) | (1u << 5) | (1u << 10) | (1u << 11))) {
++		say("vayu-ipa-data: GSI 2.0 preflight failed; no channel writes\n");
++		return false;
++	}
++	return true;
++}
++
++static bool
++channels_down(void)
++{
++	bool ok = true;
++
++	for (unsigned i = NCHANNELS; i-- > 0;) {
++		struct channel *ch = &channels[i];
++		if (ch->started) {
++			if (!gsi_command(ch, false, GSI_STOP, 3)) {
++				say("vayu-ipa-data: %s would not stop; leaving its SMMU/context allocated\n", ch->name);
++				ok = false;
++				continue;
++			}
++			ch->started = false;
++		}
++		if (ch->allocated) {
++			if (gsi_command(ch, false, GSI_RESET, 1)) gsi_command(ch, false, GSI_DEALLOCATE, 0);
++			ch->allocated = false;
++		}
++		if (ch->event_allocated) {
++			if (gsi_command(ch, true, GSI_RESET, 1)) gsi_command(ch, true, GSI_DEALLOCATE, 0);
++			ch->event_allocated = false;
++		}
++	}
++	return ok;
++}
++
++bool
++vayu_ipa_data_prepare(void)
++{
++	uint32_t enabled = 0;
++
++	if (prepared) return ready;
++	if (!PE_parse_boot_argn("vayu_ipa_data", &enabled, sizeof(enabled)) || enabled == 0) return true;
++	if (enabled != 1) {
++		say("vayu-ipa-data: vayu_ipa_data=%u refused: only 1 enables GSI\n", enabled);
++		return false;
++	}
++	PE_parse_boot_argn("vayu_ipa_data_trace", &trace, sizeof(trace));
++	stopping = false;
++	filter_failed = false;
++	ready = false;
++	/* Empty-table initialization covers modem-owned areas too. It is legal only
++	 * before MPSS; never rewrite them after the modem accepted INIT_MODEM_DRIVER. */
++	if (vayu_ipa_modem_started()) {
++		say("vayu-ipa-data: MPSS already started; refusing to rewrite modem-owned tables\n");
++		return false;
++	}
++	/* Small table images first: allocating the large packet buffers first would
++	 * waste the last pool bytes on PAGE_SIZE alignment before the zero rule. */
++	if (!registers_map_and_check() || !pool_init() || !table_images() || !channel_memory()) return false;
++	/* The whole pool was zeroed through the cacheable CPU mapping. Push those dirty
++	 * zero lines out before any doorbell: a later dc civac on a device-written event
++	 * or RX buffer must never write stale zeros over the hardware's fresh data. */
++	dma_sync((vm_offset_t)ipa_pool, sizeof(ipa_pool));
++	gsi_interrupts_off();
++	for (unsigned i = 0; i < NCHANNELS; i++) {
++		if (!channel_setup(&channels[i])) {
++			(void)channels_down();
++			return false;
++		}
++	}
++	for (unsigned i = 0; i < NCHANNELS; i++) {
++		if (!channel_start(&channels[i])) {
++			(void)channels_down();
++			return false;
++		}
++	}
++	if (!tables_setup() || !tables_verify()) {
++		say("vayu-ipa-data: tables are not initialized; stopping channels, no data_ready\n");
++		(void)channels_down();
++		return false;
++	}
++	thread_t thread;
++	thread_running = true;                    /* readiness cannot race the new thread */
++	if (kernel_thread_start(ipa_data_thread, NULL, &thread) != KERN_SUCCESS) {
++		thread_running = false;
++		say("vayu-ipa-data: no polling thread\n");
++		(void)channels_down();
++		return false;
++	}
++	thread_deallocate(thread);
++	prepared = true;
++	ready = true;
++	say("vayu-ipa-data: GSI/tables READY; runtime modem filter rules still fail closed; no internet claim\n");
++	say("vayu-data: S2 GSI CHANNELS: OK 4 channels (cmd ch4/EP5, lan-rx ch5/EP10, wan-tx ch3/EP2, "
++	    "wan-rx ch6/EP11), event rings, tables read back\n");
++	return true;
++}
++
++bool
++vayu_ipa_data_ready(void)
++{
++	return prepared && ready && thread_running && !filter_failed && !stopping;
++}
++
++void
++vayu_ipa_data_filter_error(void)
++{
++	if (!filter_failed) say("vayu-ipa-data: modem requested unimplemented filter installation; WDS/data blocked\n");
++	filter_failed = true;
++	ready = false;
++}
++
++bool
++vayu_ipa_data_stop(void)
++{
++	bool ok;
++
++	if (!prepared && !thread_running) return true;
++	stopping = true;
++	ready = false;
++	for (unsigned ms = 0; ms < 2000 && thread_running; ms += 10) delay_for_interval(10, NSEC_PER_MSEC);
++	if (thread_running) {
++		say("vayu-ipa-data: polling thread did not stop; IPA firmware must stay up\n");
++		return false;
++	}
++	ok = channels_down();
++	prepared = !ok;
++	say("vayu-ipa-data: %s\n", ok ? "stopped" : "channel stop failed; IPA firmware must stay up");
++	return ok;
++}
+--- a/bsd/dev/vayu_cell_net.c
++++ b/bsd/dev/vayu_cell_net.c
+@@ -0,0 +1,871 @@
++/*
++ * en1: the modem's raw IPv4 data path as a real interface, for the POCO X3 Pro (vayu, SM8150-AC).
++ *
++ * The control plane (bsd/dev/vayu_cell_data.c) leaves an IPv4 session behind: WDS says the
++ * address, mask, gateway, DNS and MTU, and WDA says the packets are raw IP inside QMAP on mux 1.
++ * This file is the smallest interface that can carry that: no Ethernet header, no ARP, no DHCP,
++ * no link-layer address, no CommCenter and no configd. en1 is IFNET_FAMILY_CELLULAR/IFT_CELLULAR,
++ * a point-to-point link whose peer is the WDS gateway, BPF sees DLT_RAW, and inbound packets are
++ * handed to PF_INET with proto_input() after the QMAP layer has removed its 4-byte header
++ * (sys/vayu_cell_qmap.h). en0 and en2 are not touched.
++ *
++ * The shape of the address setup is the proven one of bsd/dev/vayu_usbnet_ecm.c (itself the
++ * ifconfig path): SIOCPROTOATTACH for PF_INET through the plumber this file registers, then
++ * SIOCAIFADDR with the address, the netmask, and -- because the link is point-to-point -- the
++ * gateway in ifra_broadaddr, then SIOCGIFFLAGS/SIOCSIFFLAGS with IFF_UP. IFF_RUNNING is added
++ * afterwards, directly and only after the address and peer were installed, so no KEV_DL_LINK_ON
++ * is ever posted. bsd/net/if_gif.c is the model for the raw, headerless interface: ifnet_demux
++ * reads the IP version nibble, ifnet_attach_protocol registers an input that only calls
++ * proto_input(), and BPF is attached with DLT_RAW. Unlike gif there is no encapsulation and no
++ * ifra_dstaddr configuration here.
++ *
++ * What this file does NOT do, and does not pretend to: it does not make the IPA data path work
++ * (vayu_ipa_data_transmit() is the main agent's side), it does not tell configd or CommCenter that
++ * there is a network service, it does not publish DNS, and it adds no default route unless
++ * vayu_cell_net_default=1. IFF_RUNNING means "the address and peer were installed", not "the
++ * Internet works". No KEV_DL_LINK_ON/OFF is posted, so no DHCP client is told that a link came up.
++ *
++ * Boot args:
++ *   vayu_cell_net=0          nothing (the default)
++ *   vayu_cell_net=1          attach en1 and start the configuration thread
++ *   vayu_cell_net_default=1  also add a global default route via the session's gateway
++ *
++ * Threading: vayu_cell_net_session() only copies its arguments under a mutex and wakes the thread;
++ * vayu_cell_net_input() and the output callback never sleep, never open a socket and never log.
++ * All socket/ioctl/route work happens in the one thread this file starts. Teardown only removes
++ * the route and the address it added and clears the flags; the ifnet stays attached, so a later
++ * session can reuse it, and every teardown step is tolerant of being already done.
++ */
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <net/bpf.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/route.h>
++#include <netinet/in.h>
++#include <pexpert/pexpert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <sys/errno.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/param.h>
++#include <sys/sockio.h>
++#include <sys/systm.h>
++#include <sys/vayu_cell_net.h>
++
++extern void loader_log_putc(char c);
++/* The main agent's IPA transmit; it must copy the bytes before returning (the mbuf is freed below). */
++extern bool vayu_ipa_data_transmit(uint8_t mux, const void *packet, size_t length);
++/* bsd/net/route.c; net/route.h keeps the flags but not the prototype. */
++extern int rtrequest(int req, struct sockaddr *dst, struct sockaddr *gateway,
++    struct sockaddr *netmask, int flags, struct rtentry **ret_nrt);
++
++#define CELL_NET_NAME           "en1"
++#define CELL_NET_PREFIX         "en"
++#define CELL_NET_UNIT           1
++#define CELL_NET_UNIQUEID       "vayu-cell-net"
++#define CELL_NET_IPV4_MIN       20      /* the smallest IPv4 header */
++
++static int say(const char *format, ...) __printflike(1, 2);
++
++static int
++say(const char *format, ...)
++{
++	char line[300];
++	va_list list;
++	int length;
++
++	va_start(list, format);
++	length = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	printf("%s", line);
++	return length;
++}
++
++/* Same index line shape as vayu_cell_data.c: vayu-data: S9 EN1 IFNET: OK|ERROR ... */
++static void
++cell_net_stage(const char *result, const char *format, ...)
++{
++	char detail[180], line[260];
++	va_list list;
++
++	va_start(list, format);
++	vsnprintf(detail, sizeof(detail), format, list);
++	va_end(list);
++	snprintf(line, sizeof(line), "vayu-data: S9 EN1 IFNET: %s %s\n", result, detail);
++	for (const char *c = line; *c != 0; c++) loader_log_putc(*c);
++	printf("%s", line);
++}
++
++/* The WDS numbers are host order; the log shows them the way ip4_string does in vayu_cell_data.c. */
++static void
++ip4_string(char *to, size_t size, uint32_t address)
++{
++	snprintf(to, size, "%u.%u.%u.%u", (address >> 24) & 0xff, (address >> 16) & 0xff,
++	    (address >> 8) & 0xff, address & 0xff);
++}
++
++/* ---- state --------------------------------------------------------------------------------------- */
++
++struct cell_net_request {
++	bool     up;
++	uint32_t address;
++	uint32_t mask;
++	uint32_t gateway;
++	uint32_t dns1;
++	uint32_t dns2;
++	uint32_t mtu;
++	uint32_t generation;
++};
++
++/* What the interface currently has; owned by the configuration thread, copied under the lock. */
++struct cell_net_applied {
++	bool     address_set;
++	bool     route_set;
++	bool     fully_configured;
++	uint32_t address;
++	uint32_t mask;
++	uint32_t gateway;
++	uint32_t dns1;
++	uint32_t dns2;
++	uint32_t mtu;
++};
++
++static struct {
++	ifnet_t ifp;
++	bool    started;
++	bool    thread_started;
++	bool    default_route;
++	struct cell_net_request request;
++	bool     pending;
++	uint32_t request_generation;    /* the last request copied into `request` */
++	struct cell_net_applied applied;
++	uint32_t applied_generation;
++	/* statistics; approximate by nature, the data path does not take the lock */
++	volatile uint64_t rx_packets, rx_bytes, rx_dropped;
++	volatile uint64_t tx_packets, tx_bytes, tx_dropped;
++} cell_net;
++
++static LCK_GRP_DECLARE(cell_net_lock_group, "vayu-cell-net");
++static LCK_MTX_DECLARE(cell_net_lock, &cell_net_lock_group);
++
++/* ---- helpers ------------------------------------------------------------------------------------- */
++
++static bool
++cell_net_mask_valid(uint32_t mask)
++{
++	uint32_t host;
++
++	if (mask == 0) {
++		return false;
++	}
++	host = ~mask;
++	return (host & (host + 1)) == 0;        /* the host part is 2^k - 1 */
++}
++
++/*
++ * A complete IPv4 datagram: version 4, a header that fits, a total length that is at least the
++ * header and no larger than what was handed over. `length` comes back as the datagram's own total
++ * length; the module trims trailing bytes (padding that survived a QMAP layer) rather than passing
++ * them to IP.
++ */
++static bool
++cell_net_ipv4_valid(const uint8_t *packet, size_t available, size_t *length)
++{
++	size_t header_length, total_length;
++
++	if (packet == NULL || available < CELL_NET_IPV4_MIN || (packet[0] >> 4) != 4) {
++		return false;
++	}
++	header_length = (size_t)(packet[0] & 0x0f) * 4;
++	if (header_length < CELL_NET_IPV4_MIN || header_length > available) {
++		return false;
++	}
++	total_length = ((size_t)packet[2] << 8) | packet[3];
++	if (total_length < header_length || total_length > available) {
++		return false;
++	}
++	if (length != NULL) {
++		*length = total_length;
++	}
++	return true;
++}
++
++static bool
++cell_net_open_socket(socket_t *so)
++{
++	errno_t error;
++
++	if (*so != NULL) {
++		return true;
++	}
++	error = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, so);
++	if (error != 0) {
++		*so = NULL;
++		say("vayu-cell-net: no PF_INET socket: %d\n", error);
++		return false;
++	}
++	return true;
++}
++
++/*
++ * The usbnet pattern's last step: SIOCGIFFLAGS/SIOCSIFFLAGS with IFF_UP. This is what lets the
++ * rest of the stack see an administratively up interface; IFF_RUNNING is not part of it and is
++ * added separately, only when the address and peer were really installed.
++ */
++static int
++cell_net_set_up(socket_t so)
++{
++	struct ifreq ifr;
++	int error;
++
++	bzero(&ifr, sizeof(ifr));
++	strlcpy(ifr.ifr_name, CELL_NET_NAME, sizeof(ifr.ifr_name));
++	error = sock_ioctl(so, SIOCGIFFLAGS, &ifr);
++	if (error == 0) {
++		ifr.ifr_flags |= IFF_UP;
++		error = sock_ioctl(so, SIOCSIFFLAGS, &ifr);
++	}
++	return error;
++}
++
++/* ---- the address, route and flags (only ever called from cell_net_thread) ------------------------ */
++
++/*
++ * struct in_aliasreq as bsd/netinet/in.c casts the SIOCAIFADDR argument: three sockaddr_in after
++ * the name, the second one being the point-to-point destination (ifra_broadaddr in if.h).
++ */
++struct cell_net_aliasreq {
++	char ifra_name[IFNAMSIZ];
++	struct sockaddr_in ifra_addr;
++	struct sockaddr_in ifra_broadaddr;
++	struct sockaddr_in ifra_mask;
++};
++
++static int
++cell_net_address_set(socket_t so, const struct cell_net_request *request)
++{
++	struct cell_net_aliasreq ifra;
++	struct sockaddr_in *sin;
++	bool numbered = request->gateway == 0;
++	int error;
++
++	bzero(&ifra, sizeof(ifra));
++	strlcpy(ifra.ifra_name, CELL_NET_NAME, sizeof(ifra.ifra_name));
++	sin = &ifra.ifra_addr;
++	sin->sin_len = sizeof(*sin);
++	sin->sin_family = AF_INET;
++	sin->sin_addr.s_addr = htonl(request->address);
++	sin = &ifra.ifra_broadaddr;
++	sin->sin_len = sizeof(*sin);
++	sin->sin_family = AF_INET;
++	sin->sin_addr.s_addr = htonl(request->gateway);
++	sin = &ifra.ifra_mask;
++	sin->sin_len = sizeof(*sin);
++	sin->sin_family = AF_INET;
++	sin->sin_addr.s_addr = htonl(request->mask);
++
++	/*
++	 * in_control() refuses a point-to-point SIOCAIFADDR with a zero destination (EDESTADDRREQ,
++	 * bsd/netinet/in.c). With no gateway there is no peer to name, but the requirement is to
++	 * keep a valid address: make this one call as a numbered link address, then put the
++	 * interface back to point-to-point. The state stays "not fully configured", no peer route
++	 * is made and no default route is added; the log says why.
++	 */
++	if (numbered) {
++		ifnet_set_flags(cell_net.ifp, 0, IFF_POINTOPOINT);
++	}
++	error = sock_ioctl(so, SIOCAIFADDR, &ifra);
++	if (numbered) {
++		ifnet_set_flags(cell_net.ifp, IFF_POINTOPOINT, IFF_POINTOPOINT);
++	}
++	return error;
++}
++
++static bool
++cell_net_route_add(uint32_t gateway)
++{
++	struct sockaddr_in dst = { .sin_len = sizeof(dst), .sin_family = AF_INET };
++	struct sockaddr_in mask = { .sin_len = sizeof(mask), .sin_family = AF_INET };
++	struct sockaddr_in peer = { .sin_len = sizeof(peer), .sin_family = AF_INET };
++	char gateway_text[16];
++	int error;
++
++	ip4_string(gateway_text, sizeof(gateway_text), gateway);
++	peer.sin_addr.s_addr = htonl(gateway);
++	error = rtrequest(RTM_ADD, (struct sockaddr *)&dst, (struct sockaddr *)&peer,
++	    (struct sockaddr *)&mask, RTF_UP | RTF_GATEWAY | RTF_STATIC, NULL);
++	if (error != 0) {
++		say("vayu-cell-net: default route via %s was not added: %d\n", gateway_text, error);
++		return false;
++	}
++	say("vayu-cell-net: default route via %s added (vayu_cell_net_default=1)\n", gateway_text);
++	return true;
++}
++
++static void
++cell_net_route_delete(uint32_t gateway)
++{
++	struct sockaddr_in dst = { .sin_len = sizeof(dst), .sin_family = AF_INET };
++	struct sockaddr_in mask = { .sin_len = sizeof(mask), .sin_family = AF_INET };
++	struct sockaddr_in peer = { .sin_len = sizeof(peer), .sin_family = AF_INET };
++	char gateway_text[16];
++	int error;
++
++	ip4_string(gateway_text, sizeof(gateway_text), gateway);
++	peer.sin_addr.s_addr = htonl(gateway);
++	error = rtrequest(RTM_DELETE, (struct sockaddr *)&dst, (struct sockaddr *)&peer,
++	    (struct sockaddr *)&mask, RTF_UP | RTF_GATEWAY | RTF_STATIC, NULL);
++	if (error != 0) {
++		say("vayu-cell-net: default route via %s delete: %d (already gone)\n", gateway_text, error);
++	} else {
++		say("vayu-cell-net: default route via %s removed\n", gateway_text);
++	}
++}
++
++/*
++ * Remove only what this module installed: the default route it added, the address it set, and
++ * the interface flags. Not the ifnet: en1 stays attached for the next session. Idempotent; the
++ * address is named exactly, so en0 and en2 cannot be touched.
++ */
++static void
++cell_net_teardown(struct cell_net_applied *applied, socket_t *so)
++{
++	bool had_address = applied->address_set;
++	bool had_route = applied->route_set;
++
++	if ((had_address || had_route) && cell_net_open_socket(so)) {
++		if (had_route) {
++			cell_net_route_delete(applied->gateway);
++		}
++		if (had_address) {
++			struct ifreq ifr;
++			struct sockaddr_in *sin;
++			char address[16];
++			int error;
++
++			bzero(&ifr, sizeof(ifr));
++			strlcpy(ifr.ifr_name, CELL_NET_NAME, sizeof(ifr.ifr_name));
++			sin = (struct sockaddr_in *)&ifr.ifr_addr;
++			sin->sin_len = sizeof(*sin);
++			sin->sin_family = AF_INET;
++			sin->sin_addr.s_addr = htonl(applied->address);
++			error = sock_ioctl(*so, SIOCDIFADDR, &ifr);
++			ip4_string(address, sizeof(address), applied->address);
++			if (error != 0 && error != EADDRNOTAVAIL) {
++				say("vayu-cell-net: address %s remove: %d\n", address, error);
++			} else {
++				say("vayu-cell-net: address %s removed\n", address);
++			}
++		}
++	} else if (had_address || had_route) {
++		say("vayu-cell-net: no socket to remove the address or route; flags dropped\n");
++	}
++
++	bzero(applied, sizeof(*applied));
++	if (cell_net.ifp != NULL) {
++		ifnet_set_flags(cell_net.ifp, 0, IFF_UP | IFF_RUNNING);
++	}
++}
++
++static void
++cell_net_apply(const struct cell_net_request *request, struct cell_net_applied *applied,
++    socket_t *so)
++{
++	char address[16], mask[16], gateway_text[16], dns1_text[16], dns2_text[16];
++	uint32_t mtu;
++	int error;
++
++	if (!request->up) {
++		cell_net_teardown(applied, so);
++		say("vayu-cell-net: session down, en1 stays attached\n");
++		return;
++	}
++
++	ip4_string(address, sizeof(address), request->address);
++	ip4_string(mask, sizeof(mask), request->mask);
++	ip4_string(gateway_text, sizeof(gateway_text), request->gateway);
++	ip4_string(dns1_text, sizeof(dns1_text), request->dns1);
++	ip4_string(dns2_text, sizeof(dns2_text), request->dns2);
++
++	mtu = request->mtu != 0 ? request->mtu : VAYU_CELL_NET_MTU_DEFAULT;
++	if (request->address == 0 || !cell_net_mask_valid(request->mask) ||
++	    mtu < VAYU_CELL_NET_MTU_MIN || mtu > VAYU_CELL_NET_MTU_MAX) {
++		say("vayu-cell-net: session refused: address %s mask %s mtu %u\n", address, mask, mtu);
++		cell_net_teardown(applied, so);
++		return;
++	}
++
++	if (!cell_net_open_socket(so)) {
++		cell_net_teardown(applied, so);
++		return;
++	}
++
++	/* A new session replaces the previous one; remove its route and address first. */
++	cell_net_teardown(applied, so);
++
++	error = ifnet_set_mtu(cell_net.ifp, mtu);
++	if (error != 0) {
++		say("vayu-cell-net: MTU %u refused: %d\n", mtu, error);
++		return;
++	}
++
++	{
++		struct ifreq ifr;
++
++		bzero(&ifr, sizeof(ifr));
++		strlcpy(ifr.ifr_name, CELL_NET_NAME, sizeof(ifr.ifr_name));
++		error = sock_ioctl(*so, SIOCPROTOATTACH, &ifr);
++		if (error != 0 && error != EEXIST) {
++			say("vayu-cell-net: SIOCPROTOATTACH: %d\n", error);
++			return;
++		}
++	}
++
++	error = cell_net_address_set(*so, request);
++	if (error != 0) {
++		say("vayu-cell-net: address %s/%s peer %s: %d\n", address, mask, gateway_text, error);
++		cell_net_teardown(applied, so);  /* in_ifinit() may have raised IFF_UP before failing */
++		return;
++	}
++
++	applied->address_set = true;
++	applied->address = request->address;
++	applied->mask = request->mask;
++	applied->gateway = request->gateway;
++	applied->dns1 = request->dns1;
++	applied->dns2 = request->dns2;
++	applied->mtu = mtu;
++	applied->fully_configured = request->gateway != 0;
++
++	if (cell_net.default_route && applied->fully_configured) {
++		applied->route_set = cell_net_route_add(request->gateway);
++	}
++
++	error = cell_net_set_up(*so);
++	if (error != 0) {
++		say("vayu-cell-net: SIOCGIFFLAGS/SIOCSIFFLAGS up: %d\n", error);
++	}
++	error = ifnet_set_flags(cell_net.ifp, IFF_UP | (applied->fully_configured ? IFF_RUNNING : 0),
++	    IFF_UP | IFF_RUNNING);
++	if (error != 0) {
++		say("vayu-cell-net: flags: %d\n", error);
++	}
++
++	say("vayu-cell-net: en1 address %s mask %s peer %s mtu %u, DNS %s %s (recorded only), "
++	    "link %s\n", address, mask, gateway_text, mtu, dns1_text, dns2_text,
++	    applied->fully_configured ? "configured" : "address only (gateway 0)");
++	cell_net_stage(applied->fully_configured ? "OK" : "ERROR",
++	    "en1 %s/%s peer %s mtu %u, flags %s%s", address, mask, gateway_text, mtu,
++	    applied->fully_configured ? "UP|RUNNING" : "address only",
++	    applied->route_set ? ", default route added" : "");
++	if (!applied->fully_configured) {
++		say("vayu-cell-net: gateway 0: address kept, no default route, not fully configured\n");
++	}
++}
++
++/* ---- the configuration thread -------------------------------------------------------------------- */
++
++static void
++cell_net_thread(void *argument __unused, wait_result_t wait __unused)
++{
++	struct cell_net_request request;
++	socket_t so = NULL;
++
++	lck_mtx_lock(&cell_net_lock);
++	for (;;) {
++		struct cell_net_applied applied;
++
++		while (!cell_net.pending) {
++			msleep(&cell_net.pending, &cell_net_lock, PZERO, "vayu-cell-net", NULL);
++		}
++		request = cell_net.request;
++		cell_net.pending = false;
++		applied = cell_net.applied;
++		lck_mtx_unlock(&cell_net_lock);
++
++		cell_net_apply(&request, &applied, &so);
++
++		lck_mtx_lock(&cell_net_lock);
++		cell_net.applied = applied;
++		cell_net.applied_generation = request.generation;
++	}
++}
++
++/* ---- the ifnet ------------------------------------------------------------------------------------ */
++
++static errno_t
++cell_net_output(ifnet_t ifp, mbuf_t packet)
++{
++	size_t length = mbuf_pkthdr_len(packet);
++	size_t total = 0;
++	const uint8_t *data = NULL;
++	mbuf_t flat = NULL;
++	bool sent = false;
++
++	if (length < CELL_NET_IPV4_MIN || length > ifnet_mtu(ifp) ||
++	    (ifnet_flags(ifp) & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING)) {
++		goto done;
++	}
++
++	if (mbuf_next(packet) == NULL && mbuf_len(packet) >= length) {
++		data = mbuf_data(packet);
++	} else {
++		unsigned int chunks = 1;
++
++		if (mbuf_allocpacket(MBUF_DONTWAIT, length, &chunks, &flat) != 0) {
++			goto done;
++		}
++		if (mbuf_copydata(packet, 0, length, mbuf_data(flat)) != 0) {
++			goto done;
++		}
++		data = mbuf_data(flat);
++	}
++	if (!cell_net_ipv4_valid(data, length, &total) || total != length) {
++		goto done;
++	}
++
++	bpf_tap_out(ifp, DLT_RAW, packet, NULL, 0);
++	sent = vayu_ipa_data_transmit(VAYU_CELL_NET_MUX, data, length);
++
++done:
++	if (flat != NULL) {
++		mbuf_freem(flat);
++	}
++	if (sent) {
++		cell_net.tx_packets++;
++		cell_net.tx_bytes += length;
++		(void)ifnet_stat_increment_out(ifp, 1, (uint32_t)length, 0);
++	} else {
++		cell_net.tx_dropped++;
++		(void)ifnet_stat_increment_out(ifp, 0, 0, 1);
++	}
++	mbuf_freem(packet);
++	return 0;
++}
++
++static errno_t
++cell_net_demux(ifnet_t ifp __unused, mbuf_t packet, char *frame_header __unused,
++    protocol_family_t *protocol)
++{
++	const uint8_t *data;
++
++	while (packet != NULL && mbuf_len(packet) < 1) {
++		packet = mbuf_next(packet);
++	}
++	if (packet == NULL) {
++		return ENOENT;
++	}
++	data = mbuf_data(packet);
++	if (data == NULL || (data[0] >> 4) != 4) {
++		return ENOENT;
++	}
++	*protocol = PF_INET;
++	return 0;
++}
++
++static errno_t
++cell_net_add_proto(ifnet_t ifp __unused, protocol_family_t protocol,
++    const struct ifnet_demux_desc *demux_array __unused, u_int32_t demux_count __unused)
++{
++	return protocol == PF_INET ? 0 : ENOPROTOOPT;
++}
++
++static errno_t
++cell_net_del_proto(ifnet_t ifp __unused, protocol_family_t protocol)
++{
++	return protocol == PF_INET ? 0 : ENOPROTOOPT;
++}
++
++static errno_t
++cell_net_proto_input(ifnet_t ifp, protocol_family_t protocol, mbuf_t packet,
++    char *frame_header __unused)
++{
++	if (proto_input(protocol, packet) != 0) {
++		(void)ifnet_stat_increment_in(ifp, 0, 0, 1);
++		mbuf_freem(packet);
++	}
++	return 0;
++}
++
++static errno_t
++cell_net_attach_proto(ifnet_t ifp, protocol_family_t protocol)
++{
++	struct ifnet_attach_proto_param register_param;
++	errno_t error;
++
++	if (protocol != PF_INET) {
++		return ENOPROTOOPT;
++	}
++	bzero(&register_param, sizeof(register_param));
++	register_param.input = cell_net_proto_input;
++	error = ifnet_attach_protocol(ifp, protocol, &register_param);
++	if (error != 0 && error != EEXIST) {
++		say("vayu-cell-net: PF_INET attach: %d\n", error);
++	}
++	return error;
++}
++
++static errno_t
++cell_net_ioctl(ifnet_t ifp, u_long command, void *data)
++{
++	struct ifreq *request = data;
++	uint16_t flags;
++	bool configured;
++
++	switch (command) {
++	case SIOCSIFADDR:
++		/* bsd/netinet/in.c calls this with a struct ifaddr while it installs the address. */
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		break;
++	case SIOCSIFFLAGS:
++		lck_mtx_lock(&cell_net_lock);
++		configured = cell_net.applied.fully_configured;
++		lck_mtx_unlock(&cell_net_lock);
++		flags = ifnet_flags(ifp);
++		ifnet_set_flags(ifp, ((flags & IFF_UP) && configured) ? IFF_RUNNING : 0, IFF_RUNNING);
++		break;
++	case SIOCSIFMTU:
++		if (request == NULL || request->ifr_mtu < VAYU_CELL_NET_MTU_MIN ||
++		    request->ifr_mtu > VAYU_CELL_NET_MTU_MAX) {
++			return EINVAL;
++		}
++		return ifnet_set_mtu(ifp, (uint32_t)request->ifr_mtu);
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		break;                          /* no link layer and no multicast on this mux */
++	default:
++		return EOPNOTSUPP;
++	}
++	return 0;
++}
++
++static bool
++cell_net_attach(void)
++{
++	struct ifnet_init_eparams init;
++	errno_t error;
++
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO;
++	init.uniqueid = CELL_NET_UNIQUEID;
++	init.uniqueid_len = (u_int32_t)strlen(CELL_NET_UNIQUEID);
++	init.name = CELL_NET_PREFIX;
++	init.unit = CELL_NET_UNIT;
++	init.family = IFNET_FAMILY_CELLULAR;
++	init.type = IFT_CELLULAR;
++	init.output = cell_net_output;
++	init.demux = cell_net_demux;
++	init.add_proto = cell_net_add_proto;
++	init.del_proto = cell_net_del_proto;
++	init.ioctl = cell_net_ioctl;
++
++	error = ifnet_allocate_extended(&init, &cell_net.ifp);
++	if (error != 0) {
++		say("vayu-cell-net: en1 cannot be made: %d (already taken?)\n", error);
++		cell_net.ifp = NULL;
++		return false;
++	}
++	ifnet_set_capabilities_enabled(cell_net.ifp, 0, (u_int32_t)-1);
++	ifnet_set_offload(cell_net.ifp, 0);
++	ifnet_set_mtu(cell_net.ifp, VAYU_CELL_NET_MTU_DEFAULT);
++	ifnet_set_hdrlen(cell_net.ifp, 0);
++	ifnet_set_flags(cell_net.ifp, IFF_POINTOPOINT, IFF_POINTOPOINT);
++
++	error = ifnet_attach(cell_net.ifp, NULL);
++	if (error != 0) {
++		say("vayu-cell-net: en1 cannot be attached: %d\n", error);
++		ifnet_release(cell_net.ifp);
++		cell_net.ifp = NULL;
++		return false;
++	}
++	bpfattach(cell_net.ifp, DLT_RAW, 0);
++	say("vayu-cell-net: en1 attached, IFT_CELLULAR, raw IPv4, link down\n");
++	return true;
++}
++
++/* ---- what the rest of the kernel calls --------------------------------------------------------- */
++
++void
++vayu_cell_net_init(void)
++{
++	uint32_t enabled = 0;
++	uint32_t default_route = 0;
++	thread_t thread;
++	errno_t error;
++
++	if (!PE_parse_boot_argn("vayu_cell_net", &enabled, sizeof(enabled)) || enabled == 0) {
++		return;
++	}
++	if (enabled != 1) {
++		say("vayu-cell-net: vayu_cell_net=%u is refused: only 1 creates en1\n", enabled);
++		return;
++	}
++
++	lck_mtx_lock(&cell_net_lock);
++	if (cell_net.started) {
++		lck_mtx_unlock(&cell_net_lock);
++		return;
++	}
++	cell_net.started = true;
++	lck_mtx_unlock(&cell_net_lock);
++
++	PE_parse_boot_argn("vayu_cell_net_default", &default_route, sizeof(default_route));
++	cell_net.default_route = default_route == 1;
++
++	error = proto_register_plumber(PF_INET, IFNET_FAMILY_CELLULAR, cell_net_attach_proto, NULL);
++	if (error != 0 && error != EEXIST) {
++		say("vayu-cell-net: proto_register_plumber: %d\n", error);
++		return;
++	}
++
++	if (!cell_net_attach()) {
++		return;
++	}
++	if (kernel_thread_start(cell_net_thread, NULL, &thread) != KERN_SUCCESS) {
++		say("vayu-cell-net: no configuration thread; en1 stays down\n");
++		return;
++	}
++	thread_deallocate(thread);
++
++	lck_mtx_lock(&cell_net_lock);
++	cell_net.thread_started = true;
++	lck_mtx_unlock(&cell_net_lock);
++	say("vayu-cell-net: ready, vayu_cell_net=1 vayu_cell_net_default=%u; no CommCenter, no configd, "
++	    "no DNS publication\n", cell_net.default_route ? 1 : 0);
++}
++
++bool
++vayu_cell_net_ready(void)
++{
++	bool ready;
++
++	lck_mtx_lock(&cell_net_lock);
++	ready = cell_net.ifp != NULL && cell_net.thread_started;
++	lck_mtx_unlock(&cell_net_lock);
++	return ready;
++}
++
++void
++vayu_cell_net_session(bool up, uint32_t address, uint32_t mask, uint32_t gateway,
++    uint32_t dns1, uint32_t dns2, uint32_t mtu)
++{
++	lck_mtx_lock(&cell_net_lock);
++	/* Copied even before vayu_cell_net_init() has started the thread: the thread will take
++	 * the latest request when it appears. Without the opt-in nothing ever reads it. */
++	cell_net.request.up = up;
++	cell_net.request.address = address;
++	cell_net.request.mask = mask;
++	cell_net.request.gateway = gateway;
++	cell_net.request.dns1 = dns1;
++	cell_net.request.dns2 = dns2;
++	cell_net.request.mtu = mtu;
++	cell_net.request.generation = ++cell_net.request_generation;
++	cell_net.pending = true;
++	wakeup(&cell_net.pending);
++	lck_mtx_unlock(&cell_net_lock);
++}
++
++void
++vayu_cell_net_input(uint8_t mux, const uint8_t *packet, size_t length)
++{
++	struct ifnet_stat_increment_param stats = { .packets_in = 1 };
++	size_t total = 0;
++	unsigned int chunks = 1;
++	mbuf_t mbuf;
++	ifnet_t ifp;
++
++	if (mux != VAYU_CELL_NET_MUX || !cell_net_ipv4_valid(packet, length, &total)) {
++		cell_net.rx_dropped++;
++		return;
++	}
++	ifp = cell_net.ifp;
++	if (ifp == NULL || total > ifnet_mtu(ifp) ||
++	    (ifnet_flags(ifp) & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING)) {
++		cell_net.rx_dropped++;
++		return;
++	}
++	if (mbuf_allocpacket(MBUF_DONTWAIT, total, &chunks, &mbuf) != 0) {
++		cell_net.rx_dropped++;
++		return;
++	}
++	if (mbuf_copyback(mbuf, 0, total, packet, MBUF_DONTWAIT) != 0) {
++		mbuf_freem(mbuf);
++		cell_net.rx_dropped++;
++		return;
++	}
++	mbuf_pkthdr_setrcvif(mbuf, ifp);
++	bpf_tap_in(ifp, DLT_RAW, mbuf, NULL, 0);
++	stats.bytes_in = (u_int32_t)total;
++	if (ifnet_input(ifp, mbuf, &stats) == 0) {
++		cell_net.rx_packets++;
++		cell_net.rx_bytes += total;
++	} else {
++		cell_net.rx_dropped++;
++	}
++}
++
++void
++vayu_cell_net_get_status(struct vayu_cell_net_status *status)
++{
++	struct cell_net_applied applied;
++	ifnet_t ifp;
++	bool thread_started;
++
++	if (status == NULL) {
++		return;
++	}
++	bzero(status, sizeof(*status));
++	lck_mtx_lock(&cell_net_lock);
++	applied = cell_net.applied;
++	ifp = cell_net.ifp;
++	thread_started = cell_net.thread_started;
++	status->generation = cell_net.applied_generation;
++	status->rx_packets = cell_net.rx_packets;
++	status->rx_bytes = cell_net.rx_bytes;
++	status->rx_dropped = cell_net.rx_dropped;
++	status->tx_packets = cell_net.tx_packets;
++	status->tx_bytes = cell_net.tx_bytes;
++	status->tx_dropped = cell_net.tx_dropped;
++	lck_mtx_unlock(&cell_net_lock);
++
++	if (ifp != NULL) {
++		uint16_t flags = ifnet_flags(ifp);
++
++		status->flags |= VAYU_CELL_NET_FLAG_ATTACHED;
++		if ((flags & IFF_UP) != 0) {
++			status->flags |= VAYU_CELL_NET_FLAG_UP;
++		}
++		if ((flags & IFF_RUNNING) != 0) {
++			status->flags |= VAYU_CELL_NET_FLAG_RUNNING;
++		}
++	}
++	if (thread_started) {
++		status->flags |= VAYU_CELL_NET_FLAG_THREAD;
++	}
++	if (applied.address_set) {
++		status->flags |= VAYU_CELL_NET_FLAG_ADDRESS;
++		status->address = applied.address;
++		status->mask = applied.mask;
++		status->gateway = applied.gateway;
++		status->dns1 = applied.dns1;
++		status->dns2 = applied.dns2;
++		status->mtu = applied.mtu;
++	}
++	if (applied.route_set) {
++		status->flags |= VAYU_CELL_NET_FLAG_DEFAULT_ROUTE;
++	}
++	if (applied.fully_configured) {
++		status->flags |= VAYU_CELL_NET_FLAG_FULLY_CONFIGURED;
++	}
++}
+--- a/bsd/sys/vayu_ipa_data.h
++++ b/bsd/sys/vayu_ipa_data.h
+@@ -0,0 +1,23 @@
++/* vayu IPA 4.1 / GSI 2.0 packet transport (separate from the modem QMI handshake). */
++#ifndef _SYS_VAYU_IPA_DATA_H_
++#define _SYS_VAYU_IPA_DATA_H_
++
++#ifdef KERNEL
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* After ipa_fws and IPA HW init, before MPSS: channels, endpoints and empty tables.
++ * vayu_ipa_data=1 opts in; 0 leaves only the control-plane handshake available. */
++bool vayu_ipa_data_prepare(void);
++/* False if the polling thread or a channel did not stop: caller must leave IPA powered. */
++bool vayu_ipa_data_stop(void);
++/* True only when all four channels started, RX was primed and all table commands completed.
++ * A modem filter request which is not implemented clears this again; WDS must fail closed. */
++bool vayu_ipa_data_ready(void);
++void vayu_ipa_data_filter_error(void);
++/* Raw IP packet, copied into a QMAP/TX slot before returning. */
++bool vayu_ipa_data_transmit(uint8_t mux, const void *packet, size_t length);
++#endif
++
++#endif /* _SYS_VAYU_IPA_DATA_H_ */
+--- a/bsd/sys/vayu_cell_net.h
++++ b/bsd/sys/vayu_cell_net.h
+@@ -0,0 +1,93 @@
++/*
++ * The cellular data interface, en1: raw IPv4 in QMAP mux 1, for the POCO X3 Pro (vayu, SM8150-AC).
++ * bsd/dev/vayu_cell_net.c is the implementation; this header is what the rest of the kernel uses.
++ *
++ * en1 is not Ethernet and carries no Ethernet header: the modem hands over IP packets in QMAP
++ * mux 1 (sys/vayu_cell_qmap.h), vayu_cell_net_input() passes them to PF_INET unchanged, and the
++ * output path hands raw IPv4 to vayu_ipa_data_transmit() for the same mux. There is no ARP, no
++ * DHCP, no link-layer address and no link header -- DLT_RAW on BPF. en0 and en2 are not touched.
++ *
++ * What is deliberately absent: CommCenter and configd know nothing of this interface (it is made
++ * with IFNET_INIT_NX_NOAUTO and no KEV_DL_LINK_ON/OFF is posted), DNS is recorded in the status and
++ * the log only, and no default route is added unless the boot arg vayu_cell_net_default=1 says so.
++ * A link that is UP and RUNNING means only that the address/mask/peer were installed; it is not a
++ * claim that the modem, IPA or the network beyond it can carry a packet.
++ *
++ * Boot args (bsd/dev/vayu_cell_net.c):
++ *   vayu_cell_net=1         create en1 and start its configuration thread (default 0: nothing)
++ *   vayu_cell_net_default=1 also add a global default route via the session's gateway (default 0)
++ *
++ * Addresses are host order, the way vayu_cell_data.c holds the WDS words (it prints them with
++ * shifts and applies htonl only when building a sockaddr). vayu_cell_net_session() copies the
++ * arguments and wakes its thread; it never opens a socket or sleeps on the configuration work.
++ * The caller must still be a sleepable kernel thread (QMI/driver threads here), not an ISR:
++ * a short mutex protects the request. vayu_cell_net_input() does no allocation that can wait.
++ */
++#ifndef _SYS_VAYU_CELL_NET_H_
++#define _SYS_VAYU_CELL_NET_H_
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* The one mux this port binds (WDS Bind Mux Data Port, vayu_cell_data.c). */
++#define VAYU_CELL_NET_MUX               1
++#define VAYU_CELL_NET_MTU_DEFAULT       1500
++#define VAYU_CELL_NET_MTU_MIN           576
++#define VAYU_CELL_NET_MTU_MAX           1500
++
++/* vayu_cell_net_get_status(): what exists and what was last applied. */
++#define VAYU_CELL_NET_FLAG_ATTACHED     0x00000001u     /* en1 was made and attached */
++#define VAYU_CELL_NET_FLAG_THREAD       0x00000002u     /* the configuration thread runs */
++#define VAYU_CELL_NET_FLAG_UP           0x00000004u     /* IFF_UP */
++#define VAYU_CELL_NET_FLAG_RUNNING      0x00000008u     /* IFF_RUNNING: address and peer installed */
++#define VAYU_CELL_NET_FLAG_ADDRESS      0x00000010u     /* en1 has the IPv4 address below */
++#define VAYU_CELL_NET_FLAG_DEFAULT_ROUTE 0x00000020u    /* the module added the default route */
++#define VAYU_CELL_NET_FLAG_FULLY_CONFIGURED 0x00000040u /* address, mask and a non-zero gateway */
++
++struct vayu_cell_net_status {
++	uint32_t flags;                 /* VAYU_CELL_NET_FLAG_* */
++	uint32_t address;               /* host order, 0 when none */
++	uint32_t mask;
++	uint32_t gateway;               /* 0: address kept, link not RUNNING, no default route */
++	uint32_t dns1;                  /* recorded and logged only, never published to configd */
++	uint32_t dns2;
++	uint32_t mtu;
++	uint32_t generation;            /* the last session request taken up */
++	uint64_t rx_packets;
++	uint64_t rx_bytes;
++	uint64_t rx_dropped;
++	uint64_t tx_packets;
++	uint64_t tx_bytes;
++	uint64_t tx_dropped;
++};
++
++#ifdef KERNEL
++
++/* Opt-in vayu_cell_net=1: attach en1 and start the thread. Idempotent; nothing without the arg. */
++void vayu_cell_net_init(void);
++/* True only when en1 and its configuration thread exist; says nothing about configuration. */
++bool vayu_cell_net_ready(void);
++
++/*
++ * Ask for a session or its end. `up` false means teardown (route and address removed, flags
++ * down) and ignores the other arguments. For up: address and mask must be valid, mtu 0 means
++ * VAYU_CELL_NET_MTU_DEFAULT, and gateway 0 means "keep the address but do not claim a complete
++ * configuration". Copies only; the socket and route work happens in the module's thread.
++ */
++void vayu_cell_net_session(bool up, uint32_t address, uint32_t mask, uint32_t gateway,
++    uint32_t dns1, uint32_t dns2, uint32_t mtu);
++
++/*
++ * One raw IPv4 packet from the modem, already stripped of its QMAP header (sys/vayu_cell_qmap.h
++ * does the aggregation walk). Only mux 1, only a complete IPv4 header/packet, only while en1 is
++ * UP and RUNNING; anything else is counted and dropped. No sleep, no socket, no link header.
++ */
++void vayu_cell_net_input(uint8_t mux, const uint8_t *packet, size_t length);
++
++/* Copy the state and counters; safe from any thread, takes only the module lock. */
++void vayu_cell_net_get_status(struct vayu_cell_net_status *status);
++
++#endif /* KERNEL */
++
++#endif /* _SYS_VAYU_CELL_NET_H_ */
+--- a/bsd/sys/vayu_cell_qmap.h
++++ b/bsd/sys/vayu_cell_qmap.h
+@@ -0,0 +1,153 @@
++/*
++ * The 4-byte QMAP/MAP header of the modem's data path (vayu, bsd/dev/vayu_cell_net.c).
++ *
++ * This is the v1 MAP header the modem uses after WDA Set Data Format asks for QMAP aggregation
++ * (bsd/dev/vayu_cell_data.c): Qualcomm's QMAP header, written down in Linux's
++ * include/linux/if_rmnet.h as
++ *
++ *     struct rmnet_map_header { u8 flags; u8 mux_id; __be16 pkt_len; };
++ *
++ * and filled the same way by qcom-usb-kernel-drivers' qmap.h (cd_rsvd_pad, mux_id, pkt_len).
++ *
++ * Bits 0..5 of `flags` are the padding, bit 6 "next header", bit 7 "command"; `mux_id` follows;
++ * `pkt_len` is big-endian and counts the payload *including* the padding but not the 4-byte
++ * header (Documentation/networking/device_drivers/cellular/qualcomm/rmnet.rst, "MAP packet v1").
++ * That one multi-byte field is big-endian, unlike the WDS address words, which vayu_cell_data.c
++ * prints with shifts and therefore holds in host order.
++ *
++ * Everything here is pure: it reads only the bytes handed to it, never more than `available`, and
++ * decides nothing about which mux id is useful. The boundary (bsd/dev/vayu_cell_net.c, and the IPA
++ * receive path to come) accepts mux 1 and rejects command frames; a command frame still decodes so
++ * that the receiver can count it and say why it was dropped. The `next` bit is reported, not
++ * followed: this port asks WDA for no checksum offload, so the only header there can be is one
++ * this code does not understand, and its payload will fail the IPv4 nibble check at the boundary.
++ *
++ * No unbounded reads: the header needs 4 bytes, the payload length is a 16-bit bound, and a
++ * packet whose header length or padding does not fit in `available` is refused.
++ *
++ * The test of this file is tools/cell-net-test (host, ASan/UBSan).
++ */
++#ifndef _SYS_VAYU_CELL_QMAP_H_
++#define _SYS_VAYU_CELL_QMAP_H_
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define VAYU_QMAP_HEADER_LEN    4
++#define VAYU_QMAP_PAD_MAX       0x3f
++#define VAYU_QMAP_LENGTH_MAX    0xffff
++#define VAYU_QMAP_MUX_MAX       0xff
++#define VAYU_QMAP_FLAG_NEXT     0x40
++#define VAYU_QMAP_FLAG_COMMAND  0x80
++
++struct vayu_qmap_header {
++	uint8_t  pad_len;       /* bytes of padding after the payload */
++	bool     next_header;   /* bit 6: another header follows the MAP header */
++	bool     command;       /* bit 7: a MAP command, not a data packet */
++	uint16_t length;        /* payload plus padding, not the 4-byte header */
++	uint8_t  mux_id;
++};
++
++/* Decode the header at `packet`. Only the 4 header bytes are looked at. */
++static inline bool
++vayu_qmap_header_decode(const uint8_t *packet, size_t available,
++    struct vayu_qmap_header *header)
++{
++	uint8_t flags;
++
++	if (packet == NULL || header == NULL || available < VAYU_QMAP_HEADER_LEN) {
++		return false;
++	}
++	flags = packet[0];
++	header->pad_len = flags & VAYU_QMAP_PAD_MAX;
++	header->next_header = (flags & VAYU_QMAP_FLAG_NEXT) != 0;
++	header->command = (flags & VAYU_QMAP_FLAG_COMMAND) != 0;
++	header->mux_id = packet[1];
++	header->length = (uint16_t)(((uint16_t)packet[2] << 8) | packet[3]);
++	return true;
++}
++
++/* Build a header; refuses a padding field that does not fit in its six bits. */
++static inline bool
++vayu_qmap_header_encode(uint8_t *packet, const struct vayu_qmap_header *header)
++{
++	if (packet == NULL || header == NULL || header->pad_len > VAYU_QMAP_PAD_MAX) {
++		return false;
++	}
++	packet[0] = (uint8_t)(header->pad_len |
++	    (header->next_header ? VAYU_QMAP_FLAG_NEXT : 0) |
++	    (header->command ? VAYU_QMAP_FLAG_COMMAND : 0));
++	packet[1] = header->mux_id;
++	packet[2] = (uint8_t)(header->length >> 8);
++	packet[3] = (uint8_t)header->length;
++	return true;
++}
++
++/*
++ * Decode one element of a MAP aggregation: the header, then `length` payload bytes, of which the
++ * last `pad_len` are padding. The element must fit in `available`; bytes past it belong to the
++ * next element and are left for the caller. `payload` points into the caller's buffer, so it is
++ * valid exactly as long as that buffer is.
++ *
++ * An empty payload (length 0, or all of the length is padding) is refused: the receiver has
++ * nothing to hand to IP, and Linux's rmnet_map_deaggregate() refuses `pkt_len == 0` for the same
++ * reason.
++ */
++static inline bool
++vayu_qmap_packet_decode(const uint8_t *packet, size_t available,
++    struct vayu_qmap_header *header, const uint8_t **payload,
++    size_t *payload_length)
++{
++	size_t total, data_length;
++
++	if (!vayu_qmap_header_decode(packet, available, header)) {
++		return false;
++	}
++	if (header->length == 0 || header->pad_len > header->length) {
++		return false;
++	}
++	total = VAYU_QMAP_HEADER_LEN + (size_t)header->length;
++	if (total > available) {
++		return false;
++	}
++	data_length = (size_t)header->length - header->pad_len;
++	if (data_length == 0) {
++		return false;
++	}
++	if (payload != NULL) {
++		*payload = packet + VAYU_QMAP_HEADER_LEN;
++	}
++	if (payload_length != NULL) {
++		*payload_length = data_length;
++	}
++	return true;
++}
++
++/*
++ * Walk a whole aggregation, one element per call. On success `*cursor` and `*remaining` advance
++ * past the element (header + payload + padding); on failure neither is changed, so the caller
++ * can drop the rest without having to reason about a partial step.
++ */
++static inline bool
++vayu_qmap_next(const uint8_t **cursor, size_t *remaining,
++    struct vayu_qmap_header *header, const uint8_t **payload,
++    size_t *payload_length)
++{
++	size_t step, available;
++
++	if (cursor == NULL || remaining == NULL || header == NULL) {
++		return false;
++	}
++	available = *remaining;
++	if (!vayu_qmap_packet_decode(*cursor, available, header, payload,
++	    payload_length)) {
++		return false;
++	}
++	step = VAYU_QMAP_HEADER_LEN + (size_t)header->length;
++	*cursor += step;
++	*remaining = available - step;
++	return true;
++}
++
++#endif /* _SYS_VAYU_CELL_QMAP_H_ */

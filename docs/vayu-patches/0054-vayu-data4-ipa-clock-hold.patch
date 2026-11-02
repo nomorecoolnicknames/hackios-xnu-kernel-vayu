@@ -1,0 +1,303 @@
+Subject: [PATCH] vayu data4: hold the IPA clock across the SRAM writes - quick hardware-init steps, rail vote re-send, ACV core vote, IPA_VERSION liveness check
+
+Base: /mnt/ramdisk/ds-data with 0044 + 0052 + 0053 applied. Applies with -p1.
+Kernel: mach-data5.bin sha256 7e154db8f25d2cf7f57487c28e8dec19b6e33df6f270f01af647e36d1de5dbc0.
+
+Run history of the same code point:
+- 115037 (data2, 0044): CLKON -> ~2.5 s -> SRAM canaries -> "IPA SRAM zeroed/canaries written
+  at 0x1e47000, proc-ctx base 0x7d0": PASSED.
+- 123126 (data3, 0052): died between the single hardware-init announcement and the canaries.
+- 125713 (data4, 0053): all register groups passed (CLKON 0x3, BCR 0x39, COMP 0xf01f8), then the
+  last line is "about to write SRAM canaries at 0x1e47000"; six ipa_step pauses put ~15 s between
+  CLKON and the first SRAM write. IPA_VERSION 0x8030300, SHARED_MEM_SIZE 0x500, restricted 0.
+INFERENCE: the IPA clock/power domain is gated while we idle, and a SRAM access then hangs the
+interconnect. Stock keeps it voted: vayu has qcom,bandwidth-vote-for-ipa, so ipa.c:5140-5152 sets
+ipa3_clk = NULL ("Vote IPA clock by bw voting via bus scaling driver") and ipa3_enable_clks()
+(ipa.c:5206) votes the bus/interconnect, whose vectors include MSM_BUS_MASTER_IPA_CORE ->
+MSM_BUS_SLAVE_IPA_CORE at every level. Our vayu_ipa_bus=6 voted SH0+MC0 only and skipped ACV, the
+IPA core rail.
+
+What:
+1. ipa_step_after(what, ms) with two wrappers: ipa_step() (vayu_ipa_step_ms, default 2500) and
+   ipa_step_hw() (vayu_ipa_hw_step_ms, default 0). The hardware-init groups (QSB, CLKON, TX+BCR,
+   counter+COMP, source, destination) use ipa_step_hw, so CLKON -> SRAM is back to ~2.5 s (only
+   the SRAM announcement keeps its 2.5 s pause, as in data2, so the loader can carry the lines out).
+2. Before the SRAM writes the IP0 and rail votes are re-sent (ipa_vote_rails(), now shared with
+   the boot-time ipa_clock_on()) and the result is logged. Nothing in this driver unvotes them;
+   the re-send is the "held, not removed after AUTH" evidence and a repair if something reset them.
+3. vayu_ipa_bus_core=1 (default): ACV, the IPA core NoC rail, is voted even when vayu_ipa_bus
+   does not include bit 3. Logs "ACV (IPA core) voted by vayu_ipa_bus_core=1".
+4. Before touching SRAM, IPA_VERSION (0x1e40034) is read: 0 or 0xffffffff -> "the IPA clock is not
+   alive; SRAM not written" and the function returns without a single SRAM access.
+5. vayu_ipa_sram_write=0/1 (default 1): 0 skips the whole canary section (logs it).
+
+Expected next-run lines:
+  vayu-ipa: bus 0x6 (core 1), post_auth_ms 8000, step_ms 2500/0, sram 1 write 1, uc_read 0
+  vayu-ipa: 4 vote(s) sent (IP0 and the rails)          [bus=6 -> IP0, SH0, MC0, ACV]
+  vayu-ipa: ACV (IPA core) voted by vayu_ipa_bus_core=1, outside vayu_ipa_bus=6
+  vayu-ipa: post-auth: about to write QSB ... (no pause)
+  vayu-ipa: hardware init: CLKON now 0x3 / BCR 0x39, COMP 0xf01f8
+  vayu-ipa: votes re-sent before the SRAM writes: N send(s), IPA core rail voted
+  vayu-ipa: IPA_VERSION 0x8030300 before the SRAM writes: clock alive
+  vayu-ipa: post-auth: about to write SRAM canaries at 0x1e47000 (vayu_ipa_sram=1)
+  vayu-ipa: IPA SRAM zeroed/canaries written at 0x1e47000, proc-ctx base 0x7d0
+If it still hangs at the SRAM write with the clock alive, the next step is to keep a client
+reference (periodic vote re-send every second across the section) or to move the SRAM canaries
+before CLKON, and to test with vayu_ipa_sram_write=0 to reach the data path without them.
+--- a/bsd/dev/vayu_ipa.c
++++ b/bsd/dev/vayu_ipa.c
+@@ -55,6 +55,12 @@
+  * canaries in the IPA 4.1 SW SRAM window (wrapper + 0x40000 + 0x7000, ipahal_reg.c v3.0..v4.2)
+  * instead of 0x1e50000 (the v4.5 offset). Ported from 0029 (w23 line) to this tree. */
+ static uint32_t ipa_bus_mask = 15, ipa_post_auth_ms, ipa_sram_fix;
++/* vayu_ipa_step_ms: the pause after each "about to ..." (default 2500). vayu_ipa_hw_step_ms: the
++ * same for the hardware-init/SRAM section, default 0 so CLKON -> SRAM stays milliseconds (run
++ * 125713 died at the first SRAM write ~15 s after CLKON; 115037 wrote it ~2.5 s after and passed).
++ * vayu_ipa_sram_write=0 skips the SRAM canaries entirely. vayu_ipa_bus_core=1 (default) also
++ * votes the ACV rail, the IPA core NoC path that stock keeps voted (use_bw_vote, ipa.c:5140). */
++static uint32_t ipa_step_ms = 2500, ipa_hw_step_ms, ipa_sram_write = 1, ipa_bus_core = 1;
+ /* vayu_ipa_uc_read=1: every read of the uC shared area (0x1e47000) is opt-in. Run 123126 hung
+  * between the "about to write QSB/CLKON/BCR/COMP" announcement and the SRAM canaries, i.e. in
+  * code that 115037 had already run; the only new MMIO in 0052 was the uC read after the hardware
+@@ -175,33 +181,60 @@
+ 	return true;
+ }
+ 
+-static bool
+-ipa_clock_on(void)
++/* IP0 (the IPA clock) plus the enabled rail BCMs. Stock on vayu has use_bw_vote: the IPA clock
++ * lives in the bus/interconnect vote, not a GCC branch (ipa.c:5140-5152), and the IPA core path
++ * (ACV here) is part of that vote at every level. Returns the number of successful sends. */
++static unsigned
++ipa_vote_rails(const char *why, bool verbose)
+ {
+ 	static const char *const rails[] = { "SN8", "SH0", "MC0", "ACV" };
+ 	uint32_t address, value;
+-	bool ok;
++	unsigned sent = 0;
+ 
+ 	address = vayu_rpmh_address("IP0");
+ 	/* BCM_VOTE(on, vote), the encoding Linux's clk-rpmh uses for IPA's own clock. */
+ 	value = (1u << 30) | (1u << 29) | 0x3fff;
+-	ok = address != 0 && vayu_rpmh_send(&address, &value, 1, "ipa clock");
+-	if (!ok) {
+-		say("vayu-ipa: IP0 clock vote failed; not starting the IPA firmware\n");
+-		return false;
++	if (address == 0 || !vayu_rpmh_send(&address, &value, 1, "ipa clock")) {
++		say("vayu-ipa: %s: IP0 clock vote failed\n", why);
++		return 0;
+ 	}
++	sent++;
+ 	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+-		/* vayu_ipa_bus=MASK (1 SN8, 2 SH0, 4 MC0, 8 ACV; absent = 15). SN8 and ACV hung the host
+-		 * during the pause (runs 0941/0942/0943); SH0+MC0 (6) survived it twice (0940, 0940r). */
+-		if (!(ipa_bus_mask & (1u << i))) {
+-			say("vayu-ipa: bus %s not voted (vayu_ipa_bus=%u)\n", rails[i], ipa_bus_mask);
++		bool core = i == 3;             /* ACV: the IPA core NoC path */
++
++		if (!(ipa_bus_mask & (1u << i)) && !(core && ipa_bus_core == 1)) {
++			if (verbose) say("vayu-ipa: bus %s not voted (vayu_ipa_bus=%u, core %u)\n", rails[i],
++			    ipa_bus_mask, ipa_bus_core);
+ 			continue;
+ 		}
+ 		address = vayu_rpmh_address(rails[i]);
+-		if (address != 0 && !vayu_rpmh_send(&address, &value, 1, "ipa bus")) {
+-			say("vayu-ipa: bus %s vote failed; IP0 is confirmed, keeping this visible\n", rails[i]);
++		if (address == 0) {
++			if (verbose) say("vayu-ipa: bus %s has no BCM address\n", rails[i]);
++			continue;
++		}
++		if (!vayu_rpmh_send(&address, &value, 1, "ipa bus")) {
++			say("vayu-ipa: %s: bus %s vote failed\n", why, rails[i]);
++			continue;
++		}
++		sent++;
++		if (core && !(ipa_bus_mask & (1u << i))) {
++			say("vayu-ipa: ACV (IPA core) voted by vayu_ipa_bus_core=1, outside vayu_ipa_bus=%u\n",
++			    ipa_bus_mask);
+ 		}
+ 	}
++	return sent;
++}
++
++static bool
++ipa_clock_on(void)
++{
++	unsigned sent = ipa_vote_rails("ipa clock", true);
++
++	if (sent == 0) {
++		say("vayu-ipa: IP0 clock vote failed; not starting the IPA firmware\n");
++		return false;
++	}
++	say("vayu-ipa: %u vote(s) sent (IP0 and the rails)\n", sent);
+ 	return true;
+ }
+ 
+@@ -213,13 +246,27 @@
+ #define GSI_BASE                0x1e04000u
+ #define UC_RESPONSE_INIT_DONE   1u              /* IPA_HW_2_CPU_RESPONSE_INIT_COMPLETED, ipa_uc.c */
+ 
+-/* Announce the next IPA access and give the loader (2 s snapshots) time to carry the line out. */
++/* Announce the next IPA access; ms is how long the loader (2 s snapshots) gets to carry the line
++ * out before the access happens. */
+ static void
+-ipa_step(const char *what)
++ipa_step_after(const char *what, uint32_t ms)
+ {
+ 	if (ipa_post_auth_ms == 0) return;
+ 	say("vayu-ipa: post-auth: about to %s\n", what);
+-	delay_for_interval(2500, NSEC_PER_MSEC);
++	if (ms != 0) delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++static void
++ipa_step(const char *what)
++{
++	ipa_step_after(what, ipa_step_ms);
++}
++
++/* The hardware-init/SRAM section: by default no pause at all (ipa_hw_step_ms = 0). */
++static void
++ipa_step_hw(const char *what)
++{
++	ipa_step_after(what, ipa_hw_step_ms);
+ }
+ 
+ /*
+@@ -302,18 +349,18 @@
+ 
+ 	/* Every group is announced separately: run 123126 stopped right after the old single
+ 	 * announcement, so the next log names the exact register group that kills the host. */
+-	ipa_step("write QSB 0x1e40074/0x1e40078");
++	ipa_step_hw("write QSB 0x1e40074/0x1e40078");
+ 	v = IPA_RD(0x74);
+ 	IPA_WR(0x74, (v & ~0xfU) | 8);                 /* DDR QMB max writes 8 */
+ 	v = IPA_RD(0x78);
+ 	IPA_WR(0x78, (v & ~0x00ff000fU) | 12 | 120U << 16); /* DDR reads 12 of 120 */
+-	ipa_step("write CLKON 0x1e40044 = 3");
++	ipa_step_hw("write CLKON 0x1e40044 = 3");
+ 	IPA_WR(0x44, 3);                              /* CLKON: open global + 2x */
+ 	say("vayu-ipa: hardware init: CLKON now %#x\n", IPA_RD(0x44));
+-	ipa_step("write TX_CFG 0x1e401fc and BCR 0x1e401d0");
++	ipa_step_hw("write TX_CFG 0x1e401fc and BCR 0x1e401d0");
+ 	IPA_WR(0x1fc, IPA_RD(0x1fc) & ~1U);           /* TX PA_MASK_EN off */
+ 	IPA_WR(0x1d0, 0x39);                          /* BCR v4_0 */
+-	ipa_step("write counter 0x1e401f0, COMP 0x1e4003c and idle 0x1e40220");
++	ipa_step_hw("write counter 0x1e401f0, COMP 0x1e4003c and idle 0x1e40220");
+ 	IPA_WR(0x1f0, 3);                             /* aggr granularity 0.5 ms (v4) */
+ 	IPA_WR(0x3c, IPA_RD(0x3c) | 1U << 7 | 1U << 8); /* in-order GSI */
+ 	IPA_WR(0x220, 256);                           /* dynamic idle after 256 */
+@@ -321,7 +368,7 @@
+ 
+ 	/* Source groups (valid only 0x400/0x420 and 0x404/0x424), v4.1:
+ 	 * pkt contexts, descriptor lists, descriptor buffers, ACK entries. */
+-	ipa_step("write source resource groups 0x1e40400..0x1e4042c");
++	ipa_step_hw("write source resource groups 0x1e40400..0x1e4042c");
+ 	IPA_WR(0x400, RSRC(1, 1, 0, 0));   /* GRP01 pkt contexts: UL_DL min/max 1 */
+ 	IPA_WR(0x420, RSRC(1, 1, 0, 0));   /* GRP23 pkt contexts: LWA_DL min/max 1 */
+ 	IPA_WR(0x404, RSRC(10, 10, 0, 0)); /* GRP01 descriptor lists: UL_DL 10 */
+@@ -333,7 +380,7 @@
+ 
+ 	/* Destination groups (valid only 0x500/0x520 and 0x504/0x524):
+ 	 * data sectors and DPS DMARS, UL_DL and LWA_DL. */
+-	ipa_step("write destination resource groups 0x1e40500..0x1e4052c");
++	ipa_step_hw("write destination resource groups 0x1e40500..0x1e4052c");
+ 	IPA_WR(0x500, RSRC(4, 4, 0, 0));   /* GRP01 data sectors: UL_DL 4 */
+ 	IPA_WR(0x520, RSRC(4, 4, 0, 0));   /* GRP23 data sectors: LWA_DL 4 */
+ 	IPA_WR(0x504, RSRC(3, 3, 0, 0));   /* GRP01 data sectors: UL_DL 3 */
+@@ -344,34 +391,56 @@
+ 	IPA_WR(0x52c, RSRC(1, 1, 0, 0));   /* GRP23 DPS DMARS: LWA_DL 1 */
+ 
+ 	/* IPA local memory: zero the modem's table/proc-ctx areas, write canaries,
+-	 * and tell the uC where modem processing contexts start. */
++	 * and tell the uC where modem processing contexts start. Run 125713 died here: the SRAM was
++	 * touched ~15 s after CLKON (six pauses), while 115037 touched it ~2.5 s after and passed.
++	 * So the votes are re-sent, IPA_VERSION is read as a clock-alive check, and the section has
++	 * no pause of its own (ipa_hw_step_ms = 0). vayu_ipa_sram_write=0 skips it. */
+ 	{
+ 		uint32_t sram_pa = vayu_ipa_sram_base() + (ipa_sram_fix == 1 ? ipa_restricted : 0);
+ 		vm_offset_t sram;
++		uint32_t version;
+ 		static const uint16_t canaries[] = {
+ 			0x0288, 0x0308, 0x0388, 0x0408, 0x0488, 0x0508, 0x0588, 0x0608,
+ 			0x0688, 0x07d0, 0x0c30, 0x13d0, 0x13f0, 0x23fc,
+ 		};
+ 
+-		ipa_step(ipa_sram_fix == 1 ? "write SRAM canaries at 0x1e47000 (vayu_ipa_sram=1)" :
+-		    "write SRAM canaries at 0x1e50000 (old v4.5 offset)");
+-		sram = ml_io_map_unmappable(sram_pa, 0x4000, VM_WIMG_IO);
+-		if (sram == 0) {
+-			say("vayu-ipa: IPA SRAM window did not map\n");
++		ipa_step_hw("re-send the IP0 and rail votes before the SRAM writes");
++		say("vayu-ipa: votes re-sent before the SRAM writes: %u send(s), IPA core rail %s\n",
++		    ipa_vote_rails("before SRAM", false), ipa_bus_core == 1 ? "voted" : "off");
++		ipa_step_hw("read IPA_VERSION 0x1e40034 as the clock-alive check");
++		version = IPA_RD(0x34);
++		if (version == 0 || version == 0xffffffffU) {
++			say("vayu-ipa: ERROR IPA_VERSION %#x before the SRAM writes: the IPA clock is not "
++			    "alive; SRAM not written\n", version);
+ 			return;
+ 		}
+-		for (uint32_t at = 0x288; at < 0x2400; at += 4) {
+-			*(volatile uint32_t *)(sram + at) = 0;
+-		}
+-		for (unsigned i = 0; i < sizeof(canaries) / sizeof(canaries[0]); i++) {
+-			uint32_t at = canaries[i];
+-			*(volatile uint32_t *)(sram + at - 8) = 0xdeadbeef;
+-			*(volatile uint32_t *)(sram + at - 4) = 0xdeadbeef;
++		say("vayu-ipa: IPA_VERSION %#x before the SRAM writes: clock alive\n", version);
++		if (ipa_sram_write != 1) {
++			say("vayu-ipa: SRAM canaries skipped (vayu_ipa_sram_write=%u)\n", ipa_sram_write);
++		} else {
++			/* The one pause that stays: data2 took ~2.5 s from CLKON to here and passed,
++			 * and the loader needs that window to carry the preceding lines out. */
++			ipa_step(ipa_sram_fix == 1 ? "write SRAM canaries at 0x1e47000 (vayu_ipa_sram=1)" :
++			    "write SRAM canaries at 0x1e50000 (old v4.5 offset)");
++			sram = ml_io_map_unmappable(sram_pa, 0x4000, VM_WIMG_IO);
++			if (sram == 0) {
++				say("vayu-ipa: IPA SRAM window did not map\n");
++				return;
++			}
++			for (uint32_t at = 0x288; at < 0x2400; at += 4) {
++				*(volatile uint32_t *)(sram + at) = 0;
++			}
++			for (unsigned i = 0; i < sizeof(canaries) / sizeof(canaries[0]); i++) {
++				uint32_t at = canaries[i];
++				*(volatile uint32_t *)(sram + at - 8) = 0xdeadbeef;
++				*(volatile uint32_t *)(sram + at - 4) = 0xdeadbeef;
++			}
++			IPA_WR(0x1e8, ipa_restricted + 0x7d0); /* LOCAL_PKT_PROC_CNTXT_BASE */
++			say("vayu-ipa: IPA SRAM zeroed/canaries written at %#x, proc-ctx base %#x\n", sram_pa,
++			    IPA_RD(0x1e8));
+ 		}
+-		IPA_WR(0x1e8, ipa_restricted + 0x7d0); /* LOCAL_PKT_PROC_CNTXT_BASE */
+-		say("vayu-ipa: IPA SRAM zeroed/canaries written at %#x, proc-ctx base %#x\n", sram_pa, IPA_RD(0x1e8));
+ 	}
+-	ipa_step("write the exception route 0x1e40048");
++	ipa_step_hw("write the exception route 0x1e40048");
+ 	/* Exception route: LAN consumer endpoint 10, header table local, retain hdr. */
+ 	IPA_WR(0x48, 0x1120052);
+ 	say("vayu-ipa: hardware init: QSB %#x %#x, CLKON %#x, BCR %#x, COMP %#x, route %#x\n",
+@@ -480,13 +549,20 @@
+ 	PE_parse_boot_argn("vayu_ipa_post_auth_ms", &ipa_post_auth_ms, sizeof(ipa_post_auth_ms));
+ 	PE_parse_boot_argn("vayu_ipa_sram", &ipa_sram_fix, sizeof(ipa_sram_fix));
+ 	PE_parse_boot_argn("vayu_ipa_uc_read", &ipa_uc_reads, sizeof(ipa_uc_reads));
++	PE_parse_boot_argn("vayu_ipa_step_ms", &ipa_step_ms, sizeof(ipa_step_ms));
++	PE_parse_boot_argn("vayu_ipa_hw_step_ms", &ipa_hw_step_ms, sizeof(ipa_hw_step_ms));
++	PE_parse_boot_argn("vayu_ipa_sram_write", &ipa_sram_write, sizeof(ipa_sram_write));
++	PE_parse_boot_argn("vayu_ipa_bus_core", &ipa_bus_core, sizeof(ipa_bus_core));
++	if (ipa_step_ms > 10000) ipa_step_ms = 2500;
++	if (ipa_hw_step_ms > 10000) ipa_hw_step_ms = 0;
+ 	if (PE_parse_boot_argn("vayu_ipa_pas", &steps, sizeof(steps))) {
+ 		vayu_pas_set_steps(steps);
+ 	}
+ 	say("vayu-ipa: PAS steps %#x (bit 0 forced shutdown, 1 image, 2 AUTH, 3 hardware init)\n",
+ 	    vayu_pas_steps());
+-	say("vayu-ipa: bus %#x, post_auth_ms %u, sram %u, uc_read %u\n", ipa_bus_mask, ipa_post_auth_ms,
+-	    ipa_sram_fix, ipa_uc_reads);
++	say("vayu-ipa: bus %#x (core %u), post_auth_ms %u, step_ms %u/%u, sram %u write %u, uc_read %u\n",
++	    ipa_bus_mask, ipa_bus_core, ipa_post_auth_ms, ipa_step_ms, ipa_hw_step_ms, ipa_sram_fix,
++	    ipa_sram_write, ipa_uc_reads);
+ 	if ((vayu_pas_steps() & VAYU_PAS_STEP_AUTH) && !(vayu_pas_steps() & VAYU_PAS_STEP_IMAGE)) {
+ 		say("vayu-ipa: vayu_ipa_pas asks for AUTH without an image: refused\n");
+ 		return;

@@ -1,0 +1,254 @@
+Subject: [PATCH] vayu_ipa: see past AUTH_AND_RESET(15); IPA 4.1 SRAM at 0x1e47000 (opt-in)
+
+Base: /mnt/ramdisk/w23/src (Wi-Fi+BT+UFS tree, banner "n8n:src" 2026-11-01 20:53).
+Apply in an XNU tree: patch -p3 (paths xnu/files/bsd/dev/...).
+Kernel: mach-modem1.bin sha256 315615c8680b7a08d3f34df0216bb9353533965a10c413c59c091c9262253d8d.
+
+Why. Every IPA run ends with "about to ask ... smc 0x42000205" as the last kernel
+line, but vayu_pause sleeps 5 s AFTER that line and BEFORE the smc, and the loader
+snapshots every ~2 s. In 172154 the last userland line (17:23:27.12) is where the smc
+starts. So nothing after the smc is observable: "AUTH never returns" and "AUTH
+returns, then ipa_hardware_init kills the host within 2 s" look the same.
+ipa_hardware_init also writes 26 deadbeef words at 0x1e50000. On IPA v3.0..v4.2
+IPA_SW_AREA_RAM_DIRECT_ACCESS_n is 0x7000 (vayu-r-oss ipahal_reg.c:2769); 0x10000
+is the v4.5 value (:3397). So IPA 4.1 SRAM is 0x1e00000+0x40000+0x7000 = 0x1e47000.
+
+What (all behind boot-args; without them, w23 behaviour except the opt-in forced shutdown):
+- vayu_ipa_post_auth_ms=N: after AUTH returns, print "AUTH_AND_RESET(15) RETURNED",
+  sleep N ms, then read-only: IPA_VERSION, GSI_CFG/GSI_EE0_STATUS, uC shared area
+  (responseOp == 1 INIT_COMPLETED, polled 2 s). Each later IPA access is announced
+  and followed by 2.5 s ("post-auth: about to ...").
+- vayu_ipa_sram=1: canaries at 0x1e47000 + restricted instead of 0x1e50000.
+- ported from the lost H-series so the args of 0954/0956 still mean the same:
+  vayu_ipa_bus=MASK (1 SN8, 2 SH0, 4 MC0, 8 ACV; default 15), vayu_ipa_ttbrfix=1 (0012),
+  vayu_ipa_forced_shutdown=1 (0001; default now no forced SHUTDOWN(15)).
+
+Markers: "post-auth: AUTH_AND_RESET(15) RETURNED" then "post-auth: GSI READY, uC READY".
+If the last line is the smc after >8 s, AUTH really does not return (FACT, not inference).
+
+--- a/xnu/files/bsd/dev/vayu_ipa.c
++++ b/xnu/files/bsd/dev/vayu_ipa.c
+@@ -46,6 +46,11 @@
+ static bool ipa_enabled, ipa_prepared, ipa_fw_ready, ipa_smp2p_ready;
+ static uint32_t ipa_filter_item, ipa_our_item, ipa_restricted;
+ static vm_offset_t ipa_regs;
++/* vayu_ipa_bus: which bus BCMs get the IP0 word. vayu_ipa_post_auth_ms: after AUTH_AND_RESET(15)
++ * returns, wait this long and announce every later IPA access with a 2.5 s pause, so the loader's
++ * 2 s snapshots show where the host stops. vayu_ipa_sram=1: canaries in the IPA 4.1 SW SRAM
++ * window (wrapper + 0x40000 + 0x7000, ipahal_reg.c v3.0..v4.2) instead of 0x1e50000 (the v4.5 offset). */
++static uint32_t ipa_bus_mask = 15, ipa_post_auth_ms, ipa_sram_fix;
+ 
+ static int say(const char *format, ...) __printflike(1, 2);
+ static int
+@@ -168,6 +173,12 @@
+ 		return false;
+ 	}
+ 	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		/* vayu_ipa_bus=MASK (1 SN8, 2 SH0, 4 MC0, 8 ACV; absent = 15). SN8 and ACV hung the host
++		 * during the pause (runs 0941/0942/0943); SH0+MC0 (6) survived it twice (0940, 0940r). */
++		if (!(ipa_bus_mask & (1u << i))) {
++			say("vayu-ipa: bus %s not voted (vayu_ipa_bus=%u)\n", rails[i], ipa_bus_mask);
++			continue;
++		}
+ 		address = vayu_rpmh_address(rails[i]);
+ 		if (address != 0 && !vayu_rpmh_send(&address, &value, 1, "ipa bus")) {
+ 			say("vayu-ipa: bus %s vote failed; IP0 is confirmed, keeping this visible\n", rails[i]);
+@@ -181,11 +192,74 @@
+ #define RSRC(xmin, xmax, ymin, ymax) \
+ 	((uint32_t)(xmin) | (uint32_t)(xmax) << 8 | (uint32_t)(ymin) << 16 | (uint32_t)(ymax) << 24)
+ 
++#define IPA_SRAM_V41            0x1e47000u      /* 0x1e00000 + 0x40000 + IPA_SW_AREA_RAM_DIRECT_ACCESS_n v3.0..v4.2 */
++#define IPA_SRAM_OLD            0x1e50000u      /* + 0x10000: the IPA v4.5 offset */
++#define GSI_BASE                0x1e04000u
++#define UC_RESPONSE_INIT_DONE   1u              /* IPA_HW_2_CPU_RESPONSE_INIT_COMPLETED, ipa_uc.c */
++
++/* Announce the next IPA access and give the loader (2 s snapshots) time to carry the line out. */
++static void
++ipa_step(const char *what)
++{
++	if (ipa_post_auth_ms == 0) return;
++	say("vayu-ipa: post-auth: about to %s\n", what);
++	delay_for_interval(2500, NSEC_PER_MSEC);
++}
++
++/* Read-only look after AUTH_AND_RESET(15): GSI enabled by TrustZone, uC INIT_COMPLETED in the
++ * shared area at SW SRAM offset 0 (struct IpaHwSharedMemCommonMapping_t: responseOp +0xc,
++ * responseParams +0x10, hwState +0x20, interfaceVersionCommon +0x24). */
++static void
++ipa_post_auth_look(void)
++{
++	vm_offset_t gsi, uc;
++	uint32_t cfg, status, response = 0, state = 0, iface = 0;
++	uint64_t waited = 0;
++
++	if (ipa_post_auth_ms == 0) return;
++	say("vayu-ipa: post-auth: AUTH_AND_RESET(15) RETURNED; holding %u ms before any IPA access\n", ipa_post_auth_ms);
++	delay_for_interval(ipa_post_auth_ms, NSEC_PER_MSEC);
++	ipa_step("read IPA_VERSION 0x1e40034");
++	say("vayu-ipa: post-auth: IPA_VERSION %#x\n", IPA_RD(0x34));
++	gsi = ml_io_map_unmappable(GSI_BASE, 0x20000, VM_WIMG_IO);
++	if (gsi == 0) {
++		say("vayu-ipa: post-auth: GSI window did not map\n");
++		return;
++	}
++	ipa_step("read GSI_CFG 0x1e04000 and GSI_EE0_STATUS 0x1e23000");
++	cfg = *(volatile uint32_t *)(gsi + 0x0);
++	status = *(volatile uint32_t *)(gsi + 0x1f000);
++	say("vayu-ipa: post-auth: GSI_CFG %#x (enable %u), GSI_EE0_STATUS %#x (enabled %u)\n",
++	    cfg, cfg & 1, status, status & 1);
++	uc = ml_io_map_unmappable(IPA_SRAM_V41, 0x1000, VM_WIMG_IO);
++	if (uc == 0) {
++		say("vayu-ipa: post-auth: uC shared area did not map\n");
++		return;
++	}
++	ipa_step("read the uC shared area at 0x1e47000");
++	for (;;) {
++		response = *(volatile uint32_t *)(uc + 0xc) & 0xff;
++		if (response == UC_RESPONSE_INIT_DONE || waited >= 2000) break;
++		delay_for_interval(10, NSEC_PER_MSEC);
++		waited += 10;
++	}
++	state = *(volatile uint32_t *)(uc + 0x20) & 0xff;
++	iface = *(volatile uint32_t *)(uc + 0x24) & 0xffff;
++	say("vayu-ipa: post-auth: uC responseOp %#x params %#x hwState %#x interface %#x after %llu ms: %s\n",
++	    response, *(volatile uint32_t *)(uc + 0x10), state, iface, waited,
++	    response == UC_RESPONSE_INIT_DONE ? "uC INIT_COMPLETED" : "uC NOT READY");
++	say("vayu-ipa: post-auth: GSI %s, uC %s\n", (status & 1) ? "READY" : "NOT ENABLED",
++	    response == UC_RESPONSE_INIT_DONE ? "READY" : "NOT READY");
++}
++
+ static bool
+ ipa_hardware_init(void)
+ {
+ 	/* vayu-r-oss ipa3_init_hw + resource groups + route for IPA 4.1. */
+-	uint32_t v = IPA_RD(0x74);
++	uint32_t v;
++
++	ipa_step("write QSB/CLKON/BCR/COMP registers and resource groups (0x1e40000 + 0x3c..0x52c)");
++	v = IPA_RD(0x74);
+ 	IPA_WR(0x74, (v & ~0xfU) | 8);                 /* DDR QMB max writes 8 */
+ 	v = IPA_RD(0x78);
+ 	IPA_WR(0x78, (v & ~0x00ff000fU) | 12 | 120U << 16); /* DDR reads 12 of 120 */
+@@ -222,11 +296,16 @@
+ 	 * SW_AREA_RAM_DIRECT_ACCESS (0x10000) = 0x1e50000. It writes only canaries;
+ 	 * headers/proc contexts are initialized by command-GSI, not by zeroing all SRAM. */
+ 	{
+-		vm_offset_t sram = ml_io_map_unmappable(0x1e50000, 0x2800, VM_WIMG_IO);
++		uint32_t sram_pa = ipa_sram_fix == 1 ? IPA_SRAM_V41 + ipa_restricted : IPA_SRAM_OLD;
++		vm_offset_t sram;
+ 		static const uint16_t canaries[] = {
+ 			0x0288, 0x0308, 0x0388, 0x0408, 0x0488, 0x0508, 0x0588, 0x0608,
+ 			0x0688, 0x07d0, 0x0bd8, 0x0c30, 0x2400,
+ 		};
++
++		ipa_step(ipa_sram_fix == 1 ? "write SRAM canaries at 0x1e47000 (vayu_ipa_sram=1)" :
++		    "write SRAM canaries at 0x1e50000 (old v4.5 offset)");
++		sram = ml_io_map_unmappable(sram_pa, 0x2800, VM_WIMG_IO);
+ 		if (sram == 0) {
+ 			say("vayu-ipa: IPA SRAM window did not map\n");
+ 			return false;
+@@ -246,8 +325,9 @@
+ 			}
+ 		}
+ 		IPA_WR(0x1e8, ipa_restricted + 0x7d0); /* LOCAL_PKT_PROC_CNTXT_BASE */
+-		say("vayu-ipa: IPA SRAM canaries read back, proc-ctx base %#x\n", IPA_RD(0x1e8));
++		say("vayu-ipa: IPA SRAM canaries read back at %#x, proc-ctx base %#x\n", sram_pa, IPA_RD(0x1e8));
+ 	}
++	ipa_step("write the exception route 0x1e40048");
+ 	/* Exception route: LAN consumer EP10 for both normal and fragment packets.
+ 	 * This first transport drops LAN exceptions, so use no header table and do not
+ 	 * retain a header that was never installed (the old value pointed to producer EP9). */
+@@ -321,7 +401,11 @@
+ 	}
+ 	if (ipa_prepared) return;
+ 	ipa_enabled = true;
+-	say("vayu-ipa: prepare: IP0, SMEM/SMP2P, PAS ipa_fws before MPSS\n");
++	PE_parse_boot_argn("vayu_ipa_bus", &ipa_bus_mask, sizeof(ipa_bus_mask));
++	PE_parse_boot_argn("vayu_ipa_post_auth_ms", &ipa_post_auth_ms, sizeof(ipa_post_auth_ms));
++	PE_parse_boot_argn("vayu_ipa_sram", &ipa_sram_fix, sizeof(ipa_sram_fix));
++	say("vayu-ipa: prepare: IP0, SMEM/SMP2P, PAS ipa_fws before MPSS (bus %#x, post_auth_ms %u, sram %u)\n",
++	    ipa_bus_mask, ipa_post_auth_ms, ipa_sram_fix);
+ 	if (!vayu_soc_check("vayu-ipa")) {
+ 		say("vayu-ipa: not vayu's shared memory/command database\n");
+ 		return;
+@@ -357,6 +441,7 @@
+ 		vayu_pas_stop(&ipa_fw, "IPA did not come up");
+ 		return;
+ 	}
++	ipa_post_auth_look();
+ 	if (!ipa_hardware_init()) {
+ 		say("vayu-ipa: hardware/SRAM initialization failed; IPA/data stay blocked\n");
+ 		return;
+--- a/xnu/files/bsd/dev/vayu_ipa_smmu.c
++++ b/xnu/files/bsd/dev/vayu_ipa_smmu.c
+@@ -12,6 +12,7 @@
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
+ #include <mach/vm_param.h>
++#include <pexpert/pexpert.h>
+ #include <stdbool.h>
+ #include <sys/systm.h>
+ #include <vm/memory_types.h>
+@@ -53,6 +54,7 @@
+ extern uint64_t kvtophys(vm_offset_t va);
+ extern void loader_log_putc(char c);
+ extern lck_mtx_t redwood_smmu_lock;     /* QUP/Wi-Fi/audio/camera allocate the same SMRs/contexts */
++static uint32_t ipa_smmu_ttbrfix;       /* vayu_ipa_ttbrfix=1: TTBR0 from the tables after they exist */
+ 
+ static int say(const char *format, ...) __printflike(1, 2);
+ static int
+@@ -177,6 +179,16 @@
+ 	vm_offset_t second = s->second, context = s->context_base;   /* kernel VAs: 32-bit locals truncated them (run 142147) */
+ 
+ 	if (!ipa_smmu_map(s)) return false;
++	if (ipa_smmu_ttbrfix == 1) {
++		/* root above was taken while s->tables was still 0 (kvtophys(0) = 0): TTBR0 held only the ASID. */
++		root = kvtophys(s->tables) | (uint64_t)s->context << 48;
++		say("vayu-ipa: ttbrfix: SID %#x TTBR0 %#llx (tables PA %#llx)\n", s->sid,
++		    (unsigned long long)root, (unsigned long long)kvtophys(s->tables));
++		if ((root & 0x0000fffffffff000ULL) == 0) {
++			say("vayu-ipa: ttbrfix: SID %#x tables PA is 0; context not programmed\n", s->sid);
++			return false;
++		}
++	}
+ 	wr(context + SMMU_CB_SCTLR, 0);
+ 	wr(second + SMMU_CBA2R(s->context), SMMU_CBA2R_64_BIT);
+ 	wr(second + SMMU_CBAR(s->context), SMMU_CBAR_STAGE_1);
+@@ -226,6 +238,7 @@
+ 		say("vayu-ipa: application SMMU did not map\n");
+ 		return false;
+ 	}
++	PE_parse_boot_argn("vayu_ipa_ttbrfix", &ipa_smmu_ttbrfix, sizeof(ipa_smmu_ttbrfix));
+ 	idr0 = rd(base + SMMU_IDR0);
+ 	idr1 = rd(base + SMMU_IDR1);
+ 	if (rd(base + SMMU_SCR0) & (1U << 3)) {
+--- a/xnu/files/bsd/dev/vayu_pas.c
++++ b/xnu/files/bsd/dev/vayu_pas.c
+@@ -1796,13 +1796,20 @@
+ 		goto out;
+ 	}
+ 	if (rp->smp2p_theirs == 0 && rp->pas_id == 15) {
+-		/* vayu DT: qcom,pil-force-shutdown on ipa_fws. There is no IPA SMP2P
+-		 * channel with which to ask first; Android does the same forced PAS shutdown. */
+-		result = scm(rp->name, "to force-shutdown before INIT_IMAGE (qcom,pil-force-shutdown)",
+-		    SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, rp->pas_id, 0, 0, &answer);
+-		if (result != 0 || answer != 0) {
+-			say("%s: forced shutdown returned %d, answer %#llx; AUTH will provide the next result\n",
+-			    rp->name, result, answer);
++		uint32_t forced = 0;
++
++		/* vayu DT: qcom,pil-force-shutdown on ipa_fws. Opt-in (0001): vayu_ipa_forced_shutdown=1;
++		 * run 0961 showed it does not change AUTH(15). */
++		PE_parse_boot_argn("vayu_ipa_forced_shutdown", &forced, sizeof(forced));
++		if (forced == 1) {
++			result = scm(rp->name, "to force-shutdown before INIT_IMAGE (qcom,pil-force-shutdown)",
++			    SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, rp->pas_id, 0, 0, &answer);
++			if (result != 0 || answer != 0) {
++				say("%s: forced shutdown returned %d, answer %#llx; AUTH will provide the next result\n",
++				    rp->name, result, answer);
++			}
++		} else {
++			say("%s: no forced shutdown before INIT_IMAGE (vayu_ipa_forced_shutdown=0)\n", rp->name);
+ 		}
+ 		rp->started = false;
+ 	}

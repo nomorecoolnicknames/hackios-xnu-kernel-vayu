@@ -1,0 +1,2967 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Mon, 2 Nov 2026 06:30:00 +0300
+Subject: [PATCH] vayu_sms: QMI WMS client, GSM 03.40/03.38 PDU codec,
+ /dev/vayu-sms
+
+The first SMS transport on vayu: WMS 0x05 over the modem's QRTR (Set Event
+Report, Get/Set Routes, List Messages, Raw Read, Raw Send, Delete, Send Ack),
+SMS-DELIVER decode (GSM 7-bit with the extension table, UCS-2, 8-bit) and
+SMS-SUBMIT encode (GSM 7-bit or UCS-2, one segment).  The inbox and the send
+and delete actions leave through /dev/vayu-sms; bsd/sys/vayu_sms.h is the ABI.
+
+Set Routes is off by default (vayu_sms_routes=1) and never rewrites an
+existing table.  The log masks a sender to its last four digits and never
+prints text or a PDU byte.
+---
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -157,6 +157,7 @@
+ bsd/dev/vayu_rmtfs.c		standard
+ bsd/dev/vayu_cell.c		standard
+ bsd/dev/vayu_cell_data.c	standard
++bsd/dev/vayu_sms.c		standard
+ bsd/dev/vayu_gnss.c		standard
+ bsd/dev/vayu_bt.c		standard
+ bsd/dev/vayu_slpi.c		standard
+--- a/bsd/dev/vayu_modem.c
++++ b/bsd/dev/vayu_modem.c
+@@ -89,6 +89,7 @@
+ #include <sys/vayu_modem.h>
+ #include <sys/vayu_pas.h>
+ #include <sys/vayu_rmtfs.h>
++#include <sys/vayu_sms.h>
+ #include <sys/vayu_wifi.h>
+ 
+ extern kern_return_t thread_terminate(thread_t thread);
+@@ -301,6 +302,7 @@
+ 	vayu_rmtfs_start(&qrtr);
+ 	vayu_ipa_start(&qrtr);
+ 	vayu_cell_start(&qrtr);		/* vayu_cell=N: SIM/network; changes gated by vayu_cell_* args */
++	vayu_sms_start(&qrtr);		/* vayu_sms=1: WMS client, inbox, /dev/vayu-sms */
+ 	vayu_gnss_start(&qrtr);		/* vayu_gnss=1: the modem's GNSS engine (bsd/dev/vayu_gnss.c) */
+ 	vayu_wifi_start(&qrtr, listen_s);
+ 	for (s = 1; s <= listen_s; s++) {
+@@ -331,6 +333,7 @@
+ 		say("vayu-modem: 3: WLFW (0x45) is not there\n");
+ 	}
+ 	vayu_gnss_stop();
++	vayu_sms_stop();
+ 	vayu_cell_stop();
+ 	vayu_wifi_stop();
+ 	vayu_ipa_stop();
+--- /dev/null
++++ b/bsd/dev/vayu_sms.c
+@@ -0,0 +1,1361 @@
++/*
++ * SMS on vayu, the first stage: a QMI WMS client of the modem's service 0x05 over
++ * QRTR, a small inbox in the kernel, and /dev/vayu-sms for a userland tool.
++ *
++ * What it asks, and why:
++ *   WMS 0x05  Get Routes       0x0033   read-only; the table is logged
++ *   WMS 0x05  Set Routes       0x0032   only under vayu_sms_routes=1, and only when
++ *                                      Get Routes returned an empty table: class 0
++ *                                      and 1, UIM storage, STORE_AND_NOTIFY
++ *   WMS 0x05  Set Event Report 0x0001   new-MT-message indications on
++ *   WMS 0x05  List Messages    0x0031   the stored messages, for the initial sweep
++ *                                      and `sms refresh`
++ *   WMS 0x05  Raw Read         0x0022   one stored message by storage/index
++ *   WMS 0x05  Raw Send         0x0020   one SMS-SUBMIT PDU built here
++ *   WMS 0x05  Delete           0x0024   one stored message the user asked to remove
++ *   WMS 0x05  Send Ack         0x0037   only when a transfer route (TLV 0x11) says
++ *                                      an acknowledgement is owed
++ *
++ * The event report and Raw Read carry a complete GSM 03.40 PDU; bsd/sys/
++ * vayu_sms_qmi.h decodes SMS-DELIVER (GSM 7-bit with the extension table, UCS-2,
++ * 8-bit) and builds SMS-SUBMIT (GSM 7-bit or UCS-2, one segment).  A UDH
++ * concatenation header is reported, but the segments are stored one by one: no
++ * reassembly queue exists in this stage.
++ *
++ * The userland interface is /dev/vayu-sms (0666): read() returns the inbox count
++ * record, ioctl() COUNT/GET reads it message by message, SEND sends one short
++ * message, DELETE removes one stored message, REFRESH sweeps one storage, STATUS
++ * reports the counters.  bsd/sys/vayu_sms.h has the ABI.
++ *
++ * Privacy: the kernel log masks a sender to its last four digits and never prints
++ * text, a PDU byte, SMSC, IMSI, ICCID or IMEI.  The inbox has the full number and
++ * text because that is what the device is for.
++ *
++ * Boot-args: vayu_sms=0/1 (default 0), vayu_sms_wait=S (30), vayu_sms_routes=1,
++ * vayu_sms_store=0|1 (UIM|NV), vayu_sms_refresh=S (60, 0 off), vayu_sms_scan=N
++ * (20, the largest index Raw Read sweeps when List Messages is refused).
++ *
++ * Facts behind the numbers: service 0x05, the message ids and the TLV layouts are
++ * libqmi's data/qmi-service-wms.json (master, read 2026-11-02); the enums are
++ * src/libqmi-glib/qmi-enums-wms.h of the same.  The QMI coding and QRTR transport
++ * are sys/hakios.qmi.h and sys/hakios.qrtr.h (the same ones vayu_cell.c uses).
++ *
++ * What is NOT known until it runs on the phone (HYPOTHESIS): that this modem's WMS
++ * accepts List Messages with only a storage TLV; how many slots it reports; whether
++ * its existing route table delivers class 1 through a store route or a transfer
++ * route; and that its SIM has room for the message being received.  Each failure is
++ * one log line and nothing is guessed in its place.
++ */
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <miscfs/devfs/devfs.h>
++#include <pexpert/pexpert.h>
++#include <stdbool.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/hakios.qmi.h>
++#include <sys/hakios.qrtr.h>
++#include <sys/systm.h>
++#include <sys/uio.h>
++#include <sys/vayu_pas.h>
++#include <sys/vayu_sms.h>
++#include <sys/vayu_sms_qmi.h>
++
++extern void loader_log_putc(char c);
++
++#define SMS_DEVICE              "vayu-sms"
++#define SMS_HANDLE_MAX          4096    /* the largest datagram the QMI handle takes */
++#define SMS_REPLY_MS            5000    /* one WMS request's reply */
++#define SMS_SEND_REPLY_MS       15000   /* Raw Send waits for the network's answer */
++#define SMS_STOP_MS             20000   /* one Raw Send may take 15 s; let it finish */
++#define SMS_EVENT_QUEUE         4
++#define SMS_NUMBER_TAIL         8
++
++/* ---- state --------------------------------------------------------------------------------------- */
++
++struct sms_event {
++	uint8_t storage;
++	uint32_t index;
++	uint8_t tag;
++	bool have_mt;
++	bool have_route;
++	uint8_t ack;
++	uint32_t transaction;
++	uint8_t format;
++	uint32_t raw_length;
++	uint8_t raw[VAYU_SMS_PDU_MAX];
++};
++
++enum sms_job_kind {
++	SMS_JOB_NONE = 0,
++	SMS_JOB_SEND,
++	SMS_JOB_DELETE,
++	SMS_JOB_REFRESH,
++};
++
++struct sms_job {
++	uint32_t kind;
++	char number[VAYU_SMS_NUMBER_MAX];
++	uint32_t text_length;
++	char text[VAYU_SMS_TEXT_MAX];
++	uint32_t seq;
++	uint32_t storage;
++};
++
++struct sms_state {
++	struct qmi_handle qmi;
++	bool qmi_up;
++	volatile bool wms_there, stop, running, started;
++	uint32_t node, port, version, instance, generation;
++	uint32_t level, wait_s, routes_arg, store, refresh_s, scan_max;
++	uint64_t next_refresh_ms, next_config_ms;
++	/* the worker's inbox and the counters the device reports */
++	struct vayu_sms_message inbox[VAYU_SMS_INBOX];
++	uint32_t inbox_count, inbox_unread, next_seq;
++	uint32_t state;
++	bool event_report, routes_known, routes_written;
++	uint32_t route_count;
++	uint32_t received, sent, deleted, dropped;
++	uint32_t requests, failures;
++	uint32_t last_result, last_error, last_message, last_gsm_cause, last_failure;
++	uint8_t mr;
++	/* one control job at a time; the worker is its only executor */
++	bool job_pending, job_busy, job_done;
++	struct sms_job job, job_running;
++	int job_result;
++	uint32_t job_message_id, job_mr, job_pdu_length;
++	/* the indications, copied off the QRTR thread */
++	struct sms_event event[SMS_EVENT_QUEUE];
++	uint32_t event_head, event_tail;
++	bool work;
++};
++
++static struct sms_state sms;
++
++static LCK_GRP_DECLARE(vayu_sms_lck_grp, "vayu-sms");
++static LCK_MTX_DECLARE(vayu_sms_lock, &vayu_sms_lck_grp);
++
++static int say(const char *format, ...) __printflike(1, 2);
++
++static int
++say(const char *format, ...)
++{
++	char line[300];
++	va_list list;
++	int length;
++
++	va_start(list, format);
++	length = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	printf("%s", line);
++	return length;
++}
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t uptime, nanoseconds;
++
++	clock_get_uptime(&uptime);
++	absolutetime_to_nanoseconds(uptime, &nanoseconds);
++	return nanoseconds / NSEC_PER_MSEC;
++}
++
++/* ---- the QMI client ------------------------------------------------------------------------------ */
++
++static int
++sms_new_server(struct qmi_handle *qmi __unused, struct qmi_service *service)
++{
++	if (service->service != VAYU_SMS_QMI_WMS_SERVICE) {
++		return -1;
++	}
++	lck_mtx_lock(&vayu_sms_lock);
++	sms.node = service->node;
++	sms.port = service->port;
++	sms.version = service->version;
++	sms.instance = service->instance;
++	sms.wms_there = true;
++	sms.generation++;
++	if (sms.state < VAYU_SMS_STATE_CONFIGURING) {
++		sms.state = VAYU_SMS_STATE_CONFIGURING;
++	}
++	sms.work = true;
++	wakeup(&sms.work);
++	lck_mtx_unlock(&vayu_sms_lock);
++	return 0;
++}
++
++static void
++sms_del_server(struct qmi_handle *qmi __unused, struct qmi_service *service)
++{
++	lck_mtx_lock(&vayu_sms_lock);
++	if (service->service == VAYU_SMS_QMI_WMS_SERVICE && service->node == sms.node && service->port == sms.port) {
++		sms.wms_there = false;
++		sms.event_report = false;
++		sms.routes_known = false;
++		sms.state = VAYU_SMS_STATE_WAITING;
++	}
++	lck_mtx_unlock(&vayu_sms_lock);
++}
++
++static const struct qmi_ops sms_qmi_ops = {
++	.new_server = sms_new_server,
++	.del_server = sms_del_server,
++};
++
++/*
++ * One request and its reply, waited `timeout` ms.  Called only from the worker
++ * thread: an indication callback must never wait (its reply is delivered by the
++ * same QRTR thread).  `quiet` suppresses the log and the failure counter for an
++ * expected refusal (an empty Raw Read slot, for instance).
++ */
++static int
++sms_request(const char *what, uint16_t message, const struct qmi_elem_info *req_ei, const void *req,
++    const struct qmi_elem_info *resp_ei, void *resp, struct vayu_sms_qmi_result *result, uint32_t timeout, bool quiet)
++{
++	struct sockaddr_qrtr to = { .sq_family = AF_QIPCRTR, .sq_node = sms.node, .sq_port = sms.port };
++	struct qmi_txn txn;
++	int ret;
++
++	if (sms.stop) {
++		return -ECANCELED;
++	}
++	sms.requests++;
++	ret = qmi_txn_init(&sms.qmi, &txn, resp_ei, resp);
++	if (ret < 0) {
++		sms.failures++;
++		if (!quiet) {
++			say("vayu-sms: %s: no transaction: %d\n", what, ret);
++		}
++		return ret;
++	}
++	ret = qmi_send_request(&sms.qmi, &to, &txn, message, VAYU_SMS_QMI_REQUEST_MAX, req_ei, req);
++	if (ret < 0) {
++		qmi_txn_cancel(&txn);
++		sms.failures++;
++		if (!quiet) {
++			say("vayu-sms: %s: cannot send: %d\n", what, ret);
++		}
++		return ret;
++	}
++	ret = hakios_qmi_txn_wait_ms(&txn, timeout);
++	if (ret < 0) {
++		sms.failures++;
++		if (!quiet) {
++			if (ret == -ETIMEDOUT) {
++				say("vayu-sms: %s: no reply in %u ms\n", what, timeout);
++			} else {
++				say("vayu-sms: %s: the reply cannot be decoded (%d)\n", what, ret);
++			}
++		}
++		return ret;
++	}
++	if (result != NULL) {
++		if (!quiet) {
++			sms.last_result = result->result;
++			sms.last_error = result->error;
++			sms.last_message = message;
++		}
++		if (result->result != QMI_RESULT_SUCCESS_V01 || result->error != QMI_ERR_NONE_V01) {
++			if (!quiet) {
++				sms.failures++;         /* an empty Raw Read slot is expected, not a failure */
++			}
++			if (!quiet) {
++				say("vayu-sms: %s: the modem says result %u error %u\n", what,
++				    (unsigned int)result->result, (unsigned int)result->error);
++			}
++			return -EIO;
++		}
++	}
++	return 0;
++}
++
++/* ---- the log's view of a number ------------------------------------------------------------------ */
++
++/* Only the last four digits: "...0986".  A short or alphanumeric sender is "...". */
++static void
++sms_mask_tail(const char *number, char out[SMS_NUMBER_TAIL])
++{
++	size_t length = strlen(number);
++	size_t kept = 0;
++
++	out[0] = '.'; out[1] = '.'; out[2] = '.';
++	if (length >= 5) {
++		for (size_t i = length; i > 0 && kept < 4; i--) {
++			if (number[i - 1] < '0' || number[i - 1] > '9') {
++				break;
++			}
++			kept++;
++		}
++	}
++	for (size_t i = 0; i < kept; i++) {
++		out[3 + i] = number[length - kept + i];
++	}
++	out[3 + kept] = 0;
++}
++
++/* ---- the inbox ----------------------------------------------------------------------------------- */
++
++static struct vayu_sms_message *
++sms_find_locked(uint8_t storage, uint32_t index)
++{
++	for (uint32_t i = 0; i < VAYU_SMS_INBOX; i++) {
++		if (sms.inbox[i].seq != 0 && sms.inbox[i].storage == storage && sms.inbox[i].index == index) {
++			return &sms.inbox[i];
++		}
++	}
++	return NULL;
++}
++
++/* A free slot, or the oldest message's (the inbox is a 16-message window). */
++static struct vayu_sms_message *
++sms_slot_locked(void)
++{
++	struct vayu_sms_message *oldest = &sms.inbox[0];
++
++	for (uint32_t i = 0; i < VAYU_SMS_INBOX; i++) {
++		if (sms.inbox[i].seq == 0) {
++			return &sms.inbox[i];
++		}
++		if (sms.inbox[i].seq < oldest->seq) {
++			oldest = &sms.inbox[i];
++		}
++	}
++	return oldest;
++}
++
++/*
++ * Decode one deliver PDU and put it in the inbox.  A stored message (a real
++ * storage and index) replaces the earlier copy of that slot, keeping its seq; a
++ * transferred one (storage 0xff) always gets a new seq.  No text or number is
++ * logged.
++ */
++static void
++sms_store_pdu(uint8_t storage, uint32_t index, uint8_t tag, const uint8_t *pdu, uint32_t length)
++{
++	struct vayu_sms_deliver deliver;
++	struct vayu_sms_message message, *slot;
++	char tail[SMS_NUMBER_TAIL];
++	int ret;
++
++	ret = vayu_sms_pdu_decode_deliver(pdu, length, &deliver);
++	if (ret != VAYU_SMS_OK) {
++		sms.dropped++;
++		say("vayu-sms: one PDU from storage %u index %u is not decoded: %d; dropped\n",
++		    (unsigned int)storage, (unsigned int)index, ret);
++		return;
++	}
++	memset(&message, 0, sizeof(message));
++	message.storage = storage;
++	message.index = index;
++	message.tag = tag;
++	message.alphabet = deliver.alphabet;
++	if (deliver.originator.alphanumeric) {
++		message.flags |= VAYU_SMS_F_ALPHANUMERIC;
++	}
++	if (deliver.concatenated) {
++		message.flags |= VAYU_SMS_F_MULTIPART;
++	}
++	if (deliver.alphabet == VAYU_SMS_ALPHABET_UCS2) {
++		message.flags |= VAYU_SMS_F_UCS2;
++	} else if (deliver.alphabet == VAYU_SMS_ALPHABET_8BIT) {
++		message.flags |= VAYU_SMS_F_8BIT;
++	}
++	message.number_length = deliver.originator.length;
++	if (message.number_length >= sizeof(message.number)) {
++		message.number_length = sizeof(message.number) - 1;
++	}
++	memcpy(message.number, deliver.originator.text, message.number_length);
++	message.number[message.number_length] = 0;
++	memcpy(message.timestamp, deliver.timestamp, sizeof(message.timestamp));
++	message.timestamp[sizeof(message.timestamp) - 1] = 0;
++	message.text_length = deliver.text_length;
++	if (message.text_length >= sizeof(message.text)) {
++		message.text_length = sizeof(message.text) - 1;
++	}
++	memcpy(message.text, deliver.text, message.text_length);
++	message.text[message.text_length] = 0;
++	message.received_ms = now_ms();
++
++	lck_mtx_lock(&vayu_sms_lock);
++	slot = storage != VAYU_SMS_QMI_STORAGE_NONE ? sms_find_locked(storage, index) : NULL;
++	if (slot != NULL && slot->text_length == message.text_length &&
++	    slot->number_length == message.number_length &&
++	    memcmp(slot->text, message.text, message.text_length) == 0 &&
++	    memcmp(slot->number, message.number, message.number_length) == 0 &&
++	    memcmp(slot->timestamp, message.timestamp, sizeof(message.timestamp)) == 0) {
++		/* the periodic sweep read the same slot again: not a new message */
++		if (slot->tag == VAYU_SMS_QMI_TAG_MT_NOT_READ && message.tag != VAYU_SMS_QMI_TAG_MT_NOT_READ) {
++			sms.inbox_unread--;
++		} else if (slot->tag != VAYU_SMS_QMI_TAG_MT_NOT_READ && message.tag == VAYU_SMS_QMI_TAG_MT_NOT_READ) {
++			sms.inbox_unread++;
++		}
++		slot->received_ms = message.received_ms;
++		slot->tag = message.tag;
++		lck_mtx_unlock(&vayu_sms_lock);
++		return;
++	}
++	if (slot != NULL) {
++		if (slot->tag == VAYU_SMS_QMI_TAG_MT_NOT_READ) {
++			sms.inbox_unread--;
++		}
++		message.seq = slot->seq;
++		*slot = message;
++	} else {
++		slot = sms_slot_locked();
++		if (slot->seq != 0) {
++			sms.inbox_count--;
++			if (slot->tag == VAYU_SMS_QMI_TAG_MT_NOT_READ) {
++				sms.inbox_unread--;
++			}
++		}
++		message.seq = sms.next_seq++;
++		*slot = message;
++		sms.inbox_count++;
++	}
++	if (message.tag == VAYU_SMS_QMI_TAG_MT_NOT_READ) {
++		sms.inbox_unread++;
++	}
++	sms.received++;
++	lck_mtx_unlock(&vayu_sms_lock);
++
++	if (message.flags & VAYU_SMS_F_ALPHANUMERIC) {
++		say("vayu-sms: message %u from an alphanumeric sender, %u bytes, %s, at %s%s\n",
++		    (unsigned int)message.seq, (unsigned int)message.text_length,
++		    message.alphabet == VAYU_SMS_ALPHABET_UCS2 ? "UCS-2" : "GSM 7-bit",
++		    message.timestamp[0] != 0 ? message.timestamp : "(no time)",
++		    (message.flags & VAYU_SMS_F_MULTIPART) ? ", multipart segment" : "");
++	} else {
++		sms_mask_tail(message.number, tail);
++		say("vayu-sms: message %u from %s, %u bytes, %s, at %s%s\n",
++		    (unsigned int)message.seq, tail, (unsigned int)message.text_length,
++		    message.alphabet == VAYU_SMS_ALPHABET_UCS2 ? "UCS-2" :
++		    message.alphabet == VAYU_SMS_ALPHABET_8BIT ? "8-bit" : "GSM 7-bit",
++		    message.timestamp[0] != 0 ? message.timestamp : "(no time)",
++		    (message.flags & VAYU_SMS_F_MULTIPART) ? ", multipart segment" : "");
++	}
++}
++
++/* ---- WMS conversations (worker thread only) ------------------------------------------------------- */
++
++static int
++sms_raw_read(uint8_t storage, uint32_t index, struct vayu_sms_qmi_raw_read_resp *response, bool quiet)
++{
++	struct vayu_sms_qmi_raw_read_req request;
++
++	memset(&request, 0, sizeof(request));
++	request.id.storage = storage;
++	request.id.index = index;
++	request.mode_valid = 1;
++	request.mode = VAYU_SMS_QMI_MODE_GSM;
++	memset(response, 0, sizeof(*response));
++	return sms_request("raw read", VAYU_SMS_QMI_RAW_READ, vayu_sms_qmi_raw_read_req_ei, &request,
++	    vayu_sms_qmi_raw_read_resp_ei, response, &response->result, quiet ? 2000 : SMS_REPLY_MS, quiet);
++}
++
++/* One stored message: read it and decode it.  Returns 1 when a message was stored. */
++static int
++sms_read_index(uint8_t storage, uint32_t index, bool quiet)
++{
++	struct vayu_sms_qmi_raw_read_resp response;
++	int ret;
++
++	ret = sms_raw_read(storage, index, &response, quiet);
++	if (ret != 0 || !response.raw_valid) {
++		return ret == -ETIMEDOUT ? -ETIMEDOUT : 0;
++	}
++	if (response.raw.format != VAYU_SMS_QMI_FORMAT_GSM_P2P) {
++		if (!quiet) {
++			say("vayu-sms: storage %u index %u holds format %u, not a GSM point-to-point message; skipped\n",
++			    (unsigned int)storage, (unsigned int)index, (unsigned int)response.raw.format);
++		}
++		return 0;
++	}
++	if (response.raw.tag != VAYU_SMS_QMI_TAG_MT_READ && response.raw.tag != VAYU_SMS_QMI_TAG_MT_NOT_READ) {
++		return 0;                       /* an MO message: not the inbox's business */
++	}
++	if (response.raw.raw_length == 0 || response.raw.raw_length > VAYU_SMS_PDU_MAX) {
++		sms.dropped++;
++		return 0;
++	}
++	sms_store_pdu(storage, index, response.raw.tag, response.raw.raw, response.raw.raw_length);
++	return 1;
++}
++
++/*
++ * List Messages, then Raw Read every MT entry.  When the modem refuses List
++ * (some firmware does without a tag), sweep the first vayu_sms_scan indices
++ * instead.  The List reply's count prefix is 32 bits, so its TLV was captured
++ * opaque by sys/vayu_sms_qmi.h and is parsed here.
++ */
++static uint32_t
++sms_refresh_store(uint8_t storage, bool quiet)
++{
++	struct vayu_sms_qmi_list_req request = { .storage = storage };
++	struct vayu_sms_qmi_list_resp response;
++	struct vayu_sms_qmi_message_list list;
++	uint32_t found = 0;
++	int ret;
++
++	memset(&response, 0, sizeof(response));
++	ret = sms_request("list messages", VAYU_SMS_QMI_LIST_MESSAGES, vayu_sms_qmi_list_req_ei, &request,
++	    vayu_sms_qmi_list_resp_ei, &response, &response.result, SMS_REPLY_MS, quiet);
++	if (ret == 0 && response.list_valid) {
++		uint32_t count = vayu_sms_le32((const uint8_t *)response.list);
++		size_t payload = 4u + (size_t)count * 5u;
++
++		if (payload > sizeof(response.list) ||
++		    vayu_sms_qmi_list_parse(response.list, payload, &list) != VAYU_SMS_OK) {
++			say("vayu-sms: list messages: the list TLV does not parse; nothing read from it\n");
++		} else {
++			if (!quiet) {
++				say("vayu-sms: storage %u lists %u message(s)\n", (unsigned int)storage,
++				    (unsigned int)list.count);
++			}
++			for (uint32_t i = 0; i < list.count; i++) {
++				if (sms.stop) {
++					break;
++				}
++				if (list.entry[i].tag != VAYU_SMS_QMI_TAG_MT_READ &&
++				    list.entry[i].tag != VAYU_SMS_QMI_TAG_MT_NOT_READ) {
++					continue;
++				}
++				if (sms_read_index(storage, list.entry[i].index, true) > 0) {
++					found++;
++				}
++			}
++			return found;
++		}
++	} else if (!quiet) {
++		say("vayu-sms: list messages is not answered; sweeping the first %u indices of storage %u\n",
++		    (unsigned int)sms.scan_max, (unsigned int)storage);
++	}
++	{
++		uint32_t timeouts = 0;
++
++		for (uint32_t index = 0; index < sms.scan_max && !sms.stop; index++) {
++			int result = sms_read_index(storage, index, true);
++
++			if (result == -ETIMEDOUT) {
++				if (++timeouts >= 3) {
++					say("vayu-sms: storage %u: three Raw Reads in a row timed out at index %u; sweep stops\n",
++					    (unsigned int)storage, (unsigned int)index);
++					break;
++				}
++			} else {
++				timeouts = 0;
++			}
++			if (result > 0) {
++				found++;
++			}
++		}
++	}
++	if (!quiet) {
++		say("vayu-sms: storage %u: %u message(s) read\n", (unsigned int)storage, (unsigned int)found);
++	}
++	return found;
++}
++
++static const char *
++sms_action_name(uint8_t action)
++{
++	switch (action) {
++	case VAYU_SMS_QMI_RECEIPT_DISCARD: return "discard";
++	case VAYU_SMS_QMI_RECEIPT_STORE: return "store-and-notify";
++	case VAYU_SMS_QMI_RECEIPT_TRANSFER: return "transfer-only";
++	case VAYU_SMS_QMI_RECEIPT_TRANSFER_ACK: return "transfer-and-ack";
++	default: return "?";
++	}
++}
++
++/* Get Routes; install a store route only when the table is empty and explicitly allowed. */
++static void
++sms_configure_routes(void)
++{
++	struct vayu_sms_qmi_get_routes_resp routes;
++	int ret;
++
++	memset(&routes, 0, sizeof(routes));
++	ret = sms_request("get routes", VAYU_SMS_QMI_GET_ROUTES, NULL, NULL, vayu_sms_qmi_get_routes_resp_ei,
++	    &routes, &routes.result, SMS_REPLY_MS, false);
++	if (ret != 0 || !routes.routes_valid) {
++		say("vayu-sms: get routes gave no table; incoming messages depend on the modem's own table\n");
++		return;
++	}
++	sms.routes_known = true;
++	sms.route_count = routes.routes.count;
++	say("vayu-sms: %u route(s)%s\n", (unsigned int)routes.routes.count,
++	    routes.routes.count == 0 ? " (empty)" : "");
++	for (uint32_t i = 0; i < routes.routes.count && i < VAYU_SMS_ROUTE_MAX; i++) {
++		say("vayu-sms: route %u: type %u, class %u, storage %u, action %s\n", (unsigned int)i + 1,
++		    (unsigned int)routes.routes.route[i].message_type,
++		    (unsigned int)routes.routes.route[i].message_class,
++		    (unsigned int)routes.routes.route[i].storage,
++		    sms_action_name(routes.routes.route[i].receipt_action));
++	}
++	if (routes.routes.count != 0) {
++		return;                         /* never rewrite a table that exists */
++	}
++	if (sms.routes_arg != 1) {
++		say("vayu-sms: the route table is empty and vayu_sms_routes=0: Set Routes is not sent\n");
++		return;
++	}
++	{
++		struct vayu_sms_qmi_set_routes_req request;
++		struct vayu_sms_qmi_result_resp response;
++
++		memset(&request, 0, sizeof(request));
++		request.routes.count = 2;
++		request.routes.route[0].message_type = VAYU_SMS_QMI_TYPE_P2P;
++		request.routes.route[0].message_class = VAYU_SMS_QMI_CLASS_0;
++		request.routes.route[0].storage = VAYU_SMS_QMI_STORAGE_UIM;
++		request.routes.route[0].receipt_action = VAYU_SMS_QMI_RECEIPT_STORE;
++		request.routes.route[1] = request.routes.route[0];
++		request.routes.route[1].message_class = VAYU_SMS_QMI_CLASS_1;
++		memset(&response, 0, sizeof(response));
++		say("vayu-sms: vayu_sms_routes=1: Set Routes class 0 and 1, UIM, store-and-notify\n");
++		ret = sms_request("set routes", VAYU_SMS_QMI_SET_ROUTES, vayu_sms_qmi_set_routes_req_ei, &request,
++		    vayu_sms_qmi_result_resp_ei, &response, &response.result, SMS_REPLY_MS, false);
++		if (ret != 0) {
++			say("vayu-sms: set routes was refused; incoming messages depend on the modem's table\n");
++			return;
++		}
++		sms.routes_written = true;
++		/* verify what the modem now says, without trusting the write's echo */
++		memset(&routes, 0, sizeof(routes));
++		ret = sms_request("get routes after set", VAYU_SMS_QMI_GET_ROUTES, NULL, NULL,
++		    vayu_sms_qmi_get_routes_resp_ei, &routes, &routes.result, SMS_REPLY_MS, false);
++		if (ret == 0 && routes.routes_valid) {
++			sms.route_count = routes.routes.count;
++			say("vayu-sms: set routes: %u route(s) now\n", (unsigned int)routes.routes.count);
++		}
++	}
++}
++
++static void
++sms_configure_events(void)
++{
++	struct vayu_sms_qmi_set_event_req request = { .report = 1 };
++	struct vayu_sms_qmi_result_resp response;
++	int ret;
++
++	memset(&response, 0, sizeof(response));
++	ret = sms_request("set event report", VAYU_SMS_QMI_SET_EVENT_REPORT, vayu_sms_qmi_set_event_report_req_ei,
++	    &request, vayu_sms_qmi_result_resp_ei, &response, &response.result, SMS_REPLY_MS, false);
++	lck_mtx_lock(&vayu_sms_lock);
++	sms.event_report = ret == 0;
++	sms.state = ret == 0 ? VAYU_SMS_STATE_READY : VAYU_SMS_STATE_FAILED;
++	lck_mtx_unlock(&vayu_sms_lock);
++	say("vayu-sms: new-MT-message event report: %s\n", ret == 0 ? "accepted" : "refused");
++}
++
++/* ---- indications --------------------------------------------------------------------------------- */
++
++static void
++sms_event_indication(struct qmi_handle *qmi __unused, struct sockaddr_qrtr *sq __unused, struct qmi_txn *txn __unused,
++    const void *decoded)
++{
++	const struct vayu_sms_qmi_event_report *report = decoded;
++	struct sms_event *event;
++	uint32_t next;
++
++	if (!report->mt_valid && !report->route_valid) {
++		return;
++	}
++	lck_mtx_lock(&vayu_sms_lock);
++	if (sms.stop || !sms.wms_there) {
++		lck_mtx_unlock(&vayu_sms_lock);
++		return;
++	}
++	next = (sms.event_head + 1) % SMS_EVENT_QUEUE;
++	if (next == sms.event_tail) {
++		sms.dropped++;
++		lck_mtx_unlock(&vayu_sms_lock);
++		return;
++	}
++	event = &sms.event[sms.event_head];
++	memset(event, 0, sizeof(*event));
++	event->storage = VAYU_SMS_QMI_STORAGE_NONE;
++	if (report->mt_valid) {
++		event->have_mt = true;
++		event->storage = report->mt.storage;
++		event->index = report->mt.index;
++	}
++	if (report->route_valid) {
++		event->have_route = true;
++		event->ack = report->route.ack;
++		event->transaction = report->route.transaction;
++		event->format = report->route.format;
++		event->raw_length = report->route.raw_length;
++		if (event->raw_length > sizeof(event->raw)) {
++			event->raw_length = sizeof(event->raw);
++		}
++		memcpy(event->raw, report->route.raw, event->raw_length);
++	}
++	event->tag = VAYU_SMS_QMI_TAG_MT_NOT_READ;
++	sms.event_head = next;
++	sms.work = true;
++	wakeup(&sms.work);
++	lck_mtx_unlock(&vayu_sms_lock);
++}
++
++static const struct qmi_msg_handler sms_handlers[] = {
++	{
++		.type = QMI_INDICATION,
++		.msg_id = VAYU_SMS_QMI_EVENT_REPORT,
++		.ei = vayu_sms_qmi_event_report_ei,
++		.decoded_size = sizeof(struct vayu_sms_qmi_event_report),
++		.fn = sms_event_indication,
++	},
++	{ .fn = NULL },
++};
++
++/* ---- sending and deleting (worker thread) --------------------------------------------------------- */
++
++static void
++sms_send_ack(uint32_t transaction, bool success)
++{
++	struct vayu_sms_qmi_send_ack_req request;
++	struct vayu_sms_qmi_result_resp response;
++
++	memset(&request, 0, sizeof(request));
++	request.info.transaction = transaction;
++	request.info.protocol = 1;              /* QMI_WMS_MESSAGE_PROTOCOL_WCDMA */
++	request.info.success = success ? 1 : 0;
++	memset(&response, 0, sizeof(response));
++	(void)sms_request("send ack", VAYU_SMS_QMI_SEND_ACK, vayu_sms_qmi_send_ack_req_ei, &request,
++	    vayu_sms_qmi_result_resp_ei, &response, &response.result, SMS_REPLY_MS, true);
++}
++
++static int
++sms_do_send(const char *number, const char *text, uint32_t text_length, uint32_t *message_id, uint32_t *reference,
++    uint32_t *pdu_length)
++{
++	uint8_t pdu[VAYU_SMS_PDU_MAX];
++	struct vayu_sms_qmi_raw_send_req request;
++	struct vayu_sms_qmi_raw_send_resp response;
++	size_t length = 0;
++	uint32_t dcs = 0;
++	uint8_t mr = sms.mr++;
++	int ret;
++
++	ret = vayu_sms_pdu_encode_submit(number, text, text_length, mr, pdu, sizeof(pdu), &length, &dcs);
++	if (ret != VAYU_SMS_OK) {
++		say("vayu-sms: send: the PDU encoder refused the message (%d) for %u bytes of %s text\n", ret,
++		    (unsigned int)text_length, dcs == 0x08 ? "UCS-2" : "GSM 7-bit");
++		return ret == VAYU_SMS_ERR_TOO_LONG ? -EMSGSIZE : -EINVAL;
++	}
++	if (vayu_sms_qmi_raw_send_fill(&request, pdu, length) != VAYU_SMS_OK) {
++		return -EMSGSIZE;
++	}
++	memset(&response, 0, sizeof(response));
++	ret = sms_request("raw send", VAYU_SMS_QMI_RAW_SEND, vayu_sms_qmi_raw_send_req_ei, &request,
++	    vayu_sms_qmi_raw_send_resp_ei, &response, &response.result, SMS_SEND_REPLY_MS, false);
++	if (ret != 0) {
++		if (response.cause_valid) {
++			sms.last_gsm_cause = response.cause.rp_cause;
++			say("vayu-sms: raw send refused: GSM cause %u, TP cause %u\n",
++			    (unsigned int)response.cause.rp_cause, (unsigned int)response.cause.tp_cause);
++		}
++		return -EIO;
++	}
++	*message_id = response.message_id_valid ? response.message_id : 0;
++	*reference = mr;
++	*pdu_length = (uint32_t)length;
++	sms.sent++;
++	say("vayu-sms: one message sent: PDU %u bytes, %s, message id %u, MR %u\n", (unsigned int)length,
++	    dcs == 0x08 ? "UCS-2" : "GSM 7-bit", (unsigned int)*message_id, (unsigned int)mr);
++	return 0;
++}
++
++static int
++sms_do_delete(uint32_t seq)
++{
++	struct vayu_sms_qmi_delete_req request;
++	struct vayu_sms_qmi_result_resp response;
++	struct vayu_sms_message *message = NULL;
++	uint32_t slot = 0;
++	int ret;
++
++	lck_mtx_lock(&vayu_sms_lock);
++	for (uint32_t i = 0; i < VAYU_SMS_INBOX; i++) {
++		if (sms.inbox[i].seq == seq) {
++			message = &sms.inbox[i];
++			slot = i;
++			break;
++		}
++	}
++	if (message == NULL) {
++		lck_mtx_unlock(&vayu_sms_lock);
++		return -ENOENT;
++	}
++	if (message->storage == VAYU_SMS_QMI_STORAGE_NONE) {
++		lck_mtx_unlock(&vayu_sms_lock);
++		return -EOPNOTSUPP;             /* a transferred message has no storage slot */
++	}
++	memset(&request, 0, sizeof(request));
++	request.storage = (uint8_t)message->storage;
++	request.index = message->index;
++	request.tag = (uint8_t)message->tag;
++	lck_mtx_unlock(&vayu_sms_lock);
++
++	memset(&response, 0, sizeof(response));
++	ret = sms_request("delete", VAYU_SMS_QMI_DELETE, vayu_sms_qmi_delete_req_ei, &request,
++	    vayu_sms_qmi_result_resp_ei, &response, &response.result, SMS_REPLY_MS, false);
++	if (ret != 0) {
++		return -EIO;
++	}
++	lck_mtx_lock(&vayu_sms_lock);
++	if (sms.inbox[slot].seq == seq) {
++		if (sms.inbox[slot].tag == VAYU_SMS_QMI_TAG_MT_NOT_READ) {
++			sms.inbox_unread--;
++		}
++		memset(&sms.inbox[slot], 0, sizeof(sms.inbox[slot]));
++		sms.inbox_count--;
++		sms.deleted++;
++	}
++	lck_mtx_unlock(&vayu_sms_lock);
++	say("vayu-sms: message %u deleted from storage %u index %u\n", (unsigned int)seq,
++	    (unsigned int)request.storage, (unsigned int)request.index);
++	return 0;
++}
++
++/* ---- the worker thread --------------------------------------------------------------------------- */
++
++static void
++sms_handle_event(struct sms_event *event)
++{
++	struct vayu_sms_deliver deliver;
++	int ret = VAYU_SMS_ERR_UNSUPPORTED;
++
++	if (event->have_route && event->format == VAYU_SMS_QMI_FORMAT_GSM_P2P && event->raw_length > 0) {
++		ret = vayu_sms_pdu_decode_deliver(event->raw, event->raw_length, &deliver);
++		if (ret == VAYU_SMS_OK) {
++			sms_store_pdu(event->storage, event->index, event->tag, event->raw, event->raw_length);
++		} else {
++			sms.dropped++;
++			say("vayu-sms: a transferred PDU is not decoded: %d; %s\n", ret,
++			    event->ack == VAYU_SMS_QMI_ACK_NEEDED ? "acknowledged anyway" : "no ack was owed");
++		}
++		if (event->ack == VAYU_SMS_QMI_ACK_NEEDED) {
++			sms_send_ack(event->transaction, ret == VAYU_SMS_OK);
++		}
++		return;
++	}
++	if (event->have_mt) {
++		(void)sms_read_index(event->storage, event->index, false);
++		return;
++	}
++	sms.dropped++;
++}
++
++static void
++sms_run_job(struct sms_job *job)
++{
++	int result = 0;
++
++	switch (job->kind) {
++	case SMS_JOB_SEND:
++		result = sms_do_send(job->number, job->text, job->text_length, &sms.job_message_id, &sms.job_mr,
++		    &sms.job_pdu_length);
++		break;
++	case SMS_JOB_DELETE:
++		result = sms_do_delete(job->seq);
++		break;
++	case SMS_JOB_REFRESH:
++		sms.job_pdu_length = sms_refresh_store((uint8_t)job->storage, false);
++		break;
++	default:
++		result = -EINVAL;
++		break;
++	}
++	lck_mtx_lock(&vayu_sms_lock);
++	sms.job_result = result;
++	sms.job_busy = false;
++	wakeup(&sms.job_done);
++	lck_mtx_unlock(&vayu_sms_lock);
++}
++
++static void
++sms_thread(void *argument __unused, wait_result_t wait __unused)
++{
++	uint64_t waited_ms = 0;
++	int ret;
++
++	ret = qmi_handle_init(&sms.qmi, SMS_HANDLE_MAX, &sms_qmi_ops, sms_handlers);
++	if (ret < 0) {
++		say("vayu-sms: qmi_handle_init: %d (no QRTR transport?)\n", ret);
++		goto out;
++	}
++	sms.qmi_up = true;
++	ret = qmi_add_lookup(&sms.qmi, VAYU_SMS_QMI_WMS_SERVICE, 1, 0);
++	if (ret < 0) {
++		say("vayu-sms: qmi_add_lookup(WMS): %d\n", ret);
++		goto out;
++	}
++	while (!sms.wms_there && !sms.stop && waited_ms < (uint64_t)sms.wait_s * 1000) {
++		delay_for_interval(100, NSEC_PER_MSEC);
++		waited_ms += 100;
++	}
++	say("vayu-sms: after %llu ms: WMS is %s\n", (unsigned long long)waited_ms,
++	    sms.wms_there ? "there" : "MISSING");
++	if (!sms.wms_there) {
++		lck_mtx_lock(&vayu_sms_lock);
++		sms.state = VAYU_SMS_STATE_FAILED;
++		lck_mtx_unlock(&vayu_sms_lock);
++		goto out;
++	}
++	say("vayu-sms: WMS: node %u port %u, version %u instance %u\n", sms.node, sms.port, sms.version,
++	    sms.instance);
++
++	sms_configure_routes();
++	sms_configure_events();
++	/* stored messages can be read whether or not the event report was accepted */
++	(void)sms_refresh_store((uint8_t)sms.store, false);
++	sms.next_refresh_ms = now_ms() + (uint64_t)sms.refresh_s * 1000;
++	sms.next_config_ms = now_ms() + 20000;
++
++	for (;;) {
++		struct sms_event event;
++		bool have_event = false;
++		bool have_job = false;
++
++		lck_mtx_lock(&vayu_sms_lock);
++		if (sms.stop) {
++			lck_mtx_unlock(&vayu_sms_lock);
++			break;
++		}
++		if (sms.job_pending) {
++			sms.job_running = sms.job;
++			sms.job_pending = false;
++			have_job = true;
++		} else if (sms.event_tail != sms.event_head) {
++			event = sms.event[sms.event_tail];
++			sms.event_tail = (sms.event_tail + 1) % SMS_EVENT_QUEUE;
++			have_event = true;
++		}
++		lck_mtx_unlock(&vayu_sms_lock);
++
++		if (have_job) {
++			sms_run_job(&sms.job_running);
++			continue;
++		}
++		if (have_event) {
++			sms_handle_event(&event);
++			continue;
++		}
++		if (!sms.event_report && now_ms() >= sms.next_config_ms && sms.wms_there) {
++			sms.next_config_ms = now_ms() + 20000;
++			sms_configure_events();
++			if (sms.event_report) {
++				sms.next_refresh_ms = now_ms() + (uint64_t)sms.refresh_s * 1000;
++			}
++			continue;
++		}
++		if (sms.refresh_s != 0 && now_ms() >= sms.next_refresh_ms) {
++			sms.next_refresh_ms = now_ms() + (uint64_t)sms.refresh_s * 1000;
++			(void)sms_refresh_store((uint8_t)sms.store, true);
++			continue;
++		}
++		delay_for_interval(200, NSEC_PER_MSEC);
++	}
++out:
++	if (sms.qmi_up) {
++		qmi_handle_release(&sms.qmi);
++		sms.qmi_up = false;
++	}
++	lck_mtx_lock(&vayu_sms_lock);
++	sms.running = false;
++	sms.wms_there = false;
++	lck_mtx_unlock(&vayu_sms_lock);
++	say("vayu-sms: the client's thread is done\n");
++	thread_terminate(current_thread());
++}
++
++/* ---- the device ---------------------------------------------------------------------------------- */
++
++static int
++sms_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++sms_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++sms_count_locked(struct vayu_sms_count *count)
++{
++	count->count = sms.inbox_count;
++	count->capacity = VAYU_SMS_INBOX;
++	count->unread = sms.inbox_unread;
++	count->next_seq = sms.next_seq;
++}
++
++static int
++sms_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct vayu_sms_count count;
++
++	if (uio_resid(uio) < (user_ssize_t)sizeof(count)) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&vayu_sms_lock);
++	sms_count_locked(&count);
++	lck_mtx_unlock(&vayu_sms_lock);
++	return uiomove((caddr_t)&count, sizeof(count), uio);
++}
++
++/* Send one job to the worker and wait for its answer.  A Raw Send takes at most 15 s;
++ * a refresh that has to sweep 30 slots may take a minute. */
++static int
++sms_submit(struct sms_job *job)
++{
++	struct timespec step = { .tv_sec = 5, .tv_nsec = 0 };
++	struct timespec limit = { .tv_sec = 90, .tv_nsec = 0 };
++	int result;
++
++	lck_mtx_lock(&vayu_sms_lock);
++	if (!sms.wms_there || !sms.running || sms.state == VAYU_SMS_STATE_OFF) {
++		lck_mtx_unlock(&vayu_sms_lock);
++		return ENOTCONN;
++	}
++	while (sms.job_busy && !sms.stop) {
++		if (msleep(&sms.job_done, &vayu_sms_lock, PRIBIO, "vayu-sms-queue", &step) == EWOULDBLOCK) {
++			break;
++		}
++	}
++	if (sms.stop) {
++		lck_mtx_unlock(&vayu_sms_lock);
++		return ECANCELED;
++	}
++	if (sms.job_busy) {
++		lck_mtx_unlock(&vayu_sms_lock);
++		return EBUSY;
++	}
++	sms.job = *job;
++	sms.job_pending = true;
++	sms.job_busy = true;
++	sms.job_result = -EINPROGRESS;
++	sms.work = true;
++	wakeup(&sms.work);
++	while (sms.job_busy && !sms.stop) {
++		if (msleep(&sms.job_done, &vayu_sms_lock, PRIBIO, "vayu-sms-job", &limit) == EWOULDBLOCK) {
++			break;
++		}
++	}
++	/*
++	 * On a timeout the worker may still be inside a WMS transaction; leave
++	 * job_busy set so that the next caller waits for it instead of overwriting
++	 * the job it is running.
++	 */
++	result = sms.job_busy ? -ETIMEDOUT : sms.job_result;
++	lck_mtx_unlock(&vayu_sms_lock);
++	return result;
++}
++
++static int
++sms_ioctl_count(caddr_t data)
++{
++	struct vayu_sms_count *count = (struct vayu_sms_count *)data;
++
++	lck_mtx_lock(&vayu_sms_lock);
++	sms_count_locked(count);
++	lck_mtx_unlock(&vayu_sms_lock);
++	return 0;
++}
++
++static int
++sms_ioctl_get(caddr_t data)
++{
++	struct vayu_sms_get *get = (struct vayu_sms_get *)data;
++	bool found = false;
++
++	lck_mtx_lock(&vayu_sms_lock);
++	for (uint32_t i = 0; i < VAYU_SMS_INBOX; i++) {
++		if (sms.inbox[i].seq == get->seq) {
++			get->message = sms.inbox[i];
++			found = true;
++			break;
++		}
++	}
++	lck_mtx_unlock(&vayu_sms_lock);
++	return found ? 0 : ENOENT;
++}
++
++static int
++sms_ioctl_send(caddr_t data)
++{
++	struct vayu_sms_send *send = (struct vayu_sms_send *)data;
++	struct sms_job job;
++	size_t length;
++	int ret;
++
++	length = strnlen(send->number, sizeof(send->number));
++	if (length == 0 || length >= sizeof(send->number)) {
++		return EINVAL;
++	}
++	if (send->text_length == 0 || send->text_length >= sizeof(send->text)) {
++		return EINVAL;
++	}
++	memset(&job, 0, sizeof(job));
++	job.kind = SMS_JOB_SEND;
++	memcpy(job.number, send->number, length);
++	job.number[length] = 0;
++	job.text_length = send->text_length;
++	memcpy(job.text, send->text, send->text_length);
++	job.text[send->text_length] = 0;
++	ret = sms_submit(&job);
++	if (ret == 0) {
++		send->message_id = sms.job_message_id;
++		send->message_reference = sms.job_mr;
++		send->pdu_length = sms.job_pdu_length;
++	}
++	return ret < 0 ? -ret : ret;
++}
++
++static int
++sms_ioctl_delete(caddr_t data)
++{
++	struct vayu_sms_delete *delete = (struct vayu_sms_delete *)data;
++	struct sms_job job;
++
++	memset(&job, 0, sizeof(job));
++	job.kind = SMS_JOB_DELETE;
++	job.seq = delete->seq;
++	{
++		int ret = sms_submit(&job);
++
++		return ret < 0 ? -ret : ret;
++	}
++}
++
++static int
++sms_ioctl_refresh(caddr_t data)
++{
++	uint32_t storage = *(uint32_t *)data;
++	struct sms_job job;
++	int ret;
++
++	if (storage != VAYU_SMS_QMI_STORAGE_UIM && storage != VAYU_SMS_QMI_STORAGE_NV) {
++		return EINVAL;
++	}
++	memset(&job, 0, sizeof(job));
++	job.kind = SMS_JOB_REFRESH;
++	job.storage = storage;
++	ret = sms_submit(&job);
++	if (ret != 0) {
++		return ret < 0 ? -ret : ret;
++	}
++	*(uint32_t *)data = sms.job_pdu_length;
++	return 0;
++}
++
++static int
++sms_ioctl_status(caddr_t data)
++{
++	struct vayu_sms_status *status = (struct vayu_sms_status *)data;
++
++	memset(status, 0, sizeof(*status));
++	lck_mtx_lock(&vayu_sms_lock);
++	status->magic = VAYU_SMS_MAGIC;
++	status->version = VAYU_SMS_VERSION;
++	status->size = sizeof(*status);
++	status->state = sms.state;
++	status->wms_present = sms.wms_there ? 1 : 0;
++	status->event_report = sms.event_report ? 1 : 0;
++	status->routes_known = sms.routes_known ? 1 : 0;
++	status->routes_written = sms.routes_written ? 1 : 0;
++	status->routes_allowed = sms.routes_arg;
++	status->route_count = sms.route_count;
++	status->store = sms.store;
++	status->inbox_count = sms.inbox_count;
++	status->received = sms.received;
++	status->sent = sms.sent;
++	status->deleted = sms.deleted;
++	status->dropped = sms.dropped;
++	status->requests = sms.requests;
++	status->failures = sms.failures;
++	status->last_result = sms.last_result;
++	status->last_error = sms.last_error;
++	status->last_message = sms.last_message;
++	status->last_gsm_cause = sms.last_gsm_cause;
++	lck_mtx_unlock(&vayu_sms_lock);
++	return 0;
++}
++
++static int
++sms_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	switch (command) {
++	case VAYU_SMS_IOC_COUNT:
++		return sms_ioctl_count(data);
++	case VAYU_SMS_IOC_GET:
++		return sms_ioctl_get(data);
++	case VAYU_SMS_IOC_SEND:
++		return sms_ioctl_send(data);
++	case VAYU_SMS_IOC_DELETE:
++		return sms_ioctl_delete(data);
++	case VAYU_SMS_IOC_REFRESH:
++		return sms_ioctl_refresh(data);
++	case VAYU_SMS_IOC_STATUS:
++		return sms_ioctl_status(data);
++	default:
++		return ENOTTY;
++	}
++}
++
++static const struct cdevsw sms_cdevsw = {
++	.d_open = sms_open, .d_close = sms_close, .d_read = sms_read, .d_write = eno_rdwrt,
++	.d_ioctl = sms_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++static bool
++sms_make_node(void)
++{
++	int major = cdevsw_add(-1, &sms_cdevsw);
++
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, SMS_DEVICE) == NULL) {
++		say("vayu-sms: /dev/%s cannot be made\n", SMS_DEVICE);
++		return false;
++	}
++	say("vayu-sms: /dev/%s (0666) is made: the count record is %u bytes\n", SMS_DEVICE,
++	    (unsigned int)sizeof(struct vayu_sms_count));
++	return true;
++}
++
++/* ---- start and stop ------------------------------------------------------------------------------ */
++
++int
++vayu_sms_start(struct vayu_qrtr *q)
++{
++	thread_t thread;
++	uint32_t level = 0, wait_s = 30, routes_arg = 0, store = VAYU_SMS_QMI_STORAGE_UIM, refresh_s = 60;
++	uint32_t scan_max = 20;
++
++	if (!PE_parse_boot_argn("vayu_sms", &level, sizeof(level)) || level == 0) {
++		return 0;
++	}
++	if (sms.started) {
++		say("vayu-sms: already started\n");
++		return 0;
++	}
++	if (sms.running) {
++		return -EBUSY;
++	}
++	if (q == NULL || q->glink == NULL || !q->glink->up) {
++		say("vayu-sms: vayu_sms=%u, but the modem's GLINK channel is not up: nothing is done\n", level);
++		return 0;
++	}
++	PE_parse_boot_argn("vayu_sms_wait", &wait_s, sizeof(wait_s));
++	if (wait_s < 1) {
++		wait_s = 1;
++	}
++	if (wait_s > 120) {
++		wait_s = 120;
++	}
++	PE_parse_boot_argn("vayu_sms_routes", &routes_arg, sizeof(routes_arg));
++	if (routes_arg != 0 && routes_arg != 1) {
++		say("vayu-sms: vayu_sms_routes=%u is refused: only 1 allows Set Routes\n", routes_arg);
++		routes_arg = 0;
++	}
++	PE_parse_boot_argn("vayu_sms_store", &store, sizeof(store));
++	if (store != VAYU_SMS_QMI_STORAGE_UIM && store != VAYU_SMS_QMI_STORAGE_NV) {
++		say("vayu-sms: vayu_sms_store=%u is refused: 0 (UIM) and 1 (NV) only\n", store);
++		store = VAYU_SMS_QMI_STORAGE_UIM;
++	}
++	PE_parse_boot_argn("vayu_sms_refresh", &refresh_s, sizeof(refresh_s));
++	if (refresh_s != 0 && refresh_s < 15) {
++		refresh_s = 15;
++	}
++	if (refresh_s > 3600) {
++		refresh_s = 3600;
++	}
++	PE_parse_boot_argn("vayu_sms_scan", &scan_max, sizeof(scan_max));
++	if (scan_max < 1) {
++		scan_max = 1;
++	}
++	if (scan_max > 40) {
++		scan_max = 40;
++	}
++	memset(&sms.inbox, 0, sizeof(sms.inbox));
++	sms.inbox_count = sms.inbox_unread = 0;
++	sms.next_seq = 1;
++	sms.mr = 0;
++	sms.level = level;
++	sms.wait_s = wait_s;
++	sms.routes_arg = routes_arg;
++	sms.store = store;
++	sms.refresh_s = refresh_s;
++	sms.scan_max = scan_max;
++	sms.stop = false;
++	sms.running = true;
++	sms.state = VAYU_SMS_STATE_WAITING;
++	sms.event_report = false;
++	sms.routes_known = false;
++	sms.routes_written = false;
++	sms.route_count = 0;
++	sms.received = sms.sent = sms.deleted = sms.dropped = 0;
++	sms.requests = sms.failures = 0;
++	sms.last_result = sms.last_error = 0xffff;
++	sms.last_message = 0;
++	sms.last_gsm_cause = 0xffff;
++	sms.last_failure = 0;
++	sms.job_pending = sms.job_busy = sms.job_done = false;
++	sms.job.kind = SMS_JOB_NONE;
++	sms.event_head = sms.event_tail = 0;
++	sms.work = false;
++	sms.next_refresh_ms = 0;
++	sms.next_config_ms = now_ms() + 20000;
++	say("vayu-sms: vayu_sms=%u vayu_sms_wait=%u vayu_sms_routes=%u vayu_sms_store=%u vayu_sms_refresh=%u "
++	    "vayu_sms_scan=%u\n", level, wait_s, routes_arg, store, refresh_s, scan_max);
++	say("vayu-sms: WMS 0x05 (routes, event report, list, raw read, raw send, delete, ack); "
++	    "the log masks numbers and never prints text\n");
++	(void)sms_make_node();
++	sms.started = true;
++	if (kernel_thread_start(sms_thread, NULL, &thread) != KERN_SUCCESS) {
++		say("vayu-sms: no thread\n");
++		sms.running = false;
++		sms.started = false;
++		sms.state = VAYU_SMS_STATE_OFF;
++		return -ENOMEM;
++	}
++	thread_deallocate(thread);
++	return 0;
++}
++
++void
++vayu_sms_stop(void)
++{
++	if (!sms.started) {
++		return;
++	}
++	lck_mtx_lock(&vayu_sms_lock);
++	sms.stop = true;
++	wakeup(&sms.work);
++	wakeup(&sms.job_done);
++	lck_mtx_unlock(&vayu_sms_lock);
++	for (uint32_t waited = 0; waited < SMS_STOP_MS && sms.running; waited += 20) {
++		delay_for_interval(20, NSEC_PER_MSEC);
++	}
++	if (sms.running) {
++		say("vayu-sms: the client's thread has not finished in %u ms; /dev/%s still holds the inbox\n",
++		    SMS_STOP_MS, SMS_DEVICE);
++	} else {
++		sms.started = false;
++		sms.state = VAYU_SMS_STATE_OFF;
++		say("vayu-sms: done: %u received, %u sent, %u deleted, %u dropped; /dev/%s still holds %u message(s)\n",
++		    (unsigned int)sms.received, (unsigned int)sms.sent, (unsigned int)sms.deleted,
++		    (unsigned int)sms.dropped, SMS_DEVICE, (unsigned int)sms.inbox_count);
++	}
++}
+--- /dev/null
++++ b/bsd/sys/vayu_sms.h
+@@ -0,0 +1,172 @@
++/*
++ * vayu SMS: the control surface between bsd/dev/vayu_sms.c and userland.
++ *
++ * The kernel keeps a QMI WMS client of the modem (service 0x05) and a small inbox of
++ * the messages it has decoded.  /dev/vayu-sms exposes that inbox and the two
++ * actions this first stage has: send one short message and delete one stored one.
++ * Nothing here talks to CommCenter: the kernel device is the only transport, and a
++ * userland tool (work/hackios-vayu/userland/src/sms.c, /redwood/bin/sms) is its
++ * first user.
++ *
++ * Boot-args read by vayu_sms_start():
++ *   vayu_sms=0          nothing at all (the default)
++ *   vayu_sms=1          the WMS client, /dev/vayu-sms and the inbox
++ *   vayu_sms_wait=S     how long to wait for the WMS service (default 30, 1..120)
++ *   vayu_sms_routes=1   permit Set Routes 0x0032, and only when Get Routes returns an
++ *                       empty table: point-to-point class 0 and 1, UIM storage,
++ *                       STORE_AND_NOTIFY.  Default 0: the table is only read.  NV is
++ *                       never requested.  An existing table is never rewritten.
++ *   vayu_sms_store=N    storage enumerated at startup and by `sms refresh`:
++ *                       0 UIM (default), 1 NV
++ *   vayu_sms_refresh=S  seconds between automatic List Messages sweeps (default 60,
++ *                       0 disables, at least 15 otherwise)
++ *
++ * Privacy: the kernel log masks a sender number to its last four digits, never
++ * prints message text or a PDU byte, and never prints an identifier.  The inbox
++ * carries the full number and text because that is what the user asked to see; the
++ * device is 0666 on a research image.
++ *
++ * ioctl commands are plain numbers, not _IOWR(): the userland tool is built without
++ * the kernel headers and both sides must agree on one value, not on a structure's
++ * size.  The structures below are the ABI; their fields are fixed-width and no
++ * pointers are passed.
++ */
++#ifndef _SYS_VAYU_SMS_H_
++#define _SYS_VAYU_SMS_H_
++
++#include <stdint.h>
++
++#define VAYU_SMS_MAGIC          0x534d5331u     /* "SMS1" little-endian */
++#define VAYU_SMS_VERSION        1
++#define VAYU_SMS_DEVICE         "vayu-sms"
++
++#define VAYU_SMS_NUMBER_MAX     32
++#define VAYU_SMS_TEXT_MAX       640
++#define VAYU_SMS_TIMESTAMP_MAX  26
++#define VAYU_SMS_INBOX          16
++
++/* vayu_sms_message.flags */
++#define VAYU_SMS_F_ALPHANUMERIC 0x00000001u     /* the sender is a name, not a number */
++#define VAYU_SMS_F_MULTIPART    0x00000002u     /* a UDH concatenation header was present */
++#define VAYU_SMS_F_UCS2         0x00000004u     /* DCS said UCS-2 */
++#define VAYU_SMS_F_8BIT         0x00000008u     /* DCS said 8-bit data; text is a byte view */
++
++/* vayu_sms_message.alphabet */
++#define VAYU_SMS_ALPHABET_GSM7  0
++#define VAYU_SMS_ALPHABET_8BIT  1
++#define VAYU_SMS_ALPHABET_UCS2  2
++#define VAYU_SMS_ALPHABET_NONE  0xff
++
++/* QmiWmsMessageTagType, the two the inbox cares for. */
++#define VAYU_SMS_TAG_MT_READ      0
++#define VAYU_SMS_TAG_MT_NOT_READ  1
++
++/* The state of the WMS client, as `sms status` prints it. */
++#define VAYU_SMS_STATE_OFF          0
++#define VAYU_SMS_STATE_WAITING      1
++#define VAYU_SMS_STATE_CONFIGURING  2
++#define VAYU_SMS_STATE_READY        3
++#define VAYU_SMS_STATE_FAILED       4
++
++struct vayu_sms_message {
++	uint32_t seq;                   /* inbox sequence, never 0; Delete and dedupe key */
++	uint32_t storage;               /* QmiWmsStorageType (0 UIM, 1 NV, 0xff unknown) */
++	uint32_t index;                 /* memory index inside that storage */
++	uint32_t tag;                   /* QmiWmsMessageTagType (0 MT read, 1 MT not read) */
++	uint32_t flags;                 /* VAYU_SMS_F_* */
++	uint32_t alphabet;              /* VAYU_SMS_ALPHABET_* */
++	uint32_t text_length;           /* bytes in text, UTF-8 (or raw 8-bit view) */
++	uint32_t number_length;         /* bytes in number */
++	uint64_t received_ms;           /* kernel uptime when it was decoded */
++	char     timestamp[VAYU_SMS_TIMESTAMP_MAX];  /* "2026-11-02 06:30:00 +0300" from TP-SCTS */
++	char     number[VAYU_SMS_NUMBER_MAX];        /* full number, NUL-terminated */
++	char     text[VAYU_SMS_TEXT_MAX];            /* UTF-8, NUL-terminated */
++};
++
++/*
++ * The inbox is read in two steps: COUNT says how many and which seq the next one
++ * will get, then GET fetches one message by its seq.  (A whole inbox in one ioctl
++ * would exceed IOCPARM_MAX, 8 KiB.)  The tool walks seq 1 .. next_seq-1 and skips
++ * the ENOENT answers: at most VAYU_SMS_INBOX of them are there.
++ */
++struct vayu_sms_count {
++	uint32_t count;                 /* messages in the inbox */
++	uint32_t capacity;              /* VAYU_SMS_INBOX */
++	uint32_t unread;                /* tag == MT_NOT_READ */
++	uint32_t next_seq;              /* the seq the next message will get */
++};
++
++struct vayu_sms_get {
++	uint32_t seq;                   /* in: the seq to fetch */
++	struct vayu_sms_message message;/* out */
++};
++
++struct vayu_sms_send {
++	char     number[VAYU_SMS_NUMBER_MAX];   /* in: digits, optional leading '+' */
++	uint32_t text_length;                   /* in: bytes of text, 1..VAYU_SMS_TEXT_MAX-1 */
++	uint32_t message_id;                    /* out: QMI message id */
++	uint32_t message_reference;             /* out: TP-MR used */
++	uint32_t pdu_length;                    /* out: bytes of the SMS-SUBMIT PDU */
++	char     text[VAYU_SMS_TEXT_MAX];       /* in: UTF-8 */
++};
++
++struct vayu_sms_delete {
++	uint32_t seq;                   /* in: the inbox sequence to delete */
++};
++
++struct vayu_sms_status {
++	uint32_t magic;                 /* VAYU_SMS_MAGIC */
++	uint32_t version;               /* VAYU_SMS_VERSION */
++	uint32_t size;                  /* sizeof(struct vayu_sms_status) */
++	uint32_t state;                 /* VAYU_SMS_STATE_* */
++	uint32_t wms_present;
++	uint32_t event_report;
++	uint32_t routes_known;
++	uint32_t routes_written;
++	uint32_t routes_allowed;
++	uint32_t route_count;
++	uint32_t store;                 /* vayu_sms_store */
++	uint32_t inbox_count;
++	uint32_t received;
++	uint32_t sent;
++	uint32_t deleted;
++	uint32_t dropped;
++	uint32_t requests;
++	uint32_t failures;
++	uint32_t last_result;
++	uint32_t last_error;
++	uint32_t last_message;
++	uint32_t last_gsm_cause;        /* RP cause of the last Raw Send failure, 0xffff none */
++	uint32_t last_failure;          /* local errno of the last failed request */
++};
++
++/*
++ * ioctl numbers, encoded the way XNU's <sys/ioccom.h> does (_IOWR: 0xc0000000,
++ * the structure's size in bits 16..28, group in 8..15, number in 0..7).  The
++ * macro is written out here so that a userland program built without the kernel
++ * headers gets exactly the same numbers; the structures' layouts are the ABI.
++ */
++#define VAYU_SMS_IOC_NUMBER(group, number, type) \
++	((uint32_t)0xc0000000u | (((uint32_t)sizeof(type) & 0x1fffu) << 16) | \
++	 ((uint32_t)(group) << 8) | (uint32_t)(number))
++#define VAYU_SMS_IOC_COUNT     VAYU_SMS_IOC_NUMBER('S', 1, struct vayu_sms_count)
++#define VAYU_SMS_IOC_GET       VAYU_SMS_IOC_NUMBER('S', 2, struct vayu_sms_get)
++#define VAYU_SMS_IOC_SEND      VAYU_SMS_IOC_NUMBER('S', 3, struct vayu_sms_send)
++#define VAYU_SMS_IOC_DELETE    VAYU_SMS_IOC_NUMBER('S', 4, struct vayu_sms_delete)
++#define VAYU_SMS_IOC_STATUS    VAYU_SMS_IOC_NUMBER('S', 5, struct vayu_sms_status)
++#define VAYU_SMS_IOC_REFRESH   VAYU_SMS_IOC_NUMBER('S', 6, uint32_t)
++
++#ifdef KERNEL
++struct vayu_qrtr;
++
++/*
++ * Start the client's thread after the modem's QRTR transport is registered.  It does
++ * nothing unless vayu_sms=1.  Returns 0 when the thread is running (or was already),
++ * -EBUSY while an earlier stop is still completing, or a negative errno.
++ */
++int vayu_sms_start(struct vayu_qrtr *q);
++/* Ask the thread to stop and wait a bounded time; /dev/vayu-sms stays readable. */
++void vayu_sms_stop(void);
++#endif /* KERNEL */
++
++#endif /* _SYS_VAYU_SMS_H_ */
+--- /dev/null
++++ b/bsd/sys/vayu_sms_qmi.h
+@@ -0,0 +1,1373 @@
++/*
++ * The QMI WMS messages and the GSM 03.40/03.38 PDU codec of bsd/dev/vayu_sms.c.
++ *
++ * The structures and tables are here, apart from the client, so that a program on the
++ * machine that builds the kernel codes and decodes the same messages and PDUs
++ * (tools/sms-test).  The wire format (a 7-byte header, then TLVs) and the element
++ * tables are sys/hakios.qmi.h's.
++ *
++ * WMS message ids and TLV layouts are libqmi's data/qmi-service-wms.json (master,
++ * read 2026-11-02); enum values are src/libqmi-glib/qmi-enums-wms.h of the same:
++ *   WMS 0x05  Set Event Report  0x0001  TLV 0x10 {new MT message report u8}
++ *   WMS 0x05  Event Report      0x0001  indication: 0x10 {storage,index},
++ *                                       0x11 {ack,transaction,format,raw}, 0x12 mode,
++ *                                       0x16 SMS-on-IMS
++ *   WMS 0x05  Raw Send          0x0020  TLV 0x01 {format, u16 length, PDU};
++ *                                       reply 0x01 message id, 0x12 GSM cause
++ *   WMS 0x05  Raw Read          0x0022  TLV 0x01 {storage,index}, 0x10 mode;
++ *                                       reply 0x01 {tag,format,u16 length,PDU}
++ *   WMS 0x05  List Messages     0x0031  input 0x01 storage; reply 0x01 array of
++ *                                       {index u32, tag u8}, u32 count prefix
++ *   WMS 0x05  Delete            0x0024  TLV 0x01 storage, 0x10 index, 0x11 tag
++ *   WMS 0x05  Set/Get Routes    0x0032/0x0033  array of
++ *                                       {type,class,storage,receipt action}, u16 count
++ *   WMS 0x05  Send Ack          0x0037  TLV 0x01 {transaction,protocol,success}
++ *
++ * PDU: TS 23.040 SMS-DELIVER and SMS-SUBMIT, TS 23.038 GSM 7-bit default alphabet
++ * (with the extension table) and UCS-2.  A message longer than one segment is
++ * refused for sending and decoded one segment at a time for receiving; the UDH
++ * concatenation header, when present, is reported in the deliver structure but the
++ * segments are not joined.  That limit is deliberate: joining would need a
++ * reassembly queue with its own timeouts, and this stage does not have one.
++ *
++ * None of these functions logs or stores anything by itself.
++ */
++#ifndef _SYS_VAYU_SMS_QMI_H_
++#define _SYS_VAYU_SMS_QMI_H_
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#include <sys/hakios.qmi.h>
++#include <sys/vayu_sms.h>
++
++/* ---- limits ---------------------------------------------------------------------------------- */
++
++#define VAYU_SMS_SEPTETS_MAX            160     /* one GSM 7-bit segment */
++#define VAYU_SMS_USER_OCTETS_MAX        140     /* TP-UD octets in one segment */
++#define VAYU_SMS_TPDU_MAX               164     /* worst-case SMS-DELIVER TPDU */
++#define VAYU_SMS_PDU_MAX                176     /* TPDU plus the SMSC prefix */
++#define VAYU_SMS_TEXT_MAX               640     /* UTF-8 bytes of the decoded body */
++#define VAYU_SMS_ADDRESS_MAX            32      /* a sender as text, plus NUL */
++#define VAYU_SMS_TIMESTAMP_MAX          26      /* "2026-11-02 06:30:00 +0300" and NUL */
++#define VAYU_SMS_ROUTE_MAX              16
++#define VAYU_SMS_LIST_MAX               32
++#define VAYU_SMS_QMI_REQUEST_MAX        512
++
++#define VAYU_SMS_QMI_WMS_SERVICE        0x05
++#define VAYU_SMS_QMI_SET_EVENT_REPORT   0x0001
++#define VAYU_SMS_QMI_EVENT_REPORT       0x0001
++#define VAYU_SMS_QMI_RAW_SEND           0x0020
++#define VAYU_SMS_QMI_RAW_READ           0x0022
++#define VAYU_SMS_QMI_DELETE             0x0024
++#define VAYU_SMS_QMI_LIST_MESSAGES      0x0031
++#define VAYU_SMS_QMI_SET_ROUTES         0x0032
++#define VAYU_SMS_QMI_GET_ROUTES         0x0033
++#define VAYU_SMS_QMI_SEND_ACK           0x0037
++
++/* QmiWmsStorageType, QmiWmsMessageMode, QmiWmsMessageFormat, QmiWmsMessageTagType. */
++#define VAYU_SMS_QMI_STORAGE_UIM        0x00
++#define VAYU_SMS_QMI_STORAGE_NV         0x01
++#define VAYU_SMS_QMI_STORAGE_NONE       0xff
++#define VAYU_SMS_QMI_MODE_GSM           0x01
++#define VAYU_SMS_QMI_FORMAT_GSM_P2P     0x06
++#define VAYU_SMS_QMI_TAG_MT_READ        0x00
++#define VAYU_SMS_QMI_TAG_MT_NOT_READ    0x01
++#define VAYU_SMS_QMI_TAG_MO_SENT        0x02
++#define VAYU_SMS_QMI_TAG_MO_NOT_SENT    0x03
++
++/* QmiWmsMessageType, QmiWmsMessageClass, QmiWmsReceiptAction. */
++#define VAYU_SMS_QMI_TYPE_P2P           0x00
++#define VAYU_SMS_QMI_CLASS_0            0x00
++#define VAYU_SMS_QMI_CLASS_1            0x01
++#define VAYU_SMS_QMI_RECEIPT_DISCARD    0x00
++#define VAYU_SMS_QMI_RECEIPT_STORE      0x01
++#define VAYU_SMS_QMI_RECEIPT_TRANSFER   0x02
++#define VAYU_SMS_QMI_RECEIPT_TRANSFER_ACK 0x03
++#define VAYU_SMS_QMI_ACK_NEEDED         0x00
++
++/* ---- status codes ---------------------------------------------------------------------------- */
++
++enum {
++	VAYU_SMS_OK = 0,
++	VAYU_SMS_ERR_ARGUMENT = -1,
++	VAYU_SMS_ERR_TRUNCATED = -2,
++	VAYU_SMS_ERR_MALFORMED = -3,
++	VAYU_SMS_ERR_UNSUPPORTED = -4,
++	VAYU_SMS_ERR_TOO_LONG = -5,
++	VAYU_SMS_ERR_BUFFER = -6,
++	VAYU_SMS_ERR_ADDRESS = -7,
++	VAYU_SMS_ERR_TIMESTAMP = -8,
++};
++
++/* VAYU_SMS_ALPHABET_* names the alphabet the DCS names; sys/vayu_sms.h has them. */
++
++/* ---- UTF-8 ----------------------------------------------------------------------------------- */
++
++/* Decode one UTF-8 sequence at *at; returns 0 and advances, or -1.  No overlongs, no surrogates. */
++static __inline__ int
++vayu_sms_utf8_next(const char *text, size_t length, size_t *at, uint32_t *codepoint)
++{
++	const uint8_t *s = (const uint8_t *)text;
++	size_t i = *at;
++	uint32_t cp;
++	int extra;
++
++	if (i >= length) {
++		return -1;
++	}
++	if (s[i] < 0x80) {
++		*codepoint = s[i];
++		*at = i + 1;
++		return 0;
++	}
++	if ((s[i] & 0xe0) == 0xc0) {
++		cp = s[i] & 0x1f;
++		extra = 1;
++	} else if ((s[i] & 0xf0) == 0xe0) {
++		cp = s[i] & 0x0f;
++		extra = 2;
++	} else if ((s[i] & 0xf8) == 0xf0) {
++		cp = s[i] & 0x07;
++		extra = 3;
++	} else {
++		return -1;
++	}
++	if (i + (size_t)extra >= length) {
++		return -1;
++	}
++	for (int k = 1; k <= extra; k++) {
++		if (i + (size_t)k >= length || (s[i + (size_t)k] & 0xc0) != 0x80) {
++			return -1;
++		}
++		cp = (cp << 6) | (s[i + (size_t)k] & 0x3f);
++	}
++	if ((extra == 1 && cp < 0x80) || (extra == 2 && cp < 0x800) || (extra == 3 && cp < 0x10000) ||
++	    (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) {
++		return -1;
++	}
++	*codepoint = cp;
++	*at = i + 1 + (size_t)extra;
++	return 0;
++}
++
++/* Append one codepoint as UTF-8; returns 0 or -1 when it does not fit. */
++static __inline__ int
++vayu_sms_utf8_put(char *text, size_t capacity, size_t *at, uint32_t cp)
++{
++	size_t i = *at;
++
++	if (cp < 0x80) {
++		if (i + 1 >= capacity) {
++			return -1;
++		}
++		text[i++] = (char)cp;
++	} else if (cp < 0x800) {
++		if (i + 2 >= capacity) {
++			return -1;
++		}
++		text[i++] = (char)(0xc0 | (cp >> 6));
++		text[i++] = (char)(0x80 | (cp & 0x3f));
++	} else if (cp < 0x10000) {
++		if (i + 3 >= capacity) {
++			return -1;
++		}
++		text[i++] = (char)(0xe0 | (cp >> 12));
++		text[i++] = (char)(0x80 | ((cp >> 6) & 0x3f));
++		text[i++] = (char)(0x80 | (cp & 0x3f));
++	} else {
++		if (i + 4 >= capacity) {
++			return -1;
++		}
++		text[i++] = (char)(0xf0 | (cp >> 18));
++		text[i++] = (char)(0x80 | ((cp >> 12) & 0x3f));
++		text[i++] = (char)(0x80 | ((cp >> 6) & 0x3f));
++		text[i++] = (char)(0x80 | (cp & 0x3f));
++	}
++	text[i] = 0;
++	*at = i;
++	return 0;
++}
++
++/* ---- GSM 7-bit default alphabet (TS 23.038) -------------------------------------------------- */
++
++/*
++ * Septet to Unicode.  0xffff means the septet has no assigned character (0x1b is
++ * handled as the escape and never looked up here).
++ */
++static const uint16_t vayu_sms_gsm7_unicode[128] = {
++	0x0040, 0x00a3, 0x0024, 0x00a5, 0x00e8, 0x00e9, 0x00f9, 0x00ec,
++	0x00f2, 0x00c7, 0x000a, 0x00d8, 0x00f8, 0x000d, 0x00c5, 0x00e5,
++	0x0394, 0x005f, 0x03a6, 0x0393, 0x039b, 0x03a9, 0x03a0, 0x03a8,
++	0x03a3, 0x0398, 0x039e, 0xffff, 0x00c6, 0x00e6, 0x00df, 0x00c9,
++	0x0020, 0x0021, 0x0022, 0x0023, 0x00a4, 0x0025, 0x0026, 0x0027,
++	0x0028, 0x0029, 0x002a, 0x002b, 0x002c, 0x002d, 0x002e, 0x002f,
++	0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
++	0x0038, 0x0039, 0x003a, 0x003b, 0x003c, 0x003d, 0x003e, 0x003f,
++	0x00a1, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,
++	0x0048, 0x0049, 0x004a, 0x004b, 0x004c, 0x004d, 0x004e, 0x004f,
++	0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057,
++	0x0058, 0x0059, 0x005a, 0x00c4, 0x00d6, 0x00d1, 0x00dc, 0x00a7,
++	0x00bf, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,
++	0x0068, 0x0069, 0x006a, 0x006b, 0x006c, 0x006d, 0x006e, 0x006f,
++	0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,
++	0x0078, 0x0079, 0x007a, 0x00e4, 0x00f6, 0x00f1, 0x00fc, 0x00e0,
++};
++
++/* The extension table after 0x1b: code to Unicode, 0xffff unassigned. */
++static __inline__ uint16_t
++vayu_sms_gsm7_extension_unicode(uint8_t code)
++{
++	switch (code) {
++	case 0x0a: return 0x000c;       /* form feed */
++	case 0x14: return 0x005e;       /* ^ */
++	case 0x28: return 0x007b;       /* { */
++	case 0x29: return 0x007d;       /* } */
++	case 0x2f: return 0x005c;       /* backslash */
++	case 0x3c: return 0x005b;       /* [ */
++	case 0x3d: return 0x007e;       /* ~ */
++	case 0x3e: return 0x005d;       /* ] */
++	case 0x40: return 0x007c;       /* | */
++	case 0x65: return 0x20ac;       /* euro */
++	default: return 0xffff;
++	}
++}
++
++/* Unicode to a GSM code: 0x000-0x07f basic septet, 0x100|code escaped, 0xffff none. */
++static __inline__ uint16_t
++vayu_sms_unicode_to_gsm7(uint32_t cp)
++{
++	for (uint16_t i = 0; i < 128; i++) {
++		if (i != 0x1b && vayu_sms_gsm7_unicode[i] == cp) {
++			return i;
++		}
++	}
++	switch (cp) {
++	case 0x000c: return 0x100u | 0x0a;
++	case 0x005e: return 0x100u | 0x14;
++	case 0x007b: return 0x100u | 0x28;
++	case 0x007d: return 0x100u | 0x29;
++	case 0x005c: return 0x100u | 0x2f;
++	case 0x005b: return 0x100u | 0x3c;
++	case 0x007e: return 0x100u | 0x3d;
++	case 0x005d: return 0x100u | 0x3e;
++	case 0x007c: return 0x100u | 0x40;
++	case 0x20ac: return 0x100u | 0x65;
++	default: return 0xffff;
++	}
++}
++
++/* Pack septets, least significant bit first. */
++static __inline__ int
++vayu_sms_gsm7_pack(const uint8_t *septets, size_t count, uint8_t *out, size_t out_size, size_t *out_length)
++{
++	size_t octets;
++
++	if (septets == NULL || out == NULL || out_length == NULL) {
++		return VAYU_SMS_ERR_ARGUMENT;
++	}
++	if (count > VAYU_SMS_SEPTETS_MAX) {
++		return VAYU_SMS_ERR_TOO_LONG;
++	}
++	octets = (count * 7u + 7u) / 8u;
++	if (out_size < octets) {
++		return VAYU_SMS_ERR_BUFFER;
++	}
++	memset(out, 0, octets);
++	for (size_t i = 0; i < count; i++) {
++		size_t bit = i * 7u;
++
++		if (septets[i] > 0x7fu) {
++			return VAYU_SMS_ERR_MALFORMED;
++		}
++		out[bit / 8u] |= (uint8_t)(septets[i] << (bit % 8u));
++		if ((bit % 8u) > 1u) {
++			out[bit / 8u + 1u] |= (uint8_t)(septets[i] >> (8u - (bit % 8u)));
++		}
++	}
++	*out_length = octets;
++	return VAYU_SMS_OK;
++}
++
++/* Unpack septets starting at an arbitrary bit offset (a UDH may shift the text). */
++static __inline__ int
++vayu_sms_gsm7_unpack_at(const uint8_t *data, size_t data_length, size_t bit_offset, size_t septets,
++    uint8_t *out, size_t out_size)
++{
++	size_t needed;
++
++	if (data == NULL || out == NULL) {
++		return VAYU_SMS_ERR_ARGUMENT;
++	}
++	if (septets > VAYU_SMS_SEPTETS_MAX) {
++		return VAYU_SMS_ERR_TOO_LONG;
++	}
++	if (out_size < septets) {
++		return VAYU_SMS_ERR_BUFFER;
++	}
++	needed = (bit_offset + septets * 7u + 7u) / 8u;
++	if (data_length < needed) {
++		return VAYU_SMS_ERR_TRUNCATED;
++	}
++	for (size_t i = 0; i < septets; i++) {
++		size_t bit = bit_offset + i * 7u;
++		uint16_t value = (uint16_t)(data[bit / 8u] >> (bit % 8u));
++
++		if ((bit % 8u) > 1u) {
++			value |= (uint16_t)(data[bit / 8u + 1u] << (8u - (bit % 8u)));
++		}
++		out[i] = (uint8_t)(value & 0x7f);
++	}
++	return VAYU_SMS_OK;
++}
++
++/* Septets (with 0x1b escapes) to UTF-8 text. */
++static __inline__ int
++vayu_sms_gsm7_to_utf8(const uint8_t *septets, size_t count, char *text, size_t text_size, size_t *text_length)
++{
++	size_t at = 0;
++
++	if (septets == NULL || text == NULL || text_length == NULL) {
++		return VAYU_SMS_ERR_ARGUMENT;
++	}
++	text[0] = 0;
++	for (size_t i = 0; i < count; i++) {
++		uint32_t cp = 0xffff;
++
++		if (septets[i] == 0x1b && i + 1 < count) {
++			cp = vayu_sms_gsm7_extension_unicode(septets[++i]);
++			if (cp == 0xffff) {
++				cp = 0x0020;            /* an unknown escape: one space, never a guess */
++			}
++		} else if (septets[i] < 128) {
++			cp = vayu_sms_gsm7_unicode[septets[i]];
++			if (cp == 0xffff) {
++				cp = 0x0020;
++			}
++		}
++		if (vayu_sms_utf8_put(text, text_size, &at, cp) < 0) {
++			return VAYU_SMS_ERR_BUFFER;
++		}
++	}
++	*text_length = at;
++	return VAYU_SMS_OK;
++}
++
++/* UTF-8 text to septets; -VAYU_SMS_ERR_UNSUPPORTED if a character has no GSM 7-bit form. */
++static __inline__ int
++vayu_sms_utf8_to_gsm7(const char *text, size_t text_length, uint8_t *septets, size_t septets_size,
++    size_t *septet_count)
++{
++	size_t at = 0, out = 0;
++
++	if (text == NULL || septets == NULL || septet_count == NULL) {
++		return VAYU_SMS_ERR_ARGUMENT;
++	}
++	while (at < text_length) {
++		uint32_t cp;
++		uint16_t code;
++
++		if (vayu_sms_utf8_next(text, text_length, &at, &cp) < 0) {
++			return VAYU_SMS_ERR_MALFORMED;
++		}
++		code = vayu_sms_unicode_to_gsm7(cp);
++		if (code == 0xffff) {
++			return VAYU_SMS_ERR_UNSUPPORTED;
++		}
++		if (code & 0x100u) {
++			if (out + 2 > septets_size) {
++				return VAYU_SMS_ERR_TOO_LONG;
++			}
++			septets[out++] = 0x1b;
++			septets[out++] = (uint8_t)(code & 0x7f);
++		} else {
++			if (out + 1 > septets_size) {
++				return VAYU_SMS_ERR_TOO_LONG;
++			}
++			septets[out++] = (uint8_t)code;
++		}
++	}
++	*septet_count = out;
++	return VAYU_SMS_OK;
++}
++
++/* ---- UCS-2 ----------------------------------------------------------------------------------- */
++
++/* UTF-8 to UTF-16BE octets. */
++static __inline__ int
++vayu_sms_utf8_to_ucs2(const char *text, size_t text_length, uint8_t *out, size_t out_size, size_t *out_length)
++{
++	size_t at = 0, octets = 0;
++
++	if (text == NULL || out == NULL || out_length == NULL) {
++		return VAYU_SMS_ERR_ARGUMENT;
++	}
++	while (at < text_length) {
++		uint32_t cp;
++
++		if (vayu_sms_utf8_next(text, text_length, &at, &cp) < 0) {
++			return VAYU_SMS_ERR_MALFORMED;
++		}
++		if (cp < 0x10000) {
++			if (octets + 2 > out_size) {
++				return VAYU_SMS_ERR_TOO_LONG;
++			}
++			out[octets++] = (uint8_t)(cp >> 8);
++			out[octets++] = (uint8_t)cp;
++		} else {
++			uint32_t v = cp - 0x10000;
++
++			if (octets + 4 > out_size) {
++				return VAYU_SMS_ERR_TOO_LONG;
++			}
++			out[octets++] = (uint8_t)(0xd8 | (v >> 18));
++			out[octets++] = (uint8_t)((v >> 10) & 0xff);
++			out[octets++] = (uint8_t)(0xdc | ((v >> 8) & 0x03));
++			out[octets++] = (uint8_t)(v & 0xff);
++		}
++	}
++	*out_length = octets;
++	return VAYU_SMS_OK;
++}
++
++/* UTF-16BE octets (with surrogate pairs) to UTF-8. */
++static __inline__ int
++vayu_sms_ucs2_to_utf8(const uint8_t *data, size_t length, char *text, size_t text_size, size_t *text_length)
++{
++	size_t at = 0, out = 0;
++
++	if (data == NULL || text == NULL || text_length == NULL) {
++		return VAYU_SMS_ERR_ARGUMENT;
++	}
++	if ((length & 1u) != 0) {
++		return VAYU_SMS_ERR_TRUNCATED;
++	}
++	text[0] = 0;
++	while (at < length) {
++		uint32_t cp = (uint32_t)data[at] << 8 | data[at + 1];
++
++		at += 2;
++		if (cp >= 0xd800 && cp <= 0xdbff) {
++			uint32_t low;
++
++			if (at + 2 > length) {
++				return VAYU_SMS_ERR_TRUNCATED;
++			}
++			low = (uint32_t)data[at] << 8 | data[at + 1];
++			if (low < 0xdc00 || low > 0xdfff) {
++				return VAYU_SMS_ERR_MALFORMED;
++			}
++			at += 2;
++			cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
++		} else if (cp >= 0xdc00 && cp <= 0xdfff) {
++			return VAYU_SMS_ERR_MALFORMED;
++		}
++		if (vayu_sms_utf8_put(text, text_size, &out, cp) < 0) {
++			return VAYU_SMS_ERR_BUFFER;
++		}
++	}
++	*text_length = out;
++	return VAYU_SMS_OK;
++}
++
++/* ---- SMS-DELIVER ----------------------------------------------------------------------------- */
++
++struct vayu_sms_address {
++	uint32_t length;                /* bytes in text */
++	uint8_t type_of_address;        /* TP-OA's type-of-address octet */
++	bool alphanumeric;
++	char text[VAYU_SMS_ADDRESS_MAX];
++};
++
++struct vayu_sms_deliver {
++	struct vayu_sms_address originator;
++	uint8_t first_octet;
++	uint8_t pid;
++	uint8_t dcs;
++	uint8_t alphabet;               /* VAYU_SMS_ALPHABET_* */
++	uint8_t scts[7];
++	char timestamp[VAYU_SMS_TIMESTAMP_MAX];
++	uint8_t user_data_header_length;
++	bool concatenated;
++	uint8_t concat_reference;
++	uint8_t concat_total;
++	uint8_t concat_sequence;
++	uint32_t text_length;
++	char text[VAYU_SMS_TEXT_MAX];
++};
++
++/* A semi-octet pair: the low nibble is the first (tens) digit, the high one the units. */
++static __inline__ int
++vayu_sms_bcd_value(uint8_t octet)
++{
++	return (octet & 0x0f) * 10 + (octet >> 4);
++}
++
++/* "2026-11-02 06:30:00 +0300"; the TP-SCTS timezone is in quarter hours. */
++static __inline__ void
++vayu_sms_format_scts(const uint8_t raw[7], char out[VAYU_SMS_TIMESTAMP_MAX])
++{
++	static const char digits[] = "0123456789";
++	int year, month, day, hour, minute, second, quarters, sign;
++	char local[6];
++
++	year = vayu_sms_bcd_value(raw[0]);
++	month = vayu_sms_bcd_value(raw[1]);
++	day = vayu_sms_bcd_value(raw[2]);
++	hour = vayu_sms_bcd_value(raw[3]);
++	minute = vayu_sms_bcd_value(raw[4]);
++	second = vayu_sms_bcd_value(raw[5]);
++	sign = (raw[6] & 0x08) != 0;
++	quarters = (raw[6] & 0x07) * 10 + (raw[6] >> 4);
++	if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59 || quarters > 79) {
++		out[0] = 0;
++		return;
++	}
++	/* 20xx, two digits of the year as the PDU carries them */
++	local[0] = '2';
++	local[1] = '0';
++	local[2] = digits[(year / 10) % 10];
++	local[3] = digits[year % 10];
++	local[4] = 0;
++	out[0] = local[0]; out[1] = local[1]; out[2] = local[2]; out[3] = local[3];
++	out[4] = '-';
++	out[5] = digits[month / 10]; out[6] = digits[month % 10];
++	out[7] = '-';
++	out[8] = digits[day / 10]; out[9] = digits[day % 10];
++	out[10] = ' ';
++	out[11] = digits[hour / 10]; out[12] = digits[hour % 10];
++	out[13] = ':';
++	out[14] = digits[minute / 10]; out[15] = digits[minute % 10];
++	out[16] = ':';
++	out[17] = digits[second / 10]; out[18] = digits[second % 10];
++	out[19] = ' ';
++	out[20] = sign ? '-' : '+';
++	out[21] = digits[(quarters * 15 / 60) / 10];
++	out[22] = digits[(quarters * 15 / 60) % 10];
++	out[23] = digits[(quarters * 15 % 60) / 10];
++	out[24] = digits[(quarters * 15 % 60) % 10];
++	out[25] = 0;
++}
++
++static __inline__ int
++vayu_sms_parse_address(const uint8_t *pdu, size_t length, size_t *at, struct vayu_sms_address *address)
++{
++	size_t octets;
++	uint8_t address_length, type_of_address;
++
++	if (pdu == NULL || at == NULL || address == NULL) {
++		return VAYU_SMS_ERR_ARGUMENT;
++	}
++	if (*at + 2 > length) {
++		return VAYU_SMS_ERR_TRUNCATED;
++	}
++	address_length = pdu[(*at)++];
++	type_of_address = pdu[(*at)++];
++	address->type_of_address = type_of_address;
++	address->alphanumeric = false;
++	if ((type_of_address & 0x70) == 0x50) {
++		uint8_t septets[VAYU_SMS_ADDRESS_MAX];
++		size_t text_length;
++
++		octets = ((size_t)address_length * 7u + 7u) / 8u;
++		if (*at + octets > length) {
++			return VAYU_SMS_ERR_TRUNCATED;
++		}
++		if (address_length > VAYU_SMS_ADDRESS_MAX - 1) {
++			return VAYU_SMS_ERR_TOO_LONG;
++		}
++		if (vayu_sms_gsm7_unpack_at(pdu + *at, octets, 0, address_length, septets, sizeof(septets)) != VAYU_SMS_OK) {
++			return VAYU_SMS_ERR_MALFORMED;
++		}
++		if (vayu_sms_gsm7_to_utf8(septets, address_length, address->text, sizeof(address->text), &text_length) != VAYU_SMS_OK) {
++			return VAYU_SMS_ERR_MALFORMED;
++		}
++		address->length = (uint32_t)text_length;
++		address->alphanumeric = true;
++		*at += octets;
++		return VAYU_SMS_OK;
++	}
++	octets = ((size_t)address_length + 1u) / 2u;
++	if (*at + octets > length) {
++		return VAYU_SMS_ERR_TRUNCATED;
++	}
++	if (address_length > VAYU_SMS_ADDRESS_MAX - 2) {
++		return VAYU_SMS_ERR_TOO_LONG;
++	}
++	{
++		size_t out = 0;
++
++		if ((type_of_address & 0x70) == 0x10) {
++			address->text[out++] = '+';
++		}
++		for (size_t i = 0; i < address_length; i++) {
++			uint8_t nibble = (i & 1u) != 0 ? (uint8_t)(pdu[*at + i / 2u] >> 4) : (uint8_t)(pdu[*at + i / 2u] & 0x0f);
++
++			if (nibble == 0x0f) {
++				continue;
++			}
++			if (nibble > 9) {
++				return VAYU_SMS_ERR_MALFORMED;
++			}
++			address->text[out++] = (char)('0' + nibble);
++		}
++		address->text[out] = 0;
++		address->length = (uint32_t)out;
++	}
++	*at += octets;
++	return VAYU_SMS_OK;
++}
++
++static __inline__ uint8_t
++vayu_sms_dcs_alphabet(uint8_t dcs)
++{
++	uint8_t group = dcs & 0xf0;
++	uint8_t bits;
++
++	if (group == 0x00 || group == 0x10 || group == 0x20 || group == 0x30) {
++		bits = (uint8_t)((dcs >> 2) & 0x03);
++	} else if (group == 0x40 || group == 0x50 || group == 0x60 || group == 0x70 || group == 0xe0) {
++		return VAYU_SMS_ALPHABET_GSM7;          /* message-waiting groups: always GSM 7-bit */
++	} else if (group == 0xf0) {
++		bits = (uint8_t)((dcs >> 2) & 0x03);
++	} else {
++		return VAYU_SMS_ALPHABET_NONE;
++	}
++	switch (bits) {
++	case 0: return VAYU_SMS_ALPHABET_GSM7;
++	case 1: return VAYU_SMS_ALPHABET_8BIT;
++	case 2: return VAYU_SMS_ALPHABET_UCS2;
++	default: return VAYU_SMS_ALPHABET_NONE;
++	}
++}
++
++/*
++ * Decode one complete SMS-DELIVER PDU (SMSC prefix included).  out is zeroed first.
++ * A UDH is parsed for concatenation metadata; the text of this one segment is
++ * decoded.  DCS alphabets this stage does not know are VAYU_SMS_ERR_UNSUPPORTED.
++ */
++static __inline__ int
++vayu_sms_pdu_decode_deliver(const uint8_t *pdu, size_t length, struct vayu_sms_deliver *out)
++{
++	size_t at, prefix, udh_octets = 0, ud_octets;
++	uint8_t first, udl, alphabet;
++
++	if (pdu == NULL || out == NULL) {
++		return VAYU_SMS_ERR_ARGUMENT;
++	}
++	memset(out, 0, sizeof(*out));
++	out->alphabet = VAYU_SMS_ALPHABET_NONE;
++	if (length < 2) {
++		return VAYU_SMS_ERR_TRUNCATED;
++	}
++	prefix = 1u + (size_t)pdu[0];
++	if (prefix >= length) {
++		return VAYU_SMS_ERR_TRUNCATED;
++	}
++	at = prefix;
++	first = pdu[at++];
++	out->first_octet = first;
++	if ((first & 0x03u) != 0) {
++		return VAYU_SMS_ERR_UNSUPPORTED;         /* not SMS-DELIVER: SMS-SUBMIT, STATUS-REPORT... */
++	}
++	if (vayu_sms_parse_address(pdu, length, &at, &out->originator) != VAYU_SMS_OK) {
++		return VAYU_SMS_ERR_MALFORMED;
++	}
++	if (at + 2 > length) {
++		return VAYU_SMS_ERR_TRUNCATED;
++	}
++	out->pid = pdu[at++];
++	out->dcs = pdu[at++];
++	alphabet = vayu_sms_dcs_alphabet(out->dcs);
++	if (alphabet == VAYU_SMS_ALPHABET_NONE) {
++		return VAYU_SMS_ERR_UNSUPPORTED;
++	}
++	out->alphabet = alphabet;
++	if (at + 7 > length) {
++		return VAYU_SMS_ERR_TRUNCATED;
++	}
++	memcpy(out->scts, pdu + at, 7);
++	vayu_sms_format_scts(out->scts, out->timestamp);
++	at += 7;
++	if (at + 1 > length) {
++		return VAYU_SMS_ERR_TRUNCATED;
++	}
++	udl = pdu[at++];
++	if ((first & 0x40u) != 0) {                     /* TP-UDHI */
++		if (at + 1 > length) {
++			return VAYU_SMS_ERR_TRUNCATED;
++		}
++		out->user_data_header_length = pdu[at];
++		udh_octets = (size_t)out->user_data_header_length + 1u;
++		if (at + udh_octets > length) {
++			return VAYU_SMS_ERR_TRUNCATED;
++		}
++		for (size_t i = 1; i + 1 < udh_octets;) {
++			uint8_t iei = pdu[at + i];
++			uint8_t ie_length = pdu[at + i + 1];
++
++			if (i + 2u + ie_length > udh_octets) {
++				return VAYU_SMS_ERR_MALFORMED;
++			}
++			if (iei == 0x00 && ie_length == 3) {
++				out->concatenated = true;
++				out->concat_reference = pdu[at + i + 2];
++				out->concat_total = pdu[at + i + 3];
++				out->concat_sequence = pdu[at + i + 4];
++			} else if (iei == 0x08 && ie_length == 4) {
++				out->concatenated = true;
++				out->concat_reference = (uint8_t)(pdu[at + i + 3] & 0xff);
++				out->concat_total = pdu[at + i + 4];
++				out->concat_sequence = pdu[at + i + 5];
++			}
++			i += 2u + ie_length;
++		}
++		at += udh_octets;
++	}
++	if (alphabet == VAYU_SMS_ALPHABET_GSM7) {
++		size_t septets = udl;
++		size_t skip = 0, relative_bits = 0;
++
++		/*
++		 * The UDH occupies whole octets before the septets.  The text's first
++		 * septet starts at the next septet boundary; relative_bits is the 0..6-bit
++		 * shift of that boundary inside the first octet after the UDH.
++		 */
++		if (udh_octets != 0) {
++			skip = (udh_octets * 8u + 6u) / 7u;
++			relative_bits = skip * 7u - udh_octets * 8u;
++			if (skip >= septets) {
++				out->text_length = 0;
++				return VAYU_SMS_OK;
++			}
++			septets -= skip;
++		}
++		ud_octets = (relative_bits + septets * 7u + 7u) / 8u;
++		if (at + ud_octets > length) {
++			return VAYU_SMS_ERR_TRUNCATED;
++		}
++		{
++			uint8_t septet_data[VAYU_SMS_SEPTETS_MAX];
++			size_t text_length;
++
++			if (vayu_sms_gsm7_unpack_at(pdu + at, ud_octets, relative_bits, septets, septet_data, sizeof(septet_data)) != VAYU_SMS_OK) {
++				return VAYU_SMS_ERR_MALFORMED;
++			}
++			if (vayu_sms_gsm7_to_utf8(septet_data, septets, out->text, sizeof(out->text), &text_length) != VAYU_SMS_OK) {
++				return VAYU_SMS_ERR_MALFORMED;
++			}
++			out->text_length = (uint32_t)text_length;
++		}
++		return VAYU_SMS_OK;
++	}
++	/*
++	 * 8-bit and UCS-2: UDL is the number of octets in TP-UD, the UDH included;
++	 * at points after the UDH already, so this segment's text is the rest.
++	 */
++	if (udl > VAYU_SMS_USER_OCTETS_MAX || udl < udh_octets) {
++		return VAYU_SMS_ERR_MALFORMED;
++	}
++	ud_octets = udl - udh_octets;
++	if (at + ud_octets > length) {
++		return VAYU_SMS_ERR_TRUNCATED;
++	}
++	if (alphabet == VAYU_SMS_ALPHABET_UCS2) {
++		size_t text_length;
++
++		if ((ud_octets & 1u) != 0) {
++			return VAYU_SMS_ERR_MALFORMED;
++		}
++		if (vayu_sms_ucs2_to_utf8(pdu + at, ud_octets, out->text, sizeof(out->text), &text_length) != VAYU_SMS_OK) {
++			return VAYU_SMS_ERR_MALFORMED;
++		}
++		out->text_length = (uint32_t)text_length;
++	} else {
++		size_t copy = ud_octets;        /* at most 140 octets, the buffer is larger */
++
++		memcpy(out->text, pdu + at, copy);
++		out->text[copy] = 0;
++		out->text_length = (uint32_t)copy;
++	}
++	return VAYU_SMS_OK;
++}
++
++/* ---- SMS-SUBMIT ------------------------------------------------------------------------------ */
++
++/*
++ * Build a complete SMS-SUBMIT PDU (with the SMSC prefix byte 0x00: "use the
++ * modem's default SMSC").  The text is GSM 7-bit when every character has a form
++ * there, UCS-2 otherwise.  More than one segment is VAYU_SMS_ERR_TOO_LONG; no
++ * truncation and no hidden concatenation.
++ */
++static __inline__ int
++vayu_sms_pdu_encode_submit(const char *number, const char *text, size_t text_length, uint8_t message_reference,
++    uint8_t *out, size_t out_size, size_t *out_length, uint32_t *pdu_dcs)
++{
++	uint8_t digits[24];
++	size_t digit_count = 0, at = 0, user_length = 0, septet_count = 0, address_octets;
++	bool international = false, gsm7 = true;
++	uint8_t user[VAYU_SMS_USER_OCTETS_MAX];
++	uint8_t septets[VAYU_SMS_SEPTETS_MAX];
++
++	if (number == NULL || text == NULL || out == NULL || out_length == NULL || pdu_dcs == NULL) {
++		return VAYU_SMS_ERR_ARGUMENT;
++	}
++	if (text_length == 0) {
++		return VAYU_SMS_ERR_ARGUMENT;
++	}
++	for (const char *c = number; *c != 0; c++) {
++		if (*c == '+' && digit_count == 0) {
++			international = true;
++			continue;
++		}
++		if (*c < '0' || *c > '9' || digit_count >= 20) {
++			return VAYU_SMS_ERR_ADDRESS;
++		}
++		digits[digit_count++] = (uint8_t)(*c - '0');
++	}
++	if (digit_count == 0) {
++		return VAYU_SMS_ERR_ADDRESS;
++	}
++	/* a leading '+' and then no digits is not an address */
++	if (international && digit_count == 0) {
++		return VAYU_SMS_ERR_ADDRESS;
++	}
++	if (vayu_sms_utf8_to_gsm7(text, text_length, septets, sizeof(septets), &septet_count) != VAYU_SMS_OK) {
++		gsm7 = false;
++	}
++	if (gsm7) {
++		if (septet_count > VAYU_SMS_SEPTETS_MAX) {
++			return VAYU_SMS_ERR_TOO_LONG;
++		}
++		if (vayu_sms_gsm7_pack(septets, septet_count, user, sizeof(user), &user_length) != VAYU_SMS_OK) {
++			return VAYU_SMS_ERR_TOO_LONG;
++		}
++	} else {
++		size_t octets;
++
++		if (vayu_sms_utf8_to_ucs2(text, text_length, user, sizeof(user), &octets) != VAYU_SMS_OK) {
++			return VAYU_SMS_ERR_TOO_LONG;
++		}
++		if (octets > VAYU_SMS_USER_OCTETS_MAX) {
++			return VAYU_SMS_ERR_TOO_LONG;
++		}
++		user_length = octets;
++	}
++	address_octets = (digit_count + 1u) / 2u;
++	if (out_size < 1u + 1u + 1u + 1u + 1u + address_octets + 1u + 1u + 1u + user_length) {
++		return VAYU_SMS_ERR_BUFFER;
++	}
++	out[at++] = 0x00;                               /* SMSC: the modem's default */
++	out[at++] = 0x01;                               /* SMS-SUBMIT, no VP, no UDH, no SR */
++	out[at++] = message_reference;
++	out[at++] = (uint8_t)digit_count;
++	out[at++] = international ? 0x91 : 0x81;
++	for (size_t i = 0; i < digit_count; i += 2) {
++		uint8_t low = digits[i];
++		uint8_t high = i + 1 < digit_count ? digits[i + 1] : 0x0f;
++
++		out[at++] = (uint8_t)((high << 4) | low);
++	}
++	out[at++] = 0x00;                               /* TP-PID */
++	if (gsm7) {
++		out[at++] = 0x00;                       /* TP-DCS: GSM 7-bit */
++		out[at++] = (uint8_t)septet_count;      /* TP-UDL in septets */
++		memcpy(out + at, user, user_length);    /* user_length: packed octets */
++		at += user_length;
++		*pdu_dcs = 0x00;
++	} else {
++		out[at++] = 0x08;                       /* TP-DCS: UCS-2 */
++		out[at++] = (uint8_t)user_length;       /* TP-UDL in octets */
++		memcpy(out + at, user, user_length);
++		at += user_length;
++		*pdu_dcs = 0x08;
++	}
++	*out_length = at;
++	return VAYU_SMS_OK;
++}
++
++/* ---- QMI WMS: common ------------------------------------------------------------------------- */
++
++struct vayu_sms_qmi_result {
++	uint16_t result;
++	uint16_t error;
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_result_ei[] = {
++	{ .data_type = QMI_UNSIGNED_2_BYTE, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_result, result) },
++	{ .data_type = QMI_UNSIGNED_2_BYTE, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_result, error) },
++	{ .data_type = QMI_EOTI },
++};
++
++static __inline__ bool
++vayu_sms_qmi_succeeded(const struct vayu_sms_qmi_result *result)
++{
++	return result != NULL && result->result == QMI_RESULT_SUCCESS_V01 && result->error == QMI_ERR_NONE_V01;
++}
++
++/* ---- Set Event Report (0x0001) ---------------------------------------------------------------- */
++
++struct vayu_sms_qmi_set_event_req {
++	uint8_t report;                 /* TLV 0x10: report new MT messages */
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_set_event_report_req_ei[] = {
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_set_event_req, report) },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_result_resp {
++	struct vayu_sms_qmi_result result;      /* TLV 0x02 */
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_result_resp_ei[] = {
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_result),
++	  .array_type = NO_ARRAY, .tlv_type = 0x02, .offset = offsetof(struct vayu_sms_qmi_result_resp, result),
++	  .ei_array = vayu_sms_qmi_result_ei },
++	{ .data_type = QMI_EOTI },
++};
++
++/* ---- Event Report indication (0x0001) --------------------------------------------------------- */
++
++struct vayu_sms_qmi_mt_message {
++	uint8_t storage;                /* QmiWmsStorageType */
++	uint32_t index;                 /* memory index */
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_mt_message_ei[] = {
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_mt_message, storage) },
++	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_mt_message, index) },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_transfer_route {
++	uint8_t ack;                    /* QmiWmsAckIndicator */
++	uint32_t transaction;
++	uint8_t format;                 /* QmiWmsMessageFormat */
++	uint32_t raw_length;            /* guint16 on the wire */
++	uint8_t raw[VAYU_SMS_PDU_MAX];
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_transfer_route_ei[] = {
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_transfer_route, ack) },
++	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_transfer_route, transaction) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_transfer_route, format) },
++	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_transfer_route, raw_length) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = VAYU_SMS_PDU_MAX, .elem_size = sizeof(uint8_t),
++	  .array_type = VAR_LEN_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE,
++	  .offset = offsetof(struct vayu_sms_qmi_transfer_route, raw) },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_event_report {
++	struct vayu_sms_qmi_result result;      /* not in an indication; left zero */
++	uint8_t mt_valid;                       /* TLV 0x10 */
++	struct vayu_sms_qmi_mt_message mt;
++	uint8_t route_valid;                    /* TLV 0x11 */
++	struct vayu_sms_qmi_transfer_route route;
++	uint8_t mode_valid;                     /* TLV 0x12 */
++	uint8_t mode;
++	uint8_t ims_valid;                      /* TLV 0x16 */
++	uint8_t ims;
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_event_report_ei[] = {
++	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_event_report, mt_valid) },
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_mt_message),
++	  .array_type = NO_ARRAY, .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_event_report, mt),
++	  .ei_array = vayu_sms_qmi_mt_message_ei },
++	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x11, .offset = offsetof(struct vayu_sms_qmi_event_report, route_valid) },
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_transfer_route),
++	  .array_type = NO_ARRAY, .tlv_type = 0x11, .offset = offsetof(struct vayu_sms_qmi_event_report, route),
++	  .ei_array = vayu_sms_qmi_transfer_route_ei },
++	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x12, .offset = offsetof(struct vayu_sms_qmi_event_report, mode_valid) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x12, .offset = offsetof(struct vayu_sms_qmi_event_report, mode) },
++	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x16, .offset = offsetof(struct vayu_sms_qmi_event_report, ims_valid) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x16, .offset = offsetof(struct vayu_sms_qmi_event_report, ims) },
++	{ .data_type = QMI_EOTI },
++};
++
++/* ---- Raw Send (0x0020) ------------------------------------------------------------------------ */
++
++struct vayu_sms_qmi_raw_message {
++	uint8_t format;                 /* QmiWmsMessageFormat */
++	uint32_t raw_length;            /* guint16 on the wire */
++	uint8_t raw[VAYU_SMS_PDU_MAX];
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_raw_message_ei[] = {
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_raw_message, format) },
++	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_raw_message, raw_length) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = VAYU_SMS_PDU_MAX, .elem_size = sizeof(uint8_t),
++	  .array_type = VAR_LEN_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE,
++	  .offset = offsetof(struct vayu_sms_qmi_raw_message, raw) },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_raw_send_req {
++	struct vayu_sms_qmi_raw_message message;        /* TLV 0x01 */
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_raw_send_req_ei[] = {
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_raw_message),
++	  .array_type = NO_ARRAY, .tlv_type = 0x01,
++	  .offset = offsetof(struct vayu_sms_qmi_raw_send_req, message),
++	  .ei_array = vayu_sms_qmi_raw_message_ei },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_gsm_cause {
++	uint16_t rp_cause;
++	uint8_t tp_cause;
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_gsm_cause_ei[] = {
++	{ .data_type = QMI_UNSIGNED_2_BYTE, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_gsm_cause, rp_cause) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_gsm_cause, tp_cause) },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_raw_send_resp {
++	struct vayu_sms_qmi_result result;      /* TLV 0x02 */
++	uint8_t message_id_valid;               /* TLV 0x01 */
++	uint16_t message_id;
++	uint8_t cause_valid;                    /* TLV 0x12 */
++	struct vayu_sms_qmi_gsm_cause cause;
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_raw_send_resp_ei[] = {
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_result),
++	  .array_type = NO_ARRAY, .tlv_type = 0x02, .offset = offsetof(struct vayu_sms_qmi_raw_send_resp, result),
++	  .ei_array = vayu_sms_qmi_result_ei },
++	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_raw_send_resp, message_id_valid) },
++	{ .data_type = QMI_UNSIGNED_2_BYTE, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_raw_send_resp, message_id) },
++	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x12, .offset = offsetof(struct vayu_sms_qmi_raw_send_resp, cause_valid) },
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_gsm_cause),
++	  .array_type = NO_ARRAY, .tlv_type = 0x12, .offset = offsetof(struct vayu_sms_qmi_raw_send_resp, cause),
++	  .ei_array = vayu_sms_qmi_gsm_cause_ei },
++	{ .data_type = QMI_EOTI },
++};
++
++/* ---- Raw Read (0x0022) ------------------------------------------------------------------------ */
++
++struct vayu_sms_qmi_memory_id {
++	uint8_t storage;                /* QmiWmsStorageType */
++	uint32_t index;
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_memory_id_ei[] = {
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_memory_id, storage) },
++	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_memory_id, index) },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_raw_read_req {
++	struct vayu_sms_qmi_memory_id id;       /* TLV 0x01 */
++	uint8_t mode_valid;                     /* TLV 0x10 */
++	uint8_t mode;
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_raw_read_req_ei[] = {
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_memory_id),
++	  .array_type = NO_ARRAY, .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_raw_read_req, id),
++	  .ei_array = vayu_sms_qmi_memory_id_ei },
++	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_raw_read_req, mode_valid) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_raw_read_req, mode) },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_raw_read_data {
++	uint8_t tag;                    /* QmiWmsMessageTagType */
++	uint8_t format;                 /* QmiWmsMessageFormat */
++	uint32_t raw_length;            /* guint16 on the wire */
++	uint8_t raw[VAYU_SMS_PDU_MAX];
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_raw_read_data_ei[] = {
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_raw_read_data, tag) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_raw_read_data, format) },
++	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_raw_read_data, raw_length) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = VAYU_SMS_PDU_MAX, .elem_size = sizeof(uint8_t),
++	  .array_type = VAR_LEN_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE,
++	  .offset = offsetof(struct vayu_sms_qmi_raw_read_data, raw) },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_raw_read_resp {
++	struct vayu_sms_qmi_result result;      /* TLV 0x02 */
++	uint8_t raw_valid;                      /* TLV 0x01 */
++	struct vayu_sms_qmi_raw_read_data raw;
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_raw_read_resp_ei[] = {
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_result),
++	  .array_type = NO_ARRAY, .tlv_type = 0x02, .offset = offsetof(struct vayu_sms_qmi_raw_read_resp, result),
++	  .ei_array = vayu_sms_qmi_result_ei },
++	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_raw_read_resp, raw_valid) },
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_raw_read_data),
++	  .array_type = NO_ARRAY, .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_raw_read_resp, raw),
++	  .ei_array = vayu_sms_qmi_raw_read_data_ei },
++	{ .data_type = QMI_EOTI },
++};
++
++/* ---- List Messages (0x0031) ------------------------------------------------------------------ */
++
++struct vayu_sms_qmi_list_req {
++	uint8_t storage;                /* TLV 0x01; a value, not a wildcard */
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_list_req_ei[] = {
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_list_req, storage) },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_list_entry {
++	uint32_t index;
++	uint8_t tag;
++};
++
++struct vayu_sms_qmi_message_list {
++	uint32_t count;
++	struct vayu_sms_qmi_list_entry entry[VAYU_SMS_LIST_MAX];
++};
++
++#define VAYU_SMS_QMI_LIST_RAW   512     /* a 32-entry list is 164 bytes; room to spare */
++
++/*
++ * List Messages is the one WMS reply whose count prefix is 32 bits (guint32 in
++ * qmi-service-wms.json), while sys/hakios.qmi.h's QMI_DATA_LEN supports only 8- and
++ * 16-bit prefixes.  A top-level QMI_STRING element copies a whole TLV value, so the
++ * 0x01 TLV is taken as 512 opaque bytes and parsed by vayu_sms_qmi_list_parse().
++ */
++struct vayu_sms_qmi_list_resp {
++	struct vayu_sms_qmi_result result;      /* TLV 0x02 */
++	uint8_t list_valid;                     /* TLV 0x01 */
++	char list[VAYU_SMS_QMI_LIST_RAW];
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_list_resp_ei[] = {
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_result),
++	  .array_type = NO_ARRAY, .tlv_type = 0x02, .offset = offsetof(struct vayu_sms_qmi_list_resp, result),
++	  .ei_array = vayu_sms_qmi_result_ei },
++	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_list_resp, list_valid) },
++	{ .data_type = QMI_STRING, .elem_len = VAYU_SMS_QMI_LIST_RAW, .elem_size = sizeof(char),
++	  .array_type = NO_ARRAY, .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_list_resp, list) },
++	{ .data_type = QMI_EOTI },
++};
++
++static __inline__ uint16_t
++vayu_sms_le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
++static __inline__ uint32_t
++vayu_sms_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/* The 0x01 TLV body: u32 count, then {u32 index, u8 tag}. */
++static __inline__ int
++vayu_sms_qmi_list_parse(const char *payload, size_t payload_length, struct vayu_sms_qmi_message_list *out)
++{
++	const uint8_t *data = (const uint8_t *)payload;
++	uint32_t count;
++
++	if (payload == NULL || out == NULL) {
++		return VAYU_SMS_ERR_ARGUMENT;
++	}
++	memset(out, 0, sizeof(*out));
++	if (payload_length < 4) {
++		return VAYU_SMS_ERR_MALFORMED;
++	}
++	count = vayu_sms_le32(data);
++	if (count > (payload_length - 4u) / 5u) {
++		return VAYU_SMS_ERR_MALFORMED;
++	}
++	if (count > VAYU_SMS_LIST_MAX) {
++		count = VAYU_SMS_LIST_MAX;              /* more than the inbox can show */
++	}
++	out->count = count;
++	for (uint32_t i = 0; i < count; i++) {
++		const uint8_t *entry = data + 4u + (size_t)i * 5u;
++
++		out->entry[i].index = vayu_sms_le32(entry);
++		out->entry[i].tag = entry[4];
++	}
++	return VAYU_SMS_OK;
++}
++
++/* ---- Delete (0x0024) ------------------------------------------------------------------------- */
++
++struct vayu_sms_qmi_delete_req {
++	uint8_t storage;                /* TLV 0x01 */
++	uint32_t index;                 /* TLV 0x10 */
++	uint8_t tag;                    /* TLV 0x11 */
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_delete_req_ei[] = {
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_delete_req, storage) },
++	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_delete_req, index) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x11, .offset = offsetof(struct vayu_sms_qmi_delete_req, tag) },
++	{ .data_type = QMI_EOTI },
++};
++
++/* ---- Send Ack (0x0037) ----------------------------------------------------------------------- */
++
++struct vayu_sms_qmi_send_ack_info {
++	uint32_t transaction;
++	uint8_t protocol;               /* QmiWmsMessageProtocol: WCDMA = 1 */
++	uint8_t success;
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_send_ack_info_ei[] = {
++	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_send_ack_info, transaction) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_send_ack_info, protocol) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_send_ack_info, success) },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_send_ack_req {
++	struct vayu_sms_qmi_send_ack_info info; /* TLV 0x01 */
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_send_ack_req_ei[] = {
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_send_ack_info),
++	  .array_type = NO_ARRAY, .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_send_ack_req, info),
++	  .ei_array = vayu_sms_qmi_send_ack_info_ei },
++	{ .data_type = QMI_EOTI },
++};
++
++/* ---- Set/Get Routes (0x0032/0x0033) ---------------------------------------------------------- */
++
++struct vayu_sms_qmi_route {
++	uint8_t message_type;
++	uint8_t message_class;
++	uint8_t storage;
++	uint8_t receipt_action;
++};
++
++struct vayu_sms_qmi_routes {
++	uint32_t count;                 /* guint16 on the wire for routes */
++	struct vayu_sms_qmi_route route[VAYU_SMS_ROUTE_MAX];
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_route_ei[] = {
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_route, message_type) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_route, message_class) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_route, storage) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_route, receipt_action) },
++	{ .data_type = QMI_EOTI },
++};
++
++/* The route list's wire count is 16 bits, unlike List Messages' 32 (qmi-service-wms.json). */
++static const struct qmi_elem_info vayu_sms_qmi_routes_ei[] = {
++	{ .data_type = QMI_DATA_LEN, .elem_len = 1, .elem_size = sizeof(uint16_t), .array_type = NO_ARRAY,
++	  .tlv_type = QMI_COMMON_TLV_TYPE, .offset = offsetof(struct vayu_sms_qmi_routes, count) },
++	{ .data_type = QMI_STRUCT, .elem_len = VAYU_SMS_ROUTE_MAX, .elem_size = sizeof(struct vayu_sms_qmi_route),
++	  .array_type = VAR_LEN_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE,
++	  .offset = offsetof(struct vayu_sms_qmi_routes, route), .ei_array = vayu_sms_qmi_route_ei },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_set_routes_req {
++	struct vayu_sms_qmi_routes routes;      /* TLV 0x01 */
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_set_routes_req_ei[] = {
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_routes),
++	  .array_type = NO_ARRAY, .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_set_routes_req, routes),
++	  .ei_array = vayu_sms_qmi_routes_ei },
++	{ .data_type = QMI_EOTI },
++};
++
++struct vayu_sms_qmi_get_routes_resp {
++	struct vayu_sms_qmi_result result;      /* TLV 0x02 */
++	uint8_t routes_valid;                   /* TLV 0x01 */
++	struct vayu_sms_qmi_routes routes;
++	uint8_t transfer_valid;                 /* TLV 0x10 */
++	uint8_t transfer;
++};
++
++static const struct qmi_elem_info vayu_sms_qmi_get_routes_resp_ei[] = {
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_result),
++	  .array_type = NO_ARRAY, .tlv_type = 0x02, .offset = offsetof(struct vayu_sms_qmi_get_routes_resp, result),
++	  .ei_array = vayu_sms_qmi_result_ei },
++	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_get_routes_resp, routes_valid) },
++	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_routes),
++	  .array_type = NO_ARRAY, .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_get_routes_resp, routes),
++	  .ei_array = vayu_sms_qmi_routes_ei },
++	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_get_routes_resp, transfer_valid) },
++	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
++	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_get_routes_resp, transfer) },
++	{ .data_type = QMI_EOTI },
++};
++
++/*
++ * Fill a Raw Send request from a complete PDU (the form vayu_sms_pdu_encode_submit()
++ * produces).  No bytes leave the machine here.
++ */
++static __inline__ int
++vayu_sms_qmi_raw_send_fill(struct vayu_sms_qmi_raw_send_req *request, const uint8_t *pdu, size_t pdu_length)
++{
++	if (request == NULL || pdu == NULL) {
++		return VAYU_SMS_ERR_ARGUMENT;
++	}
++	if (pdu_length == 0 || pdu_length > VAYU_SMS_PDU_MAX) {
++		return VAYU_SMS_ERR_TOO_LONG;
++	}
++	memset(request, 0, sizeof(*request));
++	request->message.format = VAYU_SMS_QMI_FORMAT_GSM_P2P;
++	request->message.raw_length = (uint32_t)pdu_length;
++	memcpy(request->message.raw, pdu, pdu_length);
++	return VAYU_SMS_OK;
++}
++
++#endif /* _SYS_VAYU_SMS_QMI_H_ */

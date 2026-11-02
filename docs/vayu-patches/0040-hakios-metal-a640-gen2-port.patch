@@ -1,0 +1,777 @@
+From a9c843cb40bc5f7ac7548cad457d3f42b6efeb2e Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Mon, 2 Nov 2026 04:02:13 +0300
+Subject: [PATCH] A640 (vayu, a6xx gen2) port: chip facts, no LPAC copies,
+ RedwoodGPU transport, probe --stages
+
+---
+ include/hakios-metal/a6xx.hpp     | 85 ++++++++++++++++---------------
+ include/hakios-metal/compute.hpp  |  3 +-
+ include/hakios-metal/fake_gpu.hpp | 13 +++--
+ src/command.cpp                   |  6 +--
+ src/compiler.cpp                  | 12 +++--
+ src/fake_gpu.cpp                  | 30 +++++++----
+ src/iokit_transport.cpp           | 23 +++++++--
+ src/texture.cpp                   |  4 ++
+ tests/a6xx_test.cpp               | 20 ++++----
+ tests/c_api_test.cpp              |  2 +-
+ tests/command_test.cpp            | 18 +++----
+ tests/compute_test.cpp            | 21 ++++++--
+ tests/render_test.cpp             | 22 ++++----
+ tests/texture_test.cpp            | 12 +++--
+ tools/probe.cpp                   | 27 ++++++++++
+ tools/probe_fake_transport.cpp    | 10 ++++
+ 16 files changed, 200 insertions(+), 108 deletions(-)
+ create mode 100644 tools/probe_fake_transport.cpp
+
+diff --git a/include/hakios-metal/a6xx.hpp b/include/hakios-metal/a6xx.hpp
+index b01af4c..e75a81d 100644
+--- a/include/hakios-metal/a6xx.hpp
++++ b/include/hakios-metal/a6xx.hpp
+@@ -1,5 +1,5 @@
+ // The Adreno A6xx registers, packet words and descriptor fields a compute dispatch and one draw write, for the Adreno
+-// 7c+ Gen 3 (the A635 family, chip id 0x06030500: Mesa's "a6xx gen4", the same generation as the A660).
++// 640 (SM8150, chip id 0x06040001: Mesa's "a6xx gen2"). Ported from the Adreno 7c+ Gen 3 (A635, gen4) original.
+ //
+ // Every number here is Mesa 25.0.7's (MIT), from the register XML in src/freedreno/registers/adreno/ (a6xx.xml,
+ // adreno_pm4.xml, adreno_common.xml) through the headers Mesa's build generates from it: a6xx.xml.h,
+@@ -24,21 +24,23 @@
+ namespace hakios::metal::a6xx {
+ 
+ // --- this chip -----------------------------------------------------------------------------------------------------
+-// From Mesa's src/freedreno/common/freedreno_devices.py: the entry for chip_id ...06030500 ("Adreno 7c+ Gen 3", every
+-// speedbin of the A635) is a6xx_base + a6xx_gen4 with num_ccu = 2.
++// From Mesa's src/freedreno/common/freedreno_devices.py: the entry GPUId(640) (chip_id 0x060400ff, the patch level a
++// wildcard) is a6xx_base + a6xx_gen2 with num_ccu = 2. This port: the Adreno 640 of the POCO X3 Pro (SM8150, vayu),
++// whose kernel (bsd/dev/vayu_adreno.c vayu_gpu_parameter) answers CHIP_ID 0x06040001 and GMEM_SIZE 1 MiB.
+ 
+-inline constexpr uint32_t kChipId = 0x06030500;             // not-in-headers: freedreno_devices.py GPUId(chip_id=0x..06030500)
+-inline constexpr bool kHasLpac = true;                       // not-in-headers: freedreno_devices.py a6xx_gen4.has_lpac
++inline constexpr uint32_t kChipId = 0x06040001;             // not-in-headers: vayu_adreno.c GMU_CHIP_ID; Mesa matches it to GPUId(640)
++inline constexpr bool kHasLpac = false;                      // not-in-headers: freedreno_devices.py a6xx_gen2 (has_lpac only in a6xx_gen4)
+ inline constexpr bool kSupportsDoubleThreadsize = true;      // not-in-headers: freedreno_devices.py a6xx_base.supports_double_threadsize
+-// CP_LOAD_STATE6_0_NUM_UNIT for a shader (ST6_SHADER) is capped at this many instruction groups: Mesa's comment says
+-// the blob allows 128 but 128 hangs this generation, so 127 it is (a longer shader is fetched past the preload).
+-inline constexpr uint32_t kInstrCacheSize = 127;             // not-in-headers: freedreno_devices.py a6xx_gen4.instr_cache_size
+-inline constexpr uint32_t kFibersPerSp = 128 * 2 * 16;       // not-in-headers: freedreno_devices.py, the A635 entry (fibers_per_sp)
+-inline constexpr uint32_t kNumSpCores = 2;                   // not-in-headers: freedreno_devices.py num_sp_cores = num_ccu for the A635
+-inline constexpr uint32_t kCsSharedMemSize = 32 * 1024;      // not-in-headers: freedreno_devices.py, the A635 entry (cs_shared_mem_size)
++// CP_LOAD_STATE6_0_NUM_UNIT for a shader (ST6_SHADER) is capped at this many instruction groups (a longer shader is
++// fetched past the preload). a6xx_gen2 says 64 (marked TODO in Mesa: not measured on an A640 by anybody yet).
++inline constexpr uint32_t kInstrCacheSize = 64;              // not-in-headers: freedreno_devices.py a6xx_gen2.instr_cache_size
++inline constexpr uint32_t kRegSizeVec4 = 96;                 // not-in-headers: freedreno_devices.py a6xx_gen2.reg_size_vec4
++inline constexpr uint32_t kFibersPerSp = 128 * 4 * 16;       // not-in-headers: freedreno_devices.py, the A640 entry (fibers_per_sp)
++inline constexpr uint32_t kNumSpCores = 2;                   // not-in-headers: freedreno_devices.py num_sp_cores = num_ccu for the A640
++inline constexpr uint32_t kCsSharedMemSize = 32 * 1024;      // not-in-headers: freedreno_devices.py, the A640 entry (cs_shared_mem_size)
+ inline constexpr uint32_t kThreadsizeBase = 64;              // not-in-headers: freedreno_devices.py A6xxGPUInfo default threadsize_base
+ inline constexpr uint32_t kMaxWaves = 16;                    // not-in-headers: freedreno_devices.py A6xxGPUInfo default max_waves
+-inline constexpr uint32_t kWaveGranularity = 2;              // not-in-headers: freedreno_devices.py, the A635 entry (wave_granularity)
++inline constexpr uint32_t kWaveGranularity = 2;              // not-in-headers: freedreno_devices.py, the A640 entry (wave_granularity)
+ // ir3's "no register": regid(63, 0) = 63 << 2 | 0. The *CONSTID / *REGID fields take it for a value the shader does
+ // not read (the work group size and offset constants, the linear local id), and it is what Mesa writes there.
+ inline constexpr uint32_t kRegidNone = 0xfc;                 // not-in-headers: ir3/instr-a3xx.h INVALID_REG = regid(63, 0)
+@@ -1388,33 +1390,34 @@ struct RegWrite {
+     uint32_t value;
+ };
+ 
+-// Mesa's per-chip "magic" values, as its generated freedreno_devices.h has them for this chip (__info14, the entry every
+-// A635 chip id maps to). Mesa does not know what most of them mean either; they are what the blob writes.
+-inline constexpr uint32_t kMagicPcPowerCntl = 1;                  // not-in-headers: freedreno_devices.h __info14 .magic.PC_POWER_CNTL
+-inline constexpr uint32_t kMagicTpl1DbgEcoCntl = 0x05008000;      // not-in-headers: freedreno_devices.h __info14 .magic.TPL1_DBG_ECO_CNTL (83918848)
+-inline constexpr uint32_t kMagicGrasDbgEcoCntl = 0;               // not-in-headers: freedreno_devices.h __info14 .magic.GRAS_DBG_ECO_CNTL
+-inline constexpr uint32_t kMagicSpChickenBits = 0x00001400;       // not-in-headers: freedreno_devices.h __info14 .magic.SP_CHICKEN_BITS (5120)
+-inline constexpr uint32_t kMagicUcheClientPf = 0x00000084;        // not-in-headers: freedreno_devices.h __info14 .magic.UCHE_CLIENT_PF (132)
+-inline constexpr uint32_t kMagicPcModeCntl = 0x1f;                // not-in-headers: freedreno_devices.h __info14 .magic.PC_MODE_CNTL (31)
+-inline constexpr uint32_t kMagicSpDbgEcoCntl = 0x00000006;        // not-in-headers: freedreno_devices.h __info14 .magic.SP_DBG_ECO_CNTL
+-inline constexpr uint32_t kMagicRbDbgEcoCntl = 0x04100000;        // not-in-headers: freedreno_devices.h __info14 .magic.RB_DBG_ECO_CNTL (68157440)
+-inline constexpr uint32_t kMagicHlsqDbgEcoCntl = 0;               // not-in-headers: freedreno_devices.h __info14 .magic.HLSQ_DBG_ECO_CNTL
+-inline constexpr uint32_t kMagicRbUnknown8E01 = 0;                // not-in-headers: freedreno_devices.h __info14 .magic.RB_UNKNOWN_8E01
+-inline constexpr uint32_t kMagicVpcDbgEcoCntl = 0x02000000;       // not-in-headers: freedreno_devices.h __info14 .magic.VPC_DBG_ECO_CNTL (33554432)
+-inline constexpr uint32_t kMagicUcheUnknown0E12 = 1;              // not-in-headers: freedreno_devices.h __info14 .magic.UCHE_UNKNOWN_0E12
++// Mesa's per-chip "magic" values, as freedreno_devices.py has them for GPUId(640) (magic_regs of that entry). Mesa does
++// not know what most of them mean either; they are what the blob writes.
++inline constexpr uint32_t kMagicPcPowerCntl = 1;                  // not-in-headers: freedreno_devices.py A640 magic_regs PC_POWER_CNTL
++inline constexpr uint32_t kMagicTpl1DbgEcoCntl = 0x00008000;      // not-in-headers: freedreno_devices.py A640 magic_regs TPL1_DBG_ECO_CNTL
++inline constexpr uint32_t kMagicGrasDbgEcoCntl = 0;               // not-in-headers: freedreno_devices.py A640 magic_regs GRAS_DBG_ECO_CNTL
++inline constexpr uint32_t kMagicSpChickenBits = 0x00000420;       // not-in-headers: freedreno_devices.py A640 magic_regs SP_CHICKEN_BITS
++inline constexpr uint32_t kMagicUcheClientPf = 0x00000004;        // not-in-headers: freedreno_devices.py A640 magic_regs UCHE_CLIENT_PF
++inline constexpr uint32_t kMagicPcModeCntl = 0x1f;                // not-in-headers: freedreno_devices.py A640 magic_regs PC_MODE_CNTL
++inline constexpr uint32_t kMagicSpDbgEcoCntl = 0x00000000;        // not-in-headers: freedreno_devices.py A640 magic_regs SP_DBG_ECO_CNTL
++inline constexpr uint32_t kMagicRbDbgEcoCntl = 0x04100000;        // not-in-headers: freedreno_devices.py A640 magic_regs RB_DBG_ECO_CNTL
++inline constexpr uint32_t kMagicHlsqDbgEcoCntl = 0;               // not-in-headers: freedreno_devices.py A640 magic_regs HLSQ_DBG_ECO_CNTL
++inline constexpr uint32_t kMagicRbUnknown8E01 = 1;                // not-in-headers: freedreno_devices.py A640 magic_regs RB_UNKNOWN_8E01
++inline constexpr uint32_t kMagicVpcDbgEcoCntl = 0x02000000;       // not-in-headers: freedreno_devices.py A640 magic_regs VPC_DBG_ECO_CNTL
++inline constexpr uint32_t kMagicUcheUnknown0E12 = 1;              // not-in-headers: freedreno_devices.py A640 magic_regs UCHE_UNKNOWN_0E12
+ // and the chip facts fd6_emit_static_regs and fd6_emit_ccu_cntl branch on
+-inline constexpr bool kHasGmemFastClear = true;                   // not-in-headers: freedreno_devices.h __info14 .has_gmem_fast_clear
+-inline constexpr bool kConcurrentResolve = false;                 // not-in-headers: freedreno_devices.h __info14 has no .concurrent_resolve (false)
+-inline constexpr bool kHasEarlyPreamble = false;                  // not-in-headers: freedreno_devices.h __info14 has no .has_early_preamble (a6xx_gen4 leaves it off)
+-inline constexpr uint32_t kNumCcu = 2;                            // not-in-headers: freedreno_devices.h __info14 .num_ccu
+-inline constexpr uint32_t kSysmemPerCcuDepthCacheSize = 0x10000;  // not-in-headers: freedreno_devices.h __info14 .sysmem_per_ccu_depth_cache_size (65536)
+-inline constexpr uint32_t kSysmemPerCcuColorCacheSize = 0x10000;  // not-in-headers: freedreno_devices.h __info14 .sysmem_per_ccu_color_cache_size (65536)
+-// tiled rendering: the on-chip memory and the tile grid (a6xx_gen4 / adreno_7c3 in freedreno_devices.py)
+-inline constexpr uint32_t kGmemBytes = 512 * 1024;                // not-in-headers: freedreno_devices.py adreno_7c3 gmem_size (Linux a6xx_gpu adreno_7c3 SZ_512K)
+-inline constexpr uint32_t kGmemCcuColorCacheFraction = 4;          // not-in-headers: freedreno_devices.py a6xx_gen4 gmem_ccu_color_cache_fraction QUARTER
+-inline constexpr uint32_t kTileAlignW = 32, kTileAlignH = 16;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_align_w/h
+-inline constexpr uint32_t kGmemAlignW = 16, kGmemAlignH = 4;       // not-in-headers: freedreno_devices.py a6xx_gen4 gmem_align_w/h (the event blit's granule)
+-inline constexpr uint32_t kTileMaxW = 1024, kTileMaxH = 1008;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_max_w/h
++inline constexpr bool kHasGmemFastClear = true;                   // not-in-headers: freedreno_devices.py a6xx_base has_gmem_fast_clear (gen2 keeps it)
++inline constexpr bool kConcurrentResolve = false;                 // not-in-headers: a6xx_gen2 has no concurrent_resolve
++inline constexpr bool kHasEarlyPreamble = false;                  // not-in-headers: a6xx_gen2 has no has_early_preamble
++inline constexpr bool kHasTexFilterCubic = false;                 // not-in-headers: a6xx_gen2 has no has_tex_filter_cubic (gen3/gen4 only)
++inline constexpr uint32_t kNumCcu = 2;                            // not-in-headers: freedreno_devices.py A640 num_ccu
++inline constexpr uint32_t kSysmemPerCcuDepthCacheSize = 0x10000;  // not-in-headers: a6xx_base sysmem_per_ccu_depth_cache_size (65536)
++inline constexpr uint32_t kSysmemPerCcuColorCacheSize = 0x10000;  // not-in-headers: a6xx_base sysmem_per_ccu_color_cache_size (65536)
++// tiled rendering: the on-chip memory and the tile grid (A640 entry + A6xxGPUInfo defaults in freedreno_devices.py)
++inline constexpr uint32_t kGmemBytes = 1024 * 1024;               // not-in-headers: Linux adreno_device.c A640 SZ_1M; vayu_adreno.c GMEM_SIZE 0x100000
++inline constexpr uint32_t kGmemCcuColorCacheFraction = 4;          // not-in-headers: a6xx_base gmem_ccu_color_cache_fraction QUARTER
++inline constexpr uint32_t kTileAlignW = 32, kTileAlignH = 16;      // not-in-headers: freedreno_devices.py A640 tile_align_w/h
++inline constexpr uint32_t kGmemAlignW = 16, kGmemAlignH = 4;       // not-in-headers: A6xxGPUInfo gmem_align_w/h (the event blit's granule)
++inline constexpr uint32_t kTileMaxW = 1024, kTileMaxH = 1008;      // not-in-headers: A6xxGPUInfo tile_max_w/h for CHIP.A6XX
+ // the border color table both TP base registers point at: Gallium's is FD6_MAX_BORDER_COLORS (256) entries of
+ // sizeof(struct fd6_bcolor_entry) (128 bytes: 32 fp32/fp16/int words); zeros are a valid table (black, transparent)
+ inline constexpr uint32_t kBorderColorBytes = 256 * 128;          // not-in-headers: fd6_texture.h FD6_MAX_BORDER_COLORS * FD6_BORDER_COLOR_SIZE
+@@ -4085,18 +4088,18 @@ constexpr uint32_t binControlGmem(bool lrzFeedback, uint32_t binw, uint32_t binh
+ }
+ // RB_CCU_CNTL for tiled rendering: the colour cache shrunk to its GMEM fraction and moved to GMEM's end, so the tiles
+ // own everything below it (tu_cmd_buffer.cc tu6_emit_ccu_cntl, gmem: ccu_offset_gmem = gmem - num_ccu * color cache /
+-// fraction); depth cache unused (no depth attachment in a GMEM pass here). 0x3c400000 on this chip
++// fraction); depth cache unused (no depth attachment in a GMEM pass here). 0x7c400000 on the A640 (1 MiB: offset 0xf8000)
+ constexpr uint32_t kGmemCcuColorOffset = kGmemBytes - kNumCcu * kSysmemPerCcuColorCacheSize / kGmemCcuColorCacheFraction;
+ constexpr uint32_t rbCcuCntlGmem() {
+     return (kHasGmemFastClear ? 0u : A6XX_RB_CCU_CNTL_GMEM_FAST_CLEAR_DISABLE) | A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI(kGmemCcuColorOffset >> 21) |
+            A6XX_RB_CCU_CNTL_COLOR_CACHE_SIZE(CCU_CACHE_SIZE_QUARTER) | A6XX_RB_CCU_CNTL_COLOR_OFFSET(kGmemCcuColorOffset & 0x1fffff);
+ }
+-static_assert(rbCcuCntlGmem() == 0x3c400000, "the GMEM CCU layout turnip computes for this chip");
++static_assert(rbCcuCntlGmem() == 0x7c400000, "the GMEM CCU layout turnip computes for this chip (A640, 1 MiB GMEM)");
+ 
+ // hardware binning (fd6_gmem.cc emit_binning_pass, update_vsc_pipe, fd6_emit_tile_prep): the binning pass runs every draw's
+ // vertex stage once over the whole window and the VSC writes, for each pipe of bins, which draws and primitives reach
+ // each bin; a tile then draws only those (CP_SET_BIN_DATA5, CP_SET_VISIBILITY_OVERRIDE 0, the draws USE_VISIBILITY)
+-inline constexpr uint32_t kNumVscPipes = 32;                      // not-in-headers: freedreno_devices.py A635 num_vsc_pipes
++inline constexpr uint32_t kNumVscPipes = 32;                      // not-in-headers: freedreno_devices.py A640 num_vsc_pipes
+ inline constexpr uint32_t REG_A6XX_VSC_BIN_SIZE = 0x0c02;                                    // a6xx.xml.h:4147  WIDTH >> 5 at 0, HEIGHT >> 4 at 8
+ inline constexpr uint32_t REG_A6XX_VSC_DRAW_STRM_SIZE_ADDRESS = 0x0c03;                      // a6xx.xml.h:4164  64-bit: each pipe's draw-stream size written back
+ inline constexpr uint32_t REG_A6XX_VSC_BIN_COUNT = 0x0c06;                                   // a6xx.xml.h:4167  NX at 1, NY at 11
+diff --git a/include/hakios-metal/compute.hpp b/include/hakios-metal/compute.hpp
+index 147a5d5..c0aeb24 100644
+--- a/include/hakios-metal/compute.hpp
++++ b/include/hakios-metal/compute.hpp
+@@ -25,6 +25,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "hakios-metal/a6xx.hpp"
+ #include "hakios-metal/kernel.hpp"
+ #include "hakios-metal/pm4.hpp"
+ 
+@@ -106,7 +107,7 @@ static_assert(kTableIbosAt + kMaxIbos * 64 <= kTableTexConstAt && kTableTexConst
+ struct Options {
+     bool prelude = true;        // SP_MODE_CONTROL, SP_PERFCTR_ENABLE, SP_FLOAT_CNTL, as computerator opens with
+     bool invalidateCmd = true;  // HLSQ_INVALIDATE_CMD before the program
+-    bool hlsqCopies = true;     // the gen4 (has_lpac) copies: HLSQ_CS_CTRL_REG1, SP_CS_CNTL_0/1
++    bool hlsqCopies = a6xx::kHasLpac;   // the gen4 (has_lpac) copies: HLSQ_CS_CTRL_REG1, SP_CS_CNTL_0/1; off on the A640 (gen2)
+     bool pvtmemZero = true;     // the private-memory registers written as zero (Gallium does; computerator leaves them)
+     bool invalidate = true;     // CP_EVENT_WRITE CACHE_INVALIDATE before the dispatch (Gallium's barrier)
+     bool marker = true;         // CP_SET_MARKER RM6_COMPUTE
+diff --git a/include/hakios-metal/fake_gpu.hpp b/include/hakios-metal/fake_gpu.hpp
+index fbc45d4..e28e17b 100644
+--- a/include/hakios-metal/fake_gpu.hpp
++++ b/include/hakios-metal/fake_gpu.hpp
+@@ -50,8 +50,8 @@
+ // the CCU holds, like a draw. The packing is this model's reading of the registers; whether the GPU packs the same
+ // way is again the phone's to say.
+ //
+-// What it answers is what hakios's kernel driver answers (bsd/dev/hakios.adreno.c, hakios_gpu_parameter): GPU_ID 0,
+-// the chip id 0x06030500 with a speed bin above it, 512 KiB of GMEM, 550 MHz. And it fails as that kernel fails. A
++// What it answers is what the vayu kernel's driver answers (bsd/dev/vayu_adreno.c, vayu_gpu_parameter): GPU_ID 640,
++// the chip id 0x06040001 with no speed bin above it, 1 MiB of GMEM, 499 MHz. And it fails as that kernel fails. A
+ // submission the GPU never finishes is a hang there, found by the wait's timeout alone (the GPU raises no fault for
+ // it, and none of the measured hangs set a fault register); then either the kernel resets the GPU and gives up what it
+ // had (boot-arg gpu_recover=1: the fence word is set to the last submission's number, so every wait ends, and FAULTS
+@@ -187,11 +187,10 @@ public:
+     void resume();
+ 
+     // what the kernel says about this GPU, for the fake to say the same and for a test to check it does
+-    static constexpr uint64_t kChipId = 0x06030500;      // dt qcom,chipid: an A635-family part, "Adreno 7c+ Gen 3" to Mesa
+-    static constexpr uint64_t kSpeedBin = 0x75;          // the phone's fuse value above the chip id, as the probe read it
+-                                                         // (0x7506030500 on 28 October); Mesa's named row for this part
+-    static constexpr uint64_t kGmemBytes = 512 * 1024;
+-    static constexpr uint64_t kMaxFrequencyHz = 550000000;
++    static constexpr uint64_t kChipId = 0x06040001;      // vayu_adreno.c GMU_CHIP_ID: the Adreno 640 (Mesa GPUId(640))
++    static constexpr uint64_t kSpeedBin = 0;             // vayu_gpu_parameter answers the chip id alone, no fuse above it
++    static constexpr uint64_t kGmemBytes = 1024 * 1024;  // vayu_gpu_parameter GMEM_SIZE 0x100000
++    static constexpr uint64_t kMaxFrequencyHz = 499200000;   // the 499 MHz level the vayu kernel runs the core at
+ 
+ private:
+     struct UboDescriptor {
+diff --git a/src/command.cpp b/src/command.cpp
+index 06b5407..f1867f2 100644
+--- a/src/command.cpp
++++ b/src/command.cpp
+@@ -556,9 +556,9 @@ std::shared_ptr<Texture> CommandQueue::nullTexture(std::string* why) {
+ }
+ 
+ namespace {
+-// the A635's SP cores and fibers an SP (freedreno_devices.py, the 7c+ Gen 3 entry: num_ccu 2, fibers_per_sp 128 * 2 * 16)
+-constexpr uint32_t kSpCores = 2;
+-constexpr uint32_t kFibersPerSp = 128 * 2 * 16;
++// the chip's SP cores and fibers an SP (a6xx.hpp: the A640 entry, num_ccu 2, fibers_per_sp 128 * 4 * 16)
++constexpr uint32_t kSpCores = a6xx::kNumSpCores;
++constexpr uint32_t kFibersPerSp = a6xx::kFibersPerSp;
+ }  // namespace
+ 
+ std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave, PrivateMemory* out, std::string* why) {
+diff --git a/src/compiler.cpp b/src/compiler.cpp
+index 719d6d7..9f527ad 100644
+--- a/src/compiler.cpp
++++ b/src/compiler.cpp
+@@ -51,7 +51,7 @@ namespace {
+ 
+ std::mutex gCompilerLock;   // ir3 keeps state in the compiler object; one compilation at a time
+ 
+-// one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06030500 to the Adreno 7c+ Gen 3 row
++// one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06040001 to the GPUId(640) row (0x060400ff)
+ ir3_compiler* theCompiler() {
+     static ir3_compiler* compiler = [] {
+         fd_dev_id id{};
+@@ -75,6 +75,12 @@ bool refuse(std::string* why, const std::string& text) {
+     return false;
+ }
+ 
++std::string chipName() {
++    char text[16];
++    snprintf(text, sizeof text, "0x%08x", unsigned(a6xx::kChipId));
++    return text;
++}
++
+ // KernelTextureDim from the NIR's sampler dimension; false, with the dimension's name, for the ones no Texture can be
+ // made of yet (a buffer texture, a rectangle, a multisampled or subpass image): the dispatch would otherwise bind a 2D
+ // texture to a txf_ms and read numbers neither right nor obviously wrong
+@@ -1070,7 +1076,7 @@ bool hasCompiler() { return theCompiler() != nullptr; }
+ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
+     std::lock_guard<std::mutex> g(gCompilerLock);
+     if (theCompiler() == nullptr) {
+-        refuse(why, "ir3 has no compiler for chip 0x06030500");
++        refuse(why, "ir3 has no compiler for chip " + chipName());
+         return nullptr;
+     }
+     Translation t;
+@@ -1259,7 +1265,7 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
+                                            const KnownBuffer* known) {
+     std::lock_guard<std::mutex> g(gCompilerLock);
+     if (theCompiler() == nullptr) {
+-        refuse(why, "ir3 has no compiler for chip 0x06030500");
++        refuse(why, "ir3 has no compiler for chip " + chipName());
+         return nullptr;
+     }
+     const std::string cached = stageCachePath(bitcode, size, constants, iboBase, known);
+diff --git a/src/fake_gpu.cpp b/src/fake_gpu.cpp
+index 4fb84ff..0838828 100644
+--- a/src/fake_gpu.cpp
++++ b/src/fake_gpu.cpp
+@@ -667,12 +667,20 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
+         fault("SP_CS_CTRL_REG0 and HLSQ_CS_CNTL_1 disagree about the thread size");
+         return false;
+     }
+-    if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
+-        fault("the HLSQ's and the SP's copies of the id registers (CS_CNTL_0, CS_CNTL_1) differ");
+-        return false;
+-    }
+-    if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
+-        fault("SP_CS_CTRL_REG1 and HLSQ_CS_CTRL_REG1 differ about shared memory and the constant split");
++    if (kHasLpac) {
++        if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
++            fault("the HLSQ's and the SP's copies of the id registers (CS_CNTL_0, CS_CNTL_1) differ");
++            return false;
++        }
++        if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
++            fault("SP_CS_CTRL_REG1 and HLSQ_CS_CTRL_REG1 differ about shared memory and the constant split");
++            return false;
++        }
++    } else if (regs_.count(REG_A6XX_SP_CS_CNTL_0) != 0 || regs_.count(REG_A6XX_SP_CS_CNTL_1) != 0 ||
++               regs_.count(REG_A6XX_HLSQ_CS_CTRL_REG1) != 0) {
++        // the gen4 (has_lpac) copies on a chip without them (A640, a6xx_gen2): Mesa's computerator and fd6 write them
++        // only under info->a6xx.has_lpac
++        fault("SP_CS_CNTL_0/1 or HLSQ_CS_CTRL_REG1 written on a chip without LPAC (a6xx_gen2)");
+         return false;
+     }
+     uint32_t nd0 = reg(REG_A6XX_HLSQ_CS_NDRANGE_0);
+@@ -2434,22 +2442,22 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
+     case kGetParam: {
+         if (size != sizeof(MsmParam)) return EINVAL;
+         auto* p = static_cast<MsmParam*>(data);
+-        // the kernel's table (bsd/dev/hakios.adreno.c, hakios_gpu_parameter), number for number
++        // the kernel's table (vayu: bsd/dev/vayu_adreno.c, vayu_gpu_parameter, through redwood_gpu_parameter), number for number
+         switch (p->param) {
+-        case kParamGpuId: p->value = 0; return 0;                   // "none, the chip ID says it"
++        case kParamGpuId: p->value = 640; return 0;
+         case kParamGmemSize: p->value = kGmemBytes; return 0;
+         case kParamChipId: p->value = kChipId | kSpeedBin << 32; return 0;
+         case kParamMaxFreq: p->value = kMaxFrequencyHz; return 0;
+         case kParamTimestamp: p->value = uint64_t(nowNs()); return 0;
+-        case kParamGmemBase: p->value = 0; return 0;
++        case kParamGmemBase: p->value = 0x100000; return 0;
+         case kParamPriorities: p->value = 1; return 0;
+         case kParamPpPgtable: p->value = 0; return 0;
+         case kParamFaults: p->value = stats_.recoveries; return 0;
+         case kParamSuspends: p->value = 0; return 0;
+-        case kParamHighestBankBit: p->value = 14; return 0;
++        case kParamHighestBankBit: p->value = 15; return 0;
+         case kParamRaytracing: p->value = 0; return 0;
+         case kParamUbwcSwizzle: p->value = 6; return 0;
+-        case kParamMacrotileMode: p->value = 1; return 0;
++        case kParamMacrotileMode: p->value = 0; return 0;
+         default: return EINVAL;                                      // (kIOReturnBadArgument there: VA_START, VA_SIZE among them)
+         }
+     }
+diff --git a/src/iokit_transport.cpp b/src/iokit_transport.cpp
+index 48ef40e..2cb984b 100644
+--- a/src/iokit_transport.cpp
++++ b/src/iokit_transport.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include <cerrno>
+ #include <cstdio>
++#include <cstdlib>
++#include <string>
+ 
+ #include "hakios-metal/gpu.hpp"
+ 
+@@ -64,19 +66,34 @@ private:
+ 
+ }  // namespace
+ 
++// The service: hakios's kernel calls it HakiosGPU; the vayu kernel (iokit/Kernel/RedwoodGPU.cpp, started by
++// bsd/dev/vayu_adreno.c gpu_keep() with boot-args gpu=1 vayu_gpu=1 vayu_keep=1) calls the same msm DRM interface
++// RedwoodGPU. HAKIOS_METAL_SERVICE names another.
+ std::unique_ptr<Transport> openKernelGpu(std::string* why) {
+-    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("HakiosGPU"));
++    const char* wanted = getenv("HAKIOS_METAL_SERVICE");
++    const char* const names[] = {wanted != nullptr && *wanted != 0 ? wanted : "HakiosGPU", "RedwoodGPU"};
++    io_service_t s = 0;
++    const char* name = nullptr;
++    for (const char* n : names) {
++        s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(n));
++        if (s != 0) {
++            name = n;
++            break;
++        }
++    }
+     if (s == 0) {
+-        *why = "no HakiosGPU service: the kernel has not started the GPU (gpu=1, the firmware in fw-gpu/, the phone)";
++        *why = std::string("no ") + names[0] + " or RedwoodGPU service: the kernel has not started the GPU (gpu=1 vayu_gpu=1 vayu_keep=1, "
++               "the firmware, the phone)";
+         return nullptr;
+     }
+     io_connect_t c = 0;
+     kern_return_t r = IOServiceOpen(s, mach_task_self(), 0, &c);
+     IOObjectRelease(s);
+     if (r != KERN_SUCCESS) {
+-        *why = "HakiosGPU would not open: error " + std::to_string(r);
++        *why = std::string(name) + " would not open: error " + std::to_string(r);
+         return nullptr;
+     }
++    fprintf(stderr, "hakios-metal: the GPU through the service %s\n", name);
+     return std::unique_ptr<Transport>(new KernelGpu(c));
+ }
+ 
+diff --git a/src/texture.cpp b/src/texture.cpp
+index b1e2cf6..e990d24 100644
+--- a/src/texture.cpp
++++ b/src/texture.cpp
+@@ -1242,6 +1242,10 @@ bool makeSampler(const SamplerDesc& d, Sampler* out, std::string* why) {
+     if (d.minFilter > 2 || d.magFilter > 2) {
+         return refuse(why, "sampler filters min " + n(d.minFilter) + " mag " + n(d.magFilter) + ": Nearest (0), Linear (1) or bicubic (2)");
+     }
++    // the A640 (a6xx_gen2) has no cubic filter in its TP: has_tex_filter_cubic is gen3/gen4's
++    if (!a6xx::kHasTexFilterCubic && (d.minFilter == 2 || d.magFilter == 2)) {
++        return refuse(why, "a bicubic sampler: this chip's TP has no cubic filter (freedreno_devices.py a6xx_gen2)");
++    }
+     // bicubic is the TP's own cubic filter, which this chip has (freedreno_devices.py a6xx_gen4 has_tex_filter_cubic;
+     // turnip's VK_FILTER_CUBIC_EXT, tu6_tex_filter)
+     auto filter = [](uint32_t m) { return m == 2 ? A6XX_TEX_CUBIC : m == 1 ? A6XX_TEX_LINEAR : A6XX_TEX_NEAREST; };
+diff --git a/tests/a6xx_test.cpp b/tests/a6xx_test.cpp
+index d46ceaa..a3e3a00 100644
+--- a/tests/a6xx_test.cpp
++++ b/tests/a6xx_test.cpp
+@@ -110,8 +110,8 @@ TEST(a6xx_load_state6_word_0) {
+     // one IBO descriptor: ST6_IBO (3) << 14 = 0xc000 | 0x20000 | 0x340000 | 1 << 22 = 0x400000
+     CHECK_EQ(loadState6_0(0, ST6_IBO, SS6_INDIRECT, SB6_CS_SHADER, 1), 0x0076c000u);
+     // the shader preload is capped at the instruction cache, and that fits the 10-bit NUM_UNIT
+-    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 127u << 22);
+-    CHECK_EQ(kInstrCacheSize, 127u);
++    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 64u << 22);
++    CHECK_EQ(kInstrCacheSize, 64u);   // a6xx_gen2 (A640)
+     // the source address: the low word keeps bits 31:2, the high word is whole
+     CHECK_EQ(CP_LOAD_STATE6_1_EXT_SRC_ADDR(0x1000), 0x1000u);
+     CHECK_EQ(CP_LOAD_STATE6_1_EXT_SRC_ADDR(0x1003), 0x1000u);
+@@ -282,10 +282,10 @@ TEST(a6xx_private_memory_fields_are_scaled) {
+     CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(0x3ffff000), 0x3ffffu);
+     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x800), 1u);
+     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x10000), 0x20u);
+-    // this chip: 4096 fibers per SP, 2 SPs; a 512-byte private memory per fiber is 2 MiB per SP, 4 MiB in all
+-    CHECK_EQ(kFibersPerSp, 4096u);
++    // the A640: 8192 fibers per SP (128 * 4 * 16), 2 SPs; a 512-byte private memory per fiber is 4 MiB per SP, 8 MiB in all
++    CHECK_EQ(kFibersPerSp, 8192u);
+     CHECK_EQ(kNumSpCores, 2u);
+-    CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), 512u);
++    CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), 1024u);
+ }
+ 
+ TEST(a6xx_dispatch_words) {
+@@ -365,7 +365,7 @@ TEST(a6xx_batch_start_words) {
+     CHECK_EQ(kStaticState[1].reg, REG_A6XX_SP_FLOAT_CNTL);
+     CHECK_EQ(kStaticState[1].value, 0x8u);
+     CHECK_EQ(kStaticState[5].reg, REG_A6XX_TPL1_DBG_ECO_CNTL);
+-    CHECK_EQ(kStaticState[5].value, 0x05008000u);
++    CHECK_EQ(kStaticState[5].value, 0x00008000u);   // A640 TPL1_DBG_ECO_CNTL
+     CHECK_EQ(kStaticState[19].reg, REG_A6XX_SP_MODE_CONTROL);
+     CHECK_EQ(kStaticState[19].value, 0x5u);
+     CHECK_EQ(kStaticState[23].reg, REG_A6XX_PC_MODE_CNTL);
+@@ -386,11 +386,11 @@ TEST(a6xx_batch_start_words) {
+     for (const RegWrite& w : kStaticState) {
+         CHECK(w.reg >= 0x0e12 && w.reg <= 0xbe04);
+     }
+-    CHECK_EQ(kMagicTpl1DbgEcoCntl, 83918848u);
++    CHECK_EQ(kMagicTpl1DbgEcoCntl, 32768u);
+     CHECK_EQ(kMagicRbDbgEcoCntl, 68157440u);
+     CHECK_EQ(kMagicVpcDbgEcoCntl, 33554432u);
+-    CHECK_EQ(kMagicSpChickenBits, 5120u);
+-    CHECK_EQ(kMagicUcheClientPf, 132u);
++    CHECK_EQ(kMagicSpChickenBits, 1056u);
++    CHECK_EQ(kMagicUcheClientPf, 4u);
+     CHECK_EQ(kBorderColorBytes, 32768u);
+ }
+ 
+@@ -744,7 +744,7 @@ TEST(a6xx_first_draw_program_words) {
+     CHECK_EQ(hlsqFsCntl0(THREAD128, true), 0x3u);
+     CHECK_EQ(hlsqFsCntl0(THREAD64, false), 0u);
+     // the stage loads: NUM_UNIT is capped at the instruction cache, as compute's is
+-    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 127u << 22);
++    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 64u << 22);
+     // the private memory words are the compute ones' twins (same scales)
+     CHECK_EQ(A6XX_SP_VS_PVT_MEM_PARAM_MEMSIZEPERITEM(512), 1u);
+     CHECK_EQ(A6XX_SP_FS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(0x1000), 1u);
+diff --git a/tests/c_api_test.cpp b/tests/c_api_test.cpp
+index d9a6840..5796948 100644
+--- a/tests/c_api_test.cpp
++++ b/tests/c_api_test.cpp
+@@ -19,7 +19,7 @@ void counted(hakios_metal_cb* cb, void* context) {
+ TEST(c_api_copy_and_callbacks) {
+     hakios_metal_device* d = hakios_metal_open_fake();
+     CHECK(d != nullptr);
+-    CHECK_EQ(hakios_metal_gpu_id(d), 0x06030500ull);
++    CHECK_EQ(hakios_metal_gpu_id(d), 0x06040001ull);
+     hakios_metal_buffer* a = hakios_metal_buffer_new(d, 4096);
+     hakios_metal_buffer* b = hakios_metal_buffer_new(d, 4096);
+     CHECK_EQ(hakios_metal_buffer_length(a), 4096ull);
+diff --git a/tests/command_test.cpp b/tests/command_test.cpp
+index 6cdc574..0b6ce25 100644
+--- a/tests/command_test.cpp
++++ b/tests/command_test.cpp
+@@ -37,30 +37,30 @@ std::shared_ptr<Buffer> buffer(Rig& r, uint64_t n) {
+ }  // namespace
+ 
+ TEST(gpu_params) {
+-    // what the kernel answers (hakios: bsd/dev/hakios.adreno.c, hakios_gpu_parameter), written here from that source by
++    // what the kernel answers (vayu: bsd/dev/vayu_adreno.c, vayu_gpu_parameter), written here from that source by
+     // hand, so that the fake and this test are two readings of it and not one
+     Rig r;
+     uint64_t v = 0;
+     CHECK_EQ(r.gpu->param(kParamGpuId, &v), 0);
+-    CHECK_EQ(v, 0ull);                                      // "GPU_ID: none, the chip ID says it"
++    CHECK_EQ(v, 640ull);                                    // GPU_ID: 640
+     CHECK_EQ(r.gpu->param(kParamChipId, &v), 0);
+-    CHECK_EQ(uint32_t(v), 0x06030500u);                     // GPU_CHIP_ID (dt qcom,chipid) ...
+-    CHECK_EQ(v >> 32, FakeGpu::kSpeedBin);                  // ... "with the speed bin above it"
+-    CHECK_EQ(r.gpu->chipId(), 0x06030500u);
++    CHECK_EQ(uint32_t(v), 0x06040001u);                     // GPU_CHIP_ID (GMU_CHIP_ID) ...
++    CHECK_EQ(v >> 32, 0ull);                                // ... and nothing above it
++    CHECK_EQ(r.gpu->chipId(), 0x06040001u);
+     CHECK_EQ(r.gpu->param(kParamGmemSize, &v), 0);
+-    CHECK_EQ(v, 512ull * 1024);
++    CHECK_EQ(v, 1024ull * 1024);
+     CHECK_EQ(r.gpu->param(kParamMaxFreq, &v), 0);
+-    CHECK_EQ(v, 550000000ull);                              // core_khz * 1000, the default clock
++    CHECK_EQ(v, 499200000ull);                              // core_speeds[core_speed].khz * 1000, 499.2 MHz
+     CHECK_EQ(r.gpu->param(kParamFaults, &v), 0);
+     CHECK_EQ(v, 0ull);
+     CHECK_EQ(r.gpu->param(kParamPriorities, &v), 0);
+     CHECK_EQ(v, 1ull);
+     CHECK_EQ(r.gpu->param(kParamHighestBankBit, &v), 0);
+-    CHECK_EQ(v, 14ull);
++    CHECK_EQ(v, 15ull);
+     CHECK_EQ(r.gpu->param(kParamUbwcSwizzle, &v), 0);
+     CHECK_EQ(v, 6ull);
+     CHECK_EQ(r.gpu->param(kParamMacrotileMode, &v), 0);
+-    CHECK_EQ(v, 1ull);
++    CHECK_EQ(v, 0ull);
+     CHECK_EQ(r.gpu->param(0x0e, &v), EINVAL);               // VA_START: "addresses are ours to give"
+     CHECK_EQ(r.gpu->param(0x0f, &v), EINVAL);               // VA_SIZE
+     CHECK_EQ(r.gpu->param(0x99, &v), EINVAL);
+diff --git a/tests/compute_test.cpp b/tests/compute_test.cpp
+index c7f9c6f..3fc31a7 100644
+--- a/tests/compute_test.cpp
++++ b/tests/compute_test.cpp
+@@ -162,8 +162,8 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
+     auto at = [&](uint32_t reg) { size_t i = e.findReg(reg); return i == size_t(-1) ? 0xdeadbeefu : e.stream.words()[i]; };
+     CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(512));
+     CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 1), uint32_t(scratch->gpuAddress()));
+-    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3), (512u * 4096u) >> 12);
+-    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET), (512u * 4096u) >> 11);
++    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3), (512u * kFibersPerSp) >> 12);
++    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET), (512u * kFibersPerSp) >> 11);
+     // through a command buffer the queue's own is bound, and the fake takes the dispatch
+     auto cb = r.queue->commandBuffer();
+     CHECK(cb->dispatch(k, kGroups16, nullptr, {Binding{out.get(), 0}}));
+@@ -180,7 +180,11 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
+     Encoded big(r, kernels::fill_id, kGroups16, nullptr, tg);
+     CHECK(big.ok);
+     CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_SP_CS_CTRL_REG1)]), 7u);
+-    CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
++    if (kHasLpac) {
++        CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
++    } else {
++        CHECK_EQ(big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1), size_t(-1));   // no gen4 copy on the A640
++    }
+     tg.sharedBytes = 32 * 1024 + 1;
+     Encoded over(r, kernels::fill_id, kGroups16, nullptr, tg);
+     CHECK(!over.ok);
+@@ -532,6 +536,11 @@ TEST(the_fake_refuses_id_registers_whose_two_copies_differ) {
+         }
+         i += 1 + h.count;
+     }
++    if (!a6xx::kHasLpac) {
++        // the A640 (a6xx_gen2): the SP's copies are not written at all, and the fake refuses them where they are
++        CHECK(!changed);
++        return;
++    }
+     CHECK(changed);
+     Raw raw(r);
+     CHECK_EQ(raw.submit(words), ETIMEDOUT);
+@@ -1187,10 +1196,12 @@ TEST(a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround) {
+     {
+         Encoded e(r, kernels::chain160_air, kGroups16, local, b);
+         CHECK(e.ok);
+-        CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1));
++        // 96 units: inside a 127-unit cache (gen4), past a 64-unit one (the A640's gen2), where it gets the workaround
++        const bool past = kernels::chain160_air.instrlen > a6xx::kInstrCacheSize;
++        CHECK((e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1)) == !past);
+         size_t before = 0, after = 0;
+         labels(e, &before, &after);
+-        CHECK_EQ(before + after, size_t(0));
++        CHECK_EQ(before + after, past ? size_t(2) : size_t(0));
+         // the same kernel with its preload cut below its length is fetched past the preload, and gets it
+         compute::Options cut;
+         cut.preloadCap = 64;
+diff --git a/tests/render_test.cpp b/tests/render_test.cpp
+index 3868c9f..1231012 100644
+--- a/tests/render_test.cpp
++++ b/tests/render_test.cpp
+@@ -2147,8 +2147,8 @@ TEST(a_stage_that_wants_private_memory_gets_the_queues) {
+     auto scratch = r.queue->privateMemory(64, false, &pm, &why);
+     CHECK(scratch != nullptr);
+     CHECK_EQ(pm.perFiber, 512u);
+-    CHECK_EQ(pm.perSp, 512u * 4096u);
+-    CHECK_EQ(scratch->length(), 2ull * 512u * 4096u);
++    CHECK_EQ(pm.perSp, 512u * kFibersPerSp);
++    CHECK_EQ(scratch->length(), 2ull * 512u * kFibersPerSp);
+     Bindings fsb;
+     fsb.privateMemory = pm;
+     Encoded e(r, p, pass, wholeDraw(3), render::Options{}, Bindings{}, fsb);
+@@ -2156,8 +2156,8 @@ TEST(a_stage_that_wants_private_memory_gets_the_queues) {
+     if (!e.ok) std::printf("       %s\n", e.error.c_str());
+     CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 3), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(512));
+     CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 4), uint32_t(scratch->gpuAddress()));
+-    CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 6), (512u * 4096u) >> 12);
+-    CHECK_EQ(e.reg(REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET), (512u * 4096u) >> 11);
++    CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 6), (512u * kFibersPerSp) >> 12);
++    CHECK_EQ(e.reg(REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET), (512u * kFibersPerSp) >> 11);
+     CHECK_EQ(e.reg(REG_A6XX_SP_VS_OBJ_FIRST_EXEC_OFFSET + 4), 0u);
+     CHECK_EQ(e.reg(REG_A6XX_SP_VS_PVT_MEM_HW_STACK_OFFSET), 0u);
+     auto cb = drawOnce(r, p, pass, wholeDraw(3));
+@@ -4648,7 +4648,7 @@ TEST(a_program_longer_than_the_instruction_cache_is_preloaded_in_part) {
+         const uint32_t type = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_TYPE__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_TYPE__SHIFT;
+         const uint32_t block = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__SHIFT;
+         if (type == a6xx::ST6_SHADER && block == a6xx::SB6_FS_SHADER) {
+-            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, 127u);
++            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, a6xx::kInstrCacheSize);
+             w[i + 1] = (d0 & ~a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) | a6xx::CP_LOAD_STATE6_0_NUM_UNIT(128);
+             found = true;
+         }
+@@ -5338,14 +5338,14 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
+         CHECK(p.cols * p.binW >= w && (p.cols - 1) * p.binW < w && p.rows * p.binH >= h && (p.rows - 1) * p.binH < h);
+         std::printf("       %ux%u %s: %u x %u tiles of %u x %u\n", w, h, t->info().name, p.cols, p.rows, p.binW, p.binH);
+     }
+-    // the screen at 4 bytes a pixel: two columns of 576 and twelve rows of 208, 24 tiles
++    // the screen at 4 bytes a pixel in the A640's 1 MiB: two columns of 576 and six rows of 416, 12 tiles
+     {
+         auto t = target(r, 1125, 2436, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+         RenderPass a;
+         a.color0 = t.get();
+         render::GmemPlan p;
+         CHECK(render::gmemPlan(a, &p, nullptr));
+-        CHECK(p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208);
++        CHECK(p.cols == 2 && p.rows == 6 && p.binW == 576 && p.binH == 416);
+     }
+     // what stays in sysmem: a second colour attachment of another size, an integer target
+     {
+@@ -5462,7 +5462,7 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
+         a.more[0].load = LoadAction::kLoad;
+         render::GmemPlan p;
+         CHECK(render::gmemPlan(a, &p, nullptr));
+-        CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000);
++        CHECK(p.binW == 576 && p.binH == 208 && p.base[0] == 0 && p.base[1] == 0x7c000 && p.room[0] == 0x7c000 && p.room[1] == 0x7c000);
+         auto cb = r.queue->commandBuffer();
+         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
+         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
+@@ -5696,7 +5696,7 @@ TEST(a_clear_in_gmem_comes_out_as_the_fill_does) {
+ // (CP_SET_BIN_DATA5) and draws USE_VISIBILITY; the target comes back as it was through the tiles' loads and stores
+ TEST(a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
+     Rig r;
+-    auto t = target(r, 1125, 300, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
++    auto t = target(r, 1125, 900, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+     fillCoords(*t);
+     RenderPass a;
+     a.color0 = t.get();
+@@ -5705,7 +5705,7 @@ TEST(a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
+     render::Options o;
+     o.gmemBinning = true;
+     auto cb = r.queue->commandBuffer();
+-    for (int i = 0; i < 3; i++) CHECK(cb->draw(flatProgram(), a, wholeDraw(3, 1125, 300), Bindings{}, Bindings{}, o));
++    for (int i = 0; i < 3; i++) CHECK(cb->draw(flatProgram(), a, wholeDraw(3, 1125, 900), Bindings{}, Bindings{}, o));
+     cb->commit();
+     cb->waitUntilCompleted();
+     CHECK(cb->status() == CommandBuffer::kCompleted);
+@@ -5722,7 +5722,7 @@ TEST(a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
+         render::Options twin = o;
+         twin.gmemBinningStage = 9;
+         auto c2 = r.queue->commandBuffer();
+-        for (int i = 0; i < 3; i++) CHECK(c2->draw(flatProgram(), a, wholeDraw(3, 1125, 300), Bindings{}, Bindings{}, twin));
++        for (int i = 0; i < 3; i++) CHECK(c2->draw(flatProgram(), a, wholeDraw(3, 1125, 900), Bindings{}, Bindings{}, twin));
+         c2->commit();
+         c2->waitUntilCompleted();
+         CHECK(r.fake->stats().faults > s.faults);
+diff --git a/tests/texture_test.cpp b/tests/texture_test.cpp
+index 8731b23..ece95ff 100644
+--- a/tests/texture_test.cpp
++++ b/tests/texture_test.cpp
+@@ -506,9 +506,15 @@ TEST(sampler_words_follow_galliums_encoding_of_metals_descriptor) {
+         c.minFilter = c.magFilter = 2;
+         Sampler cs;
+         std::string cwhy;
+-        CHECK(makeSampler(c, &cs, &cwhy));
+-        CHECK_EQ((cs.words[0] & A6XX_TEX_SAMP_0_XY_MIN__MASK) >> A6XX_TEX_SAMP_0_XY_MIN__SHIFT, uint32_t(A6XX_TEX_CUBIC));
+-        CHECK_EQ((cs.words[0] & A6XX_TEX_SAMP_0_XY_MAG__MASK) >> A6XX_TEX_SAMP_0_XY_MAG__SHIFT, uint32_t(A6XX_TEX_CUBIC));
++        if (!kHasTexFilterCubic) {
++            // the A640 (a6xx_gen2): no cubic filter, refused by name
++            CHECK(!makeSampler(c, &cs, &cwhy));
++            CHECK(has(cwhy, "a bicubic sampler: this chip's TP has no cubic filter"));
++        } else {
++            CHECK(makeSampler(c, &cs, &cwhy));
++            CHECK_EQ((cs.words[0] & A6XX_TEX_SAMP_0_XY_MIN__MASK) >> A6XX_TEX_SAMP_0_XY_MIN__SHIFT, uint32_t(A6XX_TEX_CUBIC));
++            CHECK_EQ((cs.words[0] & A6XX_TEX_SAMP_0_XY_MAG__MASK) >> A6XX_TEX_SAMP_0_XY_MAG__SHIFT, uint32_t(A6XX_TEX_CUBIC));
++        }
+     }
+     d = SamplerDesc{};
+     d.mipFilter = 3;
+diff --git a/tools/probe.cpp b/tools/probe.cpp
+index 89cc762..0d148e5 100644
+--- a/tools/probe.cpp
++++ b/tools/probe.cpp
+@@ -10,6 +10,7 @@
+ #include <cmath>
+ #include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <functional>
+ #include <mutex>
+@@ -375,6 +376,7 @@ static const char* dimName(uint8_t dim) {
+ 
+ int main(int argc, char** argv) {
+     bool recover = false, bisect = false, binTrace = false;
++    int lastStage = 0;   // --stages N: stop after stage N (1-3 the command processor alone: buffers, submission, CP_MEMCPY/CP_MEM_WRITE)
+     compute::Options chosen;   // what the dispatches of stage 5 are encoded with
+     std::vector<std::pair<std::string, std::string>> metallibs;   // --metallib FILE FUNCTION: a kernel of the phone's own image
+     for (int i = 1; i < argc; i++) {
+@@ -384,6 +386,7 @@ int main(int argc, char** argv) {
+         // --notail: no end-of-dispatch events and waits of our own; the kernel's own CACHE_FLUSH_TS fence closes the
+         // submission (28 October: with them every dispatch hung, without them end_only completed in 48 us)
+         if (strcmp(argv[i], "--notail") == 0) chosen.tail = false;
++        if (strcmp(argv[i], "--stages") == 0 && i + 1 < argc) lastStage = atoi(argv[++i]);
+         if (strcmp(argv[i], "--metallib") == 0 && i + 2 < argc) {
+             metallibs.emplace_back(argv[i + 1], argv[i + 2]);
+             i += 2;
+@@ -457,6 +460,12 @@ int main(int argc, char** argv) {
+                    std::to_string(cb->gpuNanoseconds() / 1000) + " us");
+     }
+ 
++    if (lastStage != 0 && lastStage <= 1) {
++        std::printf("probe: stopped after stage %d (--stages)\n", lastStage);
++        std::printf("probe: %d failure%s\n", failures, failures == 1 ? "" : "s");
++        return failures;
++    }
++
+     // 2. fills of lengths that end inside the doubling, at an offset
+     for (uint64_t len : {4ull, 256ull, 260ull, 65540ull, 999996ull}) {
+         memset(b->contents(), 0x11, mb);
+@@ -471,6 +480,12 @@ int main(int argc, char** argv) {
+         report(ok && cb->status() == CommandBuffer::kCompleted, "fill of " + std::to_string(len) + " bytes at 16");
+     }
+ 
++    if (lastStage != 0 && lastStage <= 2) {
++        std::printf("probe: stopped after stage %d (--stages)\n", lastStage);
++        std::printf("probe: %d failure%s\n", failures, failures == 1 ? "" : "s");
++        return failures;
++    }
++
+     // 3. forty command buffers in flight at once: their handlers in commit order, and the memory as the last left it
+     {
+         std::vector<int> order;
+@@ -497,6 +512,12 @@ int main(int argc, char** argv) {
+                                    ", memory " + (mem ? "as written" : "WRONG"));
+     }
+ 
++    if (lastStage != 0 && lastStage <= 3) {
++        std::printf("probe: stopped after stage %d (--stages)\n", lastStage);
++        std::printf("probe: %d failure%s\n", failures, failures == 1 ? "" : "s");
++        return failures;
++    }
++
+     // 4. how fast the command processor copies: 16 MB, five times
+     {
+         auto big1 = newBuffer(gpu, 16 * mb, &why), big2 = newBuffer(gpu, 16 * mb, &why);
+@@ -522,6 +543,12 @@ int main(int argc, char** argv) {
+         }
+     }
+ 
++    if (lastStage != 0 && lastStage <= 4) {
++        std::printf("probe: stopped after stage %d (--stages)\n", lastStage);
++        std::printf("probe: %d failure%s\n", failures, failures == 1 ? "" : "s");
++        return failures;
++    }
++
+     // 5. compute, in order of hazard: the first shader instructions this driver has ever had the GPU run. The fake GPU
+     // checked that the dispatch holds together; only this says whether the GPU runs it, and what it writes.
+     {
+diff --git a/tools/probe_fake_transport.cpp b/tools/probe_fake_transport.cpp
+new file mode 100644
+index 0000000..488be44
+--- /dev/null
++++ b/tools/probe_fake_transport.cpp
+@@ -0,0 +1,10 @@
++// The probe on a host, against the fake GPU (fake_gpu.hpp): openKernelGpu as the phone's iokit_transport.cpp has it,
++// answered by the fake instead of RedwoodGPU/HakiosGPU. Stages 1-4 run on the command processor alone and are carried
++// out by the fake's interpreter; a dispatch or a draw is checked, not run (no shader instruction executes here).
++#include "hakios-metal/fake_gpu.hpp"
++
++namespace hakios::metal {
++
++std::unique_ptr<Transport> openKernelGpu(std::string*) { return std::make_unique<FakeGpu>(true); }
++
++}  // namespace hakios::metal
+-- 
+2.39.5
+

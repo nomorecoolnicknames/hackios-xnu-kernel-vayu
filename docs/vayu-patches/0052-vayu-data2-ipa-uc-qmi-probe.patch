@@ -1,0 +1,470 @@
+Subject: [PATCH] vayu data2: IPA pipe-count preflight, uC state at three points, INIT after INDICATION_REGISTER + probe + retries
+
+Base: /mnt/ramdisk/ds-data with 0044 applied (vayu-test26 d15caf0 + 0044). Applies with -p1.
+Kernel: mach-data3.bin sha256 f465e26c94ee29f65b50657d31e1fe01ea7b15e66f36c39b46ad27740fbc255b.
+
+Run 115037 facts this patch answers:
+- S2 INIT_MODEM_DRIVER TIMEOUT 20000 ms while the request went to service 0x31 v1 inst 2,
+  node 0 port 31, message 0x0021; every TLV matches ipa_qmi_service_v01.c
+  (ipa3_init_modem_driver_req_msg_data_v01_ei) and the values match vendor ipa_4_1_mem_part
+  (ipa_utils.c:3189): hdr 0x688/0x140, v4 rt 0x508 idx 7, v6 0x608, flt 0x308/0x408,
+  modem 0x13f0/0x100c, ctrl ep 11, proc 0x7d0/0x200, hash 0x488/0x588/0x288/0x388,
+  quota 0xc30/0x60, drop 0x13d0/0x20. The port, instance, message id and TLVs are therefore
+  not the fault; the modem never answered (and the 0x24 indication at 208.3 s arrived 5 s
+  after the timeout, so the client port is reachable).
+- uC NOT READY 8 s after AUTH (responseOp 0x2c, params 0xd041cb06, hwState 0x3f, iface 0x390).
+  Stock loads no separate ipa_uc PAS on this phone: vayu's live DT has only qcom,ipa_fws
+  (pas-id 0xf) and no qcom,platform-type, and ipa.c only PIL-loads IPA_UC_SUBSYSTEM_NAME when
+  platform_type == IPA_PLAT_TYPE_APQ (ipa.c:6649). ipa_uc.mdt is present in /vendor/firmware but
+  is not referenced by the DT. What stock does after AUTH is ipa3_post_init: ipa3_init_hw
+  (CLKON/QSB/BCR/COMP, ipa_utils.c:4165) and then ipa3_uc_interface_init (map SRAM + IRQ only,
+  ipa_uc.c:785; no firmware start). So the previous look 8 s after AUTH, before any CLKON write,
+  was not conclusive: this patch reads the uC after AUTH, after the hardware init, after MPSS
+  and at every INIT attempt.
+- The GSI preflight refused a healthy IPA: IPA_ENABLED_PIPES is a COUNT (stock
+  ipa3_get_num_pipes() returns it as is, ipa_utils.c:7075; run 115037 read 0x17 = 23 pipes),
+  not a bitmask of endpoint numbers. The old test demanded bits 2/5/10/11 and failed S2.
+
+What:
+1. vayu_ipa_data.c: preflight accepts GSI enabled, >=4 event rings and >11 pipes; logs the count.
+2. vayu_ipa.c: vayu_ipa_uc_look(when, ms) reads the uC shared area (responseOp/params/hwState/
+   interface, polls up to ms) and is called after AUTH ("post-auth"), after the hardware init
+   ("post-init", logged as vayu-data: S0 IPA UC OK|ERROR), after MPSS ("after-mpss") and from
+   the QMI stage.
+3. vayu_ipa_qmi.c: after publishing 0x31/1 it waits for the modem's INDICATION_REGISTER (5 s)
+   before the first INIT, sends an unknown-message probe 0x7fff (1 s, tells whether the modem's
+   service loop runs at all), then up to 3 INIT_MODEM_DRIVER attempts (timeout each, 1 s apart).
+   vayu_ipa_qmi_regwait=MS, vayu_ipa_qmi_attempts=N (1..5). INIT is an init message, not the
+   non-idempotent WDS Start, so retrying it is safe. Four more attempts follow one per 30 s
+   ("S2 LATE INIT n/4") in case the modem/uC only becomes ready later in the boot.
+4. hakios.qmi.c/.h: vayu_qmi_trace=1 traces every datagram on the IPA handle (type, id, message,
+   source node/port, first 8 bytes) and a late reply to a given-up transaction; the "nobody
+   handles" line now names the source. This settles whether a reply arrives at all and from where.
+5. No change for the network: 115037 registered UMTS (MegaFon) at 274 s; the long SEARCHING was
+   the modem's scan, not a NAS failure, and nothing in the IPA path touches NAS.
+
+Expected next-run lines:
+  vayu-ipa-data: GSI status 0x1 ... IPA has 23 pipes
+  vayu-ipa: post-init: uC responseOp ...: uC INIT_COMPLETED | NOT READY
+  vayu-data: S0 IPA UC: OK | ERROR
+  vayu-ipa-qmi: S2 INDICATION_REGISTER: OK after N ms
+  vayu-ipa-qmi: S2 PROBE 0x7fff: OK the service answered ... | TIMEOUT
+  vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: attempt 1/3 ...
+  vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: OK after N ms ...
+  qmi: trace: ... (with vayu_qmi_trace=1)
+--- a/bsd/dev/vayu_ipa.c
++++ b/bsd/dev/vayu_ipa.c
+@@ -217,15 +217,44 @@
+ 	delay_for_interval(2500, NSEC_PER_MSEC);
+ }
+ 
+-/* Read-only look after AUTH_AND_RESET(15): GSI enabled by TrustZone, uC INIT_COMPLETED in the
+- * shared area at SW SRAM offset 0 (struct IpaHwSharedMemCommonMapping_t: responseOp +0xc,
+- * responseParams +0x10, hwState +0x20, interfaceVersionCommon +0x24). */
++/*
++ * Read the uC shared area: responseOp +0xc, responseParams +0x10, hwState +0x20,
++ * interfaceVersionCommon +0x24 (struct IpaHwSharedMemCommonMapping_t, first 128 B of the SW SRAM).
++ * Polls for INIT_COMPLETED up to `ms`, then says what it saw. Returns true when the uC said
++ * IPA_HW_2_CPU_RESPONSE_INIT_COMPLETED (1).
++ */
++bool
++vayu_ipa_uc_look(const char *when, uint64_t ms)
++{
++	vm_offset_t uc = ml_io_map_unmappable(IPA_SRAM_V41, 0x1000, VM_WIMG_IO);
++	uint32_t response = 0, params = 0, state = 0, iface = 0;
++	uint64_t waited = 0;
++
++	if (uc == 0) {
++		say("vayu-ipa: %s: uC shared area did not map\n", when);
++		return false;
++	}
++	for (;;) {
++		response = *(volatile uint32_t *)(uc + 0xc) & 0xff;
++		params = *(volatile uint32_t *)(uc + 0x10);
++		if (response == UC_RESPONSE_INIT_DONE || waited >= ms) break;
++		delay_for_interval(10, NSEC_PER_MSEC);
++		waited += 10;
++	}
++	state = *(volatile uint32_t *)(uc + 0x20) & 0xff;
++	iface = *(volatile uint32_t *)(uc + 0x24) & 0xffff;
++	say("vayu-ipa: %s: uC responseOp %#x params %#x hwState %#x interface %#x after %llu ms: %s\n",
++	    when, response, params, state, iface, waited,
++	    response == UC_RESPONSE_INIT_DONE ? "uC INIT_COMPLETED" : "uC NOT READY");
++	return response == UC_RESPONSE_INIT_DONE;
++}
++
++/* Read-only look after AUTH_AND_RESET(15): GSI enabled by TrustZone, uC state before any write. */
+ static void
+ ipa_post_auth_look(void)
+ {
+-	vm_offset_t gsi, uc;
+-	uint32_t cfg, status, response = 0, state = 0, iface = 0;
+-	uint64_t waited = 0;
++	vm_offset_t gsi;
++	uint32_t cfg, status;
+ 
+ 	if (ipa_post_auth_ms == 0) return;
+ 	say("vayu-ipa: post-auth: AUTH_AND_RESET(15) RETURNED; holding %u ms before any IPA access\n", ipa_post_auth_ms);
+@@ -242,25 +271,11 @@
+ 	status = *(volatile uint32_t *)(gsi + 0x1f000);
+ 	say("vayu-ipa: post-auth: GSI_CFG %#x (enable %u), GSI_EE0_STATUS %#x (enabled %u)\n",
+ 	    cfg, cfg & 1, status, status & 1);
+-	uc = ml_io_map_unmappable(IPA_SRAM_V41, 0x1000, VM_WIMG_IO);
+-	if (uc == 0) {
+-		say("vayu-ipa: post-auth: uC shared area did not map\n");
+-		return;
+-	}
+ 	ipa_step("read the uC shared area at 0x1e47000");
+-	for (;;) {
+-		response = *(volatile uint32_t *)(uc + 0xc) & 0xff;
+-		if (response == UC_RESPONSE_INIT_DONE || waited >= 2000) break;
+-		delay_for_interval(10, NSEC_PER_MSEC);
+-		waited += 10;
+-	}
+-	state = *(volatile uint32_t *)(uc + 0x20) & 0xff;
+-	iface = *(volatile uint32_t *)(uc + 0x24) & 0xffff;
+-	say("vayu-ipa: post-auth: uC responseOp %#x params %#x hwState %#x interface %#x after %llu ms: %s\n",
+-	    response, *(volatile uint32_t *)(uc + 0x10), state, iface, waited,
+-	    response == UC_RESPONSE_INIT_DONE ? "uC INIT_COMPLETED" : "uC NOT READY");
++	bool uc = vayu_ipa_uc_look("post-auth", 2000);
++
+ 	say("vayu-ipa: post-auth: GSI %s, uC %s\n", (status & 1) ? "READY" : "NOT ENABLED",
+-	    response == UC_RESPONSE_INIT_DONE ? "READY" : "NOT READY");
++	    uc ? "READY" : "NOT READY");
+ }
+ 
+ static void
+@@ -517,6 +532,12 @@
+ 	}
+ 	/* vayu_ipa_data=1: the four GSI channels, endpoints and the empty tables, still before MPSS
+ 	 * (stock ipa3_load_ipa_fw -> ipa3_post_init). The QMI handshake stays separate. */
++	if (vayu_ipa_uc_look("post-init", 3000)) {
++		say("vayu-data: S0 IPA UC: OK uC INIT_COMPLETED after the hardware init\n");
++	} else {
++		say("vayu-data: S0 IPA UC: ERROR uC NOT READY after the hardware init; the modem's IPA task "
++		    "may wait for it (stock gets this before the modem starts)\n");
++	}
+ 	if (!vayu_ipa_data_prepare()) {
+ 		say("vayu-ipa: data path preparation failed; IPA stays up, WDS Start will be blocked\n");
+ 	}
+@@ -582,6 +603,7 @@
+ 	    observe_regs ? "read" : "not read (vayu_ipa_observe_regs=1 to read)",
+ 	    version, status, mcs, error);
+ 	up = ipa_smp2p_verify();                /* logs what it sees; sets ipa_smp2p_ready */
++	(void)vayu_ipa_uc_look("after-mpss", 0); /* the modem-side IPA task may load/start the uC */
+ 	if (ipa_modem_loader) {
+ 		if (up || (observe_regs && ((mcs & 1) || (status & 1)))) {
+ 			say("vayu-ipa: THE MODEM HAS IPA/GSI UP (loader=modem): SMP2P %s%s%s\n",
+--- a/bsd/dev/vayu_ipa_qmi.c
++++ b/bsd/dev/vayu_ipa_qmi.c
+@@ -47,6 +47,8 @@
+ static uint32_t client_node, client_port;
+ static struct hakios_qrtr_port *host_port;
+ static uint32_t qmi_wait_ms = 60000, qmi_timeout_ms = 30000;
++static uint32_t qmi_regwait_ms = 5000, qmi_attempts = 3;
++static bool qmi_trace;
+ 
+ static int say(const char *format, ...) __printflike(1, 2);
+ static int
+@@ -112,8 +114,9 @@
+ }
+ 
+ /* INIT_MODEM_DRIVER, byte-for-byte the vayu IPA 4.1 memory layout from downstream
+- * (ipa_utils.c ipa_4_1_mem_part, ipa_qmi_service.c ipa3_qmi_init_modem_send_sync_msg). */
+-static void
++ * (ipa_utils.c ipa_4_1_mem_part, ipa_qmi_service.c ipa3_qmi_init_modem_send_sync_msg).
++ * Returns true when the modem answered success. */
++static bool
+ ipa_init_modem_driver(void)
+ {
+ 	struct vayu_ipa_init_req req = { 0 };
+@@ -170,28 +173,28 @@
+ 	ret = qmi_txn_init(&ipa_qmi, &txn, vayu_ipa_init_resp_ei, &resp);
+ 	if (ret < 0) {
+ 		say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: ERROR no transaction (%d)\n", ret);
+-		return;
++		return false;
+ 	}
+ 	started = now_ms();
+ 	ret = qmi_send_request(&ipa_qmi, &to, &txn, VAYU_IPA_INIT_MODEM_DRIVER, 256, vayu_ipa_init_req_ei, &req);
+ 	if (ret < 0) {
+ 		qmi_txn_cancel(&txn);
+ 		say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: ERROR send %d\n", ret);
+-		return;
++		return false;
+ 	}
+ 	ret = hakios_qmi_txn_wait_ms(&txn, qmi_timeout_ms);
+ 	if (ret == -ETIMEDOUT) {
+ 		say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: TIMEOUT no reply in %u ms (restricted %#x)\n", qmi_timeout_ms, o);
+-		return;
++		return false;
+ 	}
+ 	if (ret < 0) {
+ 		say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: ERROR reply not decoded (%d)\n", ret);
+-		return;
++		return false;
+ 	}
+ 	if (resp.result.result != 0 || resp.result.error != 0) {
+ 		say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: ERROR result %u error %u after %llu ms\n",
+ 		    (unsigned)resp.result.result, (unsigned)resp.result.error, now_ms() - started);
+-		return;
++		return false;
+ 	}
+ 	init_done = true;
+ 	say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: OK after %llu ms (restricted %#x; ctrl ep %s%u, default ep %s%u, "
+@@ -199,6 +202,58 @@
+ 	    resp.ctrl_comm_dest_end_pt_valid ? "" : "-", resp.ctrl_comm_dest_end_pt,
+ 	    resp.default_end_pt_valid ? "" : "-", resp.default_end_pt,
+ 	    resp.modem_driver_init_pending_valid ? "" : "-", resp.modem_driver_init_pending);
++	return true;
++}
++
++/*
++ * A request the IPA service has no handler for (0x7fff). A service whose loop is running answers
++ * an invalid message id with an error response at once; silence means the modem's IPA task has not
++ * reached its command loop (the same probe idea as hakios.mpss.c, 24 October).
++ */
++static void
++ipa_probe(void)
++{
++	struct vayu_cell_result resp = { 0 };
++	struct sockaddr_qrtr to = { .sq_family = AF_QIPCRTR, .sq_node = ipa_node, .sq_port = ipa_port };
++	struct qmi_txn txn;
++	int ret;
++
++	ret = qmi_txn_init(&ipa_qmi, &txn, vayu_cell_result_ei, &resp);
++	if (ret < 0) return;
++	ret = qmi_send_request(&ipa_qmi, &to, &txn, 0x7fff, 32, NULL, NULL);
++	if (ret < 0) {
++		qmi_txn_cancel(&txn);
++		say("vayu-ipa-qmi: S2 PROBE 0x7fff: ERROR send %d\n", ret);
++		return;
++	}
++	ret = hakios_qmi_txn_wait_ms(&txn, 1000);
++	if (ret == 0) {
++		say("vayu-ipa-qmi: S2 PROBE 0x7fff: OK the service answered (result %u error %u): its loop runs\n",
++		    (unsigned)resp.result, (unsigned)resp.error);
++	} else {
++		say("vayu-ipa-qmi: S2 PROBE 0x7fff: %s (nothing back to an unknown message id)\n",
++		    ret == -ETIMEDOUT ? "TIMEOUT" : "ERROR");
++	}
++}
++
++/* The modem's client registers indications on our 0x31/1 first; in 115037 our INIT raced it.
++ * Then up to vayu_ipa_qmi_attempts requests, each with the usual timeout. */
++static void
++stage_init(void)
++{
++	uint64_t waited;
++
++	waited = wait_for(&indication_wanted, qmi_regwait_ms);
++	say("vayu-ipa-qmi: S2 INDICATION_REGISTER: %s after %llu ms%s\n", indication_wanted ? "OK" : "TIMEOUT", waited,
++	    indication_wanted ? "" : " (the INIT is still sent; see the probe)");
++	ipa_probe();
++	for (uint32_t attempt = 1; attempt <= qmi_attempts && !ipa_stop; attempt++) {
++		(void)vayu_ipa_uc_look("qmi", 0);      /* the uC state at every attempt, no wait */
++		say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: attempt %u/%u to node %u port %u\n", attempt, qmi_attempts,
++		    ipa_node, ipa_port);
++		if (ipa_init_modem_driver()) return;
++		if (attempt < qmi_attempts) delay_for_interval(1000, NSEC_PER_MSEC);
++	}
+ }
+ 
+ /*
+@@ -359,6 +414,7 @@
+ 		return;
+ 	}
+ 	wds_qmi_up = true;
++	if (qmi_trace) hakios_qmi_trace(&wds_qmi, true);
+ 	ret = qmi_add_lookup(&wds_qmi, VAYU_IPA_WDS_SERVICE, 1, 0);
+ 	if (ret < 0) {
+ 		say("vayu-ipa-qmi: S3 WDS LOOKUP: ERROR qmi_add_lookup %d\n", ret);
+@@ -410,6 +466,7 @@
+ 		goto out;
+ 	}
+ 	ipa_qmi_up = true;
++	if (qmi_trace) hakios_qmi_trace(&ipa_qmi, true);
+ 	ret = qmi_add_lookup(&ipa_qmi, VAYU_IPA_QMI_SERVICE, VAYU_IPA_QMI_INSTANCE, VAYU_IPA_MODEM_INSTANCE);
+ 	if (ret < 0) {
+ 		say("vayu-ipa-qmi: S1 LOOKUP 0x31/2: ERROR qmi_add_lookup %d\n", ret);
+@@ -436,15 +493,11 @@
+ 		goto out;
+ 	}
+ 	say("vayu-ipa-qmi: S2 PUBLISH 0x31/1: OK\n");
+-	ipa_init_modem_driver();
++	stage_init();
+ 	if (!init_done) {
+ 		say("vayu-ipa-qmi: S2 handshake stopped; WDS Start remains blocked\n");
+ 		goto idle;
+ 	}
+-	waited = wait_for(&indication_wanted, 15000);
+-	if (!indication_wanted) {
+-		say("vayu-ipa-qmi: S2 INDICATION_REGISTER: TIMEOUT none in %llu ms after INIT_MODEM_DRIVER\n", waited);
+-	}
+ 	ipa_send_complete();
+ 	(void)wait_for(&driver_complete, 10000);
+ 	say("vayu-ipa-qmi: S2 RESULT: %s (INIT_MODEM_DRIVER %s, INDICATION_REGISTER %s, INIT_COMPLETE %s, 0x35 %s)\n",
+@@ -456,7 +509,25 @@
+ 		    vayu_ipa_ready() ? "allowed" : "ERROR blocked: IPA handshake not complete");
+ 	}
+ idle:
+-	while (!ipa_stop) delay_for_interval(100, NSEC_PER_MSEC);
++	{
++		/* A late answer is still useful: the uC/modem may only become ready later in the boot.
++		 * Four more requests, one every 30 s; never more (this is an init message, not WDS Start). */
++		uint64_t next = now_ms() + 30000;
++		uint32_t late = 0;
++
++		while (!ipa_stop) {
++			if (!init_done && stage >= 2 && ipa_modem_there && late < 4 && now_ms() >= next) {
++				late++;
++				next = now_ms() + 30000;
++				say("vayu-ipa-qmi: S2 LATE INIT %u/4: asking again\n", late);
++				if (ipa_init_modem_driver()) {
++					ipa_send_complete();
++					say("vayu-ipa-qmi: S2 LATE INIT %u/4: OK; the handshake completed late\n", late);
++				}
++			}
++			delay_for_interval(100, NSEC_PER_MSEC);
++		}
++	}
+ out:
+ 	if (wds_qmi_up) {
+ 		qmi_handle_release(&wds_qmi);
+@@ -504,9 +575,18 @@
+ 	stage = vayu_ipa_qmi_stage();
+ 	PE_parse_boot_argn("vayu_ipa_qmi_wait", &qmi_wait_ms, sizeof(qmi_wait_ms));
+ 	PE_parse_boot_argn("vayu_ipa_qmi_timeout", &qmi_timeout_ms, sizeof(qmi_timeout_ms));
++	PE_parse_boot_argn("vayu_ipa_qmi_regwait", &qmi_regwait_ms, sizeof(qmi_regwait_ms));
++	PE_parse_boot_argn("vayu_ipa_qmi_attempts", &qmi_attempts, sizeof(qmi_attempts));
+ 	if (qmi_timeout_ms < 1000 || qmi_timeout_ms > 60000) qmi_timeout_ms = 30000;
+-	say("vayu-ipa-qmi: vayu_ipa_qmi=%u wait %u ms, INIT_MODEM_DRIVER timeout %u ms\n", stage, qmi_wait_ms,
+-	    qmi_timeout_ms);
++	if (qmi_regwait_ms > 30000) qmi_regwait_ms = 30000;
++	if (qmi_attempts < 1 || qmi_attempts > 5) qmi_attempts = 3;
++	{
++		uint32_t trace = 0;
++
++		qmi_trace = PE_parse_boot_argn("vayu_qmi_trace", &trace, sizeof(trace)) && trace == 1;
++	}
++	say("vayu-ipa-qmi: vayu_ipa_qmi=%u wait %u ms, INIT_MODEM_DRIVER timeout %u ms in %u attempt(s), "
++	    "indication wait %u ms\n", stage, qmi_wait_ms, qmi_timeout_ms, qmi_attempts, qmi_regwait_ms);
+ 	if (stage == 0) return;
+ 	if (q == NULL) {
+ 		say("vayu-ipa-qmi: S1 SMP2P: ERROR no QRTR transport\n");
+--- a/bsd/dev/vayu_ipa_data.c
++++ b/bsd/dev/vayu_ipa_data.c
+@@ -35,7 +35,7 @@
+ #define IPA_SIZE                0x2000UL
+ #define IPA_DEBUG_PHYS          0x1e42000UL
+ #define IPA_DEBUG_SIZE          0x1000UL
+-#define IPA_SRAM_PHYS           0x1e50000UL
++#define IPA_SRAM_PHYS           0x1e50000UL   /* legacy v4.5 offset; real window comes from vayu_ipa_sram_base() */
+ #define IPA_SRAM_SIZE           0x2800UL
+ #define GSI_PHYS                0x1e04000UL
+ #define GSI_SIZE                0x28000UL
+@@ -831,12 +831,15 @@
+ 	uint32_t channels_hw = (params >> 3) & 0x1f;
+ 	max_event_rings = (params >> 8) & 0x1f;
+ 	uint32_t pipes = ipa_rd(IPA_ENABLED_PIPES);
+-	say("vayu-ipa-data: GSI status %#x version %#x params %#x: %u channels %u events; IPA pipes %#x\n",
++	say("vayu-ipa-data: GSI status %#x version %#x params %#x: %u channels %u events; IPA has %u pipes\n",
+ 	    status, version, params, channels_hw, max_event_rings, pipes);
++	/* IPA_ENABLED_PIPES is a COUNT of pipes (stock ipa3_get_num_pipes() returns it as is:
++	 * ipa_utils.c:7075), not a bitmask. The earlier bit test against EPs 2/5/10/11 was wrong and
++	 * refused a healthy 23-pipe IPA in run 115037. Endpoints 2, 5, 10 and 11 must exist. */
+ 	if (!(status & 1) || version == 0 || version == ~0u || channels_hw <= 6 ||
+-	    max_event_rings < NCHANNELS || (pipes & ((1u << 2) | (1u << 5) | (1u << 10) | (1u << 11))) !=
+-	    ((1u << 2) | (1u << 5) | (1u << 10) | (1u << 11))) {
+-		say("vayu-ipa-data: GSI 2.0 preflight failed; no channel writes\n");
++	    max_event_rings < NCHANNELS || pipes <= 11) {
++		say("vayu-ipa-data: GSI 2.0 preflight failed (need GSI enabled, >=%u event rings, >11 pipes); "
++		    "no channel writes\n", (unsigned)NCHANNELS);
+ 		return false;
+ 	}
+ 	return true;
+--- a/bsd/dev/hakios.qmi.c
++++ b/bsd/dev/hakios.qmi.c
+@@ -604,6 +604,7 @@
+ 	uint32_t peer_node, peer_port;
+ 	/* said in the log once each, so that a firmware that talks a lot cannot fill it */
+ 	bool said_malformed, said_undecoded, said_unknown;
++	bool trace;                             /* vayu_qmi_trace=1: every datagram, see hakios_qmi_trace() */
+ };
+ 
+ static const struct hakios_qrtr_ops *qmi_transport;
+@@ -620,6 +621,16 @@
+ 	return qmi != NULL ? (struct qmi_state *)(void *)qmi->sock : NULL;
+ }
+ 
++void
++hakios_qmi_trace(struct qmi_handle *qmi, bool on)
++{
++	struct qmi_state *s = state_of(qmi);
++
++	if (s != NULL) {
++		s->trace = on;
++	}
++}
++
+ /* With the lock held. */
+ static struct qmi_txn **
+ find_transaction(struct qmi_state *s, const struct qmi_txn *txn, uint16_t id)
+@@ -653,7 +664,8 @@
+ 	if (h == NULL || h->fn == NULL) {
+ 		if (!s->said_unknown) {
+ 			s->said_unknown = true;
+-			os_log("qmi: a message nobody handles: type %u, id %#x, %zu bytes (said once)\n", type, message, length);
++			os_log("qmi: a message nobody handles: type %u, id %#x, %zu bytes from %u:%u (said once)\n",
++			    type, message, length, node, port);
+ 		}
+ 		return;
+ 	}
+@@ -694,6 +706,11 @@
+ 	type = header[0];
+ 	id = (uint16_t)(header[1] | header[2] << 8);
+ 	message = (uint16_t)(header[3] | header[4] << 8);
++	if (s->trace) {
++		os_log("qmi: trace: %zu bytes from %u:%u type %u id %u msg %#x: %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    length, node, port, type, id, message, header[0], header[1], header[2], header[3],
++		    header[4], header[5], header[6], length > 7 ? header[7] : 0);
++	}
+ 	if (type == QMI_RESPONSE) {
+ 		os_lock(&s->lock);
+ 		found = find_transaction(s, NULL, id);
+@@ -707,6 +724,10 @@
+ 		}
+ 		os_unlock(&s->lock);
+ 		if (txn == NULL) {
++			if (s->trace) {
++				os_log("qmi: trace: a late reply to nothing (id %u, msg %#x, %zu bytes from %u:%u)\n",
++				    id, message, length, node, port);
++			}
+ 			return;                         /* a reply to nothing: late, after its transaction was given up */
+ 		}
+ 	}
+--- a/bsd/sys/hakios.qmi.h
++++ b/bsd/sys/hakios.qmi.h
+@@ -209,6 +209,10 @@
+  * handle's socket, which is how ath11k does it; here that call is this one.
+  */
+ int hakios_qmi_connect(struct socket *sock, uint32_t node, uint32_t port);
++
++/* vayu_qmi_trace=1: a line for every QMI datagram received on this handle (type, id, message,
++ * source, first bytes). */
++void hakios_qmi_trace(struct qmi_handle *qmi, bool on);
+ #ifndef HAKIOS_QMI_NO_KERNEL_CONNECT
+ static inline int
+ kernel_connect(struct socket *sock, void *address, __attribute__((unused)) int length, __attribute__((unused)) int flags)
+--- a/bsd/sys/vayu_ipa.h
++++ b/bsd/sys/vayu_ipa.h
+@@ -36,6 +36,9 @@
+ uint32_t vayu_ipa_restricted_bytes(void);
+ /* Base of the IPA local SW SRAM this boot uses (0x1e47000 with vayu_ipa_sram=1, else 0x1e50000). */
+ uint32_t vayu_ipa_sram_base(void);
++/* Read the uC shared area, polling up to ms for INIT_COMPLETED; logs one line with the raw values.
++ * True when the uC said IPA_HW_2_CPU_RESPONSE_INIT_COMPLETED. */
++bool vayu_ipa_uc_look(const char *when, uint64_t ms);
+ #endif
+ 
+ #endif /* _SYS_VAYU_IPA_H_ */

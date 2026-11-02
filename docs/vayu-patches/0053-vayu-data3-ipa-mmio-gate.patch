@@ -1,0 +1,188 @@
+Subject: [PATCH] vayu data3: uC SRAM reads opt-in (default off), per-group IPA hardware-init announcements, pipe preflight robust to count/mask
+
+Base: /mnt/ramdisk/ds-data with 0044 + 0052 applied. Applies with -p1.
+Kernel: mach-data4.bin sha256 2272cec18cc23b992deb4f5d769de57489c316f972b9e1134bebfcd9a2568503.
+
+Run 123126 (mach-data3 = 0052) hung: the last line is
+  vayu-ipa: post-auth: about to write QSB/CLKON/BCR/COMP registers and resource groups ...0x3c..0x52c
+and "about to write SRAM canaries" never came, so the host died inside the register writes that
+had already run in 115037 (mach-data2), not in the new uC read that follows them. 0052's only new
+MMIO after CLKON were the uC SRAM reads (0x1e47000 + 0xc/0x10/0x20/0x24) at post-init, after MPSS
+and at each QMI attempt. This patch removes every one of them from the default path and makes the
+hardware-init writes individually announced so the next log names the exact group.
+
+What:
+1. vayu_ipa.c: `vayu_ipa_uc_read=1` (default 0) gates ALL uC shared-area reads, including the one
+   after AUTH. Disabled path logs once: "uC reads disabled ..." and the post-auth summary says
+   "uC not read (vayu_ipa_uc_read=0)". `vayu-data: S0 IPA UC` becomes SKIP when disabled.
+2. vayu_ipa.c: ipa_hardware_init() now announces each group with ipa_step() before touching it:
+     write QSB 0x1e40074/0x1e40078
+     write CLKON 0x1e40044 = 3        (+ read-back line "CLKON now %#x")
+     write TX_CFG 0x1e401fc and BCR 0x1e401d0
+     write counter 0x1e401f0, COMP 0x1e4003c and idle 0x1e40220
+     write source resource groups 0x1e40400..0x1e4042c
+     write destination resource groups 0x1e40500..0x1e4052c
+   Values and order are unchanged from 0044; only the announcements are new (they pause only with
+   vayu_ipa_post_auth_ms != 0, as before).
+3. vayu_ipa_data.c: pipe preflight accepts IPA_ENABLED_PIPES as a count (>11, stock
+   ipa3_get_num_pipes(), ipa_utils.c:7075) or as the old bitmask (bits 2/5/10/11); the failure
+   line prints the raw value and which form was assumed.
+
+Expected next-run lines (args ... vayu_ipa_post_auth_ms=8000):
+  vayu-ipa: bus 0x6, post_auth_ms 8000, sram 1, uc_read 0
+  vayu-ipa: uC reads disabled (vayu_ipa_uc_read=1 enables the 0x1e47000 reads; ...)
+  vayu-ipa: post-auth: GSI READY, uC not read (vayu_ipa_uc_read=0)
+  vayu-ipa: post-auth: about to write QSB 0x1e40074/0x1e40078
+  ... about to write CLKON 0x1e40044 = 3 / hardware init: CLKON now 0x3
+  ... about to write TX_CFG 0x1e401fc and BCR 0x1e401d0 / counter... / source...
+  ... about to write destination resource groups 0x1e40500..0x1e4052c
+  vayu-ipa: hardware init: QSB ... CLKON ... BCR ... COMP ... route ...
+  vayu-data: S0 IPA UC: SKIP uC reads disabled (vayu_ipa_uc_read=0)
+  vayu-ipa-data: GSI status ... IPA has 23 pipes
+If it still hangs, the last "about to write ..." names the group, and that group can be split
+further (each register is a separate ipa_step in the next iteration).
+--- a/bsd/dev/vayu_ipa.c
++++ b/bsd/dev/vayu_ipa.c
+@@ -55,6 +55,11 @@
+  * canaries in the IPA 4.1 SW SRAM window (wrapper + 0x40000 + 0x7000, ipahal_reg.c v3.0..v4.2)
+  * instead of 0x1e50000 (the v4.5 offset). Ported from 0029 (w23 line) to this tree. */
+ static uint32_t ipa_bus_mask = 15, ipa_post_auth_ms, ipa_sram_fix;
++/* vayu_ipa_uc_read=1: every read of the uC shared area (0x1e47000) is opt-in. Run 123126 hung
++ * between the "about to write QSB/CLKON/BCR/COMP" announcement and the SRAM canaries, i.e. in
++ * code that 115037 had already run; the only new MMIO in 0052 was the uC read after the hardware
++ * init. Until the next run says which access is fatal, no uC SRAM read happens by default. */
++static uint32_t ipa_uc_reads;
+ 
+ static int say(const char *format, ...) __printflike(1, 2);
+ static int
+@@ -226,10 +231,22 @@
+ bool
+ vayu_ipa_uc_look(const char *when, uint64_t ms)
+ {
+-	vm_offset_t uc = ml_io_map_unmappable(IPA_SRAM_V41, 0x1000, VM_WIMG_IO);
++	vm_offset_t uc;
+ 	uint32_t response = 0, params = 0, state = 0, iface = 0;
+ 	uint64_t waited = 0;
+ 
++	if (ipa_uc_reads != 1) {
++		static bool said;
++
++		if (!said) {
++			said = true;
++			say("vayu-ipa: uC reads disabled (vayu_ipa_uc_read=1 enables the 0x1e47000 reads; "
++			    "run 123126 hung after the CLKON step)\n");
++		}
++		return false;
++	}
++	ipa_step("read the uC shared area at 0x1e47000");
++	uc = ml_io_map_unmappable(IPA_SRAM_V41, 0x1000, VM_WIMG_IO);
+ 	if (uc == 0) {
+ 		say("vayu-ipa: %s: uC shared area did not map\n", when);
+ 		return false;
+@@ -271,11 +288,10 @@
+ 	status = *(volatile uint32_t *)(gsi + 0x1f000);
+ 	say("vayu-ipa: post-auth: GSI_CFG %#x (enable %u), GSI_EE0_STATUS %#x (enabled %u)\n",
+ 	    cfg, cfg & 1, status, status & 1);
+-	ipa_step("read the uC shared area at 0x1e47000");
+ 	bool uc = vayu_ipa_uc_look("post-auth", 2000);
+ 
+ 	say("vayu-ipa: post-auth: GSI %s, uC %s\n", (status & 1) ? "READY" : "NOT ENABLED",
+-	    uc ? "READY" : "NOT READY");
++	    ipa_uc_reads != 1 ? "not read (vayu_ipa_uc_read=0)" : uc ? "READY" : "NOT READY");
+ }
+ 
+ static void
+@@ -284,20 +300,28 @@
+ 	/* vayu-r-oss ipa3_init_hw + resource groups + route for IPA 4.1. */
+ 	uint32_t v;
+ 
+-	ipa_step("write QSB/CLKON/BCR/COMP registers and resource groups (0x1e40000 + 0x3c..0x52c)");
++	/* Every group is announced separately: run 123126 stopped right after the old single
++	 * announcement, so the next log names the exact register group that kills the host. */
++	ipa_step("write QSB 0x1e40074/0x1e40078");
+ 	v = IPA_RD(0x74);
+ 	IPA_WR(0x74, (v & ~0xfU) | 8);                 /* DDR QMB max writes 8 */
+ 	v = IPA_RD(0x78);
+ 	IPA_WR(0x78, (v & ~0x00ff000fU) | 12 | 120U << 16); /* DDR reads 12 of 120 */
++	ipa_step("write CLKON 0x1e40044 = 3");
+ 	IPA_WR(0x44, 3);                              /* CLKON: open global + 2x */
++	say("vayu-ipa: hardware init: CLKON now %#x\n", IPA_RD(0x44));
++	ipa_step("write TX_CFG 0x1e401fc and BCR 0x1e401d0");
+ 	IPA_WR(0x1fc, IPA_RD(0x1fc) & ~1U);           /* TX PA_MASK_EN off */
+ 	IPA_WR(0x1d0, 0x39);                          /* BCR v4_0 */
++	ipa_step("write counter 0x1e401f0, COMP 0x1e4003c and idle 0x1e40220");
+ 	IPA_WR(0x1f0, 3);                             /* aggr granularity 0.5 ms (v4) */
+ 	IPA_WR(0x3c, IPA_RD(0x3c) | 1U << 7 | 1U << 8); /* in-order GSI */
+ 	IPA_WR(0x220, 256);                           /* dynamic idle after 256 */
++	say("vayu-ipa: hardware init: BCR %#x, COMP %#x\n", IPA_RD(0x1d0), IPA_RD(0x3c));
+ 
+ 	/* Source groups (valid only 0x400/0x420 and 0x404/0x424), v4.1:
+ 	 * pkt contexts, descriptor lists, descriptor buffers, ACK entries. */
++	ipa_step("write source resource groups 0x1e40400..0x1e4042c");
+ 	IPA_WR(0x400, RSRC(1, 1, 0, 0));   /* GRP01 pkt contexts: UL_DL min/max 1 */
+ 	IPA_WR(0x420, RSRC(1, 1, 0, 0));   /* GRP23 pkt contexts: LWA_DL min/max 1 */
+ 	IPA_WR(0x404, RSRC(10, 10, 0, 0)); /* GRP01 descriptor lists: UL_DL 10 */
+@@ -309,6 +333,7 @@
+ 
+ 	/* Destination groups (valid only 0x500/0x520 and 0x504/0x524):
+ 	 * data sectors and DPS DMARS, UL_DL and LWA_DL. */
++	ipa_step("write destination resource groups 0x1e40500..0x1e4052c");
+ 	IPA_WR(0x500, RSRC(4, 4, 0, 0));   /* GRP01 data sectors: UL_DL 4 */
+ 	IPA_WR(0x520, RSRC(4, 4, 0, 0));   /* GRP23 data sectors: LWA_DL 4 */
+ 	IPA_WR(0x504, RSRC(3, 3, 0, 0));   /* GRP01 data sectors: UL_DL 3 */
+@@ -454,12 +479,14 @@
+ 	PE_parse_boot_argn("vayu_ipa_bus", &ipa_bus_mask, sizeof(ipa_bus_mask));
+ 	PE_parse_boot_argn("vayu_ipa_post_auth_ms", &ipa_post_auth_ms, sizeof(ipa_post_auth_ms));
+ 	PE_parse_boot_argn("vayu_ipa_sram", &ipa_sram_fix, sizeof(ipa_sram_fix));
++	PE_parse_boot_argn("vayu_ipa_uc_read", &ipa_uc_reads, sizeof(ipa_uc_reads));
+ 	if (PE_parse_boot_argn("vayu_ipa_pas", &steps, sizeof(steps))) {
+ 		vayu_pas_set_steps(steps);
+ 	}
+ 	say("vayu-ipa: PAS steps %#x (bit 0 forced shutdown, 1 image, 2 AUTH, 3 hardware init)\n",
+ 	    vayu_pas_steps());
+-	say("vayu-ipa: bus %#x, post_auth_ms %u, sram %u\n", ipa_bus_mask, ipa_post_auth_ms, ipa_sram_fix);
++	say("vayu-ipa: bus %#x, post_auth_ms %u, sram %u, uc_read %u\n", ipa_bus_mask, ipa_post_auth_ms,
++	    ipa_sram_fix, ipa_uc_reads);
+ 	if ((vayu_pas_steps() & VAYU_PAS_STEP_AUTH) && !(vayu_pas_steps() & VAYU_PAS_STEP_IMAGE)) {
+ 		say("vayu-ipa: vayu_ipa_pas asks for AUTH without an image: refused\n");
+ 		return;
+@@ -532,7 +559,9 @@
+ 	}
+ 	/* vayu_ipa_data=1: the four GSI channels, endpoints and the empty tables, still before MPSS
+ 	 * (stock ipa3_load_ipa_fw -> ipa3_post_init). The QMI handshake stays separate. */
+-	if (vayu_ipa_uc_look("post-init", 3000)) {
++	if (ipa_uc_reads != 1) {
++		say("vayu-data: S0 IPA UC: SKIP uC reads disabled (vayu_ipa_uc_read=0)\n");
++	} else if (vayu_ipa_uc_look("post-init", 3000)) {
+ 		say("vayu-data: S0 IPA UC: OK uC INIT_COMPLETED after the hardware init\n");
+ 	} else {
+ 		say("vayu-data: S0 IPA UC: ERROR uC NOT READY after the hardware init; the modem's IPA task "
+--- a/bsd/dev/vayu_ipa_data.c
++++ b/bsd/dev/vayu_ipa_data.c
+@@ -834,13 +834,19 @@
+ 	say("vayu-ipa-data: GSI status %#x version %#x params %#x: %u channels %u events; IPA has %u pipes\n",
+ 	    status, version, params, channels_hw, max_event_rings, pipes);
+ 	/* IPA_ENABLED_PIPES is a COUNT of pipes (stock ipa3_get_num_pipes() returns it as is:
+-	 * ipa_utils.c:7075), not a bitmask. The earlier bit test against EPs 2/5/10/11 was wrong and
+-	 * refused a healthy 23-pipe IPA in run 115037. Endpoints 2, 5, 10 and 11 must exist. */
+-	if (!(status & 1) || version == 0 || version == ~0u || channels_hw <= 6 ||
+-	    max_event_rings < NCHANNELS || pipes <= 11) {
+-		say("vayu-ipa-data: GSI 2.0 preflight failed (need GSI enabled, >=%u event rings, >11 pipes); "
+-		    "no channel writes\n", (unsigned)NCHANNELS);
+-		return false;
++	 * ipa_utils.c:7075), not a bitmask. 115037 read 0x17 = 23 pipes. Accept the count form
++	 * (>11 means endpoints 0..11 exist) and, defensively, the old bitmask form (bits 2/5/10/11)
++	 * so a firmware that reports either is not refused. */
++	{
++		bool pipes_ok = pipes > 11 || (pipes & 0xc24u) == 0xc24u;
++
++		if (!(status & 1) || version == 0 || version == ~0u || channels_hw <= 6 ||
++		    max_event_rings < NCHANNELS || !pipes_ok) {
++			say("vayu-ipa-data: GSI 2.0 preflight failed (status %#x, %u channels, %u event rings, "
++			    "pipes %#x as %s); no channel writes\n", status, channels_hw, max_event_rings, pipes,
++			    pipes > 11 ? "count" : "mask");
++			return false;
++		}
+ 	}
+ 	return true;
+ }

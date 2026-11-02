@@ -1,0 +1,119 @@
+Subject: [PATCH] vayu_wifi W25l: the 4/4 MIC was computed over a stale 2/4 MIC (static frame buffer
+ never cleared), so hostapd rejected every 4/4; answer a retransmitted 3/4 with a new 4/4
+
+Base: /mnt/ramdisk/ds-wifi2 as run 135346 (kernel mach-wifi25k, PEER_ASSOC/VHT fix + W25j sequence
+numbers + the 300 ms pause between the 4/4 and the key install).
+
+What 135346 shows: txdata #0 (2/4, seq 1) -> the AP sends 3/4 -> txdata #1 (4/4, seq 2, clear) with
+TX completion status 0 (it went out and was ACKed) -> keys installed -> "eapol after the keys
+(info 0x13ca replay 3/4)" -> DEAUTH reason 15.  So the frame is on the air and the AP parses it;
+it is the 4/4 content hostapd throws away (invalid MIC or a counter it will not take).
+
+The bug: send_eapol() keeps its frame in a `static uint8_t f[...]` and only did `memset(f, 0, 24)`
+for the 802.11 header.  The 2/4 is built first from zeroed memory, so its MIC field is zero when
+the MIC is computed -- correct, and hostapd accepts it (hence the 3/4).  The 4/4 is built into the
+same buffer: at the moment sha1_hmac() runs over the EAPOL frame, bytes k+77..k+92 still hold the
+2/4's MIC, not zeros, so the 4/4's MIC is the HMAC of a frame that contains the previous MIC.
+hostapd's wpa_verify_key_mic() fails ("received EAPOL-Key with invalid MIC"), drops the frame and
+retransmits 3/4; the station's 4-way timer then fires (reason 15).  Everything else in the 4/4 was
+right: key_info 0x030a, replay = the 3/4's, zero nonce, key data length 0, descriptor 2.
+
+Changes (bsd/dev/vayu_wifi_rsn.c):
+ - send_eapol(): memset the whole frame buffer, not its first 24 bytes.  The MIC is then computed
+   over a frame whose MIC field is zero, which is what hostapd verifies.
+ - a 4/4 is answered again when the AP retransmits 3/4 with a bigger replay counter (as
+   wpa_supplicant does): replay <- new, the same PTK, no key reinstall and no re-authorize.
+ - the first two 4/4 frames are dumped, 131 bytes in 32-byte rows, MAC bytes 0-3 masked, MIC in the
+   clear (the 4/4 has no nonce and no key data).
+
+Expected on the next run: "4/4 sent", no "eapol after the keys", no DEAUTH reason 15, then
+"W25 S5 dhcp: OK offer ..." / "OK bound ..." and the ARP/ICMP probe lines; DHCP data frames should
+now complete with status 0 instead of 5.
+
+Artifact: /mnt/ramdisk/ds-wifi-out/mach-wifi25l.bin 16461312 B
+sha256 dc7fdbd19f883c05057e40fcf364e31ed02b4be425b53e497da52bb17a2b8dda
+
+--- a/bsd/dev/vayu_wifi_rsn.c
++++ b/bsd/dev/vayu_wifi_rsn.c
+@@ -76,7 +76,7 @@
+ 	uint32_t gtk_len, gtk_idx;
+ 	uint64_t replay, anonce_replay;
+ 	uint32_t eapol_ver, key_ver;
+-	uint32_t msg1s, msg3s, bad_mic, ignored, late;
++	uint32_t msg1s, msg3s, bad_mic, ignored, late, msg4s, msg4_dumps;
+ 	uint32_t group_cipher;
+ 	const struct vayu_rsn_ops *ops;
+ 	int (*log)(const char *format, ...) __printflike(1, 2);
+@@ -444,7 +444,11 @@
+ 	if (rsn.ops == NULL || rsn.ops->tx_data == NULL || kd_len > 64) {
+ 		return -1;
+ 	}
+-	memset(f, 0, 24);
++	/* W25l: the whole buffer, not just the header.  It is static, and W25k left the 2/4 MIC
++	 * sitting at k+77 when the 4/4 was built: the 4/4 MIC was then computed over a frame whose
++	 * MIC field held the 2/4's MIC instead of zeros, so the AP rejected every 4/4 (invalid MIC)
++	 * while the 2/4, built first from a zeroed buffer, was accepted. */
++	memset(f, 0, sizeof(f));
+ 	f[0] = 0x08;                            /* data */
+ 	f[1] = 0x01;                            /* to DS */
+ 	memcpy(f + 4, rsn.ops->bssid, 6);       /* addr1: the AP */
+@@ -485,6 +489,36 @@
+ 		memset(mic, 0, sizeof(mic));
+ 	}
+ 	flen = 24 + 8 + eapol_len;
++	if (key_info == 0x030a && kd_len == 0) {
++		rsn.msg4s++;
++	}
++	if (key_info == 0x030a && kd_len == 0 && rsn.msg4_dumps < 2) {
++		rsn.msg4_dumps++;
++		/* W25l: the whole 4/4, as it goes on the air: MAC bytes 0-3 masked, the MIC printed
++		 * (a 4/4 has no nonce and no key data, and the MIC of a finished handshake is not a
++		 * secret that opens anything). */
++		char row[32 * 3 + 1];
++		uint32_t row_at, i;
++
++		for (row_at = 0; row_at < flen; row_at += 32) {
++			uint32_t n = flen - row_at < 32 ? flen - row_at : 32, j = 0;
++
++			for (i = 0; i < n; i++) {
++				static const char hx[] = "0123456789abcdef";
++				uint32_t at = row_at + i;
++				bool mac = (at >= 4 && at < 8) || (at >= 10 && at < 14) || (at >= 16 && at < 20);
++
++				row[j++] = mac ? 'x' : hx[f[at] >> 4];
++				row[j++] = mac ? 'x' : hx[f[at] & 15];
++				row[j++] = ' ';
++			}
++			if (j != 0) {
++				j--;
++			}
++			row[j] = 0;
++			rsn.log("vayu-wifi: W25 S3 4/4 +%03u: %s\n", row_at, row);
++		}
++	}
+ 	return rsn.ops->tx_data(f, flen, true);
+ }
+ 
+@@ -735,12 +769,18 @@
+ 	}
+ 	replay = be64(k + 5);
+ 	if (rsn.state == RSN_KEYED) {
+-		/* The AP resending 3/4 after our 4/4 means it did not take the 4/4 (wrong replay or
+-		 * MIC, or a duplicate the AP dropped): the 4-way will time out and the port stays shut. */
+-		if (rsn.late < 4) {
++		/* The AP resending 3/4 after our 4/4 means it did not take the 4/4.  wpa_supplicant
++		 * answers a newer 3/4 with a new 4/4 carrying that replay counter; the keys stay. */
++		if ((info & KI_PAIRWISE) != 0 && (info & KI_ACK) != 0 && (info & KI_MIC) != 0 &&
++		    (info & KI_INSTALL) != 0 && replay > rsn.replay && rsn.msg4s < 8) {
++			rsn.replay = replay;
++			rsn.log("vayu-wifi: W25 S3 4way: OK 3/4 again with replay %llu, 4/4 sent again (no "
++			    "keys reinstalled)\n", (unsigned long long)replay);
++			(void)send_msg4();
++		} else if (rsn.late < 4) {
+ 			rsn.late++;
+ 			rsn.log("vayu-wifi: W25 S3 4way: WARNING eapol after the keys (info %#x replay %llu): "
+-			    "the AP did not take the 4/4\n", info, (unsigned long long)replay);
++			    "not answered\n", info, (unsigned long long)replay);
+ 		}
+ 		return;
+ 	}

@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Mon, 2 Nov 2026 15:10:00 +0300
+Subject: [PATCH] sms: selftest --any-reg, raw reg_state lines, unbuffered output
+
+The selftest no longer waits for a registered network when --any-reg is given:
+it sends as soon as WMS is ready and either the network was registered once
+during the wait or 120 s have passed, and prints the reason (network-registered,
+network-unknown, seen-registered, any-reg-delay).  The cell record's raw
+reg_state is printed on every change and a heartbeat every 30 s; stdout and
+stderr are unbuffered so rc.jobs sees every line.  The send is still one message,
+with the EBUSY-only retry (the kernel did not queue that attempt).
+---
+--- a/userland/src/sms.c
++++ b/userland/src/sms.c
+@@ -6,10 +6,13 @@
+  *   sms delete SEQ           remove one stored message from the SIM/NV
+  *   sms refresh [uim|nv]     sweep that storage now and print how many were read
+  *   sms status               the WMS client's state and counters
+- *   sms selftest NUMBER [WAIT_READY_S] [WAIT_RX_S]
++ *   sms selftest NUMBER [WAIT_READY_S] [WAIT_RX_S] [--any-reg]
+  *                            wait for WMS (and the cell record's registration),
+  *                            send "vayu selftest <time>" exactly once, then watch
+- *                            the inbox and print every new message masked
++ *                            the inbox and print every new message masked.
++ *                            --any-reg sends after 120 s even without a registered
++ *                            network (or as soon as one was seen), leaving the
++ *                            refusal to the modem
+  *
+  * A message longer than one segment is refused by the kernel (EMSGSIZE); this
+  * stage has no concatenation.  The kernel builds the PDU and speaks QMI WMS; this
+@@ -159,9 +162,9 @@
+ #define VAYU_CELL_BYTES   152
+ #define VAYU_CELL_REGISTERED 1
+ 
+-/* 1 registered, 0 not registered, -1 no usable record.  Reads no identifier out. */
++/* The raw QMI registration state (0..4, 0xff), or -1 when there is no usable record. */
+ static int
+-cell_registered(void)
++cell_reg_state(void)
+ {
+ 	uint8_t record[VAYU_CELL_BYTES];
+ 	struct vayu_cell_head head;
+@@ -182,26 +185,48 @@
+ 	    head.size != VAYU_CELL_BYTES) {
+ 		return -1;
+ 	}
+-	return head.reg_state == VAYU_CELL_REGISTERED ? 1 : 0;
++	if (head.reg_state > 4 && head.reg_state != 0xff) {
++		return -1;
++	}
++	return head.reg_state;
+ }
+ 
+ static const char *
+-network_name(int registered)
++network_name(int state)
+ {
+-	return registered == 1 ? "registered" : registered == 0 ? "not registered" : "unknown";
++	switch (state) {
++	case 0: return "not registered";
++	case 1: return "registered";
++	case 2: return "searching";
++	case 3: return "denied";
++	case 4: return "unknown(qmi)";
++	case 0xff: return "unknown";
++	default: return "no record";
++	}
+ }
+ 
+ /*
+- * Wait for the WMS client to be ready (and, when /dev/vayu-cell is readable, for
+- * the network to be registered); at most wait_s, polling every 5 s.  Returns an
+- * open /dev/vayu-sms or -1.
++ * Wait for the WMS client to be ready.  Without --any-reg the network must be
++ * registered at that moment (or the cell record must be absent, as before).  With
++ * --any-reg the send may proceed once WMS is ready and either the network has been
++ * registered at least once during this wait or ANY_REG_DELAY seconds have passed;
++ * the modem is then allowed to refuse the send.  At most wait_s, polling every 5 s.
++ * Prints a line on every raw reg_state change and a heartbeat every 30 s.  Returns
++ * an open /dev/vayu-sms or -1; *reason_out says why the send is made.
+  */
++#define ANY_REG_DELAY 120
++
+ static int
+-wait_ready(uint32_t wait_s, struct vayu_sms_status *status_out, int *registered_out)
++wait_ready(uint32_t wait_s, bool any_reg, struct vayu_sms_status *status_out, int *network_out,
++    const char **reason_out, time_t *waited_out)
+ {
+ 	time_t start = time(NULL), last_report = start - 100;
+ 	int last_wms = -1, last_state = -1, last_network = -2;
++	bool seen_registered = false;
+ 
++	if (reason_out != NULL) {
++		*reason_out = "not ready";
++	}
+ 	for (;;) {
+ 		struct vayu_sms_status status;
+ 		int device, wms = 0, state = -1, network;
+@@ -218,32 +243,58 @@
+ 				state = (int)status.state;
+ 			}
+ 		}
+-		network = cell_registered();
++		network = cell_reg_state();
++		if (network == 1) {
++			seen_registered = true;
++		}
+ 		{
+ 			time_t now = time(NULL);
++			bool ready = device >= 0 && wms && state == VAYU_SMS_STATE_READY;
++			const char *reason = NULL;
+ 
+-			if (device >= 0 && wms && state == VAYU_SMS_STATE_READY && network != 0) {
+-				st_out("ready after %ld s: wms=present network=%s", (long)(now - start),
+-				    network_name(network));
++			if (ready) {
++				if (!any_reg) {
++					if (network == 1) {
++						reason = "network-registered";
++					} else if (network < 0) {
++						reason = "network-unknown";
++					}
++				} else if (seen_registered) {
++					reason = "seen-registered";
++				} else if (now - start >= ANY_REG_DELAY) {
++					reason = "any-reg-delay";
++				}
++			}
++			if (reason != NULL) {
++				st_out("ready after %ld s: reason=%s wms=present network=%s", (long)(now - start),
++				    reason, network_name(network));
+ 				if (status_out != NULL) {
+ 					*status_out = status;
+ 				}
+-				if (registered_out != NULL) {
+-					*registered_out = network;
++				if (network_out != NULL) {
++					*network_out = network;
++				}
++				if (reason_out != NULL) {
++					*reason_out = reason;
++				}
++				if (waited_out != NULL) {
++					*waited_out = now - start;
+ 				}
+ 				return device;
+ 			}
+ 			if (now - start >= (time_t)wait_s) {
+-				st_err("ready timeout after %ld s: wms=%s state=%s network=%s", (long)(now - start),
+-				    wms ? "present" : "absent", state_name((uint32_t)state), network_name(network));
++				st_err("ready timeout after %ld s: wms=%s state=%s network=%s%s", (long)(now - start),
++				    wms ? "present" : "absent", state_name((uint32_t)state), network_name(network),
++				    any_reg ? " (--any-reg)" : "");
+ 				if (device >= 0) {
+ 					close(device);
+ 				}
+ 				return -1;
+ 			}
+ 			if (now - last_report >= 30 || wms != last_wms || state != last_state || network != last_network) {
+-				st_out("waiting: wms=%s state=%s network=%s (%ld s)", wms ? "present" : "absent",
+-				    state_name((uint32_t)state), network_name(network), (long)(now - start));
++				st_out("waiting: wms=%s state=%s network=%s (%ld s)%s", wms ? "present" : "absent",
++				    state_name((uint32_t)state), network_name(network), (long)(now - start),
++				    any_reg ? " any-reg" : "");
+ 				last_report = now;
+ 				last_wms = wms;
+ 				last_state = state;
+@@ -277,7 +328,7 @@
+ static int
+ command_selftest(int argc, char **argv)
+ {
+-	const char *number;
++	const char *number, *reason = "not ready";
+ 	uint32_t wait_ready_s = 600, wait_rx_s = 300;
+ 	struct vayu_sms_status status;
+ 	struct vayu_sms_send send;
+@@ -285,12 +336,12 @@
+ 	size_t text_length;
+ 	uint32_t baseline = 0, last_seq = 0;
+ 	unsigned received = 0, matched = 0;
+-	bool send_attempted = false;
+-	int device, network = -1;
+-	time_t deadline;
++	bool send_attempted = false, any_reg = false;
++	int device, network = -1, numeric_args = 0;
++	time_t deadline, waited = 0;
+ 
+ 	if (argc < 3) {
+-		st_err("usage: sms selftest NUMBER [WAIT_READY_S] [WAIT_RX_S]");
++		st_err("usage: sms selftest NUMBER [WAIT_READY_S] [WAIT_RX_S] [--any-reg]");
+ 		return 2;
+ 	}
+ 	number = argv[2];
+@@ -298,11 +349,23 @@
+ 		st_err("the destination is empty or longer than %u bytes", VAYU_SMS_NUMBER_MAX - 1);
+ 		return 2;
+ 	}
+-	wait_ready_s = parse_seconds(argc > 3 ? argv[3] : NULL, wait_ready_s);
+-	wait_rx_s = parse_seconds(argc > 4 ? argv[4] : NULL, wait_rx_s);
++	for (int i = 3; i < argc; i++) {
++		if (strcmp(argv[i], "--any-reg") == 0) {
++			any_reg = true;
++		} else if (numeric_args == 0) {
++			wait_ready_s = parse_seconds(argv[i], wait_ready_s);
++			numeric_args++;
++		} else if (numeric_args == 1) {
++			wait_rx_s = parse_seconds(argv[i], wait_rx_s);
++			numeric_args++;
++		} else {
++			st_err("usage: sms selftest NUMBER [WAIT_READY_S] [WAIT_RX_S] [--any-reg]");
++			return 2;
++		}
++	}
+ 
+ 	memset(&status, 0, sizeof(status));
+-	device = wait_ready(wait_ready_s, &status, &network);
++	device = wait_ready(wait_ready_s, any_reg, &status, &network, &reason, &waited);
+ 	if (device < 0) {
+ 		st_err("no usable /dev/%s after %u s; nothing is sent", VAYU_SMS_DEVICE, wait_ready_s);
+ 		return 1;
+@@ -322,7 +385,7 @@
+ 	strcpy(send.number, number);
+ 	memcpy(send.text, text, text_length + 1);
+ 	send.text_length = (uint32_t)text_length;
+-	st_out("sending one message: %zu bytes of text", text_length);
++	st_out("sending one message: reason=%s, waited=%ld s, %zu bytes of text", reason, (long)waited, text_length);
+ 	/*
+ 	 * The kernel returns EBUSY before it queues the job when an inbox sweep is
+ 	 * running; that attempt sent nothing.  Wait for the sweep and try again only
+@@ -564,7 +627,7 @@
+ usage(void)
+ {
+ 	fprintf(stderr, "usage: sms list | send NUMBER TEXT... | delete SEQ | refresh [uim|nv] | status\n"
+-	    "       sms selftest NUMBER [WAIT_READY_S] [WAIT_RX_S]\n");
++	    "       sms selftest NUMBER [WAIT_READY_S] [WAIT_RX_S] [--any-reg]\n");
+ }
+ 
+ int
+@@ -572,6 +635,9 @@
+ {
+ 	int device, status;
+ 
++	/* rc.jobs sends both streams to the loader log: do not let a buffer hide lines */
++	setvbuf(stdout, NULL, _IONBF, 0);
++	setvbuf(stderr, NULL, _IONBF, 0);
+ 	if (argc < 2) {
+ 		usage();
+ 		return 2;

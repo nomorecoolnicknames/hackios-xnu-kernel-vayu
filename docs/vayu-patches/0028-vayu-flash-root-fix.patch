@@ -1,0 +1,65 @@
+vayu flash root: make the UFS devices before setconf (rd=ufs_<name>)
+
+Base: /mnt/ramdisk/comb-src (already has redwood_ufs_part_dev + setconf rd=ufs_ branch).
+Cause (run 011901): setconf ran at 27.36 s, redwood_input_init -> redwood_ufs_init only after
+devfs_kernel_mount, i.e. after the root mount; part_dev failed, IOFindBSDRoot waited for
+BSD Name ufs_darwin and panicked at IOKitBSDInit.cpp:926.
+Fix: setconf calls redwood_ufs_init first for rd=ufs_*; redwood_ufs_init runs once.
+
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1126,15 +1126,21 @@
+ 
+ 	/*
+ 	 * Flash root: rd=ufs_<partition> makes a partition of the phone's storage the root.
+-	 * The UFS devices are made in bsd_init before this point (redwood_ufs_init), and the
+-	 * APFS driver mounts that device like any other block device (vayu flash boot).
++	 * The UFS devices are otherwise made only after the root is mounted (redwood_input_init,
++	 * after devfs_kernel_mount), so they are made here first; devfs is ready since vfsinit and
++	 * redwood_ufs_init does its work once. The APFS driver mounts that device like any other
++	 * block device (vayu flash boot).
+ 	 */
+ 	{
+ 		char rdname[DEVMAXNAMESIZE] = {0};
+ 		dev_t ufsdev = 0;
+ 
+ 		if (PE_parse_boot_argn("rd", rdname, sizeof(rdname)) &&
+-		    strncmp(rdname, "ufs_", 4) == 0 &&
++		    strncmp(rdname, "ufs_", 4) == 0) {
++			printf("setconf: rd=%s: redwood_ufs_init before the root\n", rdname);
++			redwood_ufs_init();
++		}
++		if (strncmp(rdname, "ufs_", 4) == 0 &&
+ 		    redwood_ufs_part_dev(rdname + 4, &ufsdev)) {
+ 			rootdev = ufsdev;
+ 			strlcpy(rootdevice, rdname, sizeof(rootdevice));
+--- a/bsd/dev/redwood_ufs.c
++++ b/bsd/dev/redwood_ufs.c
+@@ -1506,7 +1506,13 @@
+ redwood_ufs_init(void)
+ {
+ 	uint64_t pa = 0, buffer_pa;
++	static bool ufs_init_done;
+ 
++	/* once: setconf calls it early for rd=ufs_<name>, redwood_input_init again after /dev is mounted */
++	if (ufs_init_done) {
++		return;
++	}
++	ufs_init_done = true;
+ 	printf("ufs: redwood_ufs_init called\n");
+ 	uint32_t check = 0, made = 0;
+ 	vm_offset_t base;
+--- a/bsd/dev/redwood_input.c
++++ b/bsd/dev/redwood_input.c
+@@ -232,8 +232,10 @@
+ void
+ redwood_input_init(void)
+ {
+-	int major = cdevsw_add(-1, &touch_cdevsw);
++	int major;
+ 
++	printf("redwood_input_init called\n");
++	major = cdevsw_add(-1, &touch_cdevsw);
+ 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-touch") == NULL) {
+ 		printf("redwood-touch: cannot create the device\n");
+ 	}

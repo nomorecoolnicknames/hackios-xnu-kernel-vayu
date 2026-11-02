@@ -1,0 +1,408 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Mon, 2 Nov 2026 13:45:00 +0300
+Subject: [PATCH] sms: selftest NUMBER [WAIT_READY_S] [WAIT_RX_S]
+
+Wait for the WMS client (and the /dev/vayu-cell record's registration when it is
+readable), send "vayu selftest <unix time>" exactly once, then watch the inbox:
+every new message is printed as seq, masked sender, length, encoding and
+match=yes|no; the text and the destination are never printed.  All lines carry
+the sms-selftest: prefix on stdout and stderr.  An EBUSY answer means the kernel
+did not queue the send (an inbox sweep was running), so only that case waits and
+tries again; every other error is final.
+---
+--- a/userland/src/sms.c
++++ b/userland/src/sms.c
+@@ -6,6 +6,10 @@
+  *   sms delete SEQ           remove one stored message from the SIM/NV
+  *   sms refresh [uim|nv]     sweep that storage now and print how many were read
+  *   sms status               the WMS client's state and counters
++ *   sms selftest NUMBER [WAIT_READY_S] [WAIT_RX_S]
++ *                            wait for WMS (and the cell record's registration),
++ *                            send "vayu selftest <time>" exactly once, then watch
++ *                            the inbox and print every new message masked
+  *
+  * A message longer than one segment is refused by the kernel (EMSGSIZE); this
+  * stage has no concatenation.  The kernel builds the PDU and speaks QMI WMS; this
+@@ -13,11 +17,15 @@
+  */
+ #include <errno.h>
+ #include <fcntl.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stddef.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ #include "vayu_sms.h"
+@@ -57,6 +65,345 @@
+ 	return device;
+ }
+ 
++/* ---- selftest ------------------------------------------------------------------------------- */
++
++/*
++ * The selftest's lines all start with this prefix, on stdout and stderr: rc.jobs
++ * copies both to the loader log.  It never prints the destination or the text.
++ */
++static void
++st_out(const char *format, ...)
++{
++	va_list list;
++
++	fputs("sms-selftest: ", stdout);
++	va_start(list, format);
++	vfprintf(stdout, format, list);
++	va_end(list);
++	fputc('\n', stdout);
++	fflush(stdout);
++}
++
++static void
++st_err(const char *format, ...)
++{
++	va_list list;
++
++	fputs("sms-selftest: ", stderr);
++	va_start(list, format);
++	vfprintf(stderr, format, list);
++	va_end(list);
++	fputc('\n', stderr);
++	fflush(stderr);
++}
++
++/* The last four digits only: "...1234"; a short or alphanumeric sender is "...". */
++static void
++mask_number(const char *number, char out[8])
++{
++	size_t length = strlen(number);
++	size_t kept = 0;
++
++	out[0] = '.'; out[1] = '.'; out[2] = '.';
++	if (length >= 5) {
++		for (size_t i = length; i > 0 && kept < 4; i--) {
++			if (number[i - 1] < '0' || number[i - 1] > '9') {
++				break;
++			}
++			kept++;
++		}
++	}
++	for (size_t i = 0; i < kept; i++) {
++		out[3 + i] = number[length - kept + i];
++	}
++	out[3 + kept] = 0;
++}
++
++/*
++ * The first 68 bytes of bsd/sys/vayu_cell.h's struct vayu_cell_record (the same
++ * offsets: magic, version, size, ..., reg_state at 61).  The record is 152 bytes;
++ * a different magic/version/size is "unknown", never a guess.
++ */
++struct vayu_cell_head {
++	uint32_t magic;
++	uint32_t version;
++	uint32_t size;
++	uint32_t seq;
++	uint64_t updated_ms;
++	uint32_t iccid_length;
++	uint32_t imsi_length;
++	int32_t  signal_dbm;
++	int32_t  rsrq_db;
++	int32_t  snr_tenth_db;
++	uint32_t lac;
++	uint32_t cid;
++	uint16_t mcc;
++	uint16_t mnc;
++	uint8_t  sim_state;
++	uint8_t  card_state;
++	uint8_t  app_state;
++	uint8_t  pin_state;
++	uint8_t  pin_retries;
++	uint8_t  reg_state;
++	uint8_t  radio;
++	uint8_t  roam;
++	uint32_t flags;
++};
++
++_Static_assert(offsetof(struct vayu_cell_head, reg_state) == 61, "vayu_cell record layout");
++_Static_assert(offsetof(struct vayu_cell_head, flags) == 64, "vayu_cell record layout");
++_Static_assert(sizeof(struct vayu_cell_head) == 72, "vayu_cell record layout (tail padding)");
++
++#define VAYU_CELL_MAGIC   0x43454c4cu
++#define VAYU_CELL_VERSION 1
++#define VAYU_CELL_BYTES   152
++#define VAYU_CELL_REGISTERED 1
++
++/* 1 registered, 0 not registered, -1 no usable record.  Reads no identifier out. */
++static int
++cell_registered(void)
++{
++	uint8_t record[VAYU_CELL_BYTES];
++	struct vayu_cell_head head;
++	ssize_t got;
++	int device;
++
++	device = open("/dev/vayu-cell", O_RDONLY);
++	if (device < 0) {
++		return -1;
++	}
++	got = read(device, record, sizeof(record));
++	close(device);
++	if (got != (ssize_t)sizeof(record)) {
++		return -1;
++	}
++	memcpy(&head, record, sizeof(head));
++	if (head.magic != VAYU_CELL_MAGIC || head.version != VAYU_CELL_VERSION ||
++	    head.size != VAYU_CELL_BYTES) {
++		return -1;
++	}
++	return head.reg_state == VAYU_CELL_REGISTERED ? 1 : 0;
++}
++
++static const char *
++network_name(int registered)
++{
++	return registered == 1 ? "registered" : registered == 0 ? "not registered" : "unknown";
++}
++
++/*
++ * Wait for the WMS client to be ready (and, when /dev/vayu-cell is readable, for
++ * the network to be registered); at most wait_s, polling every 5 s.  Returns an
++ * open /dev/vayu-sms or -1.
++ */
++static int
++wait_ready(uint32_t wait_s, struct vayu_sms_status *status_out, int *registered_out)
++{
++	time_t start = time(NULL), last_report = start - 100;
++	int last_wms = -1, last_state = -1, last_network = -2;
++
++	for (;;) {
++		struct vayu_sms_status status;
++		int device, wms = 0, state = -1, network;
++
++		memset(&status, 0, sizeof(status));
++		device = open("/dev/" VAYU_SMS_DEVICE, O_RDWR);
++		if (device >= 0) {
++			if (ioctl(device, VAYU_SMS_IOC_STATUS, &status) != 0 ||
++			    status.magic != VAYU_SMS_MAGIC || status.version != VAYU_SMS_VERSION) {
++				memset(&status, 0, sizeof(status));
++				status.state = VAYU_SMS_STATE_OFF;
++			} else {
++				wms = status.wms_present ? 1 : 0;
++				state = (int)status.state;
++			}
++		}
++		network = cell_registered();
++		{
++			time_t now = time(NULL);
++
++			if (device >= 0 && wms && state == VAYU_SMS_STATE_READY && network != 0) {
++				st_out("ready after %ld s: wms=present network=%s", (long)(now - start),
++				    network_name(network));
++				if (status_out != NULL) {
++					*status_out = status;
++				}
++				if (registered_out != NULL) {
++					*registered_out = network;
++				}
++				return device;
++			}
++			if (now - start >= (time_t)wait_s) {
++				st_err("ready timeout after %ld s: wms=%s state=%s network=%s", (long)(now - start),
++				    wms ? "present" : "absent", state_name((uint32_t)state), network_name(network));
++				if (device >= 0) {
++					close(device);
++				}
++				return -1;
++			}
++			if (now - last_report >= 30 || wms != last_wms || state != last_state || network != last_network) {
++				st_out("waiting: wms=%s state=%s network=%s (%ld s)", wms ? "present" : "absent",
++				    state_name((uint32_t)state), network_name(network), (long)(now - start));
++				last_report = now;
++				last_wms = wms;
++				last_state = state;
++				last_network = network;
++			}
++		}
++		if (device >= 0) {
++			close(device);
++		}
++		sleep(5);
++	}
++}
++
++static uint32_t
++parse_seconds(const char *argument, uint32_t fallback)
++{
++	char *end = NULL;
++	unsigned long value;
++
++	if (argument == NULL) {
++		return fallback;
++	}
++	errno = 0;
++	value = strtoul(argument, &end, 10);
++	if (errno != 0 || end == argument || *end != 0 || value > 86400) {
++		return fallback;
++	}
++	return (uint32_t)value;
++}
++
++static int
++command_selftest(int argc, char **argv)
++{
++	const char *number;
++	uint32_t wait_ready_s = 600, wait_rx_s = 300;
++	struct vayu_sms_status status;
++	struct vayu_sms_send send;
++	char text[VAYU_SMS_TEXT_MAX];
++	size_t text_length;
++	uint32_t baseline = 0, last_seq = 0;
++	unsigned received = 0, matched = 0;
++	bool send_attempted = false;
++	int device, network = -1;
++	time_t deadline;
++
++	if (argc < 3) {
++		st_err("usage: sms selftest NUMBER [WAIT_READY_S] [WAIT_RX_S]");
++		return 2;
++	}
++	number = argv[2];
++	if (strlen(number) == 0 || strlen(number) >= VAYU_SMS_NUMBER_MAX) {
++		st_err("the destination is empty or longer than %u bytes", VAYU_SMS_NUMBER_MAX - 1);
++		return 2;
++	}
++	wait_ready_s = parse_seconds(argc > 3 ? argv[3] : NULL, wait_ready_s);
++	wait_rx_s = parse_seconds(argc > 4 ? argv[4] : NULL, wait_rx_s);
++
++	memset(&status, 0, sizeof(status));
++	device = wait_ready(wait_ready_s, &status, &network);
++	if (device < 0) {
++		st_err("no usable /dev/%s after %u s; nothing is sent", VAYU_SMS_DEVICE, wait_ready_s);
++		return 1;
++	}
++
++	/* exactly one send, whatever the answer */
++	{
++		struct vayu_sms_count count;
++
++		if (ioctl(device, VAYU_SMS_IOC_COUNT, &count) == 0) {
++			baseline = count.next_seq;
++		}
++		last_seq = baseline > 0 ? baseline - 1 : 0;
++	}
++	text_length = (size_t)snprintf(text, sizeof(text), "vayu selftest %lld", (long long)time(NULL));
++	memset(&send, 0, sizeof(send));
++	strcpy(send.number, number);
++	memcpy(send.text, text, text_length + 1);
++	send.text_length = (uint32_t)text_length;
++	st_out("sending one message: %zu bytes of text", text_length);
++	/*
++	 * The kernel returns EBUSY before it queues the job when an inbox sweep is
++	 * running; that attempt sent nothing.  Wait for the sweep and try again only
++	 * in that case.  Every other error is final: one message, no retry.
++	 */
++	for (unsigned attempt = 1; attempt <= 12; attempt++) {
++		if (ioctl(device, VAYU_SMS_IOC_SEND, &send) == 0) {
++			send_attempted = true;
++			st_out("sent: message id=%u reference=%u pdu=%u bytes", send.message_id, send.message_reference,
++			    send.pdu_length);
++			break;
++		}
++		if (errno == EBUSY && attempt < 12) {
++			st_out("send not attempted: the inbox sweep is running (busy); waiting 5 s");
++			sleep(5);
++			continue;
++		}
++		st_err("send failed: %s (errno %d); no retry is made", strerror(errno), errno);
++		break;
++	}
++
++	/* watch the inbox; every new seq is printed once, with the sender masked */
++	deadline = time(NULL) + (time_t)wait_rx_s;
++	for (;;) {
++		struct vayu_sms_count count;
++		uint32_t storage = 0;
++		int refresh_error = 0;
++
++		if (ioctl(device, VAYU_SMS_IOC_REFRESH, &storage) != 0) {
++			refresh_error = errno;
++			if (refresh_error != EBUSY) {
++				st_err("refresh: %s (errno %d)", strerror(refresh_error), refresh_error);
++			}
++		}
++		if (ioctl(device, VAYU_SMS_IOC_COUNT, &count) == 0) {
++			for (uint32_t seq = last_seq + 1; seq < count.next_seq; seq++) {
++				struct vayu_sms_get get;
++				char mask[8];
++				bool same;
++
++				memset(&get, 0, sizeof(get));
++				get.seq = seq;
++				if (ioctl(device, VAYU_SMS_IOC_GET, &get) != 0) {
++					if (errno != ENOENT) {
++						st_err("get %u: %s (errno %d)", seq, strerror(errno), errno);
++					}
++					last_seq = seq;
++					continue;
++				}
++				last_seq = seq;
++				if (seq < baseline) {
++					continue;
++				}
++				mask_number(get.message.number, mask);
++				same = get.message.text_length == text_length &&
++				    memcmp(get.message.text, text, text_length) == 0;
++				st_out("rx seq=%u from=%s len=%u enc=%s match=%s", get.message.seq, mask,
++				    get.message.text_length, alphabet_name(get.message.alphabet), same ? "yes" : "no");
++				received++;
++				if (same) {
++					matched++;
++				}
++			}
++		} else {
++			st_err("count: %s (errno %d)", strerror(errno), errno);
++		}
++		{
++			time_t now = time(NULL);
++
++			if (now >= deadline) {
++				break;
++			}
++			sleep((deadline - now) < 10 ? (unsigned)(deadline - now) : 10);
++		}
++	}
++	st_out("done: sent=%d rx=%u matched=%u waited=%us%s", send_attempted ? 1 : 0, received, matched, wait_rx_s,
++	    received == 0 ? " (no incoming message)" : "");
++	close(device);
++	return matched > 0 ? 0 : 1;
++}
++
+ static int
+ command_list(int device)
+ {
+@@ -216,7 +563,8 @@
+ static void
+ usage(void)
+ {
+-	fprintf(stderr, "usage: sms list | send NUMBER TEXT... | delete SEQ | refresh [uim|nv] | status\n");
++	fprintf(stderr, "usage: sms list | send NUMBER TEXT... | delete SEQ | refresh [uim|nv] | status\n"
++	    "       sms selftest NUMBER [WAIT_READY_S] [WAIT_RX_S]\n");
+ }
+ 
+ int
+@@ -228,6 +576,9 @@
+ 		usage();
+ 		return 2;
+ 	}
++	if (strcmp(argv[1], "selftest") == 0) {
++		return command_selftest(argc, argv);    /* it opens the device itself */
++	}
+ 	device = open_device();
+ 	if (device < 0) {
+ 		return 1;

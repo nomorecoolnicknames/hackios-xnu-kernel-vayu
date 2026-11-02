@@ -1,0 +1,91 @@
+Subject: [PATCH] vayu_wifi W25f: complete the PEER_ASSOC message (VHT_RATE_SET TLV had a header and no data)
+
+Base: /mnt/ramdisk/ds-wifi2 as run 112054 (kernel mach-wifi25e).  Only the WMI PEER_ASSOC
+command changes; the scan, auth, assoc and the handshake code are untouched.
+
+What the 112054 log shows, byte by byte (the 104-byte WMI message the HTC layer sent after
+"assoc status 0 aid 2"; HTC 8, then m[0..103]):
+  08 05 60 00 00 | 4c 00 65 00 | mac 52 ff 20 99 d3 a0 00 00 | vdev 0 | new_assoc 1 |
+  aid 2 | flags 5 | caps 0x11 | listen 10 | ht_caps 0 | max_mpdu 0 | density 0 | rate_caps 0 |
+  nss 1 | vht_caps 0 | phy_mode 0 (MODE_11A) | ht_info[2] 0 0 | num_legacy 8 | num_ht 0 |
+  TLV 08 00 11 00 + 0c 12 18 24 30 48 60 6c | TLV 00 00 11 00 | TLV 10 00 66 00  <-- end
+The struct is right (mac, vdev_id, new_assoc, assoc_id, flags, caps, listen_intval, ht_caps,
+max_mpdu, mpdu_density, rate_caps, nss, vht_caps, phy_mode, ht_info[2], num_legacy_rates,
+num_ht_rates = 76 bytes, ath10k wmi-tlv.h struct wmi_tlv_peer_assoc_cmd), the cmd id 0x6005
+and tag 0x65 are right, flags 5 = AUTH|NEED_PTK_4_WAY, phy_mode 0 = MODE_11A for 5 GHz,
+caps 0x11 from the assoc response, 8 legacy rates, 0 HT rates.  The one thing wrong is the
+last TLV: tag 0x66 WMI_TLV_TAG_STRUCT_VHT_RATE_SET declares len 16 and the message ends at
+the header -- no wmi_vht_rate_set follows (ath10k_wmi_tlv_op_gen_peer_assoc always appends
+sizeof(struct wmi_vht_rate_set) = 16 bytes, zeros when VHT is not in use).  The firmware
+parsed past the end of the message and asserted: SMP2P wlan 0 -> 0x2, early-crash-ind 1,
+CE stage stopped, "no WMI credit", VDEV_UP never sent.
+
+Changes:
+ - peer_assoc(): append the 16 bytes of wmi_vht_rate_set (rx_max_rate, rx_mcs_set,
+   tx_max_rate, tx_mcs_set, all zero: no VHT), so the message is 120 bytes and ends with
+   10 00 66 00 + 16 zero bytes; one line says the length and the TLV sizes.
+ - the rate arrays go out with the firmware's own tag numbers (ARRAY_BYTE 0x12, ath10k
+   enum wmi_tlv_tag); the old 0x11 was ARRAY_UINT32.  The same fix in rsn.c's
+   WMI_VDEV_INSTALL_KEY key-data array (0x11 -> 0x12), not yet exercised.
+ - order unchanged and as ath10k mac.c ath10k_bss_assoc(): PEER_ASSOC, then VDEV_UP.
+
+Expected in the next run: "vayu-wifi: W25 S2 peer_assoc: OK 120 bytes, 8 legacy rates, 0 ht
+rates, vht_rate_set 16, flags 0x5 caps 0x11 phymode 0 aid 2", a ce3 dump whose last line is
+10 00 66 00 followed by 16 zeros, then "W25 S2 join: OK PEER_ASSOC ... + VDEV_UP sent" and
+"W25 S3 4way: OK waiting for message 1/4".
+
+Artifact: /mnt/ramdisk/ds-wifi-out/mach-wifi25f.bin 16461192 B
+sha256 ab793ad6b475a6323ae7833f32a0a23b4fd4278c0f5aea9afecb3812bf22a013
+
+--- a/bsd/dev/vayu_wifi_sta.c
++++ b/bsd/dev/vayu_wifi_sta.c
+@@ -69,6 +69,10 @@
+ #define CMD_STA_PS_MODE         0x9001U
+ #define TAG_ARRAY_BYTE          0x11U
+ #define TAG_ARRAY_STRUCT        0x12U
++/* W25f: the firmware's own numbering (ath10k wmi-tlv.h enum wmi_tlv_tag): ARRAY_UINT32=0x11,
++ * ARRAY_BYTE=0x12, ARRAY_STRUCT=0x13.  The old 0x10/0x11/0x12 triples are what the scan and
++ * mgmt paths already send (the firmware accepted them); the peer assoc below uses the real ones. */
++#define TAG_ARRAY_BYTE_W25      0x12U
+ #define TAG_MGMT_RX_HDR         0x2cU
+ #define TAG_CHANNEL             0x50U
+ #define TAG_VDEV_START          0x58U
+@@ -852,15 +856,25 @@
+ 	p += 8;
+ 	p = put32(p, n < 16 ? n : 16);
+ 	p = put32(p, 0);
+-	r = put_tlv(p, TAG_ARRAY_BYTE, rl);
++	r = put_tlv(p, TAG_ARRAY_BYTE_W25, rl);
+ 	for (i = 0; i < n && i < 16; i++) {
+ 		uint8_t v = rates[i] & 0x7fU;
+ 
+ 		r[i] = (v == 2 || v == 4 || v == 11 || v == 22) ? (uint8_t)(v | 0x80U) : v;
+ 	}
+ 	p = r + rl;
+-	p = put_tlv(p, TAG_ARRAY_BYTE, 0);
++	p = put_tlv(p, TAG_ARRAY_BYTE_W25, 0);          /* no HT rates (no HT in our assoc request) */
++	/* wmi_vht_rate_set is not optional: ath10k always appends it, zeros when VHT is not in use.
++	 * W25e sent the TLV header alone (len 16, no data) and the firmware crashed on it. */
+ 	p = put_tlv(p, TAG_VHT_RATE_SET, 16);
++	p = put32(p, 0);                                /* rx_max_rate */
++	p = put32(p, 0);                                /* rx_mcs_set */
++	p = put32(p, 0);                                /* tx_max_rate */
++	(void)put32(p, 0);                              /* tx_mcs_set */
++	o->log("vayu-wifi: W25 S2 peer_assoc: OK %u bytes, %u legacy rates, 0 ht rates, vht_rate_set 16, "
++	    "flags %#x caps %#x phymode %u aid %u\n", (uint32_t)(p - m), n < 16 ? n : 16,
++	    PEER_FLAG_AUTH | (st.rsn ? PEER_FLAG_NEED_PTK_4WAY : 0), caps, join_freq() < 4000U ? 1U : 0U,
++	    st.aid);
+ 	return wmi_cmd(o, m, CMD_PEER_ASSOC, (uint32_t)(p - m));
+ }
+ 
+--- a/bsd/dev/vayu_wifi_rsn.c
++++ b/bsd/dev/vayu_wifi_rsn.c
+@@ -509,7 +509,7 @@
+ 	p = put32(p, key_len);
+ 	p = put32(p, 0);                        /* tx mic length */
+ 	p = put32(p, 0);                        /* rx mic length */
+-	p = put_tlv(p, 0x11U, padded);          /* WMI_TLV_TAG_ARRAY_BYTE */
++	p = put_tlv(p, 0x12U, padded);          /* WMI_TLV_TAG_ARRAY_BYTE (ath10k enum: 0x12) */
+ 	memcpy(p, key, key_len);
+ 	put32(m, CMD_VDEV_INSTALL_KEY);
+ 	return rsn.ops->wmi_send(m, (uint32_t)(4 + 4 + 92 + 4 + padded), 1000);
