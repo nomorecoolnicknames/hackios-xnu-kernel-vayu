@@ -50,7 +50,7 @@
  *   the node    stock vayu.dts:23389-23405 "qcom,qup_uart@0xc8c000", compatible
  *               "qcom,msm-geni-serial-hs", alias hsuart0 (:27591). Its wrapper is
  *               "qcom,qupv3-geni-se" at 0xcc0000 (:23650-23662): QUP wrapper 2, SE3
- *               (the bring-up notes). SE registers: 0xc8c000, 0x4000 bytes.
+ *               (docs/research/VAYU_BT_PHASE0.md §1). SE registers: 0xc8c000, 0x4000 bytes.
  *               The wrapper's own version is QUPV3_HW_VER at 0x00cc0004 (vendor
  *               qcom-geni-se.h; vayu_qup_spi.c reads it through s_ahb).
  *   the GENI    the geni-se/msm_geni_serial offsets: 0x020 GENI_FORCE_DEFAULT_REG, 0x024
@@ -132,7 +132,7 @@
  *               before the patch, 82 01 00 08 04 14 28 02 15 with IBS on, and 02 01 00 08 04 14
  *               28 02 15 with vayu_bt_ibs=0.
  *   the tty     iOS 16.5's bluetoothd reads BT_HCI_TRANSPORT (one transport name, e.g.
- *               H4; user space work from its strings), probes access("/dev/cu.bluetooth") and then "/dev/uart.bluetooth",
+ *               H4; userland-mgr from its strings), probes access("/dev/cu.bluetooth") and then "/dev/uart.bluetooth",
  *               opens the tty, does tcgetattr / cfmakeraw / cfsetspeed / tcsetattr (TIOCGETA
  *               0x40487413, TIOCSETA 0x80487414) and reads it through EVFILT_READ. It speaks
  *               plain H4: 01 command, 02 ACL, 03 SCO, 04 event.
@@ -173,6 +173,42 @@
  *   vayu_bt_ibs=0|1   default 0: 0 patches the NVM's tag 17 with in-band sleep off (bit 7
  *                     cleared) and tag 27 with deep sleep off (bit 0 cleared); 1 leaves both on,
  *                     as upstream btqca does. The RX framer filters 0xfd/0xfe/0xfc either way.
+ *   vayu_bt_leinit=0|1 default 0: before the first kctl LE Set Scan Parameters with a random
+ *                     own-address type, send real LE Set Scan Enable(0) and LE Set Random Address
+ *                     derived from NVM once, hiding only their two replies. The original scan
+ *                     result is never synthesized or changed.
+ *   vayu_bt_leanswer=0|1 default 0: answer LE Read Advertising TX Power (0x2007), LE Set Scan
+ *                     Parameters (0x200b) and LE Set Scan Enable (0x200c) locally with a Command
+ *                     Complete status 0 when the controller refuses them with 0x0c. The
+ *                     controller's real result is logged first; this only lets iOS's stack leave
+ *                     the reason-712 restart loop.
+ *   vayu_bt_lelegacy=0|1 default 0: clear LE feature bits 12 (Extended Advertising) and 13
+ *                     (Periodic Advertising) in the controller's LE Read Local Supported Features
+ *                     answer (0x2003), so bluetoothd does not send LE Read Periodic Advertiser
+ *                     List Size (0x204a). That is an extended advertising command, and after one
+ *                     the controller refuses the legacy ones (0x2007/0x200b/0x200c) with Command
+ *                     Disallowed until HCI_Reset (Core 5.x Vol 4 Part E 3.1.1). Every command still
+ *                     goes to the controller and every answer is its own; forces leanswer off.
+ *   vayu_bt_randaddr=0|1|2 default 0: bluetoothd never sends LE Set Random Address (0x2005); it
+ *                     hands its random address to Broadcom VSC 0xfd48 (_BCM_CreateMultipleAdv-
+ *                     Instance: type u8 + 6 address bytes, HCI little-endian), which Qualcomm does
+ *                     not know, so LE Set Scan Enable with own address type 1 gets 0x12. With 1 or 2,
+ *                     a 0xfd48 with type 1 is sent to the controller as a real 0x2005 with the same
+ *                     6 bytes; its Command Complete is hidden and answered as 0xfd48. A non-zero
+ *                     controller status is passed through. Status 0: mode 1 answers 0xfd48 with
+ *                     0x01 as before (multi-adv unavailable: an empty status-0 CC asserts in
+ *                     bluetoothd's parser, bcm_vsc.c:642), mode 2 with status 0 + instance 0.
+ *   vayu_bt_dt=0|1    default 0: 1 publishes the "marconi-bt" and "bluetooth" services under the
+ *                     platform with local-mac-address/transport-encoding/transport-speed (S10).
+ *                     0 publishes nothing. Measured 2026-11-02 (BT10/BT11 runs vs the 214653 run of
+ *                     the ufs line): with the service present bluetoothd takes the Apple bring-up
+ *                     path -- it opens the com.apple.BlueTool XPC right after the POSIX driver is
+ *                     made and only opens the HCI transport after that boot script answers; the
+ *                     script cannot run on this root yet (the S10 runs answered "permission
+ *                     denied" / timed out), so no transport and no LE reports. Without the service
+ *                     bluetoothd opens com.vayu.bt.uart at once (214653: kctl connect by pid 22,
+ *                     real LE reports). 0 keeps the proven path and the address from
+ *                     wlan.debug.generate-mac / BT_DEVICE_ADDRESS / the BTServer plist.
  *   vayu_bt_vsc=0|1|2 default 0: the outbound vendor-command shim in step 9. 0 leaves every
  *                     byte alone; 1 answers the host commands (type 0x01) in bt_vsc_rules and
  *                     passes every other vendor opcode (OGF 0x3f) to the controller; 2 passes
@@ -226,6 +262,7 @@
 #include <sys/ttycom.h>
 #include <sys/uio.h>
 #include <sys/vayu_bt.h>
+#include <sys/vayu_bt_leinit.h>
 #include <sys/vayu_pas.h>
 
 /*
@@ -243,6 +280,10 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void delay(int usec);
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern bool vayu_bt_dt_publish(const uint8_t *mac, uint32_t transport, uint32_t speed);
+
+/* step 8 publishes the controller's own address; S10's helpers are at the probe (see there) */
+static void bt_dt_publish(const uint8_t addr[6], const char *source);
 
 /* ---- the blocks ------------------------------------------------------------------------------- */
 
@@ -523,6 +564,24 @@ static bool g_fw_cts = true;
 static bool g_keep = false;
 static bool g_giveback = false;
 static bool g_ibs = false;              /* vayu_bt_ibs: 0 keeps the NVM's in-band/deep sleep off */
+static bool g_leinit_enabled;           /* vayu_bt_leinit=1: real LE disable+random before first 0x200b */
+static bool g_leanswer_enabled;         /* vayu_bt_leanswer=1: answer 0x2007/0x200b locally */
+static bool g_lelegacy_enabled;         /* vayu_bt_lelegacy=1: hide ext/periodic adv LE features */
+static uint32_t g_lelegacy_cc_logged, g_lelegacy_adv_reports;
+static uint32_t g_randaddr_mode;        /* vayu_bt_randaddr: 0 off, 1/2 0xfd48 -> real 0x2005 */
+static volatile bool g_randaddr_reset_pending;
+static bool g_randaddr_pending;         /* a real 0x2005 is out; its CC becomes the 0xfd48 answer */
+static uint64_t g_randaddr_sent_us;
+static uint8_t g_randaddr_addr[6];
+static uint8_t g_randaddr_hold[8];      /* RX bytes held while they may be the 0x2005 CC */
+static uint32_t g_randaddr_held;
+static uint32_t g_le_cmd_logged;        /* kctl 0x200b/0x200c/0x2005/0xfd48 parameter lines */
+#define BT_RANDADDR_TIMEOUT_US  2000000ull
+#define BT_LE_CMD_LOG_MAX       256
+static bool g_leinit_sent, g_leinit_addr_valid;
+static volatile bool g_leinit_reset_pending;
+static uint8_t g_leinit_random_addr[6];
+static struct vayu_bt_leinit_rx g_leinit_rx;
 static uint32_t g_fw_rom = 0x21;        /* step 6's fw_rom: the crbtfw/crnv names; default 0x21 */
 
 static bool g_step8_done = false;       /* "step 8 done" was printed: step 9 may run */
@@ -2313,6 +2372,7 @@ bt_nvm_patch(uint8_t *data, uint64_t size)
 		switch (id) {
 		case QCA_TAG_ID_BD_ADDR:
 			if (len >= 6) {
+				g_leinit_addr_valid = vayu_bt_leinit_random_address(tag, g_leinit_random_addr);
 				printf("vayu-bt: nvm tag 2 (BD address): %02x:%02x:%02x:%02x:%02x:%02x\n",
 				    (unsigned)tag[0], (unsigned)tag[1], (unsigned)tag[2],
 				    (unsigned)tag[3], (unsigned)tag[4], (unsigned)tag[5]);
@@ -2531,6 +2591,8 @@ bt_step8(void)
 	printf("vayu-bt: Read_BD_ADDR: %02x:%02x:%02x:%02x:%02x:%02x\n", (unsigned)payload[9],
 	    (unsigned)payload[8], (unsigned)payload[7], (unsigned)payload[6],
 	    (unsigned)payload[5], (unsigned)payload[4]);
+	/* the controller's own answer wins over the NVM file the early publish read */
+	bt_dt_publish(payload + 4, "the controller's Read_BD_ADDR");
 
 	printf("vayu-bt: step 8: %llu ms in all\n",
 	    (unsigned long long)((bt_now_us() - start) / 1000));
@@ -2583,7 +2645,9 @@ bt_step8(void)
 
 #define BT_TTY_BAUD             115200
 #define BT_TTY_IO_SIZE          256             /* one poll's worth each way */
-#define BT_TTY_POLL_US          1000            /* delay() when neither direction moved a byte */
+#define BT_TTY_POLL_US          1000            /* delay() when neither direction moved a byte, while busy */
+#define BT_TTY_POLL_MAX_US      16000           /* idle backoff cap: the poll interval doubles up to 16 ms */
+#define BT_TTY_IDLE_TURNS       64              /* idle turns at 1 ms before the backoff starts (~64 ms) */
 #define BT_TTY_IOCTLS           32              /* distinct command numbers remembered */
 #define BT_TTY_NAME_LEN         64
 
@@ -2875,7 +2939,7 @@ _Static_assert(BT_KCTL_TIOCSETAF == (uint32_t)TIOCSETAF, "the kctl setopt name i
 static LCK_GRP_DECLARE(kctl_lck_grp, "vayu-bt-kctl");
 static LCK_MTX_DECLARE(kctl_lock, &kctl_lck_grp);
 
-static kern_ctl_ref g_kctl_ctlref;      /* the registered control */
+static kern_ctl_ref g_kctl_ctlref[2];   /* [0] BT_KCTL_NAME, [1] the POSIX driver's default name */
 static kern_ctl_ref g_kctl_ref;         /* the one connected client's ref */
 static uint32_t g_kctl_unit;
 static bool g_kctl_connected;
@@ -3034,6 +3098,8 @@ bt_kctl_disconnect(kern_ctl_ref kctlref, u_int32_t unit, __unused void *unitinfo
 	lck_mtx_unlock(&kctl_lock);
 
 	if (ours) {
+		g_leinit_reset_pending = true; /* the io thread resets at its next clean boundary */
+		g_randaddr_reset_pending = true;
 		printf("vayu-bt: kctl: disconnect unit %u\n", (unsigned)unit);
 		if (queued != 0) {
 			printf("vayu-bt: kctl: %u bytes queued by unit %u were dropped at disconnect\n",
@@ -3271,15 +3337,21 @@ bt_deliver_to_host(const uint8_t *bytes, uint32_t count)
 }
 
 /* The probe-start registration (vayu_bt >= 9), modelled on netagent_register_control() but
- * without CTL_FLAG_PRIVILEGED: bluetoothd runs as mobile. */
+ * without CTL_FLAG_PRIVILEGED: bluetoothd runs as mobile. Two names, one backend: BT_KCTL_NAME for
+ * the launchd environment (BT_HCI_TRANSPORT=H4:POSIX:com.vayu.bt.uart,115200) and BT_KCTL_ALIAS_NAME
+ * for the device-tree transport, where the POSIX driver takes its default name and bluetoothd is
+ * started with no BT_HCI_TRANSPORT at all (disassembly 2026-11-02: "com.apple.uart.sk.bluetooth").
+ * Only one of them is ever connected (one bluetoothd). */
+#define BT_KCTL_ALIAS_NAME      "com.apple.uart.sk.bluetooth"
+
 static bool
-bt_kctl_create(void)
+bt_kctl_register(const char *name, kern_ctl_ref *ref)
 {
 	struct kern_ctl_reg reg;
 	errno_t error;
 
 	bzero(&reg, sizeof(reg));
-	strlcpy(reg.ctl_name, BT_KCTL_NAME, sizeof(reg.ctl_name));
+	strlcpy(reg.ctl_name, name, sizeof(reg.ctl_name));
 	reg.ctl_name[sizeof(reg.ctl_name) - 1] = 0;
 	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
 	reg.ctl_sendsize = BT_KCTL_SEND_SIZE;
@@ -3290,16 +3362,29 @@ bt_kctl_create(void)
 	reg.ctl_setopt = bt_kctl_setopt;
 	reg.ctl_getopt = bt_kctl_getopt;
 
-	error = ctl_register(&reg, &g_kctl_ctlref);
+	error = ctl_register(&reg, ref);
 	if (error != 0) {
-		printf("vayu-bt: kctl: ctl_register(\"%s\") failed: %d\n", BT_KCTL_NAME, error);
-		g_kctl_ctlref = NULL;
+		printf("vayu-bt: kctl: ctl_register(\"%s\") failed: %d\n", name, error);
+		*ref = NULL;
 		return false;
 	}
-	printf("vayu-bt: kctl: \"%s\" registered (SOCK_STREAM, %u bytes each way, no root); "
-	    "bluetoothd: BT_HCI_TRANSPORT=H4:POSIX:%s,115200\n", BT_KCTL_NAME,
-	    (unsigned)BT_KCTL_SEND_SIZE, BT_KCTL_NAME);
+	printf("vayu-bt: kctl: \"%s\" registered (SOCK_STREAM, %u bytes each way, no root)\n",
+	    name, (unsigned)BT_KCTL_SEND_SIZE);
 	return true;
+}
+
+static bool
+bt_kctl_create(void)
+{
+	bool first = bt_kctl_register(BT_KCTL_NAME, &g_kctl_ctlref[0]);
+
+	/* the alias is an addition: its failure leaves the environment path as it was */
+	(void)bt_kctl_register(BT_KCTL_ALIAS_NAME, &g_kctl_ctlref[1]);
+	if (first) {
+		printf("vayu-bt: kctl: bluetoothd: BT_HCI_TRANSPORT=H4:POSIX:%s,115200, or nothing at all "
+		    "(the device-tree transport, \"%s\")\n", BT_KCTL_NAME, BT_KCTL_ALIAS_NAME);
+	}
+	return first;
 }
 
 /* ---- step 9's H4 framer: packet boundaries, the trace, and the sleep bytes ---------------------- */
@@ -3413,6 +3498,36 @@ bt_h4_remember(struct bt_h4_framer *f, uint8_t byte)
 	}
 }
 
+/*
+ * vayu_bt_lelegacy=1: the controller's real answers to the LE commands this test is about, and
+ * the LE Advertising Reports, logged past the 200-packet trace cap (bounded separately).
+ */
+static void
+bt_lelegacy_rx_event(const struct bt_h4_framer *f)
+{
+	uint8_t code = f->hdr[0];
+
+	if (code == 0x0e && f->first_len >= 7) {
+		uint16_t opcode = bt_le16(f->first + 4);
+
+		if ((opcode == 0x2003 || opcode == 0x2007 || opcode == 0x200b || opcode == 0x200c ||
+		    opcode == 0x204a || opcode == 0x2005) && g_lelegacy_cc_logged < 128) {
+			g_lelegacy_cc_logged++;
+			printf("vayu-bt: lelegacy: controller CC %#06x status %#x (real)\n",
+			    (unsigned)opcode, (unsigned)f->first[6]);
+		}
+	} else if (code == 0x3e && f->first_len >= 4 && f->first[3] == 0x02) {
+		g_lelegacy_adv_reports++;
+		if (g_lelegacy_adv_reports <= 10 || g_lelegacy_adv_reports % 100 == 0) {
+			char hex[3 * BT_H4_FIRST + 1];
+
+			bt_hex(hex, sizeof(hex), f->first, f->first_len);
+			printf("vayu-bt: lelegacy: LE Advertising Report #%u (real): %s\n",
+			    (unsigned)g_lelegacy_adv_reports, hex);
+		}
+	}
+}
+
 /* A packet is complete: count it, and trace it or (after the 200th) summarise it. */
 static void
 bt_h4_done(struct bt_h4_way *way, bool tx)
@@ -3423,6 +3538,9 @@ bt_h4_done(struct bt_h4_way *way, bool tx)
 	f->in_packet = false;
 	way->packets++;
 	way->bytes += total;
+	if (g_lelegacy_enabled && !tx && !way->synthetic && f->type == BT_H4_EVT) {
+		bt_lelegacy_rx_event(f);
+	}
 	if (way->packets <= BT_H4_TRACE_PACKETS) {
 		bt_h4_trace(way, tx);
 	} else if ((way->packets - BT_H4_TRACE_PACKETS) % BT_H4_SUMMARY_EVERY == 0) {
@@ -3576,6 +3694,67 @@ bt_h4_rx_byte(uint8_t byte, bool *wake_ack)
 	return true;
 }
 
+/*
+ * vayu_bt_randaddr: the controller's answer to our 0x2005 is 04 0e 04 <n> 05 20 <status>. While
+ * one is outstanding, an event that starts at a packet boundary is held until it either differs
+ * from that prefix (then it goes to the host unchanged) or is complete (then it is replaced by
+ * the 0xfd48 answer). At most 7 bytes are held, so out[] grows by at most 1 + the held bytes.
+ */
+static uint32_t
+bt_randaddr_answer_fd48(uint8_t real_status, uint8_t *out, uint32_t kept)
+{
+	uint8_t status = real_status, nparams = 0;
+
+	if (real_status == 0 && g_randaddr_mode == 1) {
+		status = 0x01;          /* as the bt9 rule: multi-adv unavailable, no parser assert */
+	} else if (real_status == 0) {
+		nparams = 1;            /* mode 2: instance 0 for _BCM_CreateMultiAdvInstParser */
+	}
+	printf("vayu-bt: randaddr: fd48 -> 0x2005 %02x:%02x:%02x:%02x:%02x:%02x status %#x (real); "
+	    "0xfd48 answered with status %#x%s\n",
+	    g_randaddr_addr[5], g_randaddr_addr[4], g_randaddr_addr[3], g_randaddr_addr[2],
+	    g_randaddr_addr[1], g_randaddr_addr[0], (unsigned)real_status, (unsigned)status,
+	    nparams != 0 ? " + instance 0" : "");
+	out[kept++] = BT_H4_EVT;
+	out[kept++] = 0x0e;
+	out[kept++] = (uint8_t)(4 + nparams);
+	out[kept++] = 1;
+	out[kept++] = 0x48;
+	out[kept++] = 0xfd;
+	out[kept++] = status;
+	if (nparams != 0) {
+		out[kept++] = 0;
+	}
+	g_randaddr_pending = false;
+	return kept;
+}
+
+static uint32_t
+bt_randaddr_rx_byte(uint8_t byte, bool boundary, uint8_t *out, uint32_t kept)
+{
+	static const uint8_t prefix[7] = { 0x04, 0x0e, 0x04, 0x00, 0x05, 0x20, 0x00 };
+
+	if (g_randaddr_held == 0) {
+		if (!g_randaddr_pending || !boundary || byte != BT_H4_EVT) {
+			out[kept++] = byte;
+			return kept;
+		}
+	}
+	g_randaddr_hold[g_randaddr_held++] = byte;
+	if (g_randaddr_held <= 6 && g_randaddr_held != 4 &&
+	    g_randaddr_hold[g_randaddr_held - 1] != prefix[g_randaddr_held - 1]) {
+		memcpy(out + kept, g_randaddr_hold, g_randaddr_held);
+		kept += g_randaddr_held;
+		g_randaddr_held = 0;
+		return kept;
+	}
+	if (g_randaddr_held == 7) {
+		g_randaddr_held = 0;
+		kept = bt_randaddr_answer_fd48(byte, out, kept);
+	}
+	return kept;
+}
+
 /* The caller delivers what this returns: the bytes that belong to the tty/kctl client, unchanged. */
 static uint32_t
 bt_h4_rx_feed(const uint8_t *bytes, uint32_t count, uint8_t *out, bool *wake_ack)
@@ -3583,8 +3762,37 @@ bt_h4_rx_feed(const uint8_t *bytes, uint32_t count, uint8_t *out, bool *wake_ack
 	uint32_t kept = 0;
 
 	for (uint32_t i = 0; i < count; i++) {
+		bool boundary = !g_h4_rx.framer.in_packet;
+
 		if (bt_h4_rx_byte(bytes[i], wake_ack)) {
-			out[kept++] = bytes[i];
+			if (g_randaddr_pending || g_randaddr_held != 0) {
+				kept = bt_randaddr_rx_byte(bytes[i], boundary, out, kept);
+			} else {
+				out[kept++] = bytes[i];
+			}
+		}
+	}
+	if (g_leinit_rx.active) {
+		uint8_t events = 0, scan_status = 0, random_status = 0;
+		uint8_t filtered[BT_TTY_IO_SIZE + 8];
+
+		/* Filter the stream accepted by the H4/IBS parser, not the raw UART
+		 * bytes (which may include sleep/stray bytes or payload coincidences). */
+		kept = vayu_bt_leinit_rx_filter(&g_leinit_rx, out, kept, filtered,
+		    sizeof(filtered), &events, &scan_status, &random_status);
+		memcpy(out, filtered, kept);
+		if (g_leinit_rx.expired) {
+			printf("vayu-bt: leinit: injected replies incomplete (seen %#x); stopped waiting\n",
+			    g_leinit_rx.seen);
+			g_leinit_rx.expired = false;
+		}
+		if (events & VAYU_BT_LEINIT_RX_SCAN_COMPLETE) {
+			printf("vayu-bt: leinit: controller's Scan Enable(0) status %#x (hidden from bluetoothd)\n",
+			    scan_status);
+		}
+		if (events & VAYU_BT_LEINIT_RX_RANDOM_COMPLETE) {
+			printf("vayu-bt: leinit: controller's Set Random Address status %#x (hidden from bluetoothd)\n",
+			    random_status);
 		}
 	}
 	return kept;
@@ -3628,7 +3836,7 @@ static struct bt_vsc_rule bt_vsc_rules[] = {
 	 */
 	{ .opcode = 0x0c5b, .action = BT_VSC_CC, .status = 0, .nparams = 0, .params = NULL },
 	/*
-	 * Run 231946 (, vsc=2): bluetoothd asserted at bcm_vsc.c:642 in its create-multi-adv
+	 * Run 231946 (combo3d, vsc=2): bluetoothd asserted at bcm_vsc.c:642 in its create-multi-adv
 	 * reply parser (decompile: FUN_100126250, _BCM_CreateMultiAdvInstParser, sent as opcode 0x148 =
 	 * 0xfd48 by FUN_10012d970). With status 0 it needs >= 1 payload byte (our empty CC asserts);
 	 * with a non-zero status it skips the stream and calls back with 0xff. Run 205056 (vsc=1) shows
@@ -3835,6 +4043,28 @@ bt_vsc_tx_filter(const uint8_t *pkt, uint32_t len)
 	uint8_t action, status = 0, nparams = 0;
 	const uint8_t *params = NULL;
 
+	/*
+	 * vayu_bt_leanswer=1: the controller refuses 0x2007 and 0x200b with Command
+	 * Disallowed (0x0c) even after a real Set Random Address, and bluetoothd
+	 * restarts with reason 712.  Answer those two commands locally so the stack
+	 * can leave the loop.  This is a workaround, not a claim that LE scan works:
+	 * the original commands and the controller's answers are still logged.
+	 */
+	if (g_leanswer_enabled && len >= 4 && pkt[0] == BT_H4_CMD) {
+		uint16_t le_opcode = bt_le16(pkt + 1);
+
+		if (le_opcode == 0x2007 || le_opcode == 0x200b || le_opcode == 0x200c) {
+			static const uint8_t zero;
+
+			printf("vayu-bt: leanswer: %#06x answered locally, status 0 "
+			    "(the controller refused it; see the h4 trace above)\n",
+			    (unsigned)le_opcode);
+			bt_vsc_answer(le_opcode, BT_VSC_CC, 0,
+			    le_opcode == 0x2007 ? 1 : 0, &zero);
+			return BT_VSC_ANSWERED;
+		}
+	}
+
 	if (g_vsc_mode == 0 || len < 4 || pkt[0] != BT_H4_CMD) {
 		return BT_VSC_PASS;
 	}
@@ -3930,6 +4160,46 @@ bt_sc_rewrite(uint8_t *bytes, uint32_t count)
 }
 
 /*
+ * vayu_bt_lelegacy=1: the LE Read Local Supported Features answer 04 0e 0c 01 03 20 00 is followed
+ * by the 8 LE_Features octets; octet 1 (event byte 8) gets bits 4 and 5 (features 12, 13) cleared.
+ * The controller still supports them; the host is only kept on the legacy command set.
+ */
+static const uint8_t bt_lf_prefix[7] = { 0x04, 0x0e, 0x0c, 0x01, 0x03, 0x20, 0x00 };
+static uint32_t g_lf_match;
+static int g_lf_pos = -1;
+
+static void
+bt_lf_rewrite(uint8_t *bytes, uint32_t count)
+{
+	if (!g_lelegacy_enabled) {
+		return;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		uint8_t b = bytes[i];
+
+		if (g_lf_pos >= 0) {
+			g_lf_pos++;
+			if (g_lf_pos == 7 + 1) {
+				bytes[i] = (uint8_t)(b & ~0x30);
+				printf("vayu-bt: lelegacy: LE_Features octet 1 %#04x -> %#04x "
+				    "(ext/periodic advertising hidden)\n", (unsigned)b, (unsigned)bytes[i]);
+				g_lf_pos = -1;
+			}
+			continue;
+		}
+		if (b == bt_lf_prefix[g_lf_match]) {
+			g_lf_match++;
+		} else {
+			g_lf_match = (b == bt_lf_prefix[0]) ? 1 : 0;
+		}
+		if (g_lf_match == sizeof(bt_lf_prefix)) {
+			g_lf_match = 0;
+			g_lf_pos = (int)sizeof(bt_lf_prefix) - 1;
+		}
+	}
+}
+
+/*
  * One outbound source's reassembly: the io thread reads t_outq and the kctl ring in chunks that
  * are not packet-aligned, so every packet is collected until its header's length is satisfied
  * and the filter sees it whole. A packet longer than BT_VSC_MAX (only a large ACL packet can be)
@@ -3944,6 +4214,114 @@ struct bt_vsc_tx {
 };
 
 static struct bt_vsc_tx g_vsc_tty, g_vsc_kctl;
+
+/*
+ * The controller reports scan-enabled to the first LE Set Scan Parameters after
+ * firmware download. Stock hosts clear scan and initialize a random address
+ * before setting parameters. Do that once, with a static-random address derived
+ * from the actual NVM BD_ADDR. The original 0x200b is still forwarded and its
+ * real result is never rewritten; only our two extra Command Completes are hidden.
+ */
+static void
+bt_leinit_before_scan_params(struct bt_vsc_tx *tx, uint8_t *out, uint32_t *out_len)
+{
+	static const uint8_t disable_scan[7] = { 0x01, 0x0c, 0x20, 0x02, 0x00, 0x00, 0x00 };
+	uint8_t set_random[10] = { 0x01, 0x05, 0x20, 0x06 };
+
+	if (tx != &g_vsc_kctl || !g_leinit_enabled || g_leinit_sent ||
+	    tx->got != 11 || tx->pkt[0] != BT_H4_CMD || bt_le16(tx->pkt + 1) != 0x200b ||
+	    tx->pkt[3] != 7 || (tx->pkt[9] & 3) != 1) {
+		return;
+	}
+	g_leinit_sent = true;
+	if (!g_leinit_addr_valid) {
+		printf("vayu-bt: leinit: no valid NVM BD_ADDR; not inventing a random address\n");
+		return;
+	}
+	memcpy(set_random + 4, g_leinit_random_addr, 6);
+	bt_vsc_tx_emit(out, out_len, disable_scan, sizeof(disable_scan));
+	bt_vsc_tx_emit(out, out_len, set_random, sizeof(set_random));
+	vayu_bt_leinit_rx_reset(&g_leinit_rx);
+	g_leinit_rx.active = true;
+	printf("vayu-bt: leinit: real LE Scan Enable(0), then static-random address from NVM, "
+	    "then the original 0x200b (one shot)\n");
+}
+
+/* The parameters of the LE commands the scan depends on, past every trace cap (bounded). */
+static void
+bt_le_cmd_log(const struct bt_vsc_tx *tx)
+{
+	uint16_t opcode;
+	char hex[3 * 16 + 1];
+
+	if ((!g_lelegacy_enabled && g_randaddr_mode == 0) || tx->got < 4 || tx->pkt[0] != BT_H4_CMD) {
+		return;
+	}
+	opcode = bt_le16(tx->pkt + 1);
+	if (opcode != 0x200b && opcode != 0x200c && opcode != 0x2005 && opcode != 0xfd48) {
+		return;
+	}
+	if (g_le_cmd_logged >= BT_LE_CMD_LOG_MAX) {
+		return;
+	}
+	g_le_cmd_logged++;
+	bt_hex(hex, sizeof(hex), tx->pkt + 4, tx->got - 4 > 16 ? 16 : tx->got - 4);
+	printf("vayu-bt: lecmd: %s %#06x params %s\n", tx == &g_vsc_kctl ? "kctl" : "tty",
+	    (unsigned)opcode, hex);
+}
+
+/*
+ * vayu_bt_randaddr: 0xfd48 01 <addr[6]> becomes the real LE Set Random Address 01 05 20 06
+ * <addr[6]>. Both carry the address in HCI order (least significant octet first): bluetoothd
+ * copies the LE_Address bytes unchanged (FUN_10012d970), and the last octet's top bits are 01
+ * (resolvable private) in every trace, which is where Core Vol 6 Part B 1.3.2 puts them.
+ */
+static bool
+bt_randaddr_tx(struct bt_vsc_tx *tx, uint8_t *out, uint32_t *out_len)
+{
+	uint8_t cmd[10] = { BT_H4_CMD, 0x05, 0x20, 0x06 };
+
+	if (g_randaddr_mode == 0 || tx->got != 11 || tx->pkt[0] != BT_H4_CMD ||
+	    bt_le16(tx->pkt + 1) != 0xfd48 || tx->pkt[3] != 7) {
+		return false;
+	}
+	if (tx->pkt[4] != 0x01) {
+		printf("vayu-bt: randaddr: 0xfd48 address type %#x is not random: left to the shim\n",
+		    (unsigned)tx->pkt[4]);
+		return false;
+	}
+	if (g_randaddr_pending) {
+		printf("vayu-bt: randaddr: 0xfd48 while a 0x2005 is outstanding: left to the shim\n");
+		return false;
+	}
+	memcpy(g_randaddr_addr, tx->pkt + 5, 6);
+	memcpy(cmd + 4, g_randaddr_addr, 6);
+	g_randaddr_pending = true;
+	g_randaddr_sent_us = bt_now_us();
+	bt_vsc_tx_emit(out, out_len, cmd, sizeof(cmd));
+	return true;
+}
+
+/* The io thread, each turn: a lost 0x2005 answer must not leave bluetoothd waiting 15 s. */
+static void
+bt_randaddr_poll(void)
+{
+	if (g_randaddr_reset_pending) {
+		g_randaddr_reset_pending = false;
+		g_randaddr_pending = false;
+		g_randaddr_held = 0;
+		return;
+	}
+	if (g_randaddr_pending && g_randaddr_held == 0 &&
+	    bt_now_us() - g_randaddr_sent_us > BT_RANDADDR_TIMEOUT_US) {
+		uint8_t event[8];
+		uint32_t n;
+
+		printf("vayu-bt: randaddr: no Command Complete for 0x2005 in 2 s\n");
+		n = bt_randaddr_answer_fd48(0x01, event, 0);
+		bt_deliver_to_host(event, n);
+	}
+}
 
 static void
 bt_vsc_tx_feed(struct bt_vsc_tx *tx, const uint8_t *bytes, uint32_t count,
@@ -4028,7 +4406,13 @@ bt_vsc_tx_feed(struct bt_vsc_tx *tx, const uint8_t *bytes, uint32_t count,
 			}
 		}
 		if (tx->got == tx->want) {
-			if (!tx->streaming &&
+			bt_leinit_before_scan_params(tx, out, out_len);
+			if (!tx->streaming) {
+				bt_le_cmd_log(tx);
+			}
+			if (!tx->streaming && bt_randaddr_tx(tx, out, out_len)) {
+				/* sent as a real 0x2005; the answer comes from the RX side */
+			} else if (!tx->streaming &&
 			    bt_vsc_tx_filter(tx->pkt, tx->got) == BT_VSC_PASS) {
 				bt_vsc_tx_emit(out, out_len, tx->pkt, tx->got);
 			}
@@ -4060,10 +4444,25 @@ static void
 vayu_bt_io_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint8_t in[BT_TTY_IO_SIZE];
-	uint8_t out[BT_TTY_IO_SIZE];
+	uint8_t out[BT_TTY_IO_SIZE + 8];
+
+	/*
+	 * Battery (owner, 2026-10-26: the phone drains in iOS): polling every millisecond wakes this
+	 * core ~1000 times a second even with Bluetooth idle. After BT_TTY_IDLE_TURNS empty turns the
+	 * interval doubles up to BT_TTY_POLL_MAX_US; any byte in either direction resets it to 1 ms.
+	 * bluetoothd's command timeouts are seconds (HCI 10 s, VSC 15 s), so up to 16 ms is harmless;
+	 * the RX FIFO (32 words = 128 bytes) holds ~11 ms at 115200, and RFR (hardware flow control,
+	 * watermark rx_depth - 2) should hold the controller off if the FIFO fills while we sleep (not yet seen).
+	 */
+	uint32_t idle_turns = 0, poll_us = BT_TTY_POLL_US;
 
 	while (!g_tty_io_stop) {
 		struct tty *tp = g_tty;
+		if (g_leinit_reset_pending) {
+			vayu_bt_leinit_rx_reset(&g_leinit_rx);
+			g_leinit_reset_pending = false;
+		}
+		bt_randaddr_poll();
 		bool moved = false;
 		uint32_t n;
 
@@ -4075,7 +4474,7 @@ vayu_bt_io_thread(__unused void *parameter, __unused wait_result_t result)
 			g_tty_tx_wanted = false;
 			tty_unlock(tp);
 			if (queued != 0) {
-				if (g_vsc_mode == 0) {
+				if (g_vsc_mode == 0 && !g_leinit_enabled && g_randaddr_mode == 0) {
 					for (uint32_t i = 0; i < queued; i++) {
 						bt_h4_tx_byte(in[i], "tty");
 					}
@@ -4103,7 +4502,7 @@ vayu_bt_io_thread(__unused void *parameter, __unused wait_result_t result)
 			uint32_t queued = bt_kctl_tx_drain(in, BT_KCTL_IO_SIZE);
 
 			if (queued != 0) {
-				if (g_vsc_mode == 0) {
+				if (g_vsc_mode == 0 && !g_leinit_enabled && g_randaddr_mode == 0) {
 					for (uint32_t i = 0; i < queued; i++) {
 						bt_h4_tx_byte(in[i], "kctl");
 					}
@@ -4125,6 +4524,7 @@ vayu_bt_io_thread(__unused void *parameter, __unused wait_result_t result)
 
 			if (kept != 0) {
 				bt_sc_rewrite(out, kept);
+				bt_lf_rewrite(out, kept);
 				bt_deliver_to_host(out, kept);
 			}
 			if (wake_ack) {
@@ -4141,9 +4541,20 @@ vayu_bt_io_thread(__unused void *parameter, __unused wait_result_t result)
 			 */
 			if (g_tty_tx_wanted) {
 				g_tty_tx_wanted = false;
+				idle_turns = 0;
+				poll_us = BT_TTY_POLL_US;
 				continue;
 			}
-			delay(BT_TTY_POLL_US);
+			if (++idle_turns > BT_TTY_IDLE_TURNS && poll_us < BT_TTY_POLL_MAX_US) {
+				poll_us *= 2;
+				if (poll_us > BT_TTY_POLL_MAX_US) {
+					poll_us = BT_TTY_POLL_MAX_US;
+				}
+			}
+			delay(poll_us);
+		} else {
+			idle_turns = 0;
+			poll_us = BT_TTY_POLL_US;
 		}
 	}
 	thread_terminate(current_thread());
@@ -4262,9 +4673,11 @@ bt_step9(void)
 	    "the kctl TX ring -> the controller, the controller -> l_rint and the kctl client\n",
 	    (g_tty->t_state & TS_ISOPEN) ? "yes" : "no");
 	tty_unlock(g_tty);
-	if (g_kctl_ctlref != NULL) {
-		printf("vayu-bt: step 9 done: bluetoothd with BT_HCI_TRANSPORT=H4:POSIX:%s,115200 "
-		    "(or H4 BT_BAUDRATE=%u for the tty)\n", BT_KCTL_NAME, (unsigned)BT_TTY_BAUD);
+	if (g_kctl_ctlref[0] != NULL) {
+		printf("vayu-bt: step 9 done: bluetoothd with BT_HCI_TRANSPORT=H4:POSIX:%s,115200, or "
+		    "with no BT_HCI_TRANSPORT at all through \"%s\" (the POSIX driver's default); "
+		    "H4 BT_BAUDRATE=%u for the tty\n", BT_KCTL_NAME, BT_KCTL_ALIAS_NAME,
+		    (unsigned)BT_TTY_BAUD);
 	} else {
 		printf("vayu-bt: step 9 done: bluetoothd with BT_HCI_TRANSPORT=H4 BT_BAUDRATE=%u "
 		    "(the kctl is not registered)\n", (unsigned)BT_TTY_BAUD);
@@ -4334,6 +4747,173 @@ bt_finish(void)
 
 /* ---- the probe --------------------------------------------------------------------------------- */
 
+/*
+ * ---- S10: the local address and the "device tree" service bluetoothd reads ----------------------
+ *
+ * bluetoothd 16.5/17 asks IOKit for an IOService named "marconi-bt" and then "bluetooth", and reads
+ * "local-mac-address" (6 bytes), "transport-encoding" and "transport-speed" from it (disassembly of
+ * usr/sbin/bluetoothd: IOServiceNameMatching + IOServiceGetMatchingService +
+ * IORegistryEntrySearchCFProperty(..., "IODeviceTree", ...)). Without the service and without
+ * BT_DEVICE_ADDRESS it logs "Not a valid MAC address (all 00s)" and exits ("No bluetooth on this
+ * device", nightly run 2026-11-01 on another kernel), and Settings never sees a radio. The service
+ * itself is made in iokit/Kernel/vayu.bt.dt.cpp; here it is only fed the address, as early as the
+ * probe can (bluetoothd is RunAtLoad and starts long before the firmware download ends), then again
+ * from the controller's own Read_BD_ADDR in step 8.
+ *
+ * The early address is the NVM file's tag 2 -- the same bytes the controller reports after the
+ * download (run 050558: Read_BD_ADDR returns the NVM tag-2 address), read here without patching
+ * anything. FACT (2026-11-02): the nine stock crnv21.bin copies in work/ carry tag 2 all zeros, so
+ * there the early publish is skipped and the service appears after step 8's Read_BD_ADDR (the
+ * earlier runs' root image had a patched NVM, so Read_BD_ADDR answered a non-zero address there).
+ * Either way the zero address is never published. The console keeps only the last two octets, as
+ * the receipts do.
+ */
+
+static uint8_t g_dt_addr[6];            /* what the services carry now (HCI order) */
+static bool g_dt_done;
+static bool g_dt = false;               /* vayu_bt_dt=1: publish "marconi-bt"/"bluetooth"; 0 (default) none */
+static bool g_dt_said;
+
+#define BT_DT_TRANSPORT_H4      1       /* bluetoothd's transport-encoding: H4 over the POSIX driver */
+
+/* tag 2 of a crnv*.bin, read-only: the outer TLV (type 4 or 2) and the 4-byte tag headers. */
+static bool
+bt_nvm_bd_addr(const uint8_t *data, uint64_t size, uint8_t out[6])
+{
+	uint32_t at, end;
+
+	if (size < 8) {
+		return false;
+	}
+	switch (data[0]) {
+	case QCA_TLV_TYPE_MULTI:
+		if (data[4] != QCA_TLV_TYPE_SINGLE) {
+			return false;
+		}
+		at = 8;
+		end = at + bt_le24(data + 5);
+		break;
+	case QCA_TLV_TYPE_SINGLE:
+		at = 4;
+		end = at + bt_le24(data + 1);
+		break;
+	default:
+		return false;
+	}
+	if (end > size) {
+		return false;
+	}
+	while (at + QCA_TAG_HEADER <= end) {
+		uint16_t id = bt_le16(data + at);
+		uint16_t len = bt_le16(data + at + 2);
+		const uint8_t *tag = data + at + QCA_TAG_HEADER;
+		bool zero = true, ones = true;
+
+		if (at + QCA_TAG_HEADER + len > end) {
+			return false;
+		}
+		if (id == QCA_TAG_ID_BD_ADDR && len >= 6) {
+			for (unsigned i = 0; i < 6; i++) {
+				if (tag[i] != 0) {
+					zero = false;
+				}
+				if (tag[i] != 0xff) {
+					ones = false;
+				}
+			}
+			if (zero || ones) {
+				return false;
+			}
+			memcpy(out, tag, 6);
+			return true;
+		}
+		at += QCA_TAG_HEADER + len;
+	}
+	return false;
+}
+
+/* All zeros (the ROM default before the NVM, and a stock crnv21.bin's tag 2) or all ones is not an
+ * address: publishing it would put bluetoothd back on "Not a valid MAC address (all 00s)". */
+static bool
+bt_addr_valid(const uint8_t addr[6])
+{
+	bool zero = true, ones = true;
+
+	for (unsigned i = 0; i < 6; i++) {
+		if (addr[i] != 0) {
+			zero = false;
+		}
+		if (addr[i] != 0xff) {
+			ones = false;
+		}
+	}
+	return !zero && !ones;
+}
+
+/* Publish (or update) the two services; one pair of lines per distinct address. */
+static void
+bt_dt_publish(const uint8_t addr[6], const char *source)
+{
+	bool same;
+
+	if (!g_dt) {
+		if (!g_dt_said) {
+			g_dt_said = true;
+			printf("vayu-bt: S10 dt: off (vayu_bt_dt=0, the default): no \"marconi-bt\"/"
+			    "\"bluetooth\" service, so bluetoothd keeps the boot-arg/plist address and "
+			    "opens the POSIX transport (com.vayu.bt.uart) before any boot script; "
+			    "vayu_bt_dt=1 restores the S10 path\n");
+		}
+		return;
+	}
+	if (!bt_addr_valid(addr)) {
+		printf("vayu-bt: S10 dt: %s gives %02x:%02x:%02x:%02x:%02x:%02x: not an address, "
+		    "nothing published\n", source, (unsigned)addr[0], (unsigned)addr[1],
+		    (unsigned)addr[2], (unsigned)addr[3], (unsigned)addr[4], (unsigned)addr[5]);
+		return;
+	}
+	same = g_dt_done && memcmp(addr, g_dt_addr, 6) == 0;
+	if (!vayu_bt_dt_publish(addr, BT_DT_TRANSPORT_H4, BT_TTY_BAUD)) {
+		printf("vayu-bt: S10 dt: the IOService was NOT published (no platform or no attach)\n");
+		return;
+	}
+	g_dt_done = true;
+	memcpy(g_dt_addr, addr, 6);
+	if (same) {
+		return;
+	}
+	printf("vayu-bt: S10 dt: IOService \"marconi-bt\" and \"bluetooth\": local-mac-address 6 bytes, "
+	    "transport-encoding %u (H4), transport-speed %u, from %s\n", (unsigned)BT_DT_TRANSPORT_H4,
+	    (unsigned)BT_TTY_BAUD, source);
+	printf("vayu-bt: S10 mac: xx:xx:xx:xx:%02x:%02x (%s, HCI order %02x:%02x:%02x:%02x:%02x:%02x)\n",
+	    (unsigned)addr[5], (unsigned)addr[4], source, (unsigned)addr[0], (unsigned)addr[1],
+	    (unsigned)addr[2], (unsigned)addr[3], (unsigned)addr[4], (unsigned)addr[5]);
+}
+
+/* The NVM file, before the controller has answered anything: what bluetoothd's first start needs. */
+static void
+bt_dt_publish_early(void)
+{
+	static const char *const names[] = { "crnv21.bin", "crnv20.bin", "crnv01.bin" };
+	uint8_t addr[6];
+
+	if (!g_dt) {
+		bt_dt_publish(NULL, "vayu_bt_dt=0");    /* the one line, then nothing */
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		uint64_t size = 0;
+		const uint8_t *nvm = hakios_image_file("fw", names[i], &size, NULL);
+
+		if (nvm != NULL && bt_nvm_bd_addr(nvm, size, addr)) {
+			bt_dt_publish(addr, names[i]);
+			return;
+		}
+	}
+	printf("vayu-bt: S10 dt: no BD address in fw/crnv{21,20,01}.bin; the service follows the "
+	    "controller's Read_BD_ADDR\n");
+}
+
 static void
 vayu_bt_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -4343,6 +4923,9 @@ vayu_bt_thread(__unused void *parameter, __unused wait_result_t result)
 	if (g_level >= 9) {
 		(void)bt_tty_create();
 		(void)bt_kctl_create();
+		/* bluetoothd is RunAtLoad: both the node and the address must exist before step 1, not
+		 * after the ~22 s firmware download */
+		bt_dt_publish_early();
 	}
 	bt_sleep_ms((uint64_t)g_wait_s * 1000);
 
@@ -4460,13 +5043,28 @@ vayu_bt_init(void)
 		g_giveback = value != 0;
 	}
 	value = 0;
-	if (PE_parse_boot_argn("vayu_bt_vsc", &value, sizeof(value))) {
-		if (value > 2) {
-			printf("vayu-bt: vayu_bt_vsc=%u: only 0, 1 and 2 exist; using 2\n",
-			    (unsigned)value);
-			value = 2;
-		}
-		g_vsc_mode = value;
+	if (PE_parse_boot_argn("vayu_bt_leinit", &value, sizeof(value))) {
+		g_leinit_enabled = value != 0;
+	}
+	value = 0;
+	if (PE_parse_boot_argn("vayu_bt_leanswer", &value, sizeof(value))) {
+		g_leanswer_enabled = value != 0;
+	}
+	value = 0;
+	if (PE_parse_boot_argn("vayu_bt_lelegacy", &value, sizeof(value))) {
+		g_lelegacy_enabled = value != 0;
+	}
+	value = 0;
+	if (PE_parse_boot_argn("vayu_bt_randaddr", &value, sizeof(value))) {
+		g_randaddr_mode = value > 2 ? 2 : value;
+	}
+	value = 0;
+	if (PE_parse_boot_argn("vayu_bt_dt", &value, sizeof(value))) {
+		g_dt = value != 0;
+	}
+	if (g_lelegacy_enabled && g_leanswer_enabled) {
+		printf("vayu-bt: lelegacy: vayu_bt_leanswer=1 ignored (this test needs the real answers)\n");
+		g_leanswer_enabled = false;
 	}
 	value = 0;
 	if (PE_parse_boot_argn("vayu_bt_vsc_olympic", &value, sizeof(value))) {
@@ -4478,6 +5076,15 @@ vayu_bt_init(void)
 		}
 		g_olympic_bytes = (uint8_t)value;
 	}
+	value = 0;
+	if (PE_parse_boot_argn("vayu_bt_vsc", &value, sizeof(value))) {
+		if (value > 2) {
+			printf("vayu-bt: vayu_bt_vsc=%u: only 0, 1 and 2 exist; using 2\n",
+			    (unsigned)value);
+			value = 2;
+		}
+		g_vsc_mode = value;
+	}
 	if (g_vsc_mode != 0) {
 		printf("vayu-bt: vsc: mode %u (%s); vendor opcodes are OGF 0x3f, %u rule(s)\n",
 		    (unsigned)g_vsc_mode,
@@ -4488,6 +5095,20 @@ vayu_bt_init(void)
 			    "and %u zero byte(s): an experiment, see bt_vsc_rules\n",
 			    (unsigned)g_olympic_bytes);
 		}
+	}
+	if (g_leinit_enabled) {
+		printf("vayu-bt: leinit: enabled (one-shot real LE init before first random-address 0x200b)\n");
+	}
+	if (g_lelegacy_enabled) {
+		printf("vayu-bt: lelegacy: enabled (LE features 12/13 hidden in 0x2003; no local answers)\n");
+	}
+	if (g_randaddr_mode != 0) {
+		printf("vayu-bt: randaddr: mode %u (0xfd48 type 1 -> real 0x2005; its status answers 0xfd48)\n",
+		    (unsigned)g_randaddr_mode);
+	}
+	if (g_leanswer_enabled) {
+		printf("vayu-bt: leanswer: enabled (0x2007/0x200b/0x200c answered locally if the controller "
+		    "refuses; the real refusal is still traced)\n");
 	}
 
 	if (kernel_thread_start(vayu_bt_thread, NULL, &thread) != KERN_SUCCESS) {
