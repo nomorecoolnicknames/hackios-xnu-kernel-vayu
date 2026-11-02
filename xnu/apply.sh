@@ -27,4 +27,6 @@ git checkout -q -b hakios "$TAG"
 echo 'BUILD/' >> .git/info/exclude
 git apply --whitespace=nowarn "$HERE/hakios.patch"
 cp -a "$HERE/files/." .
+# vayu: the night-2026-11-02 changes to Apple files (build lists, a kfree type fix, no console panic)
+[ -s "$HERE/vayu-night.patch" ] && patch -s -p1 < "$HERE/vayu-night.patch"
 echo "apply.sh: $DIR: $TAG + $(grep -c '^diff --git' "$HERE/hakios.patch") changed and $(find "$HERE/files" -type f | wc -l) new files"

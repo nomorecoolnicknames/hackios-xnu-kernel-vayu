@@ -1,0 +1,75 @@
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-02 14:54:07.586673298 +0300
++++ b/bsd/conf/files	2026-11-02 14:54:07.590673354 +0300
+@@ -157,6 +157,7 @@
+ bsd/dev/vayu_rmtfs.c		standard
+ bsd/dev/vayu_cell.c		standard
+ bsd/dev/vayu_cell_data.c	standard
++bsd/dev/vayu_sms.c		standard
+ bsd/dev/vayu_gnss.c		standard
+ bsd/dev/vayu_bt.c		standard
+ bsd/dev/vayu_slpi.c		standard
+@@ -167,6 +168,16 @@
+ bsd/dev/vayu_wled.c		standard
+ bsd/dev/vayu_mdp.c		standard
+ bsd/dev/vayu_wifi.c		standard
++bsd/dev/vayu_wifi_smmu.c	standard
++bsd/dev/vayu_wifi_ce_wire.c	standard
++bsd/dev/vayu_wifi_htc.c		standard
++bsd/dev/vayu_wifi_ce.c		standard
++bsd/dev/vayu_wifi_htc_connect.c	standard
++bsd/dev/vayu_wifi_wmi.c	standard
++bsd/dev/vayu_wifi_scan.c	standard
++bsd/dev/vayu_wifi_sta.c	standard
++bsd/dev/vayu_wifi_rsn.c	standard
++bsd/dev/vayu_wifi_net.c	standard
+ bsd/dev/vayu_jack.c		standard
+ bsd/dev/vayu_nfc.c		standard
+ bsd/dev/vayu_usbnet.c		standard
+@@ -668,5 +679,7 @@
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
+ bsd/dev/vayu_ipa.c	standard
++bsd/dev/vayu_ipa_data.c	standard
+ bsd/dev/vayu_ipa_qmi.c	standard
+ bsd/dev/vayu_ipa_smmu.c	standard
++bsd/dev/vayu_cell_net.c	standard
+diff -ruN a/bsd/kern/subr_log_stream.c b/bsd/kern/subr_log_stream.c
+--- a/bsd/kern/subr_log_stream.c	2026-11-02 14:54:07.598673464 +0300
++++ b/bsd/kern/subr_log_stream.c	2026-11-02 14:54:07.598673464 +0300
+@@ -653,7 +653,7 @@
+ 		kfree_data(ls->ls_buf, buf_size);
+ 	}
+ 	if (ls->ls_blk) {
+-		kfree_type(uint8_t, ls->ls_blk_count, ls->ls_blk);
++		kfree_data(ls->ls_blk, ls->ls_blk_count);   /* vayu: allocated with kalloc_data in log_stream_setup */
+ 	}
+ 	bzero(ls, sizeof(*ls));
+ }
+diff -ruN a/iokit/conf/files b/iokit/conf/files
+--- a/iokit/conf/files	2026-11-02 14:54:07.606673575 +0300
++++ b/iokit/conf/files	2026-11-02 14:54:07.606673575 +0300
+@@ -85,6 +85,7 @@
+ iokit/Kernel/hakios.gpu.cpp				optional iokitcpp
+ iokit/Kernel/hakios.wlan.cpp			optional iokitcpp
+ iokit/Kernel/hakios.battery.cpp			optional iokitcpp
++iokit/Kernel/vayu.bt.dt.cpp			optional iokitcpp
+ iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
+ iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
+ iokit/Kernel/MiniAppleStockholm.cpp			optional iokitcpp
+diff -ruN a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+--- a/osfmk/console/serial_console.c	2026-11-02 14:54:07.614673686 +0300
++++ b/osfmk/console/serial_console.c	2026-11-02 14:54:07.618673741 +0300
+@@ -164,11 +164,8 @@
+ 	    !console_suspended &&
+ 	    startup_phase >= STARTUP_SUB_EARLY_BOOT &&
+ 	    !ml_get_interrupts_enabled()) {
+-#if defined(__arm64__) || DEBUG || DEVELOPMENT
+-		panic("Console I/O from interrupt-disabled context");
+-#else
++		/* vayu: drop the output (as RELEASE does) instead of panicking on the loader-return path */
+ 		return false;
+-#endif
+ 	}
+ 
+ 	return true;

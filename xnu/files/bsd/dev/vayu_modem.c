@@ -89,6 +89,7 @@
 #include <sys/vayu_modem.h>
 #include <sys/vayu_pas.h>
 #include <sys/vayu_rmtfs.h>
+#include <sys/vayu_sms.h>
 #include <sys/vayu_wifi.h>
 
 extern kern_return_t thread_terminate(thread_t thread);
@@ -259,6 +260,7 @@ step_up(void)
 		say("vayu-modem: 2: FAILED: TrustZone does not answer IS_CALL_AVAILABLE either way\n");
 		return false;
 	}
+	vayu_wifi_pre_modem();       /* W13: WLAN rails + AOP QDSS clock before the modem (vayu_wifi_qdss=1) */
 	if (!vayu_pas_load(&mpss)) {
 		say("vayu-modem: 2: FAILED: not loaded\n");
 		return false;
@@ -301,6 +303,7 @@ step_link(void)
 	vayu_rmtfs_start(&qrtr);
 	vayu_ipa_start(&qrtr);
 	vayu_cell_start(&qrtr);		/* vayu_cell=N: SIM/network; changes gated by vayu_cell_* args */
+	vayu_sms_start(&qrtr);		/* vayu_sms=1: WMS client, inbox, /dev/vayu-sms */
 	vayu_gnss_start(&qrtr);		/* vayu_gnss=1: the modem's GNSS engine (bsd/dev/vayu_gnss.c) */
 	vayu_wifi_start(&qrtr, listen_s);
 	for (s = 1; s <= listen_s; s++) {
@@ -331,6 +334,7 @@ step_link(void)
 		say("vayu-modem: 3: WLFW (0x45) is not there\n");
 	}
 	vayu_gnss_stop();
+	vayu_sms_stop();
 	vayu_cell_stop();
 	vayu_wifi_stop();
 	vayu_ipa_stop();
@@ -396,8 +400,8 @@ vayu_modem_init(void)
 	}
 	PE_parse_boot_argn("vayu_modem_wait", &wait_s, sizeof(wait_s));
 	PE_parse_boot_argn("vayu_modem_listen", &listen_s, sizeof(listen_s));
-	if (listen_s > 120) {
-		listen_s = 120;                         /* twenty seconds is plenty; two minutes at the most */
+	if (listen_s > 86400) {
+		listen_s = 86400;                       /* vayu: the modem stays up for a usable system (was a 120 s probe) */
 	}
 	PE_parse_boot_argn("vayu_modem_secs", &secs, sizeof(secs));
 	if (secs > 60) {
