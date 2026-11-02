@@ -376,6 +376,25 @@ static TUNABLE(uint32_t, gTouchLat, "touch_lat", 0);
  * one was. `s5_fps=0` turns it off.
  */
 static TUNABLE(uint32_t, gS5Fps, "s5_fps", 1000);
+/*
+ * Boot-arg fbfps=1 (default 1; 0 turns it off): the scroll line.
+ *
+ * S5FPS says what the window in general did; a scroll is the one window that has to be read with the
+ * finger beside it, because everything below -- the touch driver's report rate, backboardd's input
+ * thread, the application's event delivery and the window server's frame rate -- is one chain whose
+ * weakest link is invisible from a total. So, in a window in which the screen's own driver posted
+ * samples (a real finger) or a program posted them (the self-test's synthetic finger), one line:
+ *
+ *   MiniIOMobileFramebuffer: fbfps: scroll 1003 ms: 118 frames (117 a second), 236 screen touch
+ *   samples (235 a second), screen finger 1, 0 synthetic touch samples, synthetic finger 0, 120
+ *   refreshes told (119 a second), mode 120 Hz; 1400 us a frame in the copy, 200 us waiting for
+ *   the GPU's fence (0 swaps with one), 0 waited for the frame before, 1 came a refresh late
+ *
+ * frames a second against screen samples a second is the answer to "does a finger-driven scroll run
+ * at the panel's rate, and if not, which end is short"; the copy and fence times beside it say
+ * whether this driver was the reason. `s5_fps=0` (or `fbfps=0`) turns it off.
+ */
+static TUNABLE(uint32_t, gFbfps, "fbfps", 1);
 
 static inline uint64_t
 micros(uint64_t absolute)
@@ -1651,6 +1670,27 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 			    gFb120 != 0 ? 1u : (gVsyncDivisor != 0 ? gVsyncDivisor : gFBDivisor), synthesized, synth_down,
 			    screened, screen_down,
 			    fStatHeld, fStatSwapsLate, fBudgetLateNeither, fBudgetFrames);
+		}
+		/*
+		 * The scroll line (boot-arg fbfps; on by default): only in a window in which a finger was
+		 * moving -- the screen's driver's (a real finger) or a program's (the self-test's synthetic
+		 * one) -- so a boot that is idle does not print it. Frames a second beside samples a second
+		 * is the whole chain of a scroll in one line (see gFbfps).
+		 */
+		if (s5 && gFbfps != 0 && (screened > 0 || screen_down != 0 || synthesized > 0 || synth_down != 0)) {
+			uint64_t fenceWait = fStatSwapWait;
+
+			absolutetime_to_nanoseconds(fenceWait, &fenceWait);
+			IOLog("MiniIOMobileFramebuffer: fbfps: scroll %llu ms: %u frames (%llu a second), %u screen touch samples "
+			    "(%u a second), screen finger %u, %u synthetic touch samples, synthetic finger %u, %u refreshes told "
+			    "(%u a second), mode %u Hz; %llu us a frame in the copy, %llu us waiting for the GPU's fence (%u swaps "
+			    "with one), %u waited for the frame before, %u came a refresh late\n", nanos / NSEC_PER_MSEC,
+			    fStatFrames, fStatFrames * NSEC_PER_SEC / nanos, screened,
+			    (uint32_t) ((uint64_t) screened * NSEC_PER_SEC / nanos), screen_down, synthesized, synth_down, told,
+			    (uint32_t) ((uint64_t) told * NSEC_PER_SEC / nanos), refreshHz(),
+			    fStatFrames != 0 ? drawing / fStatFrames / NSEC_PER_USEC : 0,
+			    fStatSwapFence != 0 ? fenceWait / fStatSwapFence / NSEC_PER_USEC : 0, fStatSwapFence, fStatHeld,
+			    fStatSwapsLate);
 		}
 		/*
 		 * The fences of the frames: how many swaps came with a GPU submission to wait for at all (0: the
