@@ -52,6 +52,8 @@
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+/* bsd/dev/vayu_wifi_net.c: vayu_wifi_keep_secs, the hold time of vayu_wifi_keep=1 (0 = no limit) */
+extern uint32_t vayu_net_keep_secs(void);
 
 #define EV_VDEV_START_RESP      0x5001U
 #define EV_VDEV_STOPPED         0x5002U
@@ -107,7 +109,6 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 #define PEER_FLAG_NEED_PTK_4WAY 0x4U
 #define RSN_WAIT_MS             8000U   /* the AP's 1/4 retries are ~1 s apart (W24) */
 #define NET_WINDOW_MS           20000U  /* the link stays up this long for iOS/configd */
-#define KEEP_SECS               180U    /* vayu_wifi_keep=1: teardown after this */
 #define TX_LOG_MAX              16U
 #define RX_LOG_MAX              8U
 #define IE_MAX                  768U
@@ -928,7 +929,8 @@ int
 vayu_sta_run(const struct vayu_scan_ops *o)
 {
 	static uint8_t assoc[256];
-	uint32_t alen = 0, tries, waited;
+	uint32_t alen = 0, tries, keep_secs;
+	uint64_t waited;                        /* ms; 64-bit so an endless keep cannot wrap it */
 	bool started = false, peered = false, authed = false, associated = false, up = false;
 	int w = 0, rc = -1;
 
@@ -1060,6 +1062,7 @@ vayu_sta_run(const struct vayu_scan_ops *o)
 
 	/* W25 S5/S6: let iOS see the link, and prove the path with our own DHCP when asked */
 	waited = 0;
+	keep_secs = vayu_net_keep_secs();         /* 0 = no limit, the old default is 180 */
 	for (;;) {
 		bool stopped_now = false;
 		int d = vayu_net_poll();
@@ -1073,7 +1076,12 @@ vayu_sta_run(const struct vayu_scan_ops *o)
 			break;
 		}
 		if (vayu_net_keep()) {
-			if (waited >= KEEP_SECS * 1000U) {
+			/* the AP left: there is no link left to hold */
+			if (st.ap_left) {
+				break;
+			}
+			/* 0: stay joined until the run ends (CE stage abort) or the AP leaves */
+			if (keep_secs != 0 && waited >= (uint64_t)keep_secs * 1000U) {
 				break;
 			}
 			if (waited % 10000U == 0) {

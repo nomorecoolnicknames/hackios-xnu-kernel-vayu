@@ -49,12 +49,14 @@
 #define DHCP_SERVER_PORT        67U
 #define DHCP_MAGIC              0x63825363U
 #define IP4(a)                  (a)[0], (a)[1], (a)[2], (a)[3]
+#define KEEP_SECS_DEFAULT       180U    /* vayu_wifi_keep=1 without vayu_wifi_keep_secs */
 
 enum dhcp_state { DHCP_OFF, DHCP_INIT, DHCP_SELECTING, DHCP_REQUESTING, DHCP_BOUND, DHCP_FAILED };
 
 static struct {
 	bool started, linked, sta_attached, dhcp_on, keep;
 	uint32_t dhcp_mode;             /* 0 off, 1 at once, 2 fallback after 30 s */
+	uint32_t keep_secs;             /* vayu_wifi_keep_secs: hold time, 0 = until the run ends */
 	bool fallback_armed, fallback_said, fallback_bound;
 	uint64_t link_ms;
 	uint32_t chan;                  /* the channel and rssi of the join, for Apple80211's state */
@@ -729,14 +731,30 @@ vayu_net_reset(int (*log)(const char *format, ...) __printflike(1, 2))
 	net.dhcp_on = net.dhcp_mode != 0;
 	v = 0;
 	PE_parse_boot_argn("vayu_wifi_keep", &v, sizeof(v));
-	PE_parse_boot_argn("vayu_wifi_a80211", &wifi_a80211, sizeof(wifi_a80211));
 	net.keep = v != 0;
+	/* vayu_wifi_keep_secs: how long the keep stays joined; absent = the old hard 180 s */
+	net.keep_secs = KEEP_SECS_DEFAULT;
+	v = 0;
+	if (PE_parse_boot_argn("vayu_wifi_keep_secs", &v, sizeof(v))) {
+		net.keep_secs = v;
+	}
+	if (net.keep) {
+		net.log("vayu-wifi: keep: %u s (0 = until the run ends)\n", net.keep_secs);
+	}
+	PE_parse_boot_argn("vayu_wifi_a80211", &wifi_a80211, sizeof(wifi_a80211));
 }
 
 bool
 vayu_net_keep(void)
 {
 	return net.keep;
+}
+
+/* the hold time of vayu_wifi_keep=1 in seconds; 0 = until the run ends */
+uint32_t
+vayu_net_keep_secs(void)
+{
+	return net.keep_secs;
 }
 
 void

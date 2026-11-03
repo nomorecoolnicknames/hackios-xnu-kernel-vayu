@@ -1,0 +1,101 @@
+--- a/bsd/dev/vayu_wifi_net.c
++++ b/bsd/dev/vayu_wifi_net.c
+@@ -49,12 +49,14 @@
+ #define DHCP_SERVER_PORT        67U
+ #define DHCP_MAGIC              0x63825363U
+ #define IP4(a)                  (a)[0], (a)[1], (a)[2], (a)[3]
++#define KEEP_SECS_DEFAULT       180U    /* vayu_wifi_keep=1 without vayu_wifi_keep_secs */
+ 
+ enum dhcp_state { DHCP_OFF, DHCP_INIT, DHCP_SELECTING, DHCP_REQUESTING, DHCP_BOUND, DHCP_FAILED };
+ 
+ static struct {
+ 	bool started, linked, sta_attached, dhcp_on, keep;
+ 	uint32_t dhcp_mode;             /* 0 off, 1 at once, 2 fallback after 30 s */
++	uint32_t keep_secs;             /* vayu_wifi_keep_secs: hold time, 0 = until the run ends */
+ 	bool fallback_armed, fallback_said, fallback_bound;
+ 	uint64_t link_ms;
+ 	uint32_t chan;                  /* the channel and rssi of the join, for Apple80211's state */
+@@ -729,8 +731,17 @@
+ 	net.dhcp_on = net.dhcp_mode != 0;
+ 	v = 0;
+ 	PE_parse_boot_argn("vayu_wifi_keep", &v, sizeof(v));
+-	PE_parse_boot_argn("vayu_wifi_a80211", &wifi_a80211, sizeof(wifi_a80211));
+ 	net.keep = v != 0;
++	/* vayu_wifi_keep_secs: how long the keep stays joined; absent = the old hard 180 s */
++	net.keep_secs = KEEP_SECS_DEFAULT;
++	v = 0;
++	if (PE_parse_boot_argn("vayu_wifi_keep_secs", &v, sizeof(v))) {
++		net.keep_secs = v;
++	}
++	if (net.keep) {
++		net.log("vayu-wifi: keep: %u s (0 = until the run ends)\n", net.keep_secs);
++	}
++	PE_parse_boot_argn("vayu_wifi_a80211", &wifi_a80211, sizeof(wifi_a80211));
+ }
+ 
+ bool
+@@ -739,6 +750,13 @@
+ 	return net.keep;
+ }
+ 
++/* the hold time of vayu_wifi_keep=1 in seconds; 0 = until the run ends */
++uint32_t
++vayu_net_keep_secs(void)
++{
++	return net.keep_secs;
++}
++
+ void
+ vayu_net_set_tx(int (*tx80211)(const uint8_t *frame, uint32_t len, bool clear),
+     int (*log)(const char *format, ...) __printflike(1, 2))
+--- a/bsd/dev/vayu_wifi_sta.c
++++ b/bsd/dev/vayu_wifi_sta.c
+@@ -52,6 +52,8 @@
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+ extern uint64_t kvtophys(vm_offset_t va);
+ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++/* bsd/dev/vayu_wifi_net.c: vayu_wifi_keep_secs, the hold time of vayu_wifi_keep=1 (0 = no limit) */
++extern uint32_t vayu_net_keep_secs(void);
+ 
+ #define EV_VDEV_START_RESP      0x5001U
+ #define EV_VDEV_STOPPED         0x5002U
+@@ -107,7 +109,6 @@
+ #define PEER_FLAG_NEED_PTK_4WAY 0x4U
+ #define RSN_WAIT_MS             8000U   /* the AP's 1/4 retries are ~1 s apart (W24) */
+ #define NET_WINDOW_MS           20000U  /* the link stays up this long for iOS/configd */
+-#define KEEP_SECS               180U    /* vayu_wifi_keep=1: teardown after this */
+ #define TX_LOG_MAX              16U
+ #define RX_LOG_MAX              8U
+ #define IE_MAX                  768U
+@@ -928,7 +929,8 @@
+ vayu_sta_run(const struct vayu_scan_ops *o)
+ {
+ 	static uint8_t assoc[256];
+-	uint32_t alen = 0, tries, waited;
++	uint32_t alen = 0, tries, keep_secs;
++	uint64_t waited;                        /* ms; 64-bit so an endless keep cannot wrap it */
+ 	bool started = false, peered = false, authed = false, associated = false, up = false;
+ 	int w = 0, rc = -1;
+ 
+@@ -1060,6 +1062,7 @@
+ 
+ 	/* W25 S5/S6: let iOS see the link, and prove the path with our own DHCP when asked */
+ 	waited = 0;
++	keep_secs = vayu_net_keep_secs();         /* 0 = no limit, the old default is 180 */
+ 	for (;;) {
+ 		bool stopped_now = false;
+ 		int d = vayu_net_poll();
+@@ -1073,7 +1076,12 @@
+ 			break;
+ 		}
+ 		if (vayu_net_keep()) {
+-			if (waited >= KEEP_SECS * 1000U) {
++			/* the AP left: there is no link left to hold */
++			if (st.ap_left) {
++				break;
++			}
++			/* 0: stay joined until the run ends (CE stage abort) or the AP leaves */
++			if (keep_secs != 0 && waited >= (uint64_t)keep_secs * 1000U) {
+ 				break;
+ 			}
+ 			if (waited % 10000U == 0) {
