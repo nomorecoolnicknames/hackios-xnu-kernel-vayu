@@ -1,0 +1,101 @@
+--- a/bsd/dev/vayu_bt.c	2026-11-02 18:20:00.000000000 +0300
++++ b/bsd/dev/vayu_bt.c	2026-11-02 18:25:00.000000000 +0300
+@@ -31,7 +31,8 @@
+  * t_outq/the kctl ring and bt_tx_quiet(): it reassembles complete H4 packets, answers a selected
+  * vendor opcode (OGF 0x3f) with a synthetic event, and passes everything else, including every
+  * standard command, to the controller unchanged. Mode 1 uses bt_vsc_rules; mode 2 also answers an
+- * unlisted vendor opcode with a Command Complete status 0.
++ * unlisted vendor opcode with a Command Complete status 0, and 0xfd1b (factory cal read) with a
++ * body of vayu_bt_vsc_cal zero bytes because its byte-stream callback rejects an empty reply.
+  *
+  * Run 031412, the first hardware run, found (and this file now assumes):
+  *   - SE3's RCG is not in DFS: the DFS word (cmd + 0x14) reads 0x8020, bit 0 clear, and all
+@@ -214,6 +215,11 @@
+  *                     passes every other vendor opcode (OGF 0x3f) to the controller; 2 passes
+  *                     nothing unlisted and answers it with a Command Complete status 0. A
+  *                     standard command (OGF != 0x3f) always goes to the chip unchanged.
++ *   vayu_bt_vsc_cal=N default 8: how many zero bytes the 0xfd1b (BD_VSC_FACTORY_CAL_READ_TABLE)
++ *                     Command Complete carries. bluetoothd's byte-stream wrapper calls the
++ *                     calibration callback only when the reply body is longer than one byte, so
++ *                     the old empty answer stalled 15 s (VSCommandStall, reason 3602). 0 restores
++ *                     the old empty answer (the experiment's control).
+  *   vayu_bt_keep=0|1  default 0: 1 leaves rails, clock and RX running at the end; 0 cancels the
+  *                     S command. Step 9 always behaves as 1: the tty and the kctl need both.
+  *   vayu_bt_giveback=0|1  default 0: 1 also votes "enable 0" for the rails this run turned on (same
+@@ -3820,6 +3826,10 @@
+ 	bool has_subop;                 /* one opcode can carry many sub-commands (0xfce2 does) */
+ };
+ 
++/* vayu_bt_vsc_cal: the body of the 0xfd1b answer; 0 leaves the old empty CC in place. */
++#define BT_VSC_CAL_DEFAULT      8
++static uint8_t g_cal_zeros[BT_VSC_MAX_PARAMS];
++
+ static struct bt_vsc_rule bt_vsc_rules[] = {
+ 	/*
+ 	 * Filled in from the bt7 trace. The all-zero entry is only a placeholder until then: its
+@@ -3846,6 +3856,19 @@
+ 	 */
+ 	{ .opcode = 0xfd48, .action = BT_VSC_CC, .status = 0x01, .nparams = 0, .params = NULL },
+ 	/*
++	 * 0xfd1b is BD_VSC_FACTORY_CAL_READ_TABLE (run 172358, merge21 after the BlueTool root
++	 * fix: 01 1b fd 01 51 = read table 0x51). bluetoothd sends it right after 0xfd47 and
++	 * waits 15 s, then "Invalid data size 0 (status=65535)", VSCommandStall and reason 3602.
++	 * The cause is the empty body of mode 2's catch-all: Apple's byte-stream wrapper (16.5,
++	 * the dispatcher that logs "Invalid data size %d": size = length - position, cmp #1 at
++	 * 0x100125fa8, callback called at 0x1001260f8 only when size > 1) never calls the
++	 * calibration callback for zero or one data bytes, so the command stays pending. A body
++	 * of vayu_bt_vsc_cal zero bytes (default 8) is handed to that callback and the command
++	 * completes; the table is zeros, which is wrong calibration data but not a stall.
++	 */
++	{ .opcode = 0xfd1b, .action = BT_VSC_CC, .status = 0, .nparams = BT_VSC_CAL_DEFAULT,
++	    .params = g_cal_zeros },
++	/*
+ 	 * 0xfce2 is one opcode for every Olympic sub-command; the sub-opcode is the first payload
+ 	 * byte.  bt8 run 205056 shows bluetoothd sending three of them: 0x0b and 0x1c (handled, the
+ 	 * caller does not wait) and 0x15 = BD_VSC_OLYMPIC_ANTENNA_PREF_B, which it waits 15 s for
+@@ -3871,6 +3894,7 @@
+ static uint32_t g_vsc_logged;           /* per-command vsc lines printed so far */
+ static uint8_t g_olympic_bytes;         /* vayu_bt_vsc_olympic: zero bytes in the 0x15 answer, 0 = rule off */
+ static uint8_t g_olympic_zeros[8];      /* the answer's body while g_olympic_bytes is set */
++static uint8_t g_cal_bytes = BT_VSC_CAL_DEFAULT;  /* vayu_bt_vsc_cal: body length of the 0xfd1b answer */
+ static bool g_bt_trace;                 /* vayu_bt_trace=1: every per-command vsc line, no cap */
+ #define BT_VSC_LOG_FIRST        64      /* without vayu_bt_trace: the first 64 decisions, then summaries only */
+ 
+@@ -4086,6 +4110,10 @@
+ 		status = rule->status;
+ 		nparams = rule->nparams;
+ 		params = rule->params;
++		if (rule->opcode == 0xfd1b) {
++			/* vayu_bt_vsc_cal: 0 restores the old empty catch-all answer */
++			nparams = g_cal_bytes;
++		}
+ 		if (rule->has_subop && g_olympic_bytes != 0) {
+ 			/* vayu_bt_vsc_olympic=N: N zero bytes, the length still being the open question */
+ 			nparams = g_olympic_bytes;
+@@ -5077,6 +5105,16 @@
+ 		g_olympic_bytes = (uint8_t)value;
+ 	}
+ 	value = 0;
++	if (PE_parse_boot_argn("vayu_bt_vsc_cal", &value, sizeof(value))) {
++		if (value > BT_VSC_MAX_PARAMS) {
++			printf("vayu-bt: vayu_bt_vsc_cal=%u: at most %u bytes fit the answer; using %u\n",
++			    (unsigned)value, (unsigned)BT_VSC_MAX_PARAMS,
++			    (unsigned)BT_VSC_MAX_PARAMS);
++			value = BT_VSC_MAX_PARAMS;
++		}
++		g_cal_bytes = (uint8_t)value;
++	}
++	value = 0;
+ 	if (PE_parse_boot_argn("vayu_bt_vsc", &value, sizeof(value))) {
+ 		if (value > 2) {
+ 			printf("vayu-bt: vayu_bt_vsc=%u: only 0, 1 and 2 exist; using 2\n",
+@@ -5090,6 +5128,9 @@
+ 		    (unsigned)g_vsc_mode,
+ 		    g_vsc_mode == 1 ? "table answers, unlisted pass to the chip" :
+ 		    "table answers, unlisted get a CC status 0", (unsigned)BT_VSC_RULE_COUNT);
++		printf("vayu-bt: vsc: 0xfd1b (BD_VSC_FACTORY_CAL_READ_TABLE) answered with CC status 0 "
++		    "and %u zero byte(s)%s\n", (unsigned)g_cal_bytes,
++		    g_cal_bytes == 0 ? " (the old empty body: bluetoothd will stall on it)" : "");
+ 		if (g_olympic_bytes != 0) {
+ 			printf("vayu-bt: vsc: 0xfce2/0x15 (Olympic antenna) answered with CC status 0 "
+ 			    "and %u zero byte(s): an experiment, see bt_vsc_rules\n",
