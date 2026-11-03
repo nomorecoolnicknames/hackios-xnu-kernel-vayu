@@ -111,7 +111,12 @@ extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
 /* What the Wi-Fi's DSP and this one both use (hakios.wifi.c). */
 extern lck_mtx_t hakios_aop_mailbox_lock;
 extern lck_mtx_t hakios_smem_alloc_lock;
-extern lck_mtx_t hakios_rsc_lock;            /* RPMh's sequencer, shared with the other DSP's driver */
+/* TCS 0 of the apps RSC is one command slot for the whole kernel: vayu_pas.c's one lock, not a
+ * second mutex of our own (hakios_rsc_lock is gone: two mutexes are no mutual exclusion, and run
+ * 182129 wedged the modem's Wi-Fi rail vote on the other one). */
+extern bool vayu_rsc_tcs_lock(const char *who);
+extern void vayu_rsc_tcs_unlock(void);
+extern bool vayu_rsc_tcs_gave_up(void);
 
 static LCK_GRP_DECLARE(adsp_lock_group, "hakios-adsp");
 
@@ -887,6 +892,7 @@ rails(uint32_t level)
 	static const char *const names[2] = { "lcx.lvl", "lmx.lvl" };
 	uint32_t addresses[2] = { 0, 0 }, values[2] = { 0, 0 }, done = 0;
 	uint64_t began;
+	bool held;
 
 	for (unsigned r = 0; r < 2; r++) {
 		int position = level == 0 ? 0 : rail_position(names[r], level, &addresses[r]);
@@ -901,18 +907,24 @@ rails(uint32_t level)
 		values[r] = (uint32_t)position;
 	}
 	need(&rsc);
-	lck_mtx_lock(&hakios_rsc_lock);
+	hold();                          /* (the loader's pause, before the lock: a sleeper there must not sit on the slot) */
+	held = vayu_rsc_tcs_lock("adsp");
+	if (!held && vayu_rsc_tcs_gave_up()) {
+		printf("adsp: %u: TCS %u was not taken: the rails are not asked\n", step, RPMH_TCS);
+		return false;
+	}
 	/* (the boot loader leaves the trigger set after its last request, done: idle is what the status says) */
 	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0) {
 		printf("adsp: %u: TCS %u of the sequencer is busy (status %#x, control %#x): the rails are not asked\n", step, RPMH_TCS,
 		    rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS), rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL));
-		lck_mtx_unlock(&hakios_rsc_lock);
+		if (held) {
+			vayu_rsc_tcs_unlock();
+		}
 		return false;
 	}
 	printf("adsp: %u: about to ask RPMh, through TCS %u, for lcx.lvl (%#x) = %u and lmx.lvl (%#x) = %u (level %u%s)\n", step,
 	    RPMH_TCS, addresses[0], values[0], addresses[1], values[1], level, level == 0 ? ": given back" : "");
 	snprintf(last_write, sizeof(last_write), "step %u asked RPMh for the audio DSP's rails at level %u", step, level);
-	hold();
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	for (unsigned r = 0; r < 2; r++) {
 		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r), MSGID_WRITE_WAITED);
@@ -926,12 +938,11 @@ rails(uint32_t level)
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_ACTIVE_MODE);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_TRIGGER);
 	began = now_us();
-	while (now_us() - began < 100000) {
+	while (now_us() - began < 100000) {     /* a spin: the slot's lock is held, so no sleep here */
 		done = rd(rsc.base + RSC_IRQ_STATUS) & (1u << RPMH_TCS);
 		if (done) {
 			break;
 		}
-		sleep_us(50);
 	}
 	printf("adsp: %u: RPMh %s after %llu us; the commands' status %#x %#x, the TCS's %#x\n", step, done ? "HAS DONE IT" :
 	    "HAS NOT SAID DONE", now_us() - began, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(0) + 12),
@@ -939,7 +950,9 @@ rails(uint32_t level)
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
-	lck_mtx_unlock(&hakios_rsc_lock);
+	if (held) {
+		vayu_rsc_tcs_unlock();
+	}
 	return done != 0;
 }
 

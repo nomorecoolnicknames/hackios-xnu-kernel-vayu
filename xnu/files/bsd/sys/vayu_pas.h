@@ -93,8 +93,13 @@ void vayu_apcs_ring(unsigned bit);      /* one bit of APCS IPC: never read-modif
 bool vayu_aop_send(const char *text);   /* a message to the always-on processor (QMP) */
 bool vayu_rpmh_vote(const char *const names[], unsigned count, uint32_t level); /* level 0: given back */
 uint32_t vayu_rpmh_address(const char *name);   /* cmd-db address of a resource id; 0: not there */
-bool vayu_rpmh_tcs_lock(void);           /* TCS 0 of the apps RSC, one writer at a time; false: not taken (on the way out) */
-void vayu_rpmh_tcs_unlock(bool held);
+bool vayu_rsc_tcs_lock(const char *who);  /* THE lock of TCS 0 of the apps RSC (0x18220000): every driver that
+                                           * writes that slot takes it (vayu_pas.c, vayu_wifi.c, vayu_bt.c,
+                                           * vayu_cpufreq.c, vayu_qup_spi.c, hakios.adsp.c, hakios.mpss.c);
+                                           * false: not taken -- on the way out (nobody to wait for), or the
+                                           * wait ran out: then vayu_rsc_tcs_gave_up() says which */
+void vayu_rsc_tcs_unlock(void);
+bool vayu_rsc_tcs_gave_up(void);
 bool vayu_rpmh_send(const uint32_t addresses[], const uint32_t values[], unsigned count, const char *who); /* raw RPMh active-only writes through TCS 0, waited; true: RPMh said done */
 void vayu_pas_set_pause(uint32_t ms);   /* before each first-time write: time for the loader to note the log (default 2200) */
 /* TrustZone MEM_PROT_ASSIGN for a contiguous buffer: its pages are given to the modem's VMID 15

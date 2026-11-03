@@ -59,7 +59,17 @@ extern lck_mtx_t hakios_smem_alloc_lock;
 
 static LCK_GRP_DECLARE(pas_lock_group, "vayu-pas");
 static LCK_MTX_DECLARE(pas_lock, &pas_lock_group);      /* a processor being started or stopped */
-static LCK_MTX_DECLARE(rpmh_tcs_lock, &pas_lock_group); /* TCS 0 of the apps RSC: every vayu writer takes it */
+/*
+ * THE lock of TCS 0 of the apps RSC (0x18220000), for every driver of this kernel that writes that
+ * command slot: this file, vayu_wifi.c, vayu_bt.c, vayu_cpufreq.c, vayu_qup_spi.c, and
+ * hakios.adsp.c / hakios.mpss.c (whose own hakios_rsc_lock was a second mutex on the same slot:
+ * two mutexes are no mutual exclusion, and run 182129 wedged the modem's Wi-Fi rail vote waiting
+ * for a slot another of the two took). It is a sleeping mutex, so nothing sleeps while it is held.
+ */
+static LCK_MTX_DECLARE(rpmh_tcs_lock, &pas_lock_group);
+static const char *rpmh_tcs_holder;                     /* who holds it now (a name in vayu_rpmh_send's calls) */
+static uint64_t rpmh_tcs_held_since;                    /* and when it was taken, in us */
+static bool rpmh_tcs_gave_up;                           /* the last wait hit RPMH_TCS_GIVE_UP_US */
 
 /* vayu_ipa_pas= (sys/vayu_pas.h): the IPA path's steps, so one run can leave one out. */
 static uint32_t pas_steps = VAYU_PAS_STEPS_DEFAULT;
@@ -857,27 +867,102 @@ vayu_rpmh_address(const char *name)
 	return 0;
 }
 
+#define RPMH_TCS_WARN_US        1000000ull      /* 1 s: say who holds the slot */
+#define RPMH_TCS_REPORT_US      5000000ull      /* then every 5 s */
+#define RPMH_TCS_GIVE_UP_US     60000000ull     /* 60 s: fail the request rather than wedge the thread */
+#define RPMH_TCS_POLL_US        200             /* between two tries: nothing is held while waiting */
+#define RPMH_TCS_DONE_US        100000ull       /* the done bit, waited for without sleeping (see below) */
+
 /*
- * TCS 0 of the apps RSC is the one command slot set every vayu driver writes (this file, vayu_cpufreq.c's
- * bandwidth vote, vayu_qup_spi.c's QUP vote): one request at a time, through this lock. On the way out
- * (leaving, or interrupts off: the other processors are already stopped) there is nobody to wait for and
- * a mutex cannot be taken, so it is not. Returns whether it was taken, for vayu_rpmh_tcs_unlock().
+ * TCS 0 of the apps RSC is the one command slot set every vayu driver writes (this file,
+ * vayu_cpufreq.c's bandwidth vote, vayu_qup_spi.c's QUP vote, vayu_wifi.c's and vayu_bt.c's rails,
+ * and hakios.adsp.c's / hakios.mpss.c's): one request at a time, through this one lock.
+ *
+ * Returns true: taken, for vayu_rsc_tcs_unlock(). False: not taken, and then either the caller is
+ * on its way out (leaving, or interrupts off: the other processors are already stopped, and a
+ * mutex cannot be taken there) or the wait ran out (vayu_rsc_tcs_gave_up()): a driver of a research
+ * bench says so and goes on rather than holding a thread of the boot for ever.
+ *
+ * The wait says who holds the slot when it lasts over a second: that is the line run 182129 did not
+ * have, when vayu-wifi's ldoc11 vote stopped after "rpmh: ldoc11 at 0x41a00" and never said "about
+ * to ask".
  */
 bool
-vayu_rpmh_tcs_lock(void)
+vayu_rsc_tcs_lock(const char *who)
 {
+	uint64_t began, waited, next;
+
+	rpmh_tcs_gave_up = false;               /* (this wait's verdict, not the last one's) */
 	if (leaving || !ml_get_interrupts_enabled()) {
 		return false;
 	}
-	lck_mtx_lock(&rpmh_tcs_lock);
+	if (!lck_mtx_try_lock(&rpmh_tcs_lock)) {
+		began = now_us();
+		next = RPMH_TCS_WARN_US;
+		for (;;) {
+			const char *holder = rpmh_tcs_holder;
+			uint64_t since = rpmh_tcs_held_since;
+
+			if (lck_mtx_try_lock(&rpmh_tcs_lock)) {
+				break;
+			}
+			waited = now_us() - began;
+			if (waited >= next) {
+				if (holder != NULL) {
+					say("rpmh: TCS %u of %#x: %s has waited %llu ms; %s has held it for %llu ms\n", RPMH_TCS,
+					    rsc.phys, who != NULL ? who : "?", waited / 1000, holder, (now_us() - since) / 1000);
+				} else {
+					say("rpmh: TCS %u of %#x: %s has waited %llu ms; the holder was not recorded\n", RPMH_TCS,
+					    rsc.phys, who != NULL ? who : "?", waited / 1000);
+				}
+				next = waited + RPMH_TCS_REPORT_US;
+			}
+			if (waited >= RPMH_TCS_GIVE_UP_US) {
+				rpmh_tcs_gave_up = true;
+				say("rpmh: TCS %u of %#x: %s gives up after %llu ms; this request is not made\n", RPMH_TCS,
+				    rsc.phys, who != NULL ? who : "?", waited / 1000);
+				return false;
+			}
+			sleep_us(RPMH_TCS_POLL_US);     /* (the wait itself: no lock is held here) */
+		}
+	}
+	rpmh_tcs_gave_up = false;
+	rpmh_tcs_holder = who;
+	rpmh_tcs_held_since = now_us();
 	return true;
 }
 
 void
-vayu_rpmh_tcs_unlock(bool held)
+vayu_rsc_tcs_unlock(void)
 {
-	if (held) {
-		lck_mtx_unlock(&rpmh_tcs_lock);
+	rpmh_tcs_holder = NULL;
+	lck_mtx_unlock(&rpmh_tcs_lock);
+}
+
+/* True: the last vayu_rsc_tcs_lock() failed because the slot was held for RPMH_TCS_GIVE_UP_US, not
+ * because there was nobody to wait for. The caller must then leave the slot alone. */
+bool
+vayu_rsc_tcs_gave_up(void)
+{
+	return rpmh_tcs_gave_up;
+}
+
+/* The slot's done bit for those commands. A spin, not a sleep: the caller holds the TCS lock, and a
+ * thread that slept there would sit on the sequencer across a scheduler tick (the other voters'
+ * turns, and the 2.2 s pause before a first-time write, are all outside the lock for that reason).
+ * RPMh answers in some hundreds of microseconds; RPMH_TCS_DONE_US is the same 100 ms as before. */
+static uint32_t
+rpmh_tcs_wait_done(uint32_t mask, uint64_t *spent)
+{
+	uint64_t began = now_us();
+
+	for (;;) {
+		uint32_t done = rd(rsc.base + RSC_IRQ_STATUS) & mask;
+
+		*spent = now_us() - began;
+		if (done != 0 || *spent >= RPMH_TCS_DONE_US) {
+			return done;
+		}
 	}
 }
 
@@ -903,11 +988,17 @@ vayu_rpmh_send(const uint32_t addresses[], const uint32_t values[], unsigned cou
 	}
 	need(&rsc);
 	hold();                                 /* (the step pause, if any, before the lock: other voters do not wait it out) */
-	held = vayu_rpmh_tcs_lock();
+	held = vayu_rsc_tcs_lock(who);
+	if (!held && vayu_rsc_tcs_gave_up()) {
+		say("rpmh: %s: TCS %u was not taken: nothing is written\n", who, RPMH_TCS);
+		return false;
+	}
 	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0) {
 		say("rpmh: TCS %u is busy (status %#x, control %#x): not asked\n", RPMH_TCS, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS),
 		    rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL));
-		vayu_rpmh_tcs_unlock(held);
+		if (held) {
+			vayu_rsc_tcs_unlock();
+		}
 		return false;
 	}
 	at = snprintf(line, sizeof(line), "rpmh: about to ask, through TCS %u of %#x, %s for", RPMH_TCS, rsc.phys, who);
@@ -928,16 +1019,9 @@ vayu_rpmh_send(const uint32_t addresses[], const uint32_t values[], unsigned cou
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~TCS_TRIGGER);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_ACTIVE_MODE);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_TRIGGER);
-	began = now_us();
-	while (now_us() - began < 100000) {
-		done = rd(rsc.base + RSC_IRQ_STATUS) & (1u << RPMH_TCS);
-		if (done) {
-			break;
-		}
-		sleep_us(50);
-	}
+	done = rpmh_tcs_wait_done(1u << RPMH_TCS, &began);
 	at = snprintf(line, sizeof(line), "rpmh: %s after %llu us; the commands' status", done ? "DONE" : "HAS NOT SAID DONE",
-	    now_us() - began);
+	    began);
 	for (unsigned r = 0; r < count; r++) {
 		at += snprintf(line + at, sizeof(line) - (size_t)at, " %#x", rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 12));
 	}
@@ -945,7 +1029,9 @@ vayu_rpmh_send(const uint32_t addresses[], const uint32_t values[], unsigned cou
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
-	vayu_rpmh_tcs_unlock(held);
+	if (held) {
+		vayu_rsc_tcs_unlock();
+	}
 	return done != 0;
 }
 

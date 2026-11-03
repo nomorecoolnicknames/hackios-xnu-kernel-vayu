@@ -48,8 +48,9 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_line(const char *line);
 extern bool hakios_spmi_peek(uint16_t id, uint8_t reg, uint8_t *value);
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);        /* osfmk/arm64/machine_routines.c */
-extern bool vayu_rpmh_tcs_lock(void);
-extern void vayu_rpmh_tcs_unlock(bool held);
+extern bool vayu_rsc_tcs_lock(const char *who);  /* vayu_pas.c: THE lock of TCS 0 of the apps RSC */
+extern void vayu_rsc_tcs_unlock(void);
+extern bool vayu_rsc_tcs_gave_up(void);
 
 #define OSM_DOMAINS             3
 #define OSM_DOMAIN_SIZE         0x1400
@@ -431,18 +432,26 @@ cmd_db_address(const struct cmd_db_header *db, const char *name)
 	return 0;
 }
 
-/* One active-only request in command slot set 0, and the wait until RPMh has done it (as vayu_qup_spi.c). */
-static bool
-rpmh_vote(const uint32_t *address, const uint32_t *data, unsigned count, uint32_t *status)
+/* One wait that does not sleep: the TCS lock is held by the caller, and a sleeper would sit on the
+ * apps RSC's one command slot across a scheduler tick (vayu_pas.c's vayu_rsc_tcs_lock()). */
+static void
+rpmh_spin_us(uint32_t us)
 {
-	vm_offset_t tcs = ml_io_map(VAYU_RSC_TCS_PHYS, VAYU_RSC_TCS_SIZE);
+	uint64_t deadline;
+
+	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
+	while (mach_absolute_time() < deadline) {
+	}
+}
+
+/* One active-only request in command slot set 0, and the wait until RPMh has done it (as
+ * vayu_qup_spi.c). The slot's mapping is the caller's, taken before the lock: mapping may sleep. */
+static bool
+rpmh_vote(vm_offset_t tcs, const uint32_t *address, const uint32_t *data, unsigned count, uint32_t *status)
+{
 	uint32_t irq_enable;
 	bool idle = false, done = false;
 
-	if (tcs == 0) {
-		tell("cpufreq: vayu: ddr: cannot map the RSC\n");
-		return false;
-	}
 	irq_enable = *(volatile uint32_t *)(tcs + TCS_IRQ_ENABLE);
 	tell("cpufreq: vayu: ddr: tcs0 status %#x control %#x irq en %#x st %#x cmd_en %#x\n",
 	    *(volatile uint32_t *)(tcs + TCS_STATUS), *(volatile uint32_t *)(tcs + TCS_CONTROL), irq_enable,
@@ -452,7 +461,7 @@ rpmh_vote(const uint32_t *address, const uint32_t *data, unsigned count, uint32_
 			idle = true;
 			break;
 		}
-		delay_for_interval(100, NSEC_PER_USEC);
+		rpmh_spin_us(100);
 	}
 	if (!idle) {
 		/* somebody else's request is in flight: touch nothing of theirs */
@@ -477,7 +486,7 @@ rpmh_vote(const uint32_t *address, const uint32_t *data, unsigned count, uint32_
 				done = true;
 				break;
 			}
-			delay_for_interval(100, NSEC_PER_USEC);
+			rpmh_spin_us(100);
 		}
 		if (!done) {
 			tell("cpufreq: vayu: ddr: RPMh: no answer to the vote\n");
@@ -502,6 +511,7 @@ vote_bandwidth(bool dry)
 	const struct cmd_db_header *db;
 	uint32_t mc0, sh0, acv, vote = 0x3fff;
 	uint32_t address[3], data[3], status[3] = { 0 };
+	vm_offset_t tcs;
 	bool done, held;
 
 	if (PE_parse_boot_argn("vayu_cmd_db", &db_phys, sizeof(db_phys)) && db_phys == 0) {
@@ -536,9 +546,20 @@ vote_bandwidth(bool dry)
 	data[0] = BCM_VOTE(vote, vote);
 	data[1] = BCM_VOTE(vote, vote);
 	data[2] = BCM_VOTE(0, BCM_ACV_APPS);
-	held = vayu_rpmh_tcs_lock();            /* (vayu_pas.c: TCS 0 is shared) */
-	done = rpmh_vote(address, data, 3, status);
-	vayu_rpmh_tcs_unlock(held);
+	tcs = ml_io_map(VAYU_RSC_TCS_PHYS, VAYU_RSC_TCS_SIZE);   /* (the mapping may sleep: not under the lock) */
+	if (tcs == 0) {
+		tell("cpufreq: vayu: ddr: cannot map the RSC\n");
+		return;
+	}
+	held = vayu_rsc_tcs_lock("cpufreq");    /* (vayu_pas.c: THE one lock of TCS 0) */
+	if (!held && vayu_rsc_tcs_gave_up()) {
+		tell("cpufreq: vayu: ddr: TCS 0 was not taken: not voting\n");
+		return;
+	}
+	done = rpmh_vote(tcs, address, data, 3, status);
+	if (held) {
+		vayu_rsc_tcs_unlock();
+	}
 	tell("cpufreq: vayu: ddr: bandwidth vote %u on MC0/SH0 + ACV 0x8: %s\n", vote, done ? "done" : "NO ANSWER");
 	tell("cpufreq: vayu: ddr: CMD_STATUS %#x %#x %#x\n", status[0], status[1], status[2]);
 }

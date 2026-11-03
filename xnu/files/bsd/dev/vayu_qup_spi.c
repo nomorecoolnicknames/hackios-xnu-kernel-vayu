@@ -50,8 +50,9 @@
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
 
-extern bool vayu_rpmh_tcs_lock(void);
-extern void vayu_rpmh_tcs_unlock(bool held);
+extern bool vayu_rsc_tcs_lock(const char *who);  /* vayu_pas.c: THE lock of TCS 0 of the apps RSC */
+extern void vayu_rsc_tcs_unlock(void);
+extern bool vayu_rsc_tcs_gave_up(void);
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
@@ -275,6 +276,18 @@ static void
 qup_sleep_us(uint32_t us)
 {
 	delay_for_interval(us, NSEC_PER_USEC);
+}
+
+/* A wait that does not sleep: the TCS lock is held there, and a sleeper would sit on the apps
+ * RSC's one command slot across a scheduler tick (vayu_pas.c's vayu_rsc_tcs_lock()). */
+static void
+qup_spin_us(uint32_t us)
+{
+	uint64_t deadline;
+
+	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
+	while (mach_absolute_time() < deadline) {
+	}
 }
 
 
@@ -2082,18 +2095,26 @@ qup_bcm_lookup(uint64_t db_phys, const char *name)
 	return 0;
 }
 
-/* One active-only BCM vote through the first (active) TCS of the apps RSC; waits for completion. */
-static bool
-qup_bcm_vote_locked(uint32_t address, uint32_t data)
+/* The RSC's first command slot set, mapped once: the mapping may sleep, so never under the lock. */
+static vm_offset_t
+qup_rsc_tcs(void)
 {
-	vm_offset_t tcs = ml_io_map(QUP_RSC_TCS_PHYS, QUP_RSC_TCS_SIZE);
+	static vm_offset_t tcs;
+
+	if (tcs == 0) {
+		tcs = ml_io_map(QUP_RSC_TCS_PHYS, QUP_RSC_TCS_SIZE);
+	}
+	return tcs;
+}
+
+/* One active-only BCM vote through the first (active) TCS of the apps RSC; waits for completion
+ * without sleeping: the caller holds the TCS lock (see vayu_pas.c's vayu_rsc_tcs_lock()). */
+static bool
+qup_bcm_vote_locked(vm_offset_t tcs, uint32_t address, uint32_t data)
+{
 	uint32_t irq_enable;
 	bool done = false;
 
-	if (tcs == 0) {
-		QUP_LOG("bcm: cannot map the RSC\n");
-		return false;
-	}
 	irq_enable = qrd(tcs, TCS_IRQ_ENABLE);
 	QUP_LOG("bcm: tcs0 status %#x control %#x irq en %#x st %#x cmd_en %#x\n", qrd(tcs, TCS_STATUS),
 	    qrd(tcs, TCS_CONTROL), irq_enable, qrd(tcs, TCS_IRQ_STATUS), qrd(tcs, TCS_CMD_ENABLE));
@@ -2102,7 +2123,7 @@ qup_bcm_vote_locked(uint32_t address, uint32_t data)
 			QUP_LOG("bcm: tcs0 stays busy; not voting\n");
 			return false;
 		}
-		qup_sleep_us(100);
+		qup_spin_us(100);
 	}
 	qwr(tcs, TCS_CONTROL, qrd(tcs, TCS_CONTROL) & ~TCS_AMC_TRIGGER);
 	qwr(tcs, TCS_CONTROL, qrd(tcs, TCS_CONTROL) & ~TCS_AMC_ENABLE);
@@ -2120,7 +2141,7 @@ qup_bcm_vote_locked(uint32_t address, uint32_t data)
 			done = true;
 			break;
 		}
-		qup_sleep_us(100);
+		qup_spin_us(100);
 	}
 	QUP_LOG("bcm: vote %#x -> %#x %s; cmd status %#x\n", data, address, done ? "done" : "NOT done after 200 ms",
 	    qrd(tcs, TCS_CMD_STATUS(0)));
@@ -2133,14 +2154,28 @@ qup_bcm_vote_locked(uint32_t address, uint32_t data)
 	return done;
 }
 
-/* TCS 0 is shared with vayu_pas.c and vayu_cpufreq.c: one request at a time (vayu_rpmh_tcs_lock()). */
+/* "TCS 0 is shared with vayu_pas.c, vayu_wifi.c, vayu_bt.c and vayu_cpufreq.c: one request at a
+ * time, through vayu_pas.c's one lock." The mapping and the wait for a free slot are the caller's,
+ * outside it; only the slot's own writes are inside. */
 static bool
 qup_bcm_vote(uint32_t address, uint32_t data)
 {
-	bool held = vayu_rpmh_tcs_lock(), done;
+	vm_offset_t tcs = qup_rsc_tcs();
+	bool held, done;
 
-	done = qup_bcm_vote_locked(address, data);
-	vayu_rpmh_tcs_unlock(held);
+	if (tcs == 0) {
+		QUP_LOG("bcm: cannot map the RSC\n");
+		return false;
+	}
+	held = vayu_rsc_tcs_lock("qup-spi");
+	if (!held && vayu_rsc_tcs_gave_up()) {
+		QUP_LOG("bcm: TCS 0 was not taken: not voting\n");
+		return false;
+	}
+	done = qup_bcm_vote_locked(tcs, address, data);
+	if (held) {
+		vayu_rsc_tcs_unlock();
+	}
 	return done;
 }
 

@@ -191,7 +191,9 @@ static LCK_GRP_DECLARE(wifi_lock_group, "hakios-wifi");
  */
 LCK_MTX_DECLARE(hakios_aop_mailbox_lock, &wifi_lock_group);
 LCK_MTX_DECLARE(hakios_smem_alloc_lock, &wifi_lock_group);
-LCK_MTX_DECLARE(hakios_rsc_lock, &wifi_lock_group);      /* RPMh's sequencer (TCS 0 of the RSC): the audio DSP's and the modem's drivers both ask through it */
+/* (there used to be a hakios_rsc_lock here: a second mutex on TCS 0 of the apps RSC, which vayu_pas.c
+ * also locks. Two mutexes are no mutual exclusion; the one lock is vayu_pas.c's vayu_rsc_tcs_lock(),
+ * which hakios.adsp.c and hakios.mpss.c take as well.) */
 /* ... and the sound's (hakios.sound.c): a free match register and context of the SMMU, found and taken */
 LCK_MTX_DECLARE(hakios_smmu_lock, &wifi_lock_group);
 
