@@ -9,10 +9,9 @@ In the repository:
 - mkbootimg.py (Android Open Source Project), devices/poco-x5-pro/prebuilt/mkbootimg.py: Apache License 2.0.
 - Mu-Silicium / Project Mu (Project Silicium, Microsoft and contributors): devices/poco-x5-pro/uefi/ holds a
   patch and files against it; their license applies to the derived parts (BSD-2-Clause-Patent).
-- UEFI driver binaries of the phone's own firmware, devices/poco-x5-pro/uefi/files/Binaries/redwood/: the
-  vendor's (Qualcomm/Xiaomi), extracted from the phone's xbl.img the way Project Silicium redistributes
-  such drivers for other phones. They are needed only to rebuild the UEFI image; they can be removed and
-  extracted by each user from their own phone's firmware with UEFIReader.
+- UEFI driver binaries of the phone's own firmware (devices/poco-x5-pro/uefi/files/Binaries/redwood/) are
+  the vendor's (Qualcomm/Xiaomi) and are not in this repository: each user extracts them from their own
+  phone's xbl.img with UEFIReader. Only their README (the list of patches applied to them) is kept.
 
 - the FocalTech touch firmware, xnu/files/bsd/dev/hakios.focaltech_fw.h: the touch vendor's;
   generated from a device blob, redistribution terms "to verify" (THIRD_PARTY_LICENSES.md).

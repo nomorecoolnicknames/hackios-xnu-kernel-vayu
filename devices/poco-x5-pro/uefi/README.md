@@ -12,10 +12,11 @@ What is here:
   the container instead of a menu);
 - `files/`: new files: `Platforms/Xiaomi/redwoodPkg` (memory map, driver list),
   `Silicon/.../BootManagerLib/XnuLoader.[ch]`, `Resources/Configs/redwood.toml`,
-  `Resources/DTBs/redwood.dtb` (the device tree from the phone's vendor_boot), `Binaries/redwood`
-  (the UEFI drivers of the phone's own firmware, extracted from `xbl.img` with
-  [UEFIReader](https://github.com/WOA-Project/UEFIReader), the way Project Silicium ships them for
-  other phones; see `files/Binaries/redwood/README.md`).
+  `Resources/DTBs/redwood.dtb` (the device tree from the phone's vendor_boot). `Binaries/redwood`
+  (the UEFI drivers of the phone's own firmware) is **not tracked**: they are the vendor's, so you
+  extract them from your own phone's `xbl.img` with [UEFIReader](https://github.com/WOA-Project/UEFIReader)
+  into `files/Binaries/redwood/`; `files/Binaries/redwood/README.md` is kept, it lists the patches
+  that were applied to them.
 
 ## Build
 

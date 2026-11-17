@@ -1,7 +1,7 @@
 # F10 patches — LocalStorage appex `NSExtensionAttributes` and the files domain
 
 Base: TEST22C tree = `wt14` `vayu-test22` + F9 + N9 (the working copy the run used,
-`/mnt/ramdisk/t22/ws22c`). The patches apply with `patch -p1` to that tree. They do not
+`<work>/t22/ws22c`). The patches apply with `patch -p1` to that tree. They do not
 touch the kernel or the system image.
 
 ## Why
@@ -30,8 +30,9 @@ does not have to be rebuilt.
 ```sh
 cd <tree>
 mkdir -p devices/poco-x3-pro/userland/share/fp-localstorage
-cp -a F10-patches/appex/LocalStorageFileProvider.appex \
-      devices/poco-x3-pro/userland/share/fp-localstorage/
+python3 F10-patches/make-appex.py \
+    <your unpacked iOS 16.5 root>/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex \
+    devices/poco-x3-pro/userland/share/fp-localstorage/LocalStorageFileProvider.appex
 
 patch -p1 < F10-patches/0001-userland-build-F10-install-LocalStorage-appex.patch
 patch -p1 < F10-patches/0002-init-F10-bind-LocalStorage-appex.patch
@@ -55,7 +56,9 @@ NSExtension.NSExtensionAttributes`, `record: appex NSExtension.NSExtensionAttrib
 
 ## Payload
 
-`appex/LocalStorageFileProvider.appex/Info.plist` is the original iOS 16.5 plist plus:
+The appex is Apple's and is not in this repository. `make-appex.py` makes it on your machine from the
+system image you unpacked yourself: it copies the bundle's three plists (`Info.plist`,
+`InfoPlist.loctable`, `_CodeSignature/CodeResources`) and adds to `Info.plist`:
 
 ```xml
 <key>NSExtensionAttributes</key>
