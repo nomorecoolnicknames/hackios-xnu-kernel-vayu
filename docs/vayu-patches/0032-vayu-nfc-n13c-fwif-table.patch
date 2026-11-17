@@ -4,7 +4,7 @@ Why: TEST 152455 (hwbyte 0x06, 2F 19 -> 0x0015) logged "phLibNfc_MwFwCompatibili
 libNFC_Comet (system-test22 dyld subcache .33): phLibNfc_GetNfccFeatures 0x1f4592adc maps hw 6..8 to ctx[0xaf8],
 and 0x1f458f1ec expects version 1 for it (N13 had 0x22, which belongs to hw 0xa2..0xa4).
 Default changes: the 2F 19 answer follows the hw byte shown to nfcd; vayu_nfc_fwif=0x15 restores N13b.
-Built 2026-11-02 -> /mnt/ramdisk/nfc-out/kernel-n13c.bin sha256 756064a31681e7e2d612708776f35490c02d3e2ef28d24f079633921c26c45c1. Not run on hardware.
+Built 2026-11-02 -> <work>/nfc-out/kernel-n13c.bin sha256 756064a31681e7e2d612708776f35490c02d3e2ef28d24f079633921c26c45c1. Not run on hardware.
 
 --- a/xnu/files/iokit/Kernel/MiniAppleStockholm.cpp	2026-11-02 02:14:40.347678251 +0300
 +++ b/xnu/files/iokit/Kernel/MiniAppleStockholm.cpp	2026-11-02 02:18:07.230574257 +0300

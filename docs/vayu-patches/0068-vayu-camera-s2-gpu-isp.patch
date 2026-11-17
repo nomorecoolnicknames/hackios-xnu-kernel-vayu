@@ -32,7 +32,7 @@ What it adds:
   tools/cam_gpu_host.c (the same shaders through Mesa's EGL on the host, held to the C reference
   and to isp_render_nv12()).
 
-Host protocol (2026-11-02, no phone, no gunwest; Mesa 22.3.6 llvmpipe, EGL surfaceless, GL ES 3.2;
+Host protocol (2026-11-02, no phone; Mesa 22.3.6 llvmpipe, EGL surfaceless, GL ES 3.2;
 frame 1920x1080 made up as above; the tuning is fw-poco-x3-pro/camera-imx582.isp):
 - shaders against the C reference of their own arithmetic: Y 50.18 dB, UV 56.02 dB (detail),
   50.29/56.70 (smooth), 51.04/56.11 (sigma 1.5, unsharp 0.3), 50.98/56.63 (420v).

@@ -1,6 +1,6 @@
 Subject: [PATCH] vayu data2: IPA pipe-count preflight, uC state at three points, INIT after INDICATION_REGISTER + probe + retries
 
-Base: /mnt/ramdisk/ds-data with 0044 applied (vayu-test26 d15caf0 + 0044). Applies with -p1.
+Base: <work>/ds-data with 0044 applied (vayu-test26 d15caf0 + 0044). Applies with -p1.
 Kernel: mach-data3.bin sha256 f465e26c94ee29f65b50657d31e1fe01ea7b15e66f36c39b46ad27740fbc255b.
 
 Run 115037 facts this patch answers:
@@ -40,7 +40,7 @@ What:
 4. hakios.qmi.c/.h: vayu_qmi_trace=1 traces every datagram on the IPA handle (type, id, message,
    source node/port, first 8 bytes) and a late reply to a given-up transaction; the "nobody
    handles" line now names the source. This settles whether a reply arrives at all and from where.
-5. No change for the network: 115037 registered UMTS (MegaFon) at 274 s; the long SEARCHING was
+5. No change for the network: 115037 registered UMTS at 274 s; the long SEARCHING was
    the modem's scan, not a NAS failure, and nothing in the IPA path touches NAS.
 
 Expected next-run lines:

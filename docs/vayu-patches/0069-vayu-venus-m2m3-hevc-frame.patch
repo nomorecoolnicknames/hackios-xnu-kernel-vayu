@@ -1,6 +1,6 @@
 Subject: [PATCH] venus M2/M3: one NV12 frame to HEVC/H.264 on IRIS1 (vayu_venus=2)
 
-Base: /mnt/ramdisk/merge-all (line vayu-test26 + wifi/cell merge; bsd/conf/files:167 and
+Base: <work>/merge-all (line vayu-test26 + wifi/cell merge; bsd/conf/files:167 and
 hakios.input.c:346 already had M1, so those files are unchanged).  Patches the five files
 below with -p1 at the tree root.
 tools/venus-hfi/run.sh is a new file: chmod +x it (a plain diff carries no mode).

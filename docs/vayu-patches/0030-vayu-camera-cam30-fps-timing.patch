@@ -1,6 +1,6 @@
 Subject: [PATCH] vayu_camera cam30: vayu_camera_fps=N (0x0340 frame length) + per-100-frame SOF/IFE timing
 
-Base: kernel-vayu-cam 7dc5505 (xnu/files/bsd/dev/vayu_camera.c, step 6). Built on /mnt/ramdisk/w23/src
+Base: kernel-vayu-cam 7dc5505 (xnu/files/bsd/dev/vayu_camera.c, step 6). Built on <work>/w23/src
 (W24k state: BT+WiFi+UFS), whose camera was the pre-step-6 c8affda2 version: the three camera files of
 kernel-vayu-cam 7dc5505 (vayu_camera.c, sys/vayu_camera.h, redwood_camera.c) were copied over it first
 (w23's redwood_camera.c/vayu_camera.h were byte-equal to that branch's base 56902e7, so no merge).

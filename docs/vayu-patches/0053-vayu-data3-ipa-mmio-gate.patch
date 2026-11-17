@@ -1,6 +1,6 @@
 Subject: [PATCH] vayu data3: uC SRAM reads opt-in (default off), per-group IPA hardware-init announcements, pipe preflight robust to count/mask
 
-Base: /mnt/ramdisk/ds-data with 0044 + 0052 applied. Applies with -p1.
+Base: <work>/ds-data with 0044 + 0052 applied. Applies with -p1.
 Kernel: mach-data4.bin sha256 2272cec18cc23b992deb4f5d769de57489c316f972b9e1134bebfcd9a2568503.
 
 Run 123126 (mach-data3 = 0052) hung: the last line is

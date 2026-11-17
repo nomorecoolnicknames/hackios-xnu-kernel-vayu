@@ -6,7 +6,7 @@
  * "(disabled)", the extension is never launched and the owner's toggle does nothing. fp_enable (15:18) called
  * setEnabled:YES for three guessed domain identifiers and got Cocoa 4 ("The file doesn't exist") each time.
  *
- * Why (FACT, FileProviderDaemon 16.5, /tmp/opencode/fpd.txt):
+ * Why (FACT, a disassembly of FileProviderDaemon 16.5):
  *  - -[FPDXPCServicer setEnabled:forDomainIdentifier:providerIdentifier:completionHandler:] @0x1c3cc9968 hands the
  *    work to -[FPDProvider setEnabled:forDomainIdentifier:request:completionHandler:] @0x1c3cb2ce8, which looks the
  *    identifier up in the provider's domainsByID and answers NSFileNoSuchFileError (code 4) when it is absent

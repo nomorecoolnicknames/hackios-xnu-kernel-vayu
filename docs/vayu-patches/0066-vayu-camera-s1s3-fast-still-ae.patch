@@ -3,7 +3,7 @@ Subject: [PATCH] vayu camera S1/S3: the stills mode's first frame exposed from t
 Base (kernel): the shared merge-all tree, bsd/dev/vayu_camera.c sha256
 537024ea776cfb812aeb9fbf45184547a613dfc52314b8e7236cb225c6692b86 (vayu-test26 + cam31).
 Base (userland): work/hkd-ws20/userland/src/camera_device.c =
-/mnt/ramdisk/ds-ui/userland/src/camera_device.c, sha256
+<work>/ds-ui/userland/src/camera_device.c, sha256
 b3d92562bb61b3e04ec8e7b3bdba6f9c196850ca60a0d35b0b0d9e1017925f21 (the tree root-cam2 was
 rebuilt from).
 

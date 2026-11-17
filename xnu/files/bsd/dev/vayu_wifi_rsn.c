@@ -1,7 +1,7 @@
 /*
  * W25: the WPA2-PSK 4-way handshake of the vayu station (see sys/vayu_wifi_rsn.h).
  *
- * The PMK is read from /redwood/etc/vayu-wifi/gunwest.pmk (the payload image, md1) (boot-arg vayu_wifi_pmk_file=1), never
+ * The PMK is read from /redwood/etc/vayu-wifi/wifi.pmk (the payload image, md1) (boot-arg vayu_wifi_pmk_file=1), never
  * from a boot argument: boot arguments are logged by the loader, the kernel, launchd and panics.
  *
  * Flow: message 1/4 (pairwise, ack, no MIC) -> SNonce random, PTK = PRF-384(PMK, "Pairwise key
@@ -55,7 +55,7 @@
 #define WMI_CIPHER_TKIP         2U
 #define WMI_CIPHER_CCMP         4U
 
-#define PMK_PATH                "/redwood/etc/vayu-wifi/gunwest.pmk"
+#define PMK_PATH                "/redwood/etc/vayu-wifi/wifi.pmk"
 #define PMK_LEN                 32U
 #define PTK_LEN                 48U
 #define KCK_LEN                 16U

@@ -1,7 +1,7 @@
 /*
  * vayu cellular data-session control plane: DPM, WDA and WDS over the modem's QRTR.
  *
- * The NAS client proved registration first (0620: LTE MegaFon). This file starts an IPv4 data
+ * The NAS client proved registration first (0620: LTE). This file starts an IPv4 data
  * session only after NAS reports REGISTERED and only with boot-arg vayu_cell_data=1:
  *
  *   DPM Open Port        embedded port, vayu AP->modem endpoint 2, modem->AP endpoint 11

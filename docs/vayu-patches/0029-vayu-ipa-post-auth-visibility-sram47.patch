@@ -1,6 +1,6 @@
 Subject: [PATCH] vayu_ipa: see past AUTH_AND_RESET(15); IPA 4.1 SRAM at 0x1e47000 (opt-in)
 
-Base: /mnt/ramdisk/w23/src (Wi-Fi+BT+UFS tree, banner "n8n:src" 2026-11-01 20:53).
+Base: <work>/w23/src (Wi-Fi+BT+UFS tree, banner "<user>:src" 2026-11-01 20:53).
 Apply in an XNU tree: patch -p3 (paths xnu/files/bsd/dev/...).
 Kernel: mach-modem1.bin sha256 315615c8680b7a08d3f34df0216bb9353533965a10c413c59c091c9262253d8d.
 

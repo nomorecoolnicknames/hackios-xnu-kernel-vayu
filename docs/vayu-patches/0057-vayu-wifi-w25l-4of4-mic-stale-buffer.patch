@@ -1,7 +1,7 @@
 Subject: [PATCH] vayu_wifi W25l: the 4/4 MIC was computed over a stale 2/4 MIC (static frame buffer
  never cleared), so hostapd rejected every 4/4; answer a retransmitted 3/4 with a new 4/4
 
-Base: /mnt/ramdisk/ds-wifi2 as run 135346 (kernel mach-wifi25k, PEER_ASSOC/VHT fix + W25j sequence
+Base: <work>/ds-wifi2 as run 135346 (kernel mach-wifi25k, PEER_ASSOC/VHT fix + W25j sequence
 numbers + the 300 ms pause between the 4/4 and the key install).
 
 What 135346 shows: txdata #0 (2/4, seq 1) -> the AP sends 3/4 -> txdata #1 (4/4, seq 2, clear) with
@@ -30,7 +30,7 @@ Expected on the next run: "4/4 sent", no "eapol after the keys", no DEAUTH reaso
 "W25 S5 dhcp: OK offer ..." / "OK bound ..." and the ARP/ICMP probe lines; DHCP data frames should
 now complete with status 0 instead of 5.
 
-Artifact: /mnt/ramdisk/ds-wifi-out/mach-wifi25l.bin 16461312 B
+Artifact: <work>/ds-wifi-out/mach-wifi25l.bin 16461312 B
 sha256 dc7fdbd19f883c05057e40fcf364e31ed02b4be425b53e497da52bb17a2b8dda
 
 --- a/bsd/dev/vayu_wifi_rsn.c

@@ -2,7 +2,7 @@
 transport-encoding/speed), both /dev nodes and the kctl under the POSIX driver's default name,
 and the ufs-src LE fixes ported into the test26 line (lelegacy / randaddr / leinit / leanswer,
 LE command log, io-thread idle backoff).
-Base: hackios-vayu branch vayu-test26 (d15caf0) + 0032 (N13c), tree /mnt/ramdisk/n13c/src.
+Base: hackios-vayu branch vayu-test26 (d15caf0) + 0032 (N13c), tree <work>/n13c/src.
 Why: without an IOService named marconi-bt/bluetooth with local-mac-address, bluetoothd 16.5 logs
 "Unable to match bluetooth service in device tree" -> "Not a valid MAC address (all 00s)" ->
 "No bluetooth on this device" and Settings shows no radio (run 2026-11-01, another kernel).
@@ -11,7 +11,7 @@ features 12/13 hidden in 0x2003, legacy commands stay allowed) + vayu_bt_randadd
 Broadcom 0xfd48 random-address VSC becomes the real 0x2005). 300+ real LE Advertising Reports in
 the ufs-src line with those two.
 Apply: patch -p1 in a tree with xnu/files/.
-Built 2026-11-02 -> /mnt/ramdisk/ds-bt-out/mach-bt10.bin (16 356 256 B) sha256 e0dee9c8743f9c0fe9b94e8e26254131b98e6d5baa8267d4b50f3ab64e75015b. Not run on hardware.
+Built 2026-11-02 -> <work>/ds-bt-out/mach-bt10.bin (16 356 256 B) sha256 e0dee9c8743f9c0fe9b94e8e26254131b98e6d5baa8267d4b50f3ab64e75015b. Not run on hardware.
 --- a/xnu/files/bsd/dev/vayu_bt.c
 +++ b/xnu/files/bsd/dev/vayu_bt.c
 @@ -50,7 +50,7 @@

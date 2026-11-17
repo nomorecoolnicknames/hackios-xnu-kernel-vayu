@@ -1,7 +1,7 @@
 Subject: [PATCH] vayu_wifi W25j: a fresh 802.11 sequence number for every data frame (the 4/4 was
  being dropped as a duplicate), and the diagnostics that show it
 
-Base: /mnt/ramdisk/ds-wifi2 as run 132300 (kernel mach-wifi25i).  W25i got the whole 4-way through
+Base: <work>/ds-wifi2 as run 132300 (kernel mach-wifi25i).  W25i got the whole 4-way through
 -- 1/4 -> 2/4, 3/4 verified, 4/4 sent, keys installed, en0 up -- yet DHCP never got a lease and
 the AP deauthenticated us 3.3 s after its 3/4 with reason 15 (4WAY_HANDSHAKE_TIMEOUT).
 
@@ -35,7 +35,7 @@ Expected on the next run: txdata #0..#3 with seq 1,2,3,4 (not 0), no "eapol afte
 no DEAUTH reason 15, TX status histogram all 0, and then "W25 S5 dhcp: OK offer ..." and
 "OK bound ..." followed by the ARP/ICMP probe lines.
 
-Artifact: /mnt/ramdisk/ds-wifi-out/mach-wifi25j.bin 16461280 B
+Artifact: <work>/ds-wifi-out/mach-wifi25j.bin 16461280 B
 sha256 a1c2ce92295a3d0e9ca9d6b8b4675454bd0fb50b3ae9eb02228877b2de46eab3
 
 --- a/bsd/dev/vayu_wifi_scan.c

@@ -35,7 +35,7 @@
 
 **Рекомендуемый порядок**: `1. Venus M1 (железо) → M2/M3 (1 кадр HEVC) → M4 (VideoToolbox)` $\rightarrow$ `2a. IFE0 RDI0` $\rightarrow$ `2b. IFE0 PIX Bypass (NV12)` $\rightarrow$ `2c. IFE0 PIX модули + 3. CDM0` $\rightarrow$ `4. JPEG ENC` $\rightarrow$ `5. LRME`.
 
-## 3. ТЗ для исполнителя (DeepSeek) по первым двум блокам
+## 3. ТЗ для исполнителя по первым двум блокам
 
 ### ТЗ Блок 1 (`DS-HW-VENUS`): Venus / IRIS1 — от M1-пинга до кодирования NV12 $\rightarrow$ HEVC/H.264
 - **Входные файлы**: `bsd/dev/vayu_venus.c`, `bsd/sys/vayu_venus_hfi.h`, `work/hkd-ws20/tools/venus-hfi/hfi_test.c`, `userland/src/inject_media.c`, референс Linux `drivers/media/platform/qcom/venus/{hfi_cmds.c,hfi_msgs.c,venc.c}` и `VENUS_DESIGN.md:433-470`.

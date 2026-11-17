@@ -1,7 +1,7 @@
 Subject: [PATCH] vayu_wifi W25o: tell Apple80211 the station exists and has joined, and a DHCP
  fallback that configures en0 (vayu_wifi_dhcp=2)
 
-Base: /mnt/ramdisk/ds-wifi2 as run 145915 (kernel mach-wifi25n; TX slot fix, kernel DHCP off).
+Base: <work>/ds-wifi2 as run 145915 (kernel mach-wifi25n; TX slot fix, kernel DHCP off).
 
 Why iOS sent nothing in 145915 while it did DHCP in 143839: on the kernel side two things were
 missing, both seen in the logs of both runs -- "apple80211: the station says:" never printed a
@@ -31,7 +31,7 @@ request answering JOINED with the SSID/frequency/rssi, configd's DHCP on en0; if
 address: "no IPv4 on en0 after 30 s, fallback client on", "OK bound ... (fallback)", "OK address
 en0 ...", "OK default route via ...".
 
-Artifact: /mnt/ramdisk/ds-wifi-out/mach-wifi25o.bin 16461584 B
+Artifact: <work>/ds-wifi-out/mach-wifi25o.bin 16461584 B
 sha256 94f209535bb233751c22ae7ee5a7f694c9b8d1277d115bf6b1c3c9fc8268f790
 
 --- a/bsd/sys/hakios.net.h

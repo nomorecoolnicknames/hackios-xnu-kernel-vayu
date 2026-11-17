@@ -1,5 +1,5 @@
 /*
- * W23a: open-system AUTH + ASSOC to the owner's AP "Gunwest" after the W22 scan
+ * W23a: open-system AUTH + ASSOC to the test AP (target_ssid) after the W22 scan
  * (boot-arg vayu_wifi_join=1, only with vayu_wifi_scan=1).  No EAPOL, no keys:
  * 3 s of RX counting after the association, then DEAUTH (reason 3) and VDEV_STOP.
  * Sequence and WMI layouts from ios-flame phone/wifi/radio.c (commit 745c4341,
@@ -39,7 +39,7 @@
 #include <stdint.h>
 #include <sys/vayu_wifi_scan.h>
 
-/* boot-arg vayu_wifi_join: 0 off (W22b behaviour), 1 = auth + assoc to "Gunwest" after the scan. */
+/* boot-arg vayu_wifi_join: 0 off (W22b behaviour), 1 = auth + assoc to the test AP after the scan. */
 extern uint32_t vayu_sta_mode;
 
 /* Reads the boot-arg and clears the state; call after vayu_scan_reset(). */

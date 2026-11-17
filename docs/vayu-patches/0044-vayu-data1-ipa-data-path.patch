@@ -1,6 +1,6 @@
 Subject: [PATCH] vayu: test26 IPA data path - 0029 post-auth/SRAM/ttbrfix, 0041 QMI stages, GSI 4.1 channels + QMAP + en1
 
-Base: vayu-test26 d15caf0 (/mnt/ramdisk/n13c/src). Applies with -p1.
+Base: vayu-test26 d15caf0 (<work>/n13c/src). Applies with -p1.
 Kernel: mach-data1.bin sha256 271855dc69e96b48cc31fa2b56f6c37da0b9a224abc3554e817886664cdc041b.
 
 What:

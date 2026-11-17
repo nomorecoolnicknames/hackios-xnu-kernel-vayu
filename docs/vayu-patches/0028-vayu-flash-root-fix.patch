@@ -1,6 +1,6 @@
 vayu flash root: make the UFS devices before setconf (rd=ufs_<name>)
 
-Base: /mnt/ramdisk/comb-src (already has redwood_ufs_part_dev + setconf rd=ufs_ branch).
+Base: <work>/comb-src (already has redwood_ufs_part_dev + setconf rd=ufs_ branch).
 Cause (run 011901): setconf ran at 27.36 s, redwood_input_init -> redwood_ufs_init only after
 devfs_kernel_mount, i.e. after the root mount; part_dev failed, IOFindBSDRoot waited for
 BSD Name ufs_darwin and panicked at IOKitBSDInit.cpp:926.

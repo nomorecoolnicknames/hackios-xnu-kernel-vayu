@@ -1,7 +1,7 @@
 Subject: [PATCH] vayu_wifi W25p: 256 TX slots, a 32-frame queue when the pool is full (the "no slot"
  drops at the TCP window's peak), and the in-flight cap from the CE4 source ring
 
-Base: the merged W25o tree (/mnt/ramdisk/merge-all, 0060 applied; run 150920: 9987 frames sent,
+Base: the merged W25o tree (<work>/merge-all, 0060 applied; run 150920: 9987 frames sent,
 9987 completed, status 0:9959 1:25 2:3, slots back to 0 in flight, but "drops: no slot 290").
 
 Changes:
@@ -24,7 +24,7 @@ Expected: "no slot" stops growing (it now means "queued", and the queue drains w
 completion), the line reads "slots in flight 0..40, free 216..256 of 256 (ring cap 2046); queue 0",
 and no "dropped" on en0 at the peak.
 
-Artifact: /mnt/ramdisk/ds-wifi-out/mach-wifi25p.bin 16478720 B
+Artifact: <work>/ds-wifi-out/mach-wifi25p.bin 16478720 B
 sha256 09049378262ce44171603bd54660bc56591a39e832035db5086e387b7e29806c
 
 --- a/bsd/dev/vayu_wifi_scan.c

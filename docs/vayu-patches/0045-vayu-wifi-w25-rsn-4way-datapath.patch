@@ -1,9 +1,9 @@
 Subject: [PATCH] vayu_wifi W25: WPA2-PSK 4-way handshake, WMI key install, HTT data path, en0 (PMK from a file)
 
-Base: the W24G research source (/mnt/ramdisk/wifi-work2, 2026-11-02 04:59): the eight W22..W24
+Base: the W24G research source (<work>/wifi-work2, 2026-11-02 04:59): the eight W22..W24
 files (vayu_wifi_smmu/ce_wire/htc/ce/htc_connect/wmi/scan/sta.c + their sys/ headers) were copied
 into the test26 tree unchanged and this diff is relative to them.  bsd/conf/files is relative to
-the test26 base (/mnt/ramdisk/n13c/src, branch vayu-test26 d15caf0).
+the test26 base (<work>/n13c/src, branch vayu-test26 d15caf0).
 
 What W24 left: passive scan OK (54 beacons, 41 BSSIDs), auth status 0, assoc status 0 aid 2,
 HTT in-order RX delivering the EAPOL-Key 1/4 frames (len 131 = 24+8+99, decap 1, from DS), and a
@@ -11,12 +11,12 @@ panic in __doprnt from eapol_key() when the line still used %s (fixed in W24G).
 
 The PMK never travels in a boot argument (boot arguments are logged by the loader, the kernel,
 launchd's kern.bootargs and a panic buffer).  It is read from the root volume:
-/private/etc/vayu-wifi/gunwest.pmk, 64 hex digits and one line, mode 0600, when the handshake arms
+/private/etc/vayu-wifi/wifi.pmk, 64 hex digits and one line, mode 0600, when the handshake arms
 (vnode_lookup + vnode_getattr + vn_rdwr, as vayu_pas.c reads /fw), and only with the boot argument
 vayu_wifi_pmk_file=1.  The buffer is wiped after the parse; the only line is
 "vayu-wifi: W25 S0 pmk: OK file (len 32)" (or ERROR with no secret).  PMK/PTK/KCK/KEK/TK/GTK and
 nonces never reach the log.  To put the file into an existing root image:
-/tmp/opencode/ds-wifi-addfile.sh IN.apfs OUT.apfs gunwest.pmk /private/etc/vayu-wifi/gunwest.pmk
+<tools>/wifi-addfile.sh IN.apfs OUT.apfs wifi.pmk /private/etc/vayu-wifi/wifi.pmk
 (tools/apfs/apfs.py takes the image apart, tools/apfs/mkapfs.py lays it out again; the file is read
 back out and compared before it exits 0).
 
@@ -49,7 +49,7 @@ RFC 3394 and RFC 2202 vectors (after fixing the A^t half-word offset), and the a
 round-trips the 4 MiB work/hackios-vayu/userland/root.apfs (the added file reads back mode 0600
 uid 0).  Not yet run on the phone.
 
-Artifact: /mnt/ramdisk/ds-wifi-out/mach-wifi25b.bin 16458752 B
+Artifact: <work>/ds-wifi-out/mach-wifi25b.bin 16458752 B
 sha256 46081e3607d1a449878e7aac2a121c629b5455554caeb70bf5f06e80b4b258d4
 
 --- a/bsd/dev/vayu_wifi_smmu.c
@@ -699,7 +699,7 @@ sha256 46081e3607d1a449878e7aac2a121c629b5455554caeb70bf5f06e80b4b258d4
 +/*
 + * W25: the WPA2-PSK 4-way handshake of the vayu station (see sys/vayu_wifi_rsn.h).
 + *
-+ * The PMK is read from /private/etc/vayu-wifi/gunwest.pmk (boot-arg vayu_wifi_pmk_file=1), never
++ * The PMK is read from /private/etc/vayu-wifi/wifi.pmk (boot-arg vayu_wifi_pmk_file=1), never
 + * from a boot argument: boot arguments are logged by the loader, the kernel, launchd and panics.
 + *
 + * Flow: message 1/4 (pairwise, ack, no MIC) -> SNonce random, PTK = PRF-384(PMK, "Pairwise key
@@ -753,7 +753,7 @@ sha256 46081e3607d1a449878e7aac2a121c629b5455554caeb70bf5f06e80b4b258d4
 +#define WMI_CIPHER_TKIP         2U
 +#define WMI_CIPHER_CCMP         4U
 +
-+#define PMK_PATH                "/private/etc/vayu-wifi/gunwest.pmk"
++#define PMK_PATH                "/private/etc/vayu-wifi/wifi.pmk"
 +#define PMK_LEN                 32U
 +#define PTK_LEN                 48U
 +#define KCK_LEN                 16U
@@ -2164,7 +2164,7 @@ sha256 46081e3607d1a449878e7aac2a121c629b5455554caeb70bf5f06e80b4b258d4
 +/*
 + * W25: WPA2-PSK (RSN) 4-way handshake for the vayu station, and the data path that follows it.
 + *
-+ * The PMK comes from /private/etc/vayu-wifi/gunwest.pmk (64 hex digits, one line), read when the
++ * The PMK comes from /private/etc/vayu-wifi/wifi.pmk (64 hex digits, one line), read when the
 + * handshake arms and only with the boot argument vayu_wifi_pmk_file=1: boot arguments are logged by
 + * the loader, the kernel, launchd and a panic buffer, so no secret may travel in one.  The handshake is IEEE 802.11i / 802.1X-2004 with key descriptor
 + * version 2: PRF-SHA1 for the PTK, HMAC-SHA1-128 for the MIC, RFC 3394 AES key unwrap for the

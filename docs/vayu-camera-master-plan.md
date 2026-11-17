@@ -13,8 +13,8 @@
 
 ## 2 и 3. Поэтапный план S1–S6, данные Android vendor, риски, метрики и прогоны
 **Где лежат данные Android vendor (FACT):**
-- Извлечённые блобы: `/srv/forge/android/meizu-fleet/ios-xnu-lab/artifacts/vayu/shm-rescue-20261026/vayu-sens-tasks/vendor/ex/lib64/camera/` (`com.qti.sensormodule.vayu_{sunny,ofilm}_{imx582,s5k3t2}.bin`, `com.qti.tuned.vayu_{sunny,ofilm}_{imx582,s5k3t2}.bin`, `components/com.qti.stats.pdlibsony.so`); готовые `.tab`/`.isp`: `work/hkd-ws20/fw-poco-x3-pro/camera-{imx582,s5k3t2}.{tab,isp}`.
-- Видео-прошивка: `firmware/vayu/modem/venus.{mdt,b00..b04}` (sha256 `b52feb2e…`). Полный бэкап телефона: `/srv/forge/android/meizu-fleet/backups/vayu-11cc4e72-20261023/` (`super.img` → `/vendor/lib64/camera`, `persist.img` → калибровки).
+- Извлечённые с телефона блобы (`vendor/lib64/camera/`; в git не входят): (`com.qti.sensormodule.vayu_{sunny,ofilm}_{imx582,s5k3t2}.bin`, `com.qti.tuned.vayu_{sunny,ofilm}_{imx582,s5k3t2}.bin`, `components/com.qti.stats.pdlibsony.so`); готовые `.tab`/`.isp`: `work/hkd-ws20/fw-poco-x3-pro/camera-{imx582,s5k3t2}.{tab,isp}`.
+- Видео-прошивка: `firmware/vayu/modem/venus.{mdt,b00..b04}` (sha256 `b52feb2e…`). Полный бэкап телефона от 2026-10-23 (в git не входит): (`super.img` → `/vendor/lib64/camera`, `persist.img` → калибровки).
 
 | Этап | Цель и состав работ | Данные / файлы (vendor) | Главные риски | Гейт (строки лога / метрики) | Прогоны |
 |---|---|---|---|---|---|
@@ -25,13 +25,13 @@
 | **S5** | **Быстрый AF, AE/AWB, фронталка:** DW9800 аппаратный демпфер `SAC` (`0x06/0x07`) + параболический поиск по 3 точкам / PDAF (`pdlibsony`), тап-экспозиция + антифликер 50/60 Гц, S5K3T2 `bayer=2` GBRG (`res1` 2592×1940 селфи). | `com.qti.sensormodule.vayu_sunny_imx582.bin` (`actuatorData`, `pdaf`); OTP EEPROM (`0x50/0x52` I2C или `persist.img`). | Требуется поправка к правилу TLMM на запись `0x06/0x07` в DW9800 (`0x0c`) и чтение EEPROM. | `focus: the lens at … after ≤6 moves` (<250 мс до лока); `MD_AF_STATUS=4`; 0 «дыхания» фокуса; селфи 2592×1940 без мадженты/тинта. | **2–3** |
 | **S6** | **Калибровка качества «как на айфоне»:** тонмаппинг GTM/LTM, skin-tone AWB, сведение с MIUI/GCam по парным снимкам. | `com.qti.tuned.vayu_{sunny,ofilm}_{imx582,s5k3t2}.bin` + парные кадры с Android на этом же vayu. | Перешарп (гало) или «пластиковая» текстура при избытке `nr`. | Скрипт `tools/cam_iq_compare.py`: $\Delta E_{00} \le 4.0$, $\text{SSIM} \ge 0.88$, $\text{SNR} \ge 32\text{ дБ}$, 0 выбитых светов (`rolloff=1`). | **2** |
 
-## 4. Первые 3 задачи для исполнителей (DeepSeek) — ТЗ
+## 4. Первые 3 задачи для исполнителей — ТЗ
 
 ### Задача 1 (`DS-CAM-S1S3`): Верификация S1 (NEON) и мгновенный старт фото 12 МП без чёрных кадров (S3)
 - **Что сделать:**
   1. В `userland/src/camera_device.c` убедиться, что `cam_preview_half=1` и `cam_neon=1` дефолтные (исправить расхождение `hkd-ws20` vs `hackios-vayu`), и добавить в лог каждые 100 кадров разбивку времени: `isp_measure` / `render_piece` (`PrimaryScaler`, `SecondaryScaler`).
   2. В `bsd/dev/vayu_camera.c` (`cam_stream_up` при `mode == 1`, `res1` 4000×3000) убрать пропуск записи экспозиции (`!full`): пересчитывать текущую выдержку из `mode 0` (`exposure_lines * 13190 ns / 10903 ns`) и записывать `0x0202`/`0x0204` **до** `stream-on`, чтобы 1-й кадр `res1` сразу шёл с рабочей экспозицией (а не с вендорскими 11 строками = 0.12 мс), снизив дефолт `cam_still_settle` с `2` до `0`.
-- **Артефакты:** `/mnt/ramdisk/ds-cam-out/0063-camera-s1s3-fast-still-ae.patch`, ядро `mach-cam32.bin` (+ `.sha256`), библиотека `libhakios.media.dylib` (+ `.sha256`).
+- **Артефакты:** `<work>/ds-cam-out/0063-camera-s1s3-fast-still-ae.patch`, ядро `mach-cam32.bin` (+ `.sha256`), библиотека `libhakios.media.dylib` (+ `.sha256`).
 - **Критерий успеха:** чистая сборка; в прогоне `cam30: window … given ≥20.0 fps`, а при нажатии затвора — `frames of 4000x3000 from the kernel (the full stills mode)` с `green > 40 above black` на первом же кадре и доставкой фото за <150 мс.
 
 ### Задача 2 (`DS-CAM-VIDEO-SW`): Разблокировка записи видео в Camera.app через `VCPHEVC` (S4a)
@@ -39,7 +39,7 @@
   1. В `userland/src/inject_media.c` перехватить `VTCompressionSessionCreate` (или создание сессии в `BWVideoCompressorNode`) и логировать `codecType`, `width`, `height`, `encoderSpecification`.
   2. При создании видеосессии удалять из `encoderSpecification` ключи `RequireHardwareAcceleratedVideoEncoder` / `EnableHardwareAcceleratedVideoEncoder` и выставлять `kVTVideoEncoderSpecification_EncoderID = "com.apple.videotoolbox.videoencoder.hevc.vcp"`.
   3. Если граф просит `'avc1'` (H.264, для которого в iOS 16.5 нет SW-кодера, FACT `2026-10-24-vayu-camera.md:631`), принудительно переключать кодек соединения в `FigVideoCaptureConnectionConfiguration` на `'hvc1'` (`kCMVideoCodecType_HEVC`).
-- **Артефакты:** `/mnt/ramdisk/ds-cam-out/0064-camera-s4a-vcphevc-video.patch`, отчёт сверки адресов против `20F66` dyld cache, `libhakios.media.dylib` (+ `.sha256`).
+- **Артефакты:** `<work>/ds-cam-out/0064-camera-s4a-vcphevc-video.patch`, отчёт сверки адресов против `20F66` dyld cache, `libhakios.media.dylib` (+ `.sha256`).
 - **Критерий успеха:** при записи видео в логе `mediaserverd` печатается `VTCompressionSessionCreate: 1920x1080 hvc1 -> hevc.vcp (status 0)`, а файл `IMG_*.MOV` содержит атом `moov` и декодируемый поток `hvc1` (не повтор константы `00d00007`).
 
 ### Задача 3 (`DS-CAM-GPU-ISP`): Прототип шейдерного GPU-ISP на Adreno 640 через GL ES 3.0 (S2)
@@ -47,5 +47,5 @@
   1. Написать `userland/src/camera_isp_gpu.c` и автономную утилиту `tools/cam_gpu_bench.c`: offscreen `EAGLContext` (OpenGL ES 3.0 поверх `freedreno`), входной RAW10 буфер (`2400×1080`) как `GL_R8UI` текстура, uniform CCM `3×3`, 2D-текстура LSC `17×13` (`GL_RGBA16F`) и 1D LUT гаммы/тона (`4096`).
   2. В fragment-шейдере выполнить: распаковку 10 бит → вычитание `black` → билинейный LSC → дебайер Malvar 5×5 → AWB/CCM → LUT + highlight roll-off → 3×3 bilateral denoise + unsharp mask → MRT-вывод в плоскости `Y` (`GL_R8`) и `UV` (`GL_RG8`) NV12.
   3. Подключить в `camera_isp.c` за boot-arg `cam_gpu=1` (с автоматическим fallback на NEON при ошибке контекста).
-- **Артефакты:** `userland/src/camera_isp_gpu.c`, `tools/cam_gpu_bench` (arm64, `ldid -Cadhoc`), патч `/mnt/ramdisk/ds-cam-out/0065-camera-s2-gpu-isp.patch`, протокол host-теста на дампе реального кадра IMX582.
+- **Артефакты:** `userland/src/camera_isp_gpu.c`, `tools/cam_gpu_bench` (arm64, `ldid -Cadhoc`), патч `<work>/ds-cam-out/0065-camera-s2-gpu-isp.patch`, протокол host-теста на дампе реального кадра IMX582.
 - **Критерий успеха:** `cam_gpu_bench` выдаёт валидный NV12 с PSNR ≥38 дБ относительно полнопиксельного `isp_render_nv12`, время рендера 1920×1080 на Adreno 640 ≤8 мс/кадр (`given ≥29.5 fps` в Camera.app без GPU faults).

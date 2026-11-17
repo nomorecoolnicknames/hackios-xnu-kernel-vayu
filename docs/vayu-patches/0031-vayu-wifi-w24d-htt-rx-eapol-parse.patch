@@ -1,10 +1,10 @@
 Subject: [PATCH] vayu_wifi W24d: parse the HTT in-order rx msdu (desc + native wifi), EAPOL-Key diagnostics
 
-Base: W24K source (/mnt/ramdisk/w23/src at 2026-11-01 20:53, kernel mach-wifi-w24k.bin sha256
+Base: W24K source (<work>/w23/src at 2026-11-01 20:53, kernel mach-wifi-w24k.bin sha256
 ab440b26e2051c4f1cf1f900a18b134b09f8b87460bd74f05537abfc0066375c). W24a..W24k have NO patch file in
 this directory (0027, 0029, 0030 are missing); this diff is relative to W24K, not to W23b (0026).
 
-Evidence (gunwest ~/ws-qup-hwcg/logs/193128-run.log, W24C): the "00 00 00 00 43 00 30 82 ..." dumps
+Evidence (run log 193128, W24C): the "00 00 00 00 43 00 30 82 ..." dumps
 were taken at buf+0 (len 2048), i.e. the rx descriptor, not the payload:
   word1 attention 0x82300043 = MSDU_DONE|DIRECTED|DA/SA_IDX_INVALID|NON_QOS|LAST|FIRST (no errors)
   word4 mpdu_start 0x70NN0866: peer 0x66, FROM_DS, seq NN = 2,3,4,5 (the changing bytes 18-19), enc 7 = none

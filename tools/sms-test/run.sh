@@ -3,7 +3,7 @@
 # it is in the kernel tree.  Nothing of another project is needed: test_sms.c has
 # every PDU and QMI message written out by hand.
 #
-#   XNU_SRC=/mnt/ramdisk/ds-sms tools/sms-test/run.sh
+#   XNU_SRC=<xnu tree> tools/sms-test/run.sh
 #   CC=clang ... run.sh          another compiler
 #   SMS_TEST_BUILD=... run.sh    another build directory
 set -e
@@ -11,7 +11,7 @@ HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 K=${XNU_SRC:-$ROOT/xnu/files}
 SMS=${SMS_HEADER:-$K/bsd/sys/vayu_sms_qmi.h}
-B=${SMS_TEST_BUILD:-/tmp/opencode/sms-test-build}
+B=${SMS_TEST_BUILD:-${TMPDIR:-/tmp}/sms-test-build}
 CC=${CC:-cc}
 
 rm -rf "$B"

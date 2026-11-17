@@ -1,6 +1,6 @@
 Subject: [PATCH] vayu_wifi W25f: complete the PEER_ASSOC message (VHT_RATE_SET TLV had a header and no data)
 
-Base: /mnt/ramdisk/ds-wifi2 as run 112054 (kernel mach-wifi25e).  Only the WMI PEER_ASSOC
+Base: <work>/ds-wifi2 as run 112054 (kernel mach-wifi25e).  Only the WMI PEER_ASSOC
 command changes; the scan, auth, assoc and the handshake code are untouched.
 
 What the 112054 log shows, byte by byte (the 104-byte WMI message the HTC layer sent after
@@ -34,7 +34,7 @@ rates, vht_rate_set 16, flags 0x5 caps 0x11 phymode 0 aid 2", a ce3 dump whose l
 10 00 66 00 followed by 16 zeros, then "W25 S2 join: OK PEER_ASSOC ... + VDEV_UP sent" and
 "W25 S3 4way: OK waiting for message 1/4".
 
-Artifact: /mnt/ramdisk/ds-wifi-out/mach-wifi25f.bin 16461192 B
+Artifact: <work>/ds-wifi-out/mach-wifi25f.bin 16461192 B
 sha256 ab793ad6b475a6323ae7833f32a0a23b4fd4278c0f5aea9afecb3812bf22a013
 
 --- a/bsd/dev/vayu_wifi_sta.c

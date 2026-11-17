@@ -1,5 +1,5 @@
 /*
- * W23a: open-system AUTH + ASSOC to the owner's AP "Gunwest" after the W22 scan
+ * W23a: open-system AUTH + ASSOC to the test AP (target_ssid) after the W22 scan
  * (boot-arg vayu_wifi_join=1, only with vayu_wifi_scan=1).  Ported from ios-flame
  * phone/wifi/radio.c (commit 745c4341): w_channel, w_vdev_start, w_vdev_simple,
  * w_peer, w_ps_off, w_mgmt_tx, w_ap_rates, w_mgmt_hdr, w_send_auth,
@@ -7,8 +7,8 @@
  * and its completion event as Linux ath10k wmi-tlv.c / wmi-tlv.h
  * (wmi_tlv_mgmt_tx_cmd, WMI_TLV_MGMT_TX_COMPLETION_EVENTID 0x7006,
  * WMI_TLV_VDEV_STOPPED_EVENTID 0x5002).
- * Changes: synchronous and bounded; only the beacon with SSID "Gunwest" on
- * channel 64 whose BSSID ends in d3:a0 is a target (nothing is sent otherwise);
+ * Changes: synchronous and bounded; only the beacon with SSID target_ssid on
+ * channel TARGET_CHAN whose BSSID ends in TARGET_B4:TARGET_B5 is a target (nothing is sent otherwise);
  * no PEER_ASSOC / VDEV_UP / EAPOL / keys: after "assoc status 0" the RX is counted
  * for 3 s, then DEAUTH (reason 3), PEER_DELETE, VDEV_STOP.  BSSIDs masked in the log.
  *
@@ -112,11 +112,11 @@ extern uint32_t vayu_net_keep_secs(void);
 #define TX_LOG_MAX              16U
 #define RX_LOG_MAX              8U
 #define IE_MAX                  768U
-/* the only AP this code may talk to (the owner's network) */
+/* the only AP this code may talk to: the test network's SSID, channel and BSSID tail, set before a build */
 #define TARGET_CHAN             64U
-#define TARGET_B4               0xd3U
-#define TARGET_B5               0xa0U
-static const char target_ssid[] = "Gunwest";
+#define TARGET_B4               0x00U
+#define TARGET_B5               0x00U
+static const char target_ssid[] = "vayu-ap";
 #define TARGET_SSID_LEN         7U
 
 enum { ST_IDLE, ST_START, ST_AUTH, ST_ASSOC, ST_WINDOW, ST_DONE };

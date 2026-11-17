@@ -1,6 +1,6 @@
 Subject: [PATCH] vayu data4: hold the IPA clock across the SRAM writes - quick hardware-init steps, rail vote re-send, ACV core vote, IPA_VERSION liveness check
 
-Base: /mnt/ramdisk/ds-data with 0044 + 0052 + 0053 applied. Applies with -p1.
+Base: <work>/ds-data with 0044 + 0052 + 0053 applied. Applies with -p1.
 Kernel: mach-data5.bin sha256 7e154db8f25d2cf7f57487c28e8dec19b6e33df6f270f01af647e36d1de5dbc0.
 
 Run history of the same code point:

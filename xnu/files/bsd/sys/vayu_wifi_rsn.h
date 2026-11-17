@@ -1,7 +1,7 @@
 /*
  * W25: WPA2-PSK (RSN) 4-way handshake for the vayu station, and the data path that follows it.
  *
- * The PMK comes from /private/etc/vayu-wifi/gunwest.pmk (64 hex digits, one line), read when the
+ * The PMK comes from /private/etc/vayu-wifi/wifi.pmk (64 hex digits, one line), read when the
  * handshake arms and only with the boot argument vayu_wifi_pmk_file=1: boot arguments are logged by
  * the loader, the kernel, launchd and a panic buffer, so no secret may travel in one.  The handshake is IEEE 802.11i / 802.1X-2004 with key descriptor
  * version 2: PRF-SHA1 for the PTK, HMAC-SHA1-128 for the MIC, RFC 3394 AES key unwrap for the

@@ -65,8 +65,8 @@ static struct {
 	uint32_t xid;
 	/* W25n: addresses stay in the packet's byte order, as four bytes.  They used to be read
 	 * with memcpy into a u32 and written back the same way, but the requested-address option
-	 * (50) was built from a host-order value, so the REQUEST asked for 41.30.1.10 instead of
-	 * 10.1.30.41 and the server NAKed us.  Printing was swapped for the same reason. */
+	 * (50) was built from a host-order value, so the REQUEST asked for 41.0.0.10 instead of
+	 * 10.0.0.41 and the server NAKed us.  Printing was swapped for the same reason. */
 	uint8_t offered_ip[4], server_ip[4], lease_ip[4], mask[4], router[4], dns[4];
 	uint32_t dhcp_seen;
 	uint64_t next_send_ms, deadline_ms;
