@@ -89,6 +89,7 @@ static int      psci_smp_stop_owner = -1;       /* the processor that began the 
 static bool     psci_smp_boot_wanted;           /* it was not the boot processor: that one is to finish */
 static bool     psci_smp_boot_busy;             /* ... and has begun to */
 static bool     psci_smp_stopping;              /* every other core switches itself off */
+static bool     psci_smp_quiesced;              /* no other core will execute kernel work */
 
 static int64_t
 psci_call(uint64_t function, uint64_t arg1, uint64_t arg2, uint64_t arg3)
@@ -286,6 +287,12 @@ psci_smp_stop_rest(void)
 	__builtin_arm_sev();
 }
 
+boolean_t
+psci_smp_is_quiesced(void)
+{
+	return psci_smp_quiesced && cpu_number() == master_cpu;
+}
+
 /*
  * The system is going back to the boot loader (loader_return()). Returns on the boot processor
  * only, once the other cores are off -- or have been given up on. On any other processor it
@@ -299,6 +306,7 @@ psci_smp_stop_others(void)
 	uint64_t now, deadline;
 
 	if (psci_smp_started == 0) {
+		psci_smp_quiesced = true;
 		return;                 /* there is only this one */
 	}
 	__builtin_arm_wsr("DAIFSet", DAIFSC_ALL);
@@ -363,6 +371,14 @@ psci_smp_stop_others(void)
 			psci_smp_note(" did not stop: it is left running\n", cpu);
 		}
 	}
+	/* OFF is published only after a CPU abandons kernel work, even if firmware refuses CPU_OFF. */
+	for (int cpu = 0; cpu <= max_cpu; cpu++) {
+		if (cpu != me && (psci_smp_started & (1u << cpu)) &&
+		    os_atomic_load(&psci_smp_cpu_stage[cpu], acquire) != PSCI_SMP_CPU_OFF) {
+			return;
+		}
+	}
+	psci_smp_quiesced = true;
 }
 
 /*

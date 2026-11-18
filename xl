@@ -1,6 +1,11 @@
 #!/bin/bash
 # xl — drive the XNU loader on the phone over USB (fastboot protocol).
 #
+# rev 2 (05.11, after the d-1081a run): the numbers of a usbctl answer ("code len flags",
+# "total len next last", "agent") come from "getvar uctl" -- the fastboot client prints only
+# "OKAY [ t ]" for an oem command and never the text after OKAY, which is why rev 1 saw no
+# output and fetched nothing.  "touch" takes an optional hold in ms.
+#
 #   xl enter            get the phone into the resident loader (from Android or stock fastboot)
 #   xl run [N]          upload the current kernel, run it (optionally stop at checkpoint N), fetch the log
 #   xl ramdisk [FILE]   upload the big system image (default userland/system.apfs) once; it stays in
@@ -14,6 +19,18 @@
 #                       seconds of what iOS played) and make a WAV file of it (default logs/sound.wav)
 #   xl camera [P]       fetch the frames the last run's camera left (cam=3 and up among XL_CMDLINE) and make
 #                       pictures of them (P-0.png, ...; default prefix logs/camera)
+#   xl touch X Y [MS]   tap the panel at X,Y (panel pixels, 1080x2400) for MS milliseconds
+#                       (default 80: down, a sample at the same place, up)
+#   xl swipe X1 Y1 X2 Y2 [MS]   drag from one point to the other (MS, default 300)
+#   xl key home|power|volup|voldown
+#                       "home" is the home gesture (a swipe up from the bottom edge), the others
+#                       are the hardware buttons
+#   xl sh 'COMMAND'     run a shell command in iOS as root during a run (/redwood/bin/usbctld),
+#                       print its output, exit with its status; at most 500 bytes
+#   xl pull PATH [OUT]  fetch a file from iOS (32 MB at most; "-" for stdout, the default is
+#                       logs/<name>); during a run
+#   xl uctl             what the kernel's usbctl channel and its agent say they are ("1" = the
+#                       agent has /dev/vayu-ctl open)
 #   xl selftest         exercise only the kernel->loader return path
 #   xl log              fetch the loader's current log; during a run, the kernel's log so far as well
 #   xl stop             end the run in progress now (the kernel returns as when its time is up)
@@ -56,8 +73,17 @@ mkdir -p logs
 # outside all of them.
 PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone
 
-# one fastboot at a time (a run in one terminal, "xl screenshot" in another): each takes the lock for itself
-fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
+# one fastboot at a time (a run in one terminal, "xl screenshot" in another): each takes the lock
+# for itself.  vctl_seq holds the same lock across an "oem" and its "getvar uctl"/"get_staged",
+# and sets FB_LOCK_HELD so the calls inside do not take it again.
+FB_LOCK_HELD=
+fb() {
+	if [ -n "$FB_LOCK_HELD" ]; then
+		timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1
+	else
+		flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1
+	fi
+}
 # does the loader answer while its kernel runs (0.5 and later)? an older one answers only when the run is over
 live_loader() { fb getvar version | grep -Eq 'version: (0\.([5-9]|[1-9][0-9])|[1-9][0-9]*\.[0-9]+)'; }
 in_fastboot() { fastboot devices 2>/dev/null | grep -q fastboot; }
@@ -266,6 +292,226 @@ with open(out, 'wb') as f:
 PY
 }
 
+# ---------------------------------------------------------------------------------------------
+# usbctl: the phone's screen and its shell while iOS runs.
+#
+# The loader keeps the USB controller during a run (that is why "xl screenshot" works then), so
+# these take the same channel: "oem touch|swipe|key|sh|pull" is answered by the loader, which
+# hands the work to the kernel (bsd/dev/vayu_ctl.c) and to /redwood/bin/usbctld.  The touch
+# coordinates are the panel's, 1080x2400 -- the numbers /redwood/bin/touch takes; the kernel maps
+# them to the picture the way its own touch driver does.  One command at a time.
+#
+# The answers' bytes come back the way the log does: the command stages them and "fastboot
+# get_staged" fetches them.
+
+# "OKAY <numbers>" -> the numbers; "FAIL <reason>" -> the reason on stderr and status 1.
+# (The fastboot client prints only "OKAY [ time ]" for an oem command: the text after OKAY --
+# the numbers below -- never reaches its stdout.  Since loader 2.4 the same numbers are kept
+# in the loader and "getvar uctl" hands them back; the oem reply is only the success/failure.)
+vctl_fail() { # vctl_fail <what> <fastboot output>
+	local what=$1 out=$2 reason
+
+	reason=$(printf '%s\n' "$out" | sed -n "s/.*FAILED (remote: *'\\([^']*\\)').*/\\1/p" | tail -1)
+	[ -n "$reason" ] || reason=$(printf '%s\n' "$out" | sed -n 's/.*FAILED (remote: *\\(.*\\))/\\1/p' | tail -1)
+	[ -n "$reason" ] || reason="the loader did not answer"
+	echo "xl: $what: $reason" >&2
+}
+
+# The numbers of the last usbctl answer, from the loader ("0 0 0" for a touch, "<code> <len>
+# <flags>" for sh, "<total> <len> <next> <last>" for pull, "0|1" for uctl).
+vctl_numbers() {
+	local out value
+
+	out=$(FB_TIMEOUT=15 fb getvar uctl)
+	value=$(printf '%s\n' "$out" | sed -n 's/^uctl: *//p' | tail -1)
+	if [ -z "$value" ]; then
+		echo "xl: the loader did not keep an answer (loader older than 2.4?)" >&2
+		return 1
+	fi
+	printf '%s\n' "$value"
+}
+
+# One usbctl command with the fastboot lock held from the "oem" through the last "get_staged":
+# the answer ("getvar uctl") belongs to the request just made, and another terminal's xl must
+# not take it between the two.  The lock is the one every fb() takes, so stop/log wait at most
+# one command, as before; FB_LOCK_HELD keeps the inner fb() calls from taking it again.
+vctl_seq() { # vctl_seq <what> <function> [args...]
+	local what=$1 rc
+
+	shift
+	exec 9>$PHONE.lock
+	if ! flock -w 90 9; then
+		echo "xl: $what: the phone stayed busy for 90 s" >&2
+		exec 9>&-
+		return 1
+	fi
+	FB_LOCK_HELD=1
+	"$@"
+	rc=$?
+	FB_LOCK_HELD=
+	flock -u 9
+	exec 9>&-
+	return $rc
+}
+
+vctl_touch_at() { # <x> <y> [ms]
+	local out numbers
+
+	out=$(FB_TIMEOUT=25 fb oem touch "$1" "$2" "${3:-80}") || true
+	case "$out" in *OKAY*) ;; *) vctl_fail touch "$out"; return 1 ;; esac
+	numbers=$(vctl_numbers) || return 1
+	[ -n "$numbers" ] || { echo "xl: touch: no answer" >&2; return 1; }
+	return 0
+}
+
+touch_cmd() {
+	[ $# -ge 2 ] || { echo "xl: usage: xl touch X Y [MS]   (panel pixels, 1080x2400)" >&2; return 2; }
+	enter || return 1
+	vctl_seq touch vctl_touch_at "$1" "$2" "${3:-80}"
+}
+
+vctl_swipe_at() { # <x1> <y1> <x2> <y2> [ms]
+	local out ms=${5:-300}
+
+	out=$(FB_TIMEOUT=$(( ms / 1000 + 25 )) fb oem swipe "$1" "$2" "$3" "$4" "$ms") || true
+	case "$out" in *OKAY*) ;; *) vctl_fail swipe "$out"; return 1 ;; esac
+	vctl_numbers >/dev/null || return 1
+	return 0
+}
+
+swipe_cmd() {
+	[ $# -ge 4 ] || { echo "xl: usage: xl swipe X1 Y1 X2 Y2 [MS]" >&2; return 2; }
+	enter || return 1
+	vctl_seq swipe vctl_swipe_at "$1" "$2" "$3" "$4" "${5:-300}"
+}
+
+vctl_key_press() { # <name>
+	local out
+
+	out=$(FB_TIMEOUT=25 fb oem key "$1") || true
+	case "$out" in *OKAY*) ;; *) vctl_fail key "$out"; return 1 ;; esac
+	vctl_numbers >/dev/null || return 1
+	return 0
+}
+
+key_cmd() {
+	case "$1" in
+	home|power|lock|volup|voldown) ;;
+	*) echo "xl: usage: xl key home|power|volup|voldown" >&2; return 2 ;;
+	esac
+	enter || return 1
+	vctl_seq key vctl_key_press "$1"
+}
+
+# The command runs in iOS as root; its output (stdout and stderr together, 64 KB at most) is
+# printed and its exit status is xl's.  124 is usbctld's own timeout (15 s), and its note is
+# the last line of the output.
+vctl_sh_run() { # <command>
+	local out numbers code len flags tmp rc=0
+
+	out=$(FB_TIMEOUT=40 fb oem sh "$1") || true
+	case "$out" in *OKAY*) ;; *) vctl_fail sh "$out"; return 1 ;; esac
+	numbers=$(vctl_numbers) || return 1
+	set -- $numbers
+	[ $# -ge 2 ] || { echo "xl: sh: the loader's answer is \"$numbers\"" >&2; return 1; }
+	code=$((16#$1)); len=$((16#$2)); flags=$((16#${3:-0}))
+	[ $((flags & 1)) = 1 ] && echo "xl: sh: the output was cut at 64 KB" >&2
+	tmp=$(mktemp)
+	if [ "$len" -gt 0 ]; then
+		FB_TIMEOUT=60 fb get_staged "$tmp" >/dev/null || {
+			echo "xl: sh: the output did not come back" >&2; rm -f "$tmp"; return 1; }
+		cat "$tmp"
+	fi
+	rm -f "$tmp"
+	[ "$code" = 124 ] && echo "xl: sh: the command timed out (usbctld's 15 s), status 124" >&2
+	return $((code & 255))
+}
+
+sh_cmd() {
+	local cmd=$1
+
+	if [ -z "$cmd" ]; then
+		echo "xl: usage: xl sh 'command'" >&2
+		return 2
+	fi
+	if [ ${#cmd} -gt 500 ]; then
+		echo "xl: sh: the command is ${#cmd} bytes; one fastboot command carries 500 (write a file and run it instead)" >&2
+		return 2
+	fi
+	enter || return 1
+	vctl_seq sh vctl_sh_run "$cmd"
+}
+
+# A file of iOS (32 MB at most) to this side.  Piece by piece: the kernel's window is four
+# megabytes and the loader stages one window per "get_staged".
+vctl_pull_to() { # <path> <out|-> <quiet>
+	local path=$1 out=$2 quiet=$3 off=0 total=0 len next last numbers tmp answer
+
+	tmp=$(mktemp)
+	while :; do
+		answer=$(FB_TIMEOUT=60 fb oem pull "$path" "$off") || true
+		case "$answer" in *OKAY*) ;; *) vctl_fail pull "$answer"; rm -f "$tmp"; return 1 ;; esac
+		numbers=$(vctl_numbers) || { rm -f "$tmp"; return 1; }
+		set -- $numbers
+		if [ $# -lt 4 ]; then
+			echo "xl: pull: the loader's answer is \"$numbers\"" >&2; rm -f "$tmp"; return 1
+		fi
+		total=$((16#$1)); len=$((16#$2)); next=$((16#$3)); last=$((16#$4))
+		if [ "$total" -gt $((32 * 1024 * 1024)) ]; then
+			echo "xl: pull: $path is $total bytes (32 MB at most)" >&2; rm -f "$tmp"; return 3
+		fi
+		if [ "$len" -gt 0 ]; then
+			FB_TIMEOUT=180 fb get_staged "$tmp" >/dev/null || {
+				echo "xl: pull: a piece of $path did not come back" >&2; rm -f "$tmp"; return 1; }
+			case "$out" in
+			-) cat "$tmp" ;;
+			*) cat "$tmp" >> "$out" ;;
+			esac
+		fi
+		[ "$last" = 1 ] && break
+		if [ "$next" -le "$off" ]; then
+			echo "xl: pull: no progress at byte $off" >&2; rm -f "$tmp"; return 1
+		fi
+		off=$next
+	done
+	rm -f "$tmp"
+	case "$out" in
+	-) echo "xl: pull: $path: $total bytes" >&2 ;;
+	*) echo "xl: pull: $path: $total bytes -> $out" ;;
+	esac
+}
+
+pull_cmd() {
+	local path=$1 out=${2:-} quiet=/dev/null
+
+	if [ -z "$path" ]; then
+		echo "xl: usage: xl pull PATH [OUT|-]" >&2
+		return 2
+	fi
+	case "$out" in
+	-) quiet=/dev/stderr ;;
+	"") out="logs/$(basename "$path")"; : > "$out" ;;
+	*) : > "$out" ;;
+	esac
+	enter >$quiet || return 1
+	vctl_seq pull vctl_pull_to "$path" "$out" "$quiet"
+}
+
+# Whether the loader has a usbctl kernel and whether usbctld is there ("1" / "0").
+vctl_uctl_status() {
+	local out numbers
+
+	out=$(FB_TIMEOUT=15 fb oem uctl) || true
+	case "$out" in *OKAY*) ;; *) vctl_fail uctl "$out"; return 1 ;; esac
+	numbers=$(vctl_numbers) || return 1
+	printf '%s\n' "$numbers"
+}
+
+uctl_cmd() {
+	enter || return 1
+	vctl_seq uctl vctl_uctl_status
+}
+
 # stop and reboot end a run. One that was started from another working copy is somebody else's work
 # (an agent's measurement, a long session): not ended from here unless XL_FORCE=1 says so.
 not_anothers_run() { # not_anothers_run <command>
@@ -278,7 +524,7 @@ not_anothers_run() { # not_anothers_run <command>
 # While a run is in progress the loader takes only what does not disturb the kernel: state, screenshot,
 # log, stop, reboot. Anything else would wait for nothing.
 case "$1" in
-""|run|selftest|state|screenshot|log|stop|reboot) ;;
+""|run|selftest|state|screenshot|log|stop|reboot|touch|swipe|key|sh|pull|uctl) ;;
 *)	if ! flock -n $PHONE.run true 2>/dev/null; then
 		echo "xl: a run is in progress: only state, screenshot, log, stop and reboot now" >&2; exit 1
 	fi ;;
@@ -287,6 +533,12 @@ esac
 case "$1" in
 enter) enter && echo "xl: loader is up" ;;
 screenshot) screenshot "$2" ;;
+touch) touch_cmd "$2" "$3" "$4" ;;
+swipe) swipe_cmd "$2" "$3" "$4" "$5" "$6" ;;
+key) key_cmd "$2" ;;
+sh) sh_cmd "$2" ;;
+pull) pull_cmd "$2" "$3" ;;
+uctl) uctl_cmd ;;
 recording) recording "$2" ;;
 camera) camera "$2" ;;
 sound) sound "$2" ;;

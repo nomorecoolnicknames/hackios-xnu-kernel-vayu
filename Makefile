@@ -19,6 +19,8 @@
 #   SECS=600             the session's length for make phone / make qemu
 #   JOBS=8               parallel jobs for the kernel build
 
+# xnu-env.sh is a bash file (BASH_SOURCE); make's own /bin/sh is dash on Debian and Ubuntu
+SHELL := /bin/bash
 DEVICE ?= poco-x5-pro
 JOBS ?= 8
 SECS ?= 600

@@ -100,10 +100,10 @@ static struct {
 } wlan;
 
 /*
- * vayu_wifi_smmu_ttbrfix=1: take the context's TTBR0 from the table pages after
- * wlan_tables() has allocated them.  Default 0 keeps the W15-A behaviour, where the
- * root was computed while wlan.tables was still 0, so TTBR0 held only the ASID
- * (runs 172514..151133: "root 0x4000000000000").
+ * vayu_wifi_smmu_ttbrfix: parsed for old command lines only. TTBR0 is now always taken from
+ * the table pages after wlan_tables() has allocated them; before, without the argument, the
+ * root was computed while wlan.tables was still 0, so TTBR0 held only the ASID (runs
+ * 172514..151133: "root 0x4000000000000").
  */
 static uint32_t wlan_ttbrfix;
 
@@ -259,18 +259,17 @@ wlan_on(void)
 {
 	uint32_t smr = SMMU_SMR(wlan.match), s2cr = SMMU_S2CR(wlan.match);
 	uint32_t sees = 1U << 31 | WLAN_STREAM_MASK << 16 | WLAN_STREAM;
-	uint64_t root = kvtophys(wlan.tables) | (uint64_t)wlan.context_id << 48;
+	uint64_t root, pa;
 
 	if (!wlan_tables()) return false;
-	if (wlan_ttbrfix != 0) {
-		root = kvtophys(wlan.tables) | (uint64_t)wlan.context_id << 48;
-		say("vayu-wifi: smmu: ttbrfix: TTBR0 %#llx (tables pa %#llx)\n",
-		    (unsigned long long)root, (unsigned long long)kvtophys(wlan.tables));
-		if ((root & PTE_ADDRESS) == 0) {
-			say("vayu-wifi: smmu: ttbrfix: tables PA is 0; context not programmed\n");
-			return false;
-		}
+	pa = kvtophys(wlan.tables);
+	if (pa == 0 || (pa & PTE_ADDRESS) != pa) {
+		say("vayu-wifi: smmu: tables pa %#llx is not a table address; context not programmed\n", (unsigned long long)pa);
+		return false;
 	}
+	root = pa | (uint64_t)wlan.context_id << 48;
+	say("vayu-wifi: smmu: TTBR0 %#llx (tables pa %#llx)%s\n", (unsigned long long)root, (unsigned long long)pa,
+	    wlan_ttbrfix != 0 ? " (vayu_wifi_smmu_ttbrfix: no longer needed)" : "");
 	wlan.changed = true;               /* from here rollback is meaningful */
 	wr(wlan.context + SMMU_CB_SCTLR, 0);
 	wr(wlan.second + SMMU_CBA2R(wlan.context_id), SMMU_CBA2R_64_BIT);

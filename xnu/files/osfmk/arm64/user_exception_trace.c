@@ -8,6 +8,9 @@
  * the cache with "ipsw dyld a2s"), any text a register points at (the
  * library crash helpers leave their message in one) and the return
  * addresses found by walking the frame pointers.
+ *
+ * systrace_log=1 (the lines in the loader's log too) is from another HakiOS port (APSL 2.0, as this file):
+ * Scion-Project/scion-kernel, branch main, commit 8042def0c06d.
  */
 
 #include <arm/thread.h>
@@ -18,6 +21,7 @@
 #include <kern/thread.h>
 #include <mach/exception_types.h>
 #include <mach/machine/thread_status.h>
+#include <stdarg.h>
 #include <string.h>
 #include <vm/vm_map.h>
 #include <vm/vm_shared_region.h>
@@ -27,6 +31,32 @@ extern char *proc_name_address(struct proc *p);
 void user_exception_trace(exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t count, thread_t thread);
 
 static TUNABLE(uint32_t, user_exception_trace_enabled, "systrace", 0);
+
+/*
+ * Boot-arg systrace_log=1 (Scion's 8042def0c): the usertrap:, userabort: and top: lines also go to the
+ * loader's log, which outlives a kernel that dies and is what a long run's live log is made of; the
+ * console's ring loses them to whatever user space says. 0, the default: the console only, as before.
+ */
+static TUNABLE(uint32_t, user_trace_to_loader, "systrace_log", 0);
+extern void loader_log_line(const char *line);
+extern int vsnprintf(char *, size_t, const char *, va_list) __printflike(3, 0);    /* (libkern; no osfmk header has it) */
+
+static void ut_say(const char *format, ...) __printflike(1, 2);
+
+static void
+ut_say(const char *format, ...)
+{
+	char line[512];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	printf("%s", line);
+	if (user_trace_to_loader) {
+		loader_log_line(line);
+	}
+}
 
 static bool
 plausible_user_address(uint64_t address)
@@ -64,7 +94,7 @@ user_exception_trace(exception_type_t exception, mach_exception_data_t code, mac
 	}
 	proc = get_bsdtask_info(task);
 
-	printf("usertrap: %s[%d] exception %d code 0x%llx 0x%llx: pc 0x%llx lr 0x%llx sp 0x%llx, shared cache slide 0x%x\n",
+	ut_say("usertrap: %s[%d] exception %d code 0x%llx 0x%llx: pc 0x%llx lr 0x%llx sp 0x%llx, shared cache slide 0x%x\n",
 	    proc ? proc_name_address(proc) : "?", proc ? proc_pid(proc) : -1, exception,
 	    count > 0 ? (unsigned long long)code[0] : 0, count > 1 ? (unsigned long long)code[1] : 0,
 	    (unsigned long long)get_saved_state_pc(state), (unsigned long long)get_saved_state_lr(state),
@@ -85,7 +115,7 @@ user_exception_trace(exception_type_t exception, mach_exception_data_t code, mac
 			printable = printable && text[c] >= 0x20 && text[c] < 0x7f;
 		}
 		if (printable) {
-			printf("usertrap:   x%u -> \"%s\"\n", message_registers[i], text);
+			ut_say("usertrap:   x%u -> \"%s\"\n", message_registers[i], text);
 		}
 	}
 
@@ -94,7 +124,7 @@ user_exception_trace(exception_type_t exception, mach_exception_data_t code, mac
 		if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
 			break;
 		}
-		printf("usertrap:   called from 0x%llx\n", (unsigned long long)frame[1]);
+		ut_say("usertrap:   called from 0x%llx\n", (unsigned long long)frame[1]);
 		if (frame[0] <= fp) {
 			break;
 		}
@@ -119,6 +149,8 @@ user_abort_trace(void)
 	vm_shared_region_t region;
 	uint64_t frame[2], fp;
 	uint32_t slide = 0;
+	char line[480];
+	int at;
 
 	if (task == kernel_task || state == NULL || !is_saved_state64(state)) {
 		return;
@@ -128,20 +160,21 @@ user_abort_trace(void)
 		slide = region->sr_slide;
 		vm_shared_region_deallocate(region);
 	}
-	printf("userabort: %s[%d] aborts, shared cache slide 0x%x; called from:", proc ? proc_name_address(proc) : "?",
-	    proc ? proc_pid(proc) : -1, slide);
+	/* (one line, said once: in the loader's log too with systrace_log=1) */
+	at = snprintf(line, sizeof(line), "userabort: %s[%d] aborts, shared cache slide 0x%x; called from:",
+	    proc ? proc_name_address(proc) : "?", proc ? proc_pid(proc) : -1, slide);
 	fp = (uint64_t)get_saved_state_fp(state);
-	for (int depth = 0; depth < 24 && plausible_user_address(fp) && (fp & 7) == 0; depth++) {
+	for (int depth = 0; depth < 24 && plausible_user_address(fp) && (fp & 7) == 0 && at < (int)sizeof(line) - 20; depth++) {
 		if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
 			break;
 		}
-		printf(" 0x%llx", (unsigned long long)frame[1]);
+		at += snprintf(line + at, sizeof(line) - at, " 0x%llx", (unsigned long long)frame[1]);
 		if (frame[0] <= fp) {
 			break;
 		}
 		fp = frame[0];
 	}
-	printf("\n");
+	ut_say("%s\n", line);
 }
 
 /*
@@ -337,7 +370,7 @@ ustacks_top(void)
 		busy += now[i].used;
 	}
 	absolutetime_to_nanoseconds(elapsed, &elapsed_ns);
-	printf("top: in the last %llu ms the processor was busy %llu%% of the time\n", elapsed_ns / NSEC_PER_MSEC,
+	ut_say("top: in the last %llu ms the processor was busy %llu%% of the time\n", elapsed_ns / NSEC_PER_MSEC,
 	    elapsed ? busy * 100 / elapsed : 0);
 	for (unsigned i = 0; i < count; i++) {
 		before[i].pid = now[i].pid;
@@ -356,7 +389,7 @@ ustacks_top(void)
 		if (now[most].used * 1000 / elapsed == 0) {
 			break;
 		}
-		printf("top:  %3llu.%llu%%  %s[%d]\n", now[most].used * 100 / elapsed, now[most].used * 1000 / elapsed % 10,
+		ut_say("top:  %3llu.%llu%%  %s[%d]\n", now[most].used * 100 / elapsed, now[most].used * 1000 / elapsed % 10,
 		    now[most].name, now[most].pid);
 		now[most].used = 0;
 	}

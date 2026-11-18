@@ -48,6 +48,11 @@ bool vayu_wifi_ce_programmed(void);
 /* Stop the rings if they were programmed; idempotent.  Never frees live DMA memory. */
 void vayu_wifi_ce_teardown(void);
 
+/* K29: after a PFR/early-crash the next ce_stage() runs on a new firmware
+ * instance.  Reset the CE state without touching a register (the block may be
+ * down), keep the pool and its SMMU leaves, and let the next stage reprogram. */
+void vayu_wifi_ce_reset(const char *why);
+
 /* The caller saw a PFR/crash after the CE stage: the WLAN block may be collapsed,
  * so teardown must not touch a CE register. */
 void vayu_wifi_ce_mark_block_down(void);

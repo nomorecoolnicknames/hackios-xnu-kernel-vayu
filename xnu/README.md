@@ -4,8 +4,14 @@ Our changes to XNU `xnu-8796.121.2` (the kernel of iOS 16.5, Darwin 22.5.0):
 
 - `hakios.patch`: changes to Apple's files;
 - `files/`: new files at their paths in the XNU tree;
+- `hfs/`: HFS Plus for the data volume (`bsd/hfs`, `bsd/hfs_encodings`): Apple's `hfs-627.100.6` is fetched
+  like XNU (`hfs/hfs.sh`, the files `core.list` and `encodings.list` name), `hfs/hfs.patch` is our change to it;
+  only `bsd/hfs/hfs_builtin.c` is ours and in `files/`;
 - `apply.sh`: fetches the sources from Apple's GitHub and lays all of this over them;
   `export.sh`: the reverse, run before committing.
+
+`XNU_URL=` and `HFS_URL=` take another clone that has the tags (`file:///path`), e.g. for a machine without
+GitHub.
 
 It builds on Linux with stock clang (no macOS, no Xcode) and on macOS with Xcode.
 
@@ -33,7 +39,7 @@ Things to know:
 - After changing kernel headers that the two external libraries see: `xnu-deps/setup.sh --rebuild-libs`.
 - Apple's DriverKit generator (`iig`) is closed; `xnu-deps/iig-impl/` holds stubs generated from
   the linker's undefined symbols (`xnu-deps/gen-iig-stubs.py`).
-- Edit `xnu-src/xnu-8796.121.2` directly (a git tree on branch `redwood`); `xnu/export.sh`
+- Edit `xnu-src/xnu-8796.121.2` directly (a git tree on branch `hakios`); `xnu/export.sh`
   regenerates the patch and `files/` from the whole tree, so bring the tree up to the current patch
   first if somebody else changed the kernel meanwhile.
 
@@ -56,6 +62,8 @@ Things to know:
 | `bsd/dev/hakios.audio.c`, `hakios.adsp.c`, `hakios.speaker.c`, `hakios.mic.c` | sound through the audio DSP; the battery comes through it too |
 | `bsd/dev/hakios.haptic.c`, `hakios.camera.c`, `hakios.ufs.c` | the vibration motor, the cameras, the UFS storage |
 | `bsd/pthread/pthread_kext_static.c` | the pthread kext linked into the kernel |
+| `bsd/dev/vayu_*.c`, `bsd/sys/vayu_*.h` | the POCO X3 Pro's own drivers (SM8150): display, touch, buttons, power, clocks, the modem and cellular, Wi-Fi (WCN3990), Bluetooth, GNSS, audio, cameras, NFC, USB networking |
+| `bsd/hfs/hfs_builtin.c` (and Apple's HFS Plus, fetched: `hfs/`) | HFS Plus built in, for `/private/var` on the flash |
 
 The patch also fixes what keeps open XNU from building and running outside Apple: the makefiles
 on Linux, the `BCM2837` configuration it is based on, bugs in abandoned code.

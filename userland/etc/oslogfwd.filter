@@ -1,0 +1,19 @@
+# /redwood/etc/oslogfwd.filter -- what oslogfwd forwards to /dev/console.
+#
+# One process name per line.  A leading '#' is a comment; blank lines are skipped;
+# a trailing '*' makes the name a prefix; "all" (or "*") means no process filter.
+# The name is matched against the event's process name and against the basename of
+# its path, case-insensitively, so "CommCenter" matches both "CommCenter" and
+# "/System/Library/Frameworks/CoreTelephony.framework/Support/CommCenter".
+#
+# The boot-arg oslog_proc=a,b and the environment variables OSLOGFWD_FILTER (a list)
+# and OSLOGFWD_FILTER_FILE (another path) override this file.  The level filter is
+# Default+Error+Fault; oslog_levels=default,info,debug,error,fault or OSLOGFWD_LEVELS
+# changes it.
+CommCenter
+nfcd
+fileproviderd
+mediaserverd
+bluetoothd
+locationd
+SpringBoard

@@ -24,6 +24,10 @@ int vayu_net_start(const uint8_t *mac, const uint8_t *bssid, const uint8_t *ssid
     uint32_t chan, int32_t rssi);
 void vayu_net_stop(void);
 bool vayu_net_linked(void);
+/* W25r: which events the boot join tells Apple80211 (vayu_wifi_a80211 1: join-done and link,
+ * 2: link only, 0: none).  A join iOS asked for is answered by bsd/dev/hakios.sta.c itself. */
+bool vayu_net_a80211_join_done(void);
+bool vayu_net_a80211_link(void);
 /* boot-arg vayu_wifi_keep=1: stay joined after the handshake instead of tearing down. */
 bool vayu_net_keep(void);
 /* W25p: frames the radio's TX pool had no room for wait here; the completion path calls the kick. */

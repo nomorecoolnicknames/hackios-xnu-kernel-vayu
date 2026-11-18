@@ -21,6 +21,9 @@
  *                         started with wifi=1, wait for the radio's interface (en0) to appear,
  *                         and ask for it to be configured by DHCP ("dhcp en0") only if configd
  *                         has no network service of its own for it; else nothing
+ *   wifi-net              the phone's Wi-Fi step: wait for en0, let Apple's addNetworkInterface
+ *                         make the network service configd never made for it (IPv4 DHCP), and
+ *                         fall back to "dhcp en0" if no address comes; prints the store keys
  *   watch SECONDS         for so long, say when configd's store changes what tells an interface's
  *                         state: State:/Network/Service/.../IPv4, State:/Network/Interface/en0/...,
  *                         State:/Network/Global/IPv4 (the key, whether it is there, the names in it;
@@ -63,9 +66,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <spawn.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 /* not in the iOS SDK's headers, in the libraries all the same */
 extern mach_port_t bootstrap_port;
@@ -493,6 +500,122 @@ waitdns(double limit)
 	printf("net_test: waitdns: %s after %.1f s\n", [[servers componentsJoinedByString:@" "] UTF8String], seconds() - start);
 }
 
+/* ---- wifi-net --------------------------------------------------------------------------------------- */
+
+/* State:/Network/Global/IPv4 PrimaryInterface == name: what configd publishes for the service whose
+ * address became the system's, and the key wifid's isMainIf is read from. */
+static bool
+primary_is(const char *name)
+{
+	SCDynamicStoreRef session = SCDynamicStoreCreate(NULL, CFSTR("net_test"), NULL, NULL);
+	NSDictionary *value = session != NULL ?
+	    CFBridgingRelease(SCDynamicStoreCopyValue(session, CFSTR("State:/Network/Global/IPv4"))) : nil;
+	bool ok = [value isKindOfClass:NSDictionary.class] &&
+	    [value[@"PrimaryInterface"] isEqual:[NSString stringWithUTF8String:name]];
+
+	if (session != NULL) {
+		CFRelease(session);
+	}
+	return ok;
+}
+
+/* A network service in configd's settings whose Interface names this device (the key wifid
+ * reads: Setup:/Network/Service/<id>/Interface DeviceName). */
+static bool
+has_service(const char *name)
+{
+	SCDynamicStoreRef session = SCDynamicStoreCreate(NULL, CFSTR("net_test"), NULL, NULL);
+	NSArray *keys = session != NULL ?
+	    CFBridgingRelease(SCDynamicStoreCopyKeyList(session, CFSTR("Setup:/Network/Service/[^/]+/Interface"))) : nil;
+	bool found = false;
+
+	for (NSString *key in keys) {
+		NSDictionary *value = CFBridgingRelease(SCDynamicStoreCopyValue(session, (__bridge CFStringRef)key));
+
+		found |= [value isKindOfClass:NSDictionary.class] &&
+		    [value[@"DeviceName"] isEqual:[NSString stringWithUTF8String:name]];
+	}
+	if (session != NULL) {
+		CFRelease(session);
+	}
+	return found;
+}
+
+/*
+ * The radio's interface, which configd has no network service for.
+ *
+ * configd builds the list of services once, when it first opens preferences.plist.  en0 appears
+ * about 23 s later than configd on this phone (the radio's firmware, calibration and MAC come
+ * first, W25r), so there is no service for it, IPConfiguration never runs DHCP, and
+ * State:/Network/Global/IPv4 and Global/DNS never appear -- wifid's isMainIf stays false and
+ * Settings never ticks (see REPORT.md of ds-wifi5).  Nothing adds a service later: the job that
+ * does that on iOS (com.apple.usb.networking.addNetworkInterface) is not in this image's
+ * LaunchDaemons -- init grafts /redwood/LaunchDaemons over the system's -- and its -c list is
+ * USB Ethernet controllers.
+ *
+ * Apple's /usr/sbin/addNetworkInterface is that same tool with a BSD name: it finds the
+ * IONetworkInterface object (iokit/Kernel/hakios.wlan.cpp: IOInterfaceName/BSD Name en0),
+ * creates a NetworkService (SCNetworkServiceCreate + EstablishDefaultConfiguration = IPv4 DHCP),
+ * enables it, adds it to the current set and commits preferences.plist.  It carries the
+ * entitlement com.apple.SystemConfiguration.SCPreferences-write-access, which this program has
+ * not.  If no address comes in a minute, the plugin's own call (dhcp) is the fallback -- the
+ * same one the USB Ethernet step uses.
+ */
+static void
+wifi_net(void)
+{
+	double start = seconds();
+	char *const args[] = { (char *)"addNetworkInterface", (char *)"-i", (char *)"en0", NULL };
+	pid_t child = 0;
+	int status = 0, error;
+
+	while (if_nametoindex("en0") == 0 && seconds() - start < 300) {
+		usleep(500000);
+	}
+	if (if_nametoindex("en0") == 0) {
+		printf("net_test: wifi-net: no en0 after %.0f s\n", seconds() - start);
+		return;
+	}
+	printf("net_test: wifi-net: en0 after %.1f s\n", seconds() - start);
+	usleep(1000000);                /* (HakiosWLAN is published right after the BSD interface) */
+
+	error = posix_spawn(&child, "/usr/sbin/addNetworkInterface", NULL, NULL, args, environ);
+	if (error != 0) {
+		printf("net_test: wifi-net: addNetworkInterface: %s\n", strerror(error));
+	} else if (waitpid(child, &status, 0) == child) {
+		printf("net_test: wifi-net: addNetworkInterface %s\n",
+		    WIFEXITED(status) && WEXITSTATUS(status) == 0 ? "done" : "failed");
+	}
+
+	/* The test is State:/Network/Global/IPv4 PrimaryInterface, not "en0 has an address": the
+	 * kernel's own fallback (vayu_wifi_dhcp=2) puts an address on en0 30 s after the link
+	 * without a service, and that must not count -- what wifid and mDNSResponder read is the
+	 * configd key. */
+	start = seconds();
+	while (!primary_is("en0") && seconds() - start < 60) {
+		usleep(250000);
+	}
+	if (!primary_is("en0")) {
+		if (has_service("en0")) {
+			printf("net_test: wifi-net: a service for en0 is there, no Global/IPv4 yet (link down?); "
+			    "waiting instead of a second DHCP\n");
+		} else {
+			printf("net_test: wifi-net: no service and no Global/IPv4 primary en0 after %.0f s: "
+			    "DHCP asked for\n", seconds() - start);
+			dhcp("en0");
+		}
+	}
+	start = seconds();
+	while (!primary_is("en0") && seconds() - start < 600) {
+		usleep(250000);
+	}
+	printf("net_test: wifi-net: %s after %.1f s\n", primary_is("en0") ? "Global/IPv4 primary en0" :
+	    "NO Global/IPv4 primary en0", seconds() - start);
+	show("en0", false);
+	waitdns(60);
+	store("State:/Network/(Service/.*/IPv4|Interface/en0/.*|Global/IPv4|Global/DNS)");
+}
+
 /* ---- watch ------------------------------------------------------------------------------------------ */
 
 static double watch_start;
@@ -646,6 +769,8 @@ main(int argc, char **argv)
 				usleep((useconds_t)(atof(argv[++i]) * 1e6));
 			} else if (strcmp(step, "wifi") == 0) {
 				wifi();
+			} else if (strcmp(step, "wifi-net") == 0) {
+				wifi_net();
 			} else if (strcmp(step, "watch") == 0 && i + 1 < argc) {
 				watch(atof(argv[++i]));
 			} else if (strcmp(step, "ensure") == 0 && i + 2 < argc) {

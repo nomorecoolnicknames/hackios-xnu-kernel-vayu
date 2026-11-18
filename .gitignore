@@ -34,6 +34,8 @@
 !/xnu-deps/
 !/prebuilt/
 !/wifi/
+!/hakios-metal/
+/hakios-metal/out/
 
 __pycache__/
 *~
@@ -57,6 +59,9 @@ __pycache__/
 !/userland/rc.*
 !/userland/com.hakios.*.plist
 !/userland/src/
+# the Metal plug-in waits for its origin's licence (THIRD_PARTY_LICENSES.md): a copy put back for one's own builds
+# stays out of the repository
+/userland/src/HakiosMetalCA.m
 !/userland/libmini/
 !/userland/var/
 
@@ -100,3 +105,10 @@ __pycache__/
 !/xnuloader/im4p.py
 !/xnuloader/mkidentity.sh
 /fw-*/
+
+# Sources recovered from the November vayu build patches.
+!/host/
+!/userland/etc/
+!/userland/libxpc.tbd
+!/userland/com.vayu.ctshim.plist
+!/userland/com.vayu.apphang.plist

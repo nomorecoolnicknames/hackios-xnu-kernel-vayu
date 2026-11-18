@@ -93,14 +93,27 @@ void vayu_apcs_ring(unsigned bit);      /* one bit of APCS IPC: never read-modif
 bool vayu_aop_send(const char *text);   /* a message to the always-on processor (QMP) */
 bool vayu_rpmh_vote(const char *const names[], unsigned count, uint32_t level); /* level 0: given back */
 uint32_t vayu_rpmh_address(const char *name);   /* cmd-db address of a resource id; 0: not there */
-bool vayu_rsc_tcs_lock(const char *who);  /* THE lock of TCS 0 of the apps RSC (0x18220000): every driver that
-                                           * writes that slot takes it (vayu_pas.c, vayu_wifi.c, vayu_bt.c,
-                                           * vayu_cpufreq.c, vayu_qup_spi.c, hakios.adsp.c, hakios.mpss.c);
-                                           * false: not taken -- on the way out (nobody to wait for), or the
-                                           * wait ran out: then vayu_rsc_tcs_gave_up() says which */
+/* The resource's level table from the boot loader's command database: its address in *address and
+ * up to max 16-bit levels in levels[]. Returns the number of levels, -1: no such resource. This is
+ * what an RPMh BCM state is measured against: a short table is an index table (the command holds a
+ * position), a long one is a value table (the command holds the value). */
+int vayu_rpmh_levels(const char *name, uint32_t *address, uint16_t *levels, unsigned max);
+/* The index-th bus-clock-manager resource of the command database, in table order: its 8-byte id
+ * (NUL-terminated into name[9]), address and level count. False: no such entry. */
+bool vayu_rpmh_bcm_name(unsigned index, char name[9], uint32_t *address, int *levels);
+/* THE lock of TCS 0 of the apps RSC (0x18220000): every driver that writes that slot takes it (vayu_pas.c,
+ * vayu_wifi.c, vayu_bt.c, vayu_cpufreq.c, vayu_qup_spi.c, hakios.adsp.c, hakios.mpss.c). Only HELD needs an unlock. */
+enum vayu_rsc_tcs_result {
+	VAYU_RSC_TCS_FAILED,     /* the wait ran out: leave the slot alone */
+	VAYU_RSC_TCS_HELD,
+	VAYU_RSC_TCS_SHUTDOWN,   /* not taken, and the caller goes on without it: the end of a run (or interrupts off) */
+};
+enum vayu_rsc_tcs_result vayu_rsc_tcs_lock(const char *who);
 void vayu_rsc_tcs_unlock(void);
-bool vayu_rsc_tcs_gave_up(void);
 bool vayu_rpmh_send(const uint32_t addresses[], const uint32_t values[], unsigned count, const char *who); /* raw RPMh active-only writes through TCS 0, waited; true: RPMh said done */
+/* The same write without the loader pause and without the two routine log lines: for a vote that
+ * has to sit right next to the register it protects, not seconds before it. */
+bool vayu_rpmh_send_now(const uint32_t addresses[], const uint32_t values[], unsigned count, const char *who);
 void vayu_pas_set_pause(uint32_t ms);   /* before each first-time write: time for the loader to note the log (default 2200) */
 /* TrustZone MEM_PROT_ASSIGN for a contiguous buffer: its pages are given to the modem's VMID 15
  * read/write while HLOS (3) keeps them read/write. 0 on success, or the SMC's error. */
@@ -205,16 +218,29 @@ bool vayu_qrtr_find(const struct vayu_qrtr *q, uint32_t service, uint32_t *node,
 
 /* q becomes one of the routers (up to four) behind the QMI helpers (hakios_qmi_set_transport); ports opened after
  * this belong to it. Our node, its ports and published services are shared by all attached routers; a datagram goes
- * through the router behind its destination node. */
+ * through the router behind its destination node. A port that is not published speaks to the one router that first
+ * used it; a published one (vayu_qrtr_publish) is reachable from every router, and its callbacks are serialized, so
+ * two peers that both ask the same server (the modem and the audio DSP asking the pd-mapper) are both answered. */
 void vayu_qrtr_attach(struct vayu_qrtr *q);
-/* q's ports closed (each published service withdrawn with DEL_SERVER); the QMI helpers' transport taken away with the last router. */
+/* The ports that speak through q closed (each published service withdrawn with DEL_SERVER; a published port serves
+ * every router, so only the last detach takes it down); the QMI helpers' transport taken away with the last router. */
 void vayu_qrtr_detach(struct vayu_qrtr *q);
 /* The four calls (open/send/lookup/close) on the attached router: for servers of our own as well. */
 extern const struct hakios_qrtr_ops vayu_qrtr_ops;
 /* The service is OURS at that port: NEW_SERVER to the peer now if HELLO was exchanged, and again after each later
- * HELLO; DEL_SERVER when the port is closed. 0 or an errno. At most 8 published services. */
+ * HELLO and for each NEW_LOOKUP that names it (Linux ns.c announce_servers()); DEL_SERVER when the port is closed.
+ * 0 or an errno. At most 8 published services. */
 int vayu_qrtr_publish(struct hakios_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance);
 uint32_t vayu_qrtr_port_number(const struct hakios_qrtr_port *port);  /* for the log; 0 if none */
+/*
+ * vayu_ipa_seq: make qmi_add_lookup() for `service` a NEW_LOOKUP control packet to every attached
+ * peer, as Linux's qmi_add_lookup() does through the QRTR name service. 0 (the default) keeps the
+ * old local-only lookup: the peer's HELLO announcements are matched here and nothing is sent.
+ * The reason: the modem's QMI service framework only calls a service's connect callback for a
+ * client the name service has seen ask for that service; the local-only lookup leaves the IPA
+ * server's client_handle NULL and 0x21 has no one to answer it. One service at a time (0x31 here).
+ */
+void vayu_qrtr_lookup_announce(uint32_t service);
 #endif
 
 #endif /* _SYS_VAYU_PAS_H_ */

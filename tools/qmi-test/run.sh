@@ -8,7 +8,7 @@
 set -e
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-K=$ROOT/xnu-src/xnu-8796.121.2                 # the kernel tree being worked in, or else the copies that are in git
+K=${XNU_SRC:-$ROOT/xnu-src/xnu-8796.121.2}      # the kernel tree being worked in (XNU_SRC), or else the copies that are in git
 [ -f "$K/bsd/dev/hakios.qmi.c" ] || K=$ROOT/xnu/files
 ATH=${ATH11K:-$ROOT/xnu-deps/build/ath11k/src/ath11k}
 B=$ROOT/xnu-deps/build/qmi-test

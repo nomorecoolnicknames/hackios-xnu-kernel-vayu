@@ -32,20 +32,28 @@
  * can answer "can this system process an image at all", which the camera and Photos both need.
  *
  *   usage: metal_test
+ *
+ * From another HakiOS port (MIT, as this file): telegdyd/ios-vayu, branch vayu-dev, commit 061e5a82d023 (its Metal tasks 8-11).
  */
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <Metal/Metal.h>
 #import <OpenGLES/EAGL.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#import <mach-o/dyld.h>
 #import <signal.h>
 #import <stdio.h>
 #import <stdlib.h>
 #import <spawn.h>
+#import <errno.h>
+#import <string.h>
+#import <sys/stat.h>
+#import <sys/sysctl.h>
 #import <sys/wait.h>
 #import <time.h>
 #import <unistd.h>
@@ -293,21 +301,125 @@ plugins(void)
 }
 
 /* Step 5, as a program sees it. */
+/* `metal_test app LIBRARY [BUNDLE]`: the .metallib task 9's program runs (metal_app.m) */
+int metal_app(id<MTLDevice> device, const char *library_path);
+int metal_astc(id<MTLDevice> device, const char *library_path);
+static const char *app_library;
+/* `metal_test layer LIBRARY [SECONDS [DIVISOR [BUNDLE]]]`: task 10's full-screen CAMetalLayer (metal_layer.m) */
+int metal_layer(id<MTLDevice> device, const char *library_path, double seconds, double divisor);
+void metal_layer_take_bootstrap(void);
+static double layer_seconds = 20, layer_divisor = 3;
+static int layer_mode;
+static int astc_mode;   /* task 11: `astc LIBRARY BUNDLE` on the bundle's device */
+
+/* a device made by hand, by `metal_test bundle PATH` (see the_bundles_device): nil for the system's own */
+static id<MTLDevice> given_device;
+
 static void
 the_device(void)
 {
-	id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+	id<MTLDevice> device = given_device != nil ? given_device : MTLCreateSystemDefaultDevice();
 
 	if (device == nil) {
 		printf("metal_test:   MTLCreateSystemDefaultDevice() = nil (and says nothing about why)\n");
 		return;
 	}
-	printf("metal_test:   MTLCreateSystemDefaultDevice() = \"%s\", class %s\n",
+	printf("metal_test:   %s = \"%s\", class %s\n", given_device != nil ? "the bundle's device" : "MTLCreateSystemDefaultDevice()",
 	    [[device name] UTF8String], class_getName([(id)device class]));
-	printf("metal_test:   registry id %llu, unified memory %d, max threads per group %lu, "
-	    "Apple family 1/4 %d/%d\n", (unsigned long long)[device registryID], (int)[device hasUnifiedMemory],
-	    (unsigned long)[device maxThreadsPerThreadgroup].width,
-	    (int)[device supportsFamily:MTLGPUFamilyApple1], (int)[device supportsFamily:MTLGPUFamilyApple4]);
+	{
+		MTLSize t = [device maxThreadsPerThreadgroup];
+
+		printf("metal_test:   registry id %llu, unified memory %d\n", (unsigned long long)[device registryID],
+		    (int)[device hasUnifiedMemory]);
+		printf("metal_test:   limits: max buffer %llu bytes, threads per group %lux%lux%lu, threadgroup memory %lu bytes, "
+		    "sample counts", (unsigned long long)[device maxBufferLength], (unsigned long)t.width, (unsigned long)t.height,
+		    (unsigned long)t.depth, (unsigned long)[device maxThreadgroupMemoryLength]);
+		for (NSUInteger n = 1; n <= 8; n *= 2) {
+			if ([device supportsTextureSampleCount:n]) {
+				printf(" %lu", (unsigned long)n);
+			}
+		}
+		printf("\n");
+	}
+	{
+		static const struct { MTLGPUFamily family; const char *name; } families[] = {
+			{ MTLGPUFamilyCommon1, "Common1" }, { MTLGPUFamilyCommon2, "Common2" }, { MTLGPUFamilyCommon3, "Common3" },
+			{ MTLGPUFamilyApple1, "Apple1" }, { MTLGPUFamilyApple2, "Apple2" }, { MTLGPUFamilyApple3, "Apple3" },
+			{ MTLGPUFamilyApple4, "Apple4" }, { MTLGPUFamilyApple5, "Apple5" }, { MTLGPUFamilyApple6, "Apple6" },
+			{ MTLGPUFamilyApple7, "Apple7" }, { MTLGPUFamilyApple8, "Apple8" }, { MTLGPUFamilyMac2, "Mac2" },
+			{ MTLGPUFamilyMetal3, "Metal3" },
+		};
+
+		printf("metal_test:   families:");
+		for (size_t i = 0; i < sizeof(families) / sizeof(families[0]); i++) {
+			printf(" %s %s", families[i].name, [device supportsFamily:families[i].family] ? "yes" : "no");
+		}
+		printf("\n");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+		printf("metal_test:   feature sets: iOS GPU family 1 v5 %d, 2 v5 %d, 3 v1 %d, 4 v1 %d\n",
+		    (int)[device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily1_v5],
+		    (int)[device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily2_v5],
+		    (int)[device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily3_v1],
+		    (int)[device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily4_v1]);
+#pragma clang diagnostic pop
+	}
+}
+
+/*
+ * What the device makes: a queue, a buffer, and a blit fill done by the GPU and read back, through the public API only. The
+ * plug-in's blits go to the GPU when hakios-metal opened it (HAKIOS_METAL_GPU). Asked in a process of its own (metal-blit).
+ */
+static void
+the_device_makes(void)
+{
+	id<MTLDevice> device = given_device != nil ? given_device : MTLCreateSystemDefaultDevice();
+	const NSUInteger length = 4u << 20;
+	id<MTLCommandQueue> queue;
+	id<MTLBuffer> buffer;
+	id<MTLCommandBuffer> cb;
+	id<MTLBlitCommandEncoder> blit;
+	__block int handled = 0;
+	const uint8_t *bytes;
+	NSUInteger wrong = 0;
+	uint64_t began, ended;
+
+	if (device == nil) {
+		printf("metal_test:   no device\n");
+		return;
+	}
+	queue = [device newCommandQueue];
+	buffer = [device newBufferWithLength:length options:MTLResourceStorageModeShared];
+	printf("metal_test:   queue %s, buffer %s (%lu bytes, contents %p)\n", queue ? class_getName([(id)queue class]) : "nil",
+	    buffer ? class_getName([(id)buffer class]) : "nil", (unsigned long)[buffer length], [buffer contents]);
+	if (queue == nil || buffer == nil || [buffer contents] == NULL) {
+		return;
+	}
+	memset([buffer contents], 0x11, length);
+	cb = [queue commandBuffer];
+	blit = [cb blitCommandEncoder];
+	printf("metal_test:   command buffer %s, blit encoder %s\n", cb ? class_getName([(id)cb class]) : "nil",
+	    blit ? class_getName([(id)blit class]) : "nil");
+	if (cb == nil || blit == nil) {
+		return;
+	}
+	[blit fillBuffer:buffer range:NSMakeRange(4096, length - 8192) value:0xa5];
+	[blit endEncoding];
+	[cb addCompletedHandler:^(__unused id<MTLCommandBuffer> done) {
+		handled++;
+	}];
+	began = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	[cb commit];
+	[cb waitUntilCompleted];
+	ended = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	bytes = [buffer contents];
+	for (NSUInteger i = 0; i < length; i++) {
+		wrong += bytes[i] != (i < 4096 || i >= length - 4096 ? 0x11 : 0xa5);
+	}
+	printf("metal_test:   blit fill of %lu bytes: status %ld, error %s, completed handlers %d, %llu us, %lu bytes wrong: %s\n",
+	    (unsigned long)(length - 8192), (long)[cb status], [cb error] ? [[[cb error] description] UTF8String] : "none", handled,
+	    (unsigned long long)((ended - began) / 1000), (unsigned long)wrong,
+	    wrong == 0 && [cb status] == MTLCommandBufferStatusCompleted ? "PASS" : "FAIL");
 }
 
 /* What iOS publishes about graphics besides: artwork, not rendering (see the note above). */
@@ -501,6 +613,53 @@ coreimage(void)
 	}
 }
 
+/*
+ * `metal_test bundle PATH`: what Metal does with a plug-in, done by hand, for a bundle that is not (yet) where the
+ * accelerator names it -- a new HakiosMetal.bundle tried before an image carries it: the bundle loaded, its class taken
+ * (the one MetalPluginClassName would name, else the principal class), checked as Metal checks it, and sent
+ * -initWithAcceleratorPort: the first IOAcceleratorES service. Then the device's answers and a blit, in this process.
+ */
+static void
+the_bundles_device(const char *path)
+{
+	NSBundle *bundle = [NSBundle bundleWithPath:[NSString stringWithUTF8String:path]];
+	io_iterator_t it = IO_OBJECT_NULL;
+	io_service_t service;
+	Class cls, base = objc_getClass("_MTLDevice");
+	id device;
+
+	if (bundle == nil || ![bundle load]) {
+		printf("metal_test:   %s: no bundle, or it did not load\n", path);
+		return;
+	}
+	cls = [bundle classNamed:@"HakiosMetalDevice"];
+	if (cls == Nil) {
+		cls = [bundle principalClass];
+	}
+	printf("metal_test:   %s: class %s, a _MTLDevice %d, conforms to MTLDevice %d\n", path, cls ? class_getName(cls) : "(none)",
+	    cls != Nil && base != Nil && [cls isSubclassOfClass:base], cls != Nil && [cls conformsToProtocol:@protocol(MTLDevice)]);
+	if (cls == Nil || base == Nil || ![cls isSubclassOfClass:base]) {
+		return;
+	}
+	if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAcceleratorES"), &it) != KERN_SUCCESS ||
+	    (service = IOIteratorNext(it)) == IO_OBJECT_NULL) {
+		printf("metal_test:   no IOAcceleratorES service to give it\n");
+		return;
+	}
+	device = ((id (*)(id, SEL, unsigned int))objc_msgSend)([cls alloc], sel_registerName("initWithAcceleratorPort:"), service);
+	IOObjectRelease(it);
+	given_device = device;
+	printf("metal_test:   -initWithAcceleratorPort: %u gave %s\n", service, device ? class_getName([device class]) : "nil");
+	if (device != nil && app_library != NULL) {
+		exit(layer_mode ? metal_layer(device, app_library, layer_seconds, layer_divisor) :
+		     astc_mode ? metal_astc(device, app_library) : metal_app(device, app_library));
+	}
+	if (device != nil) {
+		the_device();
+		the_device_makes();
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -532,6 +691,116 @@ main(int argc, char **argv)
 			coreimage();
 		} else if (strcmp(argv[1], "plugins") == 0) {
 			plugins();
+		} else if (strcmp(argv[1], "app") == 0 && argc > 2) {
+			/* task 9: a real Metal program -- on BUNDLE's device made by hand, or on the system's */
+			app_library = argv[2];
+			/* a fifth argument: the shader cache directory to use instead of the plug-in's own (it keeps one already set) */
+			if (argc > 4) {
+				mkdir(argv[4], 0755);
+				setenv("HAKIOS_METAL_CACHE", argv[4], 1);
+			}
+			if (argc > 3) {
+				the_bundles_device(argv[3]);
+				printf("metal_test: the bundle gave no device\n");
+				return 1;
+			}
+			return metal_app(MTLCreateSystemDefaultDevice(), app_library);
+		} else if (strcmp(argv[1], "layer") == 0 && argc > 2) {
+			/* task 10: an animated full-screen CAMetalLayer over SpringBoard, composited by the GL window server */
+			app_library = argv[2];
+			layer_mode = 1;
+			/* NAME=VALUE arguments after the library go into the environment (sweetd passes none; LAYER_PLAIN=1 ...) */
+			while (argc > 3 && strchr(argv[3], '=') != NULL) {
+				putenv(argv[3]);
+				memmove(&argv[3], &argv[4], (size_t)(argc - 3) * sizeof(*argv));
+				argc--;
+			}
+			/* run again with metal_layer_lookup.dylib (beside this program) under it: the window server's services are in
+			 * launchd's user/501 domain, which a child of sweetd does not look in (metal_layer_lookup.c) */
+			if (getenv("DYLD_INSERT_LIBRARIES") == NULL) {
+				char self[1024], lib[1100];
+				uint32_t size = sizeof(self);
+
+				if (_NSGetExecutablePath(self, &size) == 0) {
+					char *slash = strrchr(self, '/');
+
+					snprintf(lib, sizeof(lib), "%.*s/metal_layer_lookup.dylib", slash != NULL ? (int)(slash - self) : 1,
+					    slash != NULL ? self : ".");
+					if (access(lib, R_OK) == 0) {
+						metal_layer_take_bootstrap();   /* (SpringBoard's bootstrap port: kept across the exec) */
+						setenv("DYLD_INSERT_LIBRARIES", lib, 1);
+						execv(self, argv);
+						printf("metal_test: cannot run again with %s\n", lib);
+					} else {
+						printf("metal_test: no %s: the window server's lookups will fail from a system job's child\n", lib);
+					}
+				}
+			}
+			if (argc > 3) {
+				layer_seconds = atof(argv[3]);
+			}
+			if (argc > 4) {
+				layer_divisor = atof(argv[4]);
+			}
+			if (argc > 5) {
+				the_bundles_device(argv[5]);
+				printf("metal_test: the bundle gave no device\n");
+				return 1;
+			}
+			return metal_layer(MTLCreateSystemDefaultDevice(), app_library, layer_seconds, layer_divisor);
+		} else if (strcmp(argv[1], "astc") == 0 && argc > 2) {
+			/* task 11: void-extent ASTC sampled on the GPU (metal_app.m, metal_astc) */
+			if (argc > 3) {
+				app_library = argv[2];
+				astc_mode = 1;
+				the_bundles_device(argv[3]);
+				printf("metal_test: the bundle gave no device\n");
+				return 1;
+			}
+			return metal_astc(MTLCreateSystemDefaultDevice(), argv[2]);
+		} else if (strcmp(argv[1], "screen") == 0 && argc > 2) {
+			/* task 11: a screenshot -- the IOSurface the framebuffer shows in layer 0 (MiniIOMobileFramebuffer's "surfaces in
+			 * layers" line names it), as u32 width, height, bytes per row and the BGRA rows (tools/metal-layer-png.py) */
+			IOSurfaceRef s = IOSurfaceLookup((IOSurfaceID)strtoul(argv[2], NULL, 0));
+			const char *out = argc > 3 ? argv[3] : "/private/var/tmp/screen.raw";
+			FILE *f;
+
+			if (s == NULL || IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL) != 0) {
+				printf("metal_test: no IOSurface %s to read\n", argv[2]);
+				return 1;
+			}
+			uint32_t head[3] = { (uint32_t)IOSurfaceGetWidth(s), (uint32_t)IOSurfaceGetHeight(s), (uint32_t)IOSurfaceGetBytesPerRow(s) };
+			if ((f = fopen(out, "wb")) != NULL) {
+				fwrite(head, sizeof(head), 1, f);
+				fwrite(IOSurfaceGetBaseAddress(s), head[2], head[1], f);
+				fclose(f);
+			}
+			IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+			printf("metal_test: IOSurface %s, %ux%u, format %.4s, %u bytes a row%s%s\n", argv[2], head[0], head[1],
+			    (const char *)&(uint32_t){ OSSwapInt32(IOSurfaceGetPixelFormat(s)) }, head[2], f != NULL ? " -> " : ": not written to ",
+			    out);
+			CFRelease(s);
+		} else if (strcmp(argv[1], "sysctl") == 0 && argc > 3) {
+			/* task 11: a string sysctl set (kern.exec_inject: metal_ca_try.dylib into backboardd, tools/metal-ca-run.sh);
+			 * sweetd's own sysctl only reads */
+			if (sysctlbyname(argv[2], NULL, NULL, argv[3], strlen(argv[3]) + 1) != 0) {
+				printf("metal_test: sysctl %s: %s\n", argv[2], strerror(errno));
+				return 1;
+			}
+			printf("metal_test: %s set (%zu bytes)\n", argv[2], strlen(argv[3]));
+		} else if (strcmp(argv[1], "bundle") == 0 && argc > 2) {
+			the_bundles_device(argv[2]);
+		} else if (strcmp(argv[1], "metal-blit") == 0) {
+			the_device_makes();
+		} else if (strcmp(argv[1], "device") == 0) {
+			/* only the Metal part (accelerators, GPU services, the device, a blit), without CoreImage or Apple's bundles */
+			printf("metal_test: the services Metal looks for (IOAcceleratorES)\n");
+			accelerators();
+			printf("metal_test: what the registry has that is a GPU\n");
+			gpu_services();
+			printf("metal_test: the device a program gets\n");
+			the_device();
+			in_a_new_process("what the device makes (a queue, a buffer, a blit by the GPU)", "metal-blit", 60);
 		} else {
 			printf("metal_test: no such question: %s\n", argv[1]);
 			return 2;
@@ -545,6 +814,7 @@ main(int argc, char **argv)
 	gpu_services();
 	printf("metal_test: the device a program gets\n");
 	the_device();
+	in_a_new_process("what the device makes (a queue, a buffer, a blit by the GPU)", "metal-blit", 60);
 	printf("metal_test: what iOS publishes about graphics (artwork, not rendering)\n");
 	gestalt();
 	printf("metal_test: CoreImage, which has a path without Metal\n");

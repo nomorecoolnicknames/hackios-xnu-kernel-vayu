@@ -16,7 +16,11 @@
 #define VAYU_CELL_WDA_SET_DATA_FORMAT           0x0020
 #define VAYU_CELL_WDS_START_NETWORK_INTERFACE   0x0020
 #define VAYU_CELL_WDS_STOP_NETWORK_INTERFACE    0x0021
-#define VAYU_CELL_WDS_GET_CURRENT_SETTINGS      0x002d
+#define VAYU_CELL_WDS_GET_PACKET_STATISTICS     0x0024
+/* Runtime address/DNS/MTU. libqmi names 0x002d "Get Current Settings"; it has no message called
+ * "Get Runtime Settings" (0x002c there is Get Default Settings). This is the runtime one. */
+#define VAYU_CELL_WDS_GET_RUNTIME_SETTINGS      0x002d
+#define VAYU_CELL_WDS_GET_CURRENT_SETTINGS      VAYU_CELL_WDS_GET_RUNTIME_SETTINGS
 #define VAYU_CELL_WDS_SET_IP_FAMILY             0x004d
 #define VAYU_CELL_WDS_BIND_MUX_DATA_PORT        0x00a2
 
@@ -206,6 +210,49 @@ static const struct qmi_elem_info vayu_cell_wds_settings_resp_ei[] = {
 	VAYU_EI(QMI_UNSIGNED_4_BYTE, struct vayu_cell_wds_settings_resp, mtu, 0x29),
 	VAYU_EI_OPT(struct vayu_cell_wds_settings_resp, ip_family_valid, 0x2b),
 	VAYU_EI(QMI_UNSIGNED_1_BYTE, struct vayu_cell_wds_settings_resp, ip_family, 0x2b),
+	{ .data_type = QMI_EOTI },
+};
+
+/* WDS Get Packet Statistics 0x0024: the modem's own counters, proof that packets crossed the
+ * modem and not just our GSI ring. */
+struct vayu_cell_wds_stats_resp {
+	struct vayu_cell_result result;
+	uint8_t tx_packets_valid;               /* TLV 0x10 */
+	uint32_t tx_packets;
+	uint8_t rx_packets_valid;               /* TLV 0x11 */
+	uint32_t rx_packets;
+	uint8_t tx_errors_valid;                /* TLV 0x12 */
+	uint32_t tx_errors;
+	uint8_t rx_errors_valid;                /* TLV 0x13 */
+	uint32_t rx_errors;
+	uint8_t tx_dropped_valid;               /* TLV 0x1d */
+	uint32_t tx_dropped;
+	uint8_t rx_dropped_valid;               /* TLV 0x1e */
+	uint32_t rx_dropped;
+	uint8_t tx_bytes_valid;                 /* TLV 0x19, 64-bit */
+	uint64_t tx_bytes;
+	uint8_t rx_bytes_valid;                 /* TLV 0x1a, 64-bit */
+	uint64_t rx_bytes;
+};
+
+static const struct qmi_elem_info vayu_cell_wds_stats_resp_ei[] = {
+	VAYU_EI_RESULT(struct vayu_cell_wds_stats_resp),
+	VAYU_EI_OPT(struct vayu_cell_wds_stats_resp, tx_packets_valid, 0x10),
+	VAYU_EI(QMI_UNSIGNED_4_BYTE, struct vayu_cell_wds_stats_resp, tx_packets, 0x10),
+	VAYU_EI_OPT(struct vayu_cell_wds_stats_resp, rx_packets_valid, 0x11),
+	VAYU_EI(QMI_UNSIGNED_4_BYTE, struct vayu_cell_wds_stats_resp, rx_packets, 0x11),
+	VAYU_EI_OPT(struct vayu_cell_wds_stats_resp, tx_errors_valid, 0x12),
+	VAYU_EI(QMI_UNSIGNED_4_BYTE, struct vayu_cell_wds_stats_resp, tx_errors, 0x12),
+	VAYU_EI_OPT(struct vayu_cell_wds_stats_resp, rx_errors_valid, 0x13),
+	VAYU_EI(QMI_UNSIGNED_4_BYTE, struct vayu_cell_wds_stats_resp, rx_errors, 0x13),
+	VAYU_EI_OPT(struct vayu_cell_wds_stats_resp, tx_bytes_valid, 0x19),
+	VAYU_EI(QMI_UNSIGNED_8_BYTE, struct vayu_cell_wds_stats_resp, tx_bytes, 0x19),
+	VAYU_EI_OPT(struct vayu_cell_wds_stats_resp, rx_bytes_valid, 0x1a),
+	VAYU_EI(QMI_UNSIGNED_8_BYTE, struct vayu_cell_wds_stats_resp, rx_bytes, 0x1a),
+	VAYU_EI_OPT(struct vayu_cell_wds_stats_resp, tx_dropped_valid, 0x1d),
+	VAYU_EI(QMI_UNSIGNED_4_BYTE, struct vayu_cell_wds_stats_resp, tx_dropped, 0x1d),
+	VAYU_EI_OPT(struct vayu_cell_wds_stats_resp, rx_dropped_valid, 0x1e),
+	VAYU_EI(QMI_UNSIGNED_4_BYTE, struct vayu_cell_wds_stats_resp, rx_dropped, 0x1e),
 	{ .data_type = QMI_EOTI },
 };
 

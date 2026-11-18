@@ -295,6 +295,7 @@ static uint64_t rmtfs_alloc_next;
 static uint32_t rmtfs_opens, rmtfs_allocs, rmtfs_iovecs, rmtfs_reads, rmtfs_writes, rmtfs_unknown;
 static uint64_t rmtfs_sectors_in, rmtfs_sectors_out, rmtfs_bytes_in, rmtfs_bytes_out;
 static uint32_t rmtfs_logged;
+static uint64_t rmtfs_drop_warning_ms, rmtfs_sync_warning_ms;
 
 static struct vayu_rmtfs_iovec_req rmtfs_request;
 static uint8_t rmtfs_answer[256];
@@ -319,6 +320,20 @@ say(const char *format, ...)
 	return length;
 }
 
+/* At most one warning of each kind per ten seconds, even during a write burst. */
+static void
+rmtfs_write_warning(uint64_t *last, const char *why)
+{
+	uint64_t ns, now;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	now = ns / NSEC_PER_MSEC;
+	if (*last == 0 || (now >= *last && now - *last >= 10000)) {
+		*last = now == 0 ? 1 : now;
+		say("vayu-rmtfs: WARNING: %s; writes are RAM-only and will not survive a restart\n", why);
+	}
+}
+
 /* ---- the EFS pages ------------------------------------------------------------------------------- */
 
 static uint8_t *
@@ -327,7 +342,7 @@ rmtfs_page(struct vayu_rmtfs_part *part, uint64_t offset)
 	uint64_t index = offset / PAGE_SIZE;
 	uint8_t *page;
 
-	if (part->page == NULL || index >= part->page_count) {
+	if (!part->ufs_found || part->page == NULL || index >= part->page_count) {
 		return NULL;
 	}
 	page = part->page[index];
@@ -348,9 +363,10 @@ rmtfs_page(struct vayu_rmtfs_part *part, uint64_t offset)
 		if (length != 0 && hakios_ufs_part_read(part->ufs_part, at, page, length) != 0) {
 			if (!part->read_failed) {
 				part->read_failed = true;
-				say("vayu-rmtfs: %s: the storage read failed at %llu; zeros are served\n", part->name, at);
+				say("vayu-rmtfs: %s: the storage read failed at %llu; the request fails\n", part->name, at);
 			}
-			memset(page, 0, PAGE_SIZE);
+			kfree_data(page, PAGE_SIZE);
+			return NULL;
 		}
 	}
 	part->page[index] = page;
@@ -368,8 +384,7 @@ rmtfs_read_sector(struct vayu_rmtfs_part *part, uint64_t sector, uint8_t *to)
 	}
 	page = rmtfs_page(part, offset);
 	if (page == NULL) {
-		memset(to, 0, VAYU_RMTFS_SECTOR);       /* no storage: a blank EFS is better than a failed request */
-		return true;
+		return false;
 	}
 	memcpy(to, page + offset % PAGE_SIZE, VAYU_RMTFS_SECTOR);
 	return true;
@@ -386,7 +401,8 @@ rmtfs_write_sector(struct vayu_rmtfs_part *part, uint64_t sector, const uint8_t 
 	}
 	page = rmtfs_page(part, offset);
 	if (page == NULL) {
-		return true;                            /* nowhere to keep it: the write is dropped, as always */
+		rmtfs_write_warning(&rmtfs_drop_warning_ms, "a sector write was dropped (no RAM page)");
+		return true;                            /* keep the RAM-only write acknowledgement */
 	}
 	memcpy(page + offset % PAGE_SIZE, from, VAYU_RMTFS_SECTOR);
 	return true;
@@ -674,6 +690,9 @@ rmtfs_iovec(uint32_t node, uint32_t from_port, uint16_t transaction, const uint8
 	write = rmtfs_request.direction != 0;
 	entries = rmtfs_request.iovec_len;
 	if (write) {
+		if (rmtfs_request.is_force_sync) {
+			rmtfs_write_warning(&rmtfs_sync_warning_ms, "force-sync cannot be persisted");
+		}
 		rmtfs_writes++;
 	} else {
 		rmtfs_reads++;
@@ -845,7 +864,7 @@ rmtfs_parts_setup(void)
 
 		part->ufs_found = hakios_ufs_part(part->name, &index, &part->bytes);
 		if (!part->ufs_found) {
-			say("vayu-rmtfs: %s (%s) is not in the storage table; reads will be zeros\n", part->name, part->path);
+			say("vayu-rmtfs: %s (%s) is not in the storage table; reads will fail\n", part->name, part->path);
 			continue;
 		}
 		part->ufs_part = index;

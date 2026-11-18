@@ -1,8 +1,9 @@
 /*
  * W25: WPA2-PSK (RSN) 4-way handshake for the vayu station, and the data path that follows it.
  *
- * The PMK comes from /private/etc/vayu-wifi/wifi.pmk (64 hex digits, one line), read when the
- * handshake arms and only with the boot argument vayu_wifi_pmk_file=1: boot arguments are logged by
+ * The PMK comes from /redwood/etc/vayu-wifi/wifi.pmk (64 hex digits, one line; vayu_wifi_pmk_name=NAME
+ * reads another file of that directory), read when the handshake arms and only with the boot argument
+ * vayu_wifi_pmk_file=1: boot arguments are logged by
  * the loader, the kernel, launchd and a panic buffer, so no secret may travel in one.  The handshake is IEEE 802.11i / 802.1X-2004 with key descriptor
  * version 2: PRF-SHA1 for the PTK, HMAC-SHA1-128 for the MIC, RFC 3394 AES key unwrap for the
  * GTK.  Crypto goes through libkern's registered provider (osfmk/minicrypto in this kernel):
@@ -36,6 +37,13 @@ struct vayu_rsn_ops {
 
 /* Reads vayu_wifi_pmk_file and clears the state; call after vayu_sta_reset(). */
 void vayu_rsn_reset(int (*log)(const char *format, ...) __printflike(1, 2));
+/* W25r: a network iOS asked for (bsd/dev/hakios.apple80211.c -> hakios.sta -> vayu_wifi_sta.c).
+ * The PMK is either given as it is, or made from the passphrase the way WPA2 says:
+ * PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32).  Neither is ever printed; the log gets lengths. */
+bool vayu_rsn_set_pmk(const uint8_t *pmk, uint32_t len);
+bool vayu_rsn_set_passphrase(const uint8_t *passphrase, uint32_t passphrase_len, const uint8_t *ssid, uint32_t ssid_len);
+/* Forget the PMK (a network was left, or another one is being joined): the file is read again if asked. */
+void vayu_rsn_forget(void);
 /* True when a PMK is set and the crypto self-test passed: the handshake can run. */
 bool vayu_rsn_armed(void);
 /* Wipe the keys (VDEV_STOP, a failed join, the end of the run). */

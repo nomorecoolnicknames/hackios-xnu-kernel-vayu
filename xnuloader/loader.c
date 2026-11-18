@@ -8,6 +8,10 @@
  *   - copies the Mach-O segments there, builds an Apple-format device tree
  *     and a boot_args structure behind the kernel
  *   - exits boot services, turns the MMU off and jumps to the kernel entry
+ *
+ * Loader 2.5's standalone start, darwin's layout block and the boot image staged from iOS follow another
+ * HakiOS port (MIT, as this file): telegdyd/ios-vayu, branch vayu-dev, commits 546ac05ab957 (loader 2.2), 8054280162b9 (2.3) and
+ * 86984b16b016 (2.8).
  */
 #include "efi.h"
 #include "identity.h"         /* who iOS shall think we are: from the iPhone's own device tree (mkidentity.py) */
@@ -451,13 +455,14 @@ write_logs(const char *klog, uint64_t klog_len)
 	ws = bio->write_blocks(bio, bio->media->media_id, 0, len, out_buf);
 
 	if (!EFI_ERROR(ws)) {
-		bio->flush_blocks(bio);
+		/* (a flush that fails leaves the write unconfirmed: said as a failed write, not read back) */
+		ws = bio->flush_blocks(bio);
 		/*
 		 * And read back: that the log is in the partition is what a run of the kernel's own UFS
 		 * driver must leave possible (the controller is shared with this one). The line goes into
 		 * the copy the host fetches over USB, not into the partition, which already has the rest.
 		 */
-		if (len <= sizeof(block_buffer)) {
+		if (!EFI_ERROR(ws) && len <= sizeof(block_buffer)) {
 			rs = bio->read_blocks(bio, bio->media->media_id, 0, len, block_buffer);
 			same = !EFI_ERROR(rs) && memcmp(block_buffer, out_buf, len) == 0;
 		}
@@ -615,6 +620,12 @@ struct darwin_identity {
 	uint64_t write_first;            /* its first block a write may reach: past what the build writes there */
 	uint16_t unit;                   /* the unit it is on, by UEFI's order */
 	efi_guid type, uniq;             /* its GPT type and unique GUIDs */
+	/*
+	 * Its block that says where everything inside it is (loader 2.5, darwin_layout below), written by the
+	 * installer only and so below write_first; 0: there is none on this device. The same fields name the
+	 * boot partition a staged boot image is written into (PLAT->boot; write_first and layout_block 0).
+	 */
+	uint64_t layout_block;
 };
 
 /* a partition there is a reference image of, and how many of its bytes the image has (ufs=1, its hash) */
@@ -638,6 +649,7 @@ struct platform {
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
 	uint64_t fb_base;                /* fallback identification: the framebuffer the firmware reports (GOP) */
 	const struct darwin_identity *darwin;      /* the port's partition; NULL: none, nothing is ever written */
+	const struct darwin_identity *boot;        /* "boot", for a staged image (flash_stage=1); NULL: never written */
 	const struct ufs_reference *ufs_refs;      /* ufs=1: the partitions hashed, and how far */
 	unsigned ufs_nrefs;
 };
@@ -660,15 +672,46 @@ static const struct ufs_reference ufs_refs_redwood[] = {
 /*
  * vayu: darwin is entry 33 of unit 0 (sda33), 24 GiB at the end of the unit, with the GPT entry
  * parsed from the phone's own partition table (type APFS, unique 1c213492-90d4-4921-869e-98ec2fa0497c,
- * LBA 55871232..62162938). Nothing is written from the computer there yet; writes begin at block 2097152
- * (8 GiB), where var_store's two slots are (userland/src/var_store.c STORE_AT), so the first 8 GiB stay
- * free for an iOS volume on flash later. The references are whole partitions of a read-only backup of the
- * phone's own Android; they are hashed with FNV-1a for comparison (ufs=1).
+ * LBA 55871232..62162938; the phone's GPT dump of 2026-11-17, gpt-sda.head.bin c649dd9e...). What the
+ * computer writes there from the recovery (devices/poco-x3-pro/tools/darwin-install.sh) lies below block
+ * 2097152 (8 GiB): the iOS volume and the two cryptexes back to back from block 0, and at 2097151 the
+ * block that says where everything is (devices/poco-x3-pro/tools/darwin-layout.py, the one place the
+ * numbers are made). Writes begin at 2097152, where var_store's two slots are (userland/src/var_store.c
+ * STORE_AT); /private/var's volume and the staged boot image are further on, as the layout block says.
+ * The references are whole partitions of a read-only backup of the phone's own Android; they are hashed
+ * with FNV-1a for comparison (ufs=1).
  */
 static const struct darwin_identity darwin_vayu = {
 	.first_lba = 55871232, .last_lba = 62162938, .write_first = 2097152, .unit = 0,
 	.type = { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } },
 	.uniq = { 0x1c213492, 0x90d4, 0x4921, { 0x86, 0x9e, 0x98, 0xec, 0x2f, 0xa0, 0x49, 0x7c } },
+	.layout_block = 2097151,
+};
+/*
+ * vayu's boot (sde49: entry 49 of unit 4, LBA 79872..112639, 128 MiB; Android boot type, unique
+ * 6829cc63-8df3-89ce-5473-55cba9339a82; gpt-sde.head.bin 9798fb3a... of the same dump; unit 4 by UEFI's
+ * order as the loader's ufs=1 survey counted it, run 014220): what a staged boot image goes into.
+ */
+static const struct darwin_identity boot_vayu = {
+	.first_lba = 79872, .last_lba = 112639, .unit = 4,
+	.type = { 0x20117f86, 0xe985, 0x4357, { 0xb9, 0xee, 0x37, 0x4b, 0xc1, 0xd8, 0x48, 0x7d } },
+	.uniq = { 0x6829cc63, 0x8df3, 0x89ce, { 0x54, 0x73, 0x55, 0xcb, 0xa9, 0x33, 0x9a, 0x82 } },
+};
+/*
+ * QEMU: the test disk of qemu/run-standalone-test.sh (darwin-layout.py --profile qemu makes its partition
+ * table and layout block), so that a standalone start -- the layout, a staged image written into "boot"
+ * -- can be tried with no phone. Its GUIDs are this test's own: no real device has them.
+ */
+static const struct darwin_identity darwin_qemu = {
+	.first_lba = 2304, .last_lba = 14303, .write_first = 1024, .unit = 0,
+	.type = { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } },
+	.uniq = { 0x48414b49, 0x4f53, 0x4441, { 0x52, 0x57, 0x49, 0x4e, 0x00, 0x00, 0x00, 0x01 } },
+	.layout_block = 1023,
+};
+static const struct darwin_identity boot_qemu = {
+	.first_lba = 256, .last_lba = 2303, .unit = 0,
+	.type = { 0x20117f86, 0xe985, 0x4357, { 0xb9, 0xee, 0x37, 0x4b, 0xc1, 0xd8, 0x48, 0x7d } },
+	.uniq = { 0x48414b49, 0x4f53, 0x424f, { 0x4f, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02 } },
 };
 static const struct ufs_reference ufs_refs_vayu[] = {
 	{ "bluetooth", 1048576 }, { "abl", 2097152 }, { "aop", 524288 }, { "xbl", 7340032 },
@@ -685,6 +728,7 @@ static const struct platform platform_qemu_virt = {
 	 * is that of real hardware: an eighth of a second by a 24 MHz clock, a twentieth here.
 	 */
 	.timeout_scale = 20,
+	.darwin = &darwin_qemu, .boot = &boot_qemu,
 };
 
 static const struct platform platform_redwood = {
@@ -714,7 +758,7 @@ static const struct platform platform_vayu = {
 	.small_cores = 0x0f,
 	/* FACT: on the phone the loader printed "display 1080 x 2400 at 9c000000"; fallback only. */
 	.fb_base = 0x9C000000,
-	.darwin = &darwin_vayu,
+	.darwin = &darwin_vayu, .boot = &boot_vayu,
 	.ufs_refs = ufs_refs_vayu, .ufs_nrefs = sizeof(ufs_refs_vayu) / sizeof(ufs_refs_vayu[0]),
 };
 
@@ -1061,6 +1105,10 @@ struct kernel_live {
 	uint64_t magic3;                /* "XNULIVE3": the kernel has what follows (USB handover, USB networking) */
 	volatile uint64_t usb_take;     /* the kernel writes 1: it wants the USB controller (usb_handover=1) */
 	volatile uint64_t usb_given;    /* this loader writes 1: it has stopped touching USB for this run */
+	uint64_t magic4;                /* "XNULIVE4": the usbctl mailbox below exists */
+	volatile uint64_t vctl_pa;      /* physical address of struct vayu_ctl_mbox (bsd/sys/vayu_ctl.h) */
+	volatile uint64_t vctl_window_pa;
+	volatile uint64_t vctl_window_len;
 };
 
 /*
@@ -1147,7 +1195,7 @@ static uint64_t sound_len;
  * SMC (IPA PAS, 2026-10-27) was reset before its log could be saved. 20 leaves two heartbeat periods
  * of margin and still wins by 10 s.
  */
-#define SILENCE_SECONDS         20
+#define SILENCE_SECONDS         50
 #define NOTE_SECONDS            24      /* how long the kernel's progress is written down as it happens */
 
 static void wdt_pet(void);
@@ -1676,6 +1724,16 @@ ufs_survey(void)
 #define BLOCK_PART_UNIT    1u                          /* the entry is a whole logical unit, not a partition */
 #define BLOCK_OP_READ      0u
 #define BLOCK_OP_WRITE     1u
+/*
+ * The data volume's writes (HFS Plus on /dev/ufs_var, loader 2.5; upstream's numbers): written and nothing
+ * more -- no flush, no read back -- because its journal asks for the flush itself (BLOCK_OP_FLUSH) where the
+ * order matters, and a flush and a read back after every 4 KB of metadata made Darwin crawl upstream. Offered
+ * with BLOCK_CAN_FAST in write_caps only when darwin's layout block names that volume, and taken only inside
+ * it; /dev/rufs_darwin's writes stay BLOCK_OP_WRITE, flushed and read back.
+ */
+#define BLOCK_OP_WRITE_FAST 2u
+#define BLOCK_OP_FLUSH     3u                          /* the write partition's cache to the flash; one block in bounds */
+#define BLOCK_CAN_FAST     1u
 
 /*
  * The one partition a write may reach, and from which of its blocks. darwin is the port's own
@@ -1719,7 +1777,7 @@ struct loader_block {
 	 * which is a read, and a loader that does not know them leaves these zero, which is no write.
 	 */
 	uint32_t write_part_plus_one;
-	uint32_t write_reserved;
+	uint32_t write_caps;                   /* BLOCK_CAN_FAST; zero from a loader before 2.5, which a kernel reads as none */
 	uint64_t write_first;
 	/* written by the kernel: what it wants, then request is advanced */
 	struct {
@@ -2022,35 +2080,43 @@ block_tables(void)
  * port was set up; one field out of place and nothing is written this run. The name UEFI reports
  * is already in bp->name (ufs_name), in ASCII.
  */
+/* What is wrong with this partition for the identity, or NULL: it is the one. */
+static const char *
+part_identity_why(const efi_partition_info *info, const efi_block_io *bio, uint16_t unit, const struct darwin_identity *d)
+{
+	if (d == NULL) {
+		return "this device has no such partition set up in the loader (struct darwin_identity)";
+	} else if (memcmp(&info->type_guid, &d->type, sizeof(d->type)) != 0) {
+		return "its type GUID is not the one it had";
+	} else if (memcmp(&info->unique_guid, &d->uniq, sizeof(d->uniq)) != 0) {
+		return "its unique GUID is not the one it had";
+	} else if (info->start_lba != d->first_lba || info->end_lba != d->last_lba) {
+		return "it does not begin and end where it did";
+	} else if (unit != d->unit) {
+		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
+		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
+		return "it is not on its logical unit";
+	} else if (bio->media->block_size != 4096 || bio->media->last_block + 1 != d->last_lba - d->first_lba + 1) {
+		return "its blocks are not what they were";
+	} else if (bio->media->read_only) {
+		return "UEFI gives it out read only";
+	}
+	return NULL;
+}
+
 static int
 block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
 {
 	const struct darwin_identity *d = PLAT->darwin;
 	static const char name[] = "darwin";
-	const char *why = NULL;
+	const char *why;
 
 	for (unsigned i = 0; i < sizeof(name); i++) {
 		if (bp->name[i] != name[i]) {
 			return 0;               /* another partition: nothing to say about it */
 		}
 	}
-	if (d == NULL) {
-		why = "this device has no darwin set up in the loader (struct darwin_identity)";
-	} else if (memcmp(&info->type_guid, &d->type, sizeof(d->type)) != 0) {
-		why = "its type GUID is not the one it had";
-	} else if (memcmp(&info->unique_guid, &d->uniq, sizeof(d->uniq)) != 0) {
-		why = "its unique GUID is not the one it had";
-	} else if (info->start_lba != d->first_lba || info->end_lba != d->last_lba) {
-		why = "it does not begin and end where it did";
-	} else if (bp->unit != d->unit) {
-		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
-		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
-		why = "it is not on its logical unit";
-	} else if (bp->block_size != 4096 || bp->blocks != d->last_lba - d->first_lba + 1) {
-		why = "its blocks are not what they were";
-	} else if (bio->media->read_only) {
-		why = "UEFI gives it out read only";
-	}
+	why = part_identity_why(info, bio, bp->unit, d);
 	if (why != NULL) {
 		print("ufs: darwin: no write will be served: %s\n", why);
 		return 0;
@@ -2058,6 +2124,256 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 	print("ufs: darwin (LBA %d..%d of unit %d): its blocks from %d on may be written this run\n",
 	    info->start_lba, info->end_lba, (uint64_t)d->unit, d->write_first);
 	return 1;
+}
+
+/* The logical units: the block devices that are not partitions of another, in the order UEFI lists them. */
+struct block_unit {
+	efi_block_io *bio;
+	const efi_device_path *path;
+	uint64_t path_bytes;
+	uint8_t lun;
+};
+
+static uint64_t
+block_units(struct block_unit *units, uint64_t max, int say)
+{
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	static const efi_guid dp_guid = EFI_DEVICE_PATH_GUID;
+	efi_handle *handles;
+	uint64_t count, nunits = 0;
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &blk_guid, NULL, &count, &handles))) {
+		return 0;
+	}
+	for (uint64_t i = 0; i < count && nunits < max; i++) {
+		efi_block_io *bio;
+		efi_device_path *dp;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) || bio->media->logical ||
+		    bio->media->block_size == 0 || bio->media->block_size > BLOCK_BUFFER_SIZE ||
+		    EFI_ERROR(BS->handle_protocol(handles[i], &dp_guid, (void **)&dp))) {
+			continue;
+		}
+		units[nunits].bio = bio;
+		units[nunits].path = dp;
+		units[nunits].path_bytes = device_path_bytes(dp);
+		units[nunits].lun = say ? device_path_print(nunits, dp) : 0xff;
+		nunits++;
+	}
+	return nunits;
+}
+
+/* the unit a partition is on: the one whose device path its own begins with; 0xffff: none */
+static uint16_t
+block_unit_of(const efi_device_path *dp, const struct block_unit *units, uint64_t nunits)
+{
+	uint64_t bytes = device_path_bytes(dp);
+	uint16_t unit = 0xffff;
+
+	for (uint64_t u = 0; u < nunits; u++) {
+		if (units[u].path_bytes < bytes && memcmp(units[u].path, dp, units[u].path_bytes) == 0) {
+			unit = (uint16_t)u;
+		}
+	}
+	return unit;
+}
+
+/*
+ * The partition named `name` that is in every way what `id` says (part_identity_why), or NULL with *why
+ * saying what was not. Read and written only through UEFI's own partition device, which bounds it too.
+ */
+static efi_block_io *
+part_by_identity(const char *name, const struct darwin_identity *id, const char **why)
+{
+	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	static const efi_guid dp_guid = EFI_DEVICE_PATH_GUID;
+	static struct block_unit units[BLOCK_MAX_UNITS];
+	uint64_t count, nunits = block_units(units, BLOCK_MAX_UNITS, 0);
+	efi_handle *handles;
+	efi_block_io *found = NULL;
+	const char *reason = "no partition of that name";
+	unsigned named = 0;
+
+	if (id == NULL) {
+		*why = "this device has no such partition set up in the loader (struct darwin_identity)";
+		return NULL;
+	}
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+		*why = "no partition information";
+		return NULL;
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		efi_partition_info *info;
+		efi_block_io *bio;
+		efi_device_path *dp;
+		char got[36];
+		const char *wrong;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2 ||
+		    EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) ||
+		    EFI_ERROR(BS->handle_protocol(handles[i], &dp_guid, (void **)&dp))) {
+			continue;
+		}
+		ufs_name(info, got, sizeof(got));
+		if (!str_eq(got, name)) {
+			continue;
+		}
+		named++;
+		wrong = part_identity_why(info, bio, block_unit_of(dp, units, nunits), id);
+		if (wrong == NULL) {
+			found = bio;
+		} else {
+			reason = wrong;
+		}
+	}
+	if (found != NULL && named > 1) {
+		found = NULL;
+		reason = "more than one partition of that name";  /* (the one is there; so is another: trust neither) */
+	}
+	if (found == NULL) {
+		*why = reason;
+	}
+	return found;
+}
+
+/*
+ * darwin's layout (loader 2.5): one block of darwin, at its identity's layout_block, written from the recovery
+ * by the installer (devices/poco-x3-pro/tools/darwin-layout.py makes it: the one place the numbers come
+ * from) and below write_first, so that nothing the kernel writes reaches it. It says where each thing
+ * inside darwin is; this loader takes from it what it hands on -- /dev/ufs_var's slice and the place of a
+ * staged boot image, as boot-args (ufs_var_first= ..., ufs_stage_first= ...) -- and what it uses itself.
+ *
+ *   0 "HKLAYOUT", u32 version 1, u32 extents; 16 u64 darwin's blocks; 24 its unique GUID as the GPT has it;
+ *   40 u64 write_first; 48 u64 the layout block itself; 64 the extents, 32 bytes each: char name[16],
+ *   u64 first, u64 blocks; 4092 u32 CRC-32 of the 4092 bytes before it. Little-endian.
+ *
+ * Taken only if all of it is right: the CRC, the partition it was made for (size, GUID, write_first, the
+ * block it is in), every extent inside darwin, none over another, and those written while iOS runs
+ * (var, stage, stagehead) at write_first or past it. Anything else: not used, and nothing of it is passed on.
+ */
+#define LAYOUT_VERSION     1u
+#define LAYOUT_EXTENTS_MAX 32u
+
+static struct {
+	int state;                      /* 0: not read yet, 1: taken, -1: none or not right */
+	efi_block_io *bio;              /* darwin, by its identity */
+	uint64_t var_first, var_blocks; /* "var": /dev/ufs_var (0 blocks: none) */
+	uint64_t stage_first, stage_blocks, stage_head;  /* "stage", "stagehead": a staged boot image (0: none) */
+} layout;
+static uint8_t layout_buf[4096] __attribute__((aligned(4096)));
+
+static uint32_t
+le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static uint64_t
+le64(const uint8_t *p)
+{
+	uint64_t v = 0;
+
+	for (int i = 7; i >= 0; i--) {
+		v = v << 8 | p[i];
+	}
+	return v;
+}
+
+static const char *
+layout_check(const struct darwin_identity *d)
+{
+	const uint8_t *b = layout_buf;
+	uint64_t blocks = d->last_lba - d->first_lba + 1;
+	uint32_t n = le32(b + 12);
+
+	if (memcmp(b, "HKLAYOUT", 8) != 0) {
+		return "no layout block there (not installed yet?)";
+	}
+	if (le32(b + 8) != LAYOUT_VERSION || n == 0 || n > LAYOUT_EXTENTS_MAX) {
+		return "a version or an extent count this loader does not know";
+	}
+	if (ufs_crc32(b, 4092) != le32(b + 4092)) {
+		return "its CRC is wrong";
+	}
+	if (le64(b + 16) != blocks || memcmp(b + 24, &d->uniq, 16) != 0 || le64(b + 40) != d->write_first ||
+	    le64(b + 48) != d->layout_block) {
+		return "it was made for another partition (size, GUID, write_first or its own place)";
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		const uint8_t *e = b + 64 + 32 * i;
+		uint64_t first = le64(e + 16), count = le64(e + 24);
+		const char *name = (const char *)e;
+		int written = str_eq(name, "var") || str_eq(name, "stage") || str_eq(name, "stagehead");
+
+		if (e[15] != 0 || count == 0 || first >= blocks || count > blocks - first) {
+			return "an extent is empty or not inside darwin";
+		}
+		if (written && first < d->write_first) {
+			return "an extent iOS writes begins before write_first";
+		}
+		for (uint32_t k = 0; k < i; k++) {
+			const uint8_t *o = b + 64 + 32 * k;
+
+			if (first < le64(o + 16) + le64(o + 24) && le64(o + 16) < first + count) {
+				return "two extents overlap";
+			}
+		}
+		if (str_eq(name, "layout") && (first != d->layout_block || count != 1)) {
+			return "its own extent is not where it is";
+		}
+		if (str_eq(name, "stagehead") && count != 1) {
+			return "the staged image's header is not one block";
+		}
+	}
+	return NULL;
+}
+
+static void
+layout_load(void)
+{
+	const struct darwin_identity *d = PLAT->darwin;
+	const char *why = NULL;
+	efi_status s;
+
+	if (layout.state != 0) {
+		return;                 /* once a session: nothing of this loader's or the kernel's writes it */
+	}
+	layout.state = -1;
+	if (d == NULL || d->layout_block == 0) {
+		return;                 /* (a device with none: said nowhere, as before) */
+	}
+	layout.bio = part_by_identity("darwin", d, &why);
+	if (layout.bio == NULL) {
+		print("layout: darwin not used: %s\n", why);
+		return;
+	}
+	s = layout.bio->read_blocks(layout.bio, layout.bio->media->media_id, d->layout_block, sizeof(layout_buf), layout_buf);
+	why = EFI_ERROR(s) ? "its block could not be read" : layout_check(d);
+	if (why != NULL) {
+		print("layout: darwin's block %d not used: %s\n", d->layout_block, why);
+		return;
+	}
+	for (uint32_t i = 0, n = le32(layout_buf + 12); i < n; i++) {
+		const uint8_t *e = layout_buf + 64 + 32 * i;
+		const char *name = (const char *)e;
+
+		if (str_eq(name, "var")) {
+			layout.var_first = le64(e + 16);
+			layout.var_blocks = le64(e + 24);
+		} else if (str_eq(name, "stage")) {
+			layout.stage_first = le64(e + 16);
+			layout.stage_blocks = le64(e + 24);
+		} else if (str_eq(name, "stagehead")) {
+			layout.stage_head = le64(e + 16);
+		}
+	}
+	if (layout.stage_blocks == 0 || layout.stage_head == 0) {
+		layout.stage_first = layout.stage_blocks = layout.stage_head = 0;
+	}
+	layout.state = 1;
+	print("layout: darwin's block %d: var %d+%d, stage %d+%d, its header %d\n", d->layout_block, layout.var_first,
+	    layout.var_blocks, layout.stage_first, layout.stage_blocks, layout.stage_head);
 }
 
 static void
@@ -2069,34 +2385,12 @@ block_start(void)
 	uint64_t count;
 
 	static const efi_guid dp_guid = EFI_DEVICE_PATH_GUID;
-	static struct {
-		efi_block_io *bio;
-		const efi_device_path *path;
-		uint64_t path_bytes;
-		uint8_t lun;
-	} units[BLOCK_MAX_UNITS];
-	uint64_t nunits = 0;
+	static struct block_unit units[BLOCK_MAX_UNITS];
+	uint64_t nunits;
 
 	memset(&block_shared, 0, sizeof(block_shared));
 	block_tables();
-	/* the logical units: the block devices that are not partitions of another */
-	if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &blk_guid, NULL, &count, &handles))) {
-		for (uint64_t i = 0; i < count && nunits < BLOCK_MAX_UNITS; i++) {
-			efi_block_io *bio;
-			efi_device_path *dp;
-
-			if (EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) || bio->media->logical ||
-			    bio->media->block_size == 0 || bio->media->block_size > BLOCK_BUFFER_SIZE ||
-			    EFI_ERROR(BS->handle_protocol(handles[i], &dp_guid, (void **)&dp))) {
-				continue;
-			}
-			units[nunits].bio = bio;
-			units[nunits].path = dp;
-			units[nunits].path_bytes = device_path_bytes(dp);
-			units[nunits].lun = device_path_print(nunits, dp);
-			nunits++;
-		}
-	}
+	nunits = block_units(units, BLOCK_MAX_UNITS, 1);
 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
 		print("ufs: no partition information: the block service is off\n");
 		return;
@@ -2120,15 +2414,8 @@ block_start(void)
 		bp->lun = 0xff;
 		/* its unit: the one whose device path its own begins with */
 		if (!EFI_ERROR(BS->handle_protocol(handles[i], &dp_guid, (void **)&dp))) {
-			uint64_t bytes = device_path_bytes(dp);
-
-			for (uint64_t u = 0; u < nunits; u++) {
-				if (units[u].path_bytes < bytes &&
-				    memcmp(units[u].path, dp, units[u].path_bytes) == 0) {
-					bp->unit = (uint16_t)u;
-					bp->lun = units[u].lun;
-				}
-			}
+			bp->unit = block_unit_of(dp, units, nunits);
+			bp->lun = bp->unit != 0xffff ? units[bp->unit].lun : 0xff;
 		}
 		if (block_write_requested && block_is_darwin(info, bio, bp)) {
 			block_write_part = (int)block_shared.parts;
@@ -2180,6 +2467,9 @@ block_start(void)
 	if (block_write_part >= 0) {
 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
 		block_shared.write_first = PLAT->darwin->write_first;   /* block_is_darwin() said yes: there is one */
+		if (layout.state == 1 && layout.var_blocks != 0) {
+			block_shared.write_caps = BLOCK_CAN_FAST;       /* (inside the layout's var alone: block_poll) */
+		}
 	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
@@ -2305,16 +2595,32 @@ block_poll(void)
 			}
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
-		} else if (op == BLOCK_OP_WRITE) {
+		} else if (op == BLOCK_OP_WRITE || op == BLOCK_OP_WRITE_FAST || op == BLOCK_OP_FLUSH) {
+			int fast = op != BLOCK_OP_WRITE;
+
 			if (block_write_part < 0 || PLAT->darwin == NULL || part != (uint32_t)block_write_part ||
-			    lba < PLAT->darwin->write_first) {
-				/* not darwin, or not past what the build writes from the computer: never */
+			    lba < PLAT->darwin->write_first || (fast && ((block_shared.write_caps & BLOCK_CAN_FAST) == 0 ||
+			    lba < layout.var_first || lba >= layout.var_first + layout.var_blocks ||
+			    count > layout.var_first + layout.var_blocks - lba))) {
+				/* not darwin, or not past what the build writes from the computer, or a fast one
+				 * outside the data volume: never */
 				if (block_writes_refused++ < 8) {
-					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
-					    block_shared.part[part].name);
+					print("ufs: a %s of %d blocks from %d of %s: REFUSED\n", fast ? "fast write or flush" : "write",
+					    count, lba, block_shared.part[part].name);
 				}
 				s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 				bytes = 0;
+			} else if (op == BLOCK_OP_FLUSH) {
+				s = bio->flush_blocks(bio);
+				bytes = 0;
+			} else if (op == BLOCK_OP_WRITE_FAST) {
+				flush_dcache((uint64_t)(uintptr_t)block_buffer,
+				    (uint64_t)(uintptr_t)block_buffer + bytes);
+				s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+				if (!EFI_ERROR(s)) {
+					block_writes++;
+					block_write_bytes += bytes;
+				}
 			} else {
 				/*
 				 * The kernel filled the buffer and cleaned its lines of it; drop whatever this
@@ -2329,7 +2635,9 @@ block_poll(void)
 				want = ufs_crc32(block_buffer, bytes);
 				s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
 				if (!EFI_ERROR(s)) {
-					bio->flush_blocks(bio);
+					s = bio->flush_blocks(bio);     /* (not flushed: not written, whatever a read back says) */
+				}
+				if (!EFI_ERROR(s)) {
 					s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
 					flush_dcache((uint64_t)(uintptr_t)block_buffer,
 					    (uint64_t)(uintptr_t)block_buffer + bytes);
@@ -3395,7 +3703,10 @@ struct payload_info {
 	uint64_t checkpoint;
 	uint64_t forced_base;
 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
+	const uint8_t *resident;        /* "resident": an image carried in the payload for the resident area (2.5) */
+	uint32_t resident_size;
 	int usb_mode;
+	int standalone;                 /* "standalone": the image boots the phone by itself, no host (2.5) */
 };
 
 static uint64_t
@@ -3438,6 +3749,9 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->ramdisk_size = e->size;
 		} else if (str_eq(e->name, "kernel")) {
 			pi->kernel = p + sizeof(*e);
+		} else if (str_eq(e->name, "resident")) {
+			pi->resident = p + sizeof(*e);            /* copied to the resident address before a one-shot run */
+			pi->resident_size = e->size;
 		} else if (str_eq(e->name, "cmdline")) {
 			pi->cmdline = text;
 		} else if (str_eq(e->name, "platform")) {
@@ -3451,6 +3765,8 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
 		} else if (str_eq(e->name, "usb")) {
 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
+		} else if (str_eq(e->name, "standalone")) {
+			pi->standalone = 1;                       /* boot by itself: see standalone_start() */
 		}
 		p += sizeof(*e) + ((e->size + 15) & ~15u);
 	}
@@ -3514,6 +3830,14 @@ static struct {
 } SCREEN;
 static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
+/*
+ * Standalone boot (loader 2.5, after vayu-dev's 2.2): the image is the phone's own boot partition and has
+ * a "standalone" entry, so no host is there to end the run. A kernel without loader_return_after then has
+ * no time limit: the watchdog is fed for as long as its heartbeat lives (a hung kernel still ends in the
+ * reset, which starts the same image again).
+ */
+static int standalone_boot;
+#define STANDALONE_BUDGET_SECONDS (100ULL * 365 * 86400)
 static char last_result[64] = "idle";
 
 static void
@@ -4497,6 +4821,29 @@ static uint64_t idle_reset_at;                  /* CNTVCT; 0: not counting */
 static unsigned usb_run_changes;                /* (tentative: defined with the USB code below) */
 static int usb_rx_queued;
 
+/*
+ * The number after `key` (written "name=" or "name=0x": up to its "=") among the words of a command line, as
+ * the kernel would read it (0x: hexadecimal, else decimal); 0: it is not there.
+ */
+static int
+cmdline_number(const char *cmdline, const char *key, uint64_t *value)
+{
+	unsigned klen = 0;
+
+	while (key[klen] != 0 && key[klen] != '=') {
+		klen++;
+	}
+	for (const char *c = cmdline; *c; c++) {
+		if ((c != cmdline && c[-1] != ' ') || memcmp(c, key, klen) != 0 || c[klen] != '=') {
+			continue;
+		}
+		c += klen + 1;
+		*value = (c[0] == '0' && (c[1] == 'x' || c[1] == 'X')) ? parse_number(c + 2, 16) : parse_number(c, 10);
+		return 1;
+	}
+	return 0;
+}
+
 static int
 run_kernel(int have_checkpoint, uint64_t checkpoint)
 {
@@ -4656,6 +5003,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		ufs_survey();
 	}
 	if (ufs_requested >= 2) {
+		layout_load();          /* (darwin's layout block: write_caps, and what goes on the command line below) */
 		block_start();
 	}
 	if (checkpoint == CHECKPOINT_SELFTEST) {
@@ -4678,6 +5026,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			}
 			break;
 		}
+	}
+	if (kernel_budget == 0 && standalone_boot) {
+		kernel_budget = STANDALONE_BUDGET_SECONDS;
+		print("standalone: no time limit; the watchdog is fed while the kernel's heartbeat lives\n");
 	}
 
 	/* Give the kernel the address of our return stub and the checkpoint to stop at. */
@@ -4795,6 +5147,38 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				}
 				if (n < FULL_CMD_LEN - 1) full_cmd[n++] = ' ';
 			}
+		}
+		/*
+		 * What darwin's layout block says (loader 2.5): /dev/ufs_var's slice and where a staged boot image
+		 * goes. Ahead of the payload's own arguments, so these are the ones the kernel takes (the first of
+		 * two wins); one of the image's own that disagrees is said here.
+		 */
+		if (layout.state == 1) {
+			uint32_t from = n;
+			const char *names[5] = { "ufs_var_first=0x", "ufs_var_blocks=0x", "ufs_stage_first=0x", "ufs_stage_blocks=0x",
+			    "ufs_stage_head=0x" };
+			uint64_t values[5] = { layout.var_first, layout.var_blocks, layout.stage_first, layout.stage_blocks,
+			    layout.stage_head };
+
+			for (int k = 0; k < 5; k++) {
+				uint64_t given;
+
+				if ((k < 2 && layout.var_blocks == 0) || (k >= 2 && layout.stage_blocks == 0)) {
+					continue;       /* (the layout has no such thing) */
+				}
+				if (cmdline_number(pi.cmdline, names[k], &given) && given != values[k]) {
+					print("layout: the image's own %s%x differs from darwin's layout (%x): the layout's is taken\n",
+					    names[k], given, values[k]);
+				}
+				for (const char *c = names[k]; *c && n < FULL_CMD_LEN - 1; c++) {
+					full_cmd[n++] = *c;
+				}
+				for (int shift = 60; shift >= 0 && n < FULL_CMD_LEN - 1; shift -= 4) {
+					full_cmd[n++] = hex[(values[k] >> shift) & 0xf];
+				}
+				if (n < FULL_CMD_LEN - 1) full_cmd[n++] = ' ';
+			}
+			print("layout: for the kernel: %s\n", full_cmd + from);    /* (full_cmd is zeros past n) */
 		}
 	}
 	if (battery_requested) {
@@ -5580,6 +5964,261 @@ starts_with(const char *s, const char *prefix)
 	return 1;
 }
 
+/* ---------------------------------------------------------------------------------------- */
+/* usbctl: touch, keys, a shell command and a file read, over this channel, in the middle of   */
+/* a run (bsd/dev/vayu_ctl.c on the kernel's side, /redwood/bin/usbctld for the commands).     */
+
+#define KERNEL_LIVE_MAGIC4      0x344556494c554e58ULL   /* "XNULIVE4" */
+
+/* The mailbox, field for field as bsd/sys/vayu_ctl.h has it. */
+struct vayu_ctl_mbox {
+	uint64_t magic;
+	volatile uint64_t seq;
+	volatile uint64_t state;
+	volatile uint64_t done_seq;
+	volatile uint64_t cmd;
+	volatile uint64_t arg[5];
+	volatile uint64_t code;
+	volatile uint64_t data_pa;
+	volatile uint64_t data_len;
+	volatile uint64_t total;
+	volatile uint64_t flags;
+	char text[512];
+};
+
+#define VCTL_MBOX_MAGIC         0x314c544355564156ULL  /* "VAVUCTL1" */
+#define VCTL_ST_IDLE            0
+#define VCTL_ST_REQ             1
+#define VCTL_ST_BUSY            2
+#define VCTL_ST_DONE            3
+
+#define VCTL_CMD_TOUCH          1
+#define VCTL_CMD_SWIPE          2
+#define VCTL_CMD_KEY            3
+#define VCTL_CMD_SH             4
+#define VCTL_CMD_PULL           5
+#define VCTL_CMD_STATUS         6
+
+#define VCTL_KEY_HOME           1
+#define VCTL_KEY_POWER          2
+#define VCTL_KEY_VOLUP           3
+#define VCTL_KEY_VOLDOWN        4
+
+#define VCTL_ERR_ARGS           (-1)
+#define VCTL_ERR_NOAGENT        (-2)
+#define VCTL_ERR_AGENT          (-3)
+#define VCTL_ERR_TIMEOUT        (-4)
+#define VCTL_ERR_BUSY           (-5)
+#define VCTL_ERR_NOWINDOW       (-6)
+
+/* How long the kernel is given for one command; its own timeout is 20 s (usbctl_timeout). */
+#define VCTL_SH_TIMEOUT_MS      25000
+#define VCTL_PULL_TIMEOUT_MS    40000
+
+#define VCTL_TOUCH_MS_DEFAULT   80
+#define VCTL_TOUCH_MS_MIN       10
+#define VCTL_TOUCH_MS_MAX       2000
+
+/*
+ * The answer's numbers, as "getvar uctl" gives them back.  The fastboot client's "oem" command
+ * prints only "OKAY [ t ]": the text after OKAY (the numbers below) never reaches its stdout, so
+ * before 2.4 the host had no way to learn a command's length, exit status or the pull's next
+ * offset -- and xl fetched nothing because it never knew there was anything to fetch.  2.4 keeps
+ * the last answer here and answers "getvar uctl" with it; the "oem" reply keeps the same text so
+ * the loader's own side is unchanged.
+ */
+static char vctl_last[64] = "0 0 0";
+
+static void vctl_hex_list(char *out, uint64_t size, const uint64_t *values, int count);
+
+static void
+vctl_set_last(uint64_t code, uint64_t len, uint64_t flags)
+{
+	uint64_t numbers[3] = { code, len, flags };
+
+	vctl_hex_list(vctl_last, sizeof(vctl_last), numbers, 3);
+}
+
+static struct vayu_ctl_mbox *
+vctl_mailbox(void)
+{
+	if (running_live == NULL || running_live->magic4 != KERNEL_LIVE_MAGIC4) {
+		return NULL;
+	}
+	if (running_live->vctl_pa == 0 || running_live->vctl_window_pa == 0) {
+		return NULL;
+	}
+	return (struct vayu_ctl_mbox *)(uintptr_t)running_live->vctl_pa;
+}
+
+/*
+ * One request to the kernel, and the answer.  While it is waited for the storage's reads are
+ * served (block_poll): the kernel may be reading a file for us, and its read waits for this
+ * core.  Nothing else from the host is taken meanwhile -- one command at a time, as the
+ * channel has always been.
+ */
+static int
+vctl_call(uint64_t cmd, const char *text, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+    uint64_t timeout_ms, int64_t *code_out)
+{
+	struct vayu_ctl_mbox *m = vctl_mailbox();
+	uint64_t freq, began, limit;
+	int64_t code;
+
+	if (m == NULL) {
+		return 0;
+	}
+	freq = READ_SYSREG(CNTFRQ_EL0);
+	if (m->seq != m->done_seq) {                    /* the previous request is still being answered */
+		uint64_t waited = 0;
+
+		while (m->seq != m->done_seq && waited < 3000) {
+			block_poll();
+			BS->stall(1000);
+			waited++;
+		}
+		if (m->seq != m->done_seq) {
+			return -1;                      /* it is not coming back; leave it to its own timeout */
+		}
+	}
+	m->cmd = cmd;
+	m->arg[0] = a0;
+	m->arg[1] = a1;
+	m->arg[2] = a2;
+	m->arg[3] = a3;
+	m->arg[4] = a4;
+	m->code = 0;
+	m->data_len = 0;
+	m->total = 0;
+	m->flags = 0;
+	m->text[0] = 0;
+	if (text != NULL) {
+		uint64_t i = 0;
+
+		for (; text[i] != 0 && i + 1 < sizeof(m->text); i++) {
+			m->text[i] = text[i];
+		}
+		m->text[i] = 0;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	m->seq = m->seq + 1;                            /* the last write: this is the request */
+	m->state = VCTL_ST_REQ;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	began = READ_SYSREG(CNTVCT_EL0);
+	limit = freq / 1000 * timeout_ms;
+	while (m->done_seq != m->seq) {                  /* the answer to *this* request, not a stale one */
+		block_poll();                            /* the kernel's storage reads are ours to serve */
+		if (READ_SYSREG(CNTVCT_EL0) - began > limit) {
+			m->state = VCTL_ST_IDLE;            /* (the kernel's done_seq check sees this one is over) */
+			return -1;
+		}
+		BS->stall(2000);                         /* 2 ms: a touch is noticed in it */
+	}
+	code = (int64_t)m->code;
+	m->state = VCTL_ST_IDLE;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*code_out = code;
+	return 1;
+}
+
+/* "oem touch 540 1200": panel pixels, as /redwood/bin/touch takes them. */
+static int
+vctl_parse_numbers(const char *text, int64_t *value, int count)
+{
+	int got = 0;
+
+	while (got < count) {
+		int64_t v = 0;
+		int digits = 0;
+
+		while (*text == ' ') {
+			text++;
+		}
+		while (*text >= '0' && *text <= '9') {
+			v = v * 10 + (*text++ - '0');
+			digits++;
+		}
+		if (digits == 0 || v > 1000000) {
+			return got;
+		}
+		value[got++] = v;
+	}
+	return got;
+}
+
+static uint32_t
+vctl_panel_width(void)
+{
+	return 1080;            /* vayu's panel; the kernel maps it to the picture (hakios_touch_post_at) */
+}
+
+static uint32_t
+vctl_panel_height(void)
+{
+	return 2400;
+}
+
+/* Panel pixels to the 0..65535 the kernel's touch path takes. */
+static uint32_t
+vctl_axis(int64_t pixel, uint32_t size)
+{
+	uint64_t v;
+
+	if (pixel < 0) {
+		pixel = 0;
+	}
+	if (pixel > (int64_t)size - 1) {
+		pixel = (int64_t)size - 1;
+	}
+	v = (uint64_t)pixel * 65535 / (size > 0 ? size : 1);
+	return (uint32_t)v;
+}
+
+/* "a b c" in lowercase hex, no leading zeros: the fastboot reply carries numbers only. */
+static void
+vctl_hex_list(char *out, uint64_t size, const uint64_t *values, int count)
+{
+	uint64_t n = 0;
+
+	for (int i = 0; i < count && n + 20 < size; i++) {
+		char tmp[20];
+		int k = 0;
+		uint64_t v = values[i];
+
+		do {
+			tmp[k++] = "0123456789abcdef"[v & 0xf];
+			v >>= 4;
+		} while (v);
+		if (n != 0) {
+			out[n++] = ' ';
+		}
+		while (k != 0) {
+			out[n++] = tmp[--k];
+		}
+	}
+	out[n] = 0;
+}
+
+/* What a negative code from the kernel means, for a "FAIL <reason>" fastboot reply. */
+static const char *
+vctl_reason(int64_t code)
+{
+	if (code <= -1000) {            /* the agent's file error: -(1000 + errno) */
+		return "the file could not be read";
+	}
+	switch ((int)code) {
+	case VCTL_ERR_ARGS:     return "bad arguments";
+	case VCTL_ERR_NOAGENT:  return "no usbctld is reading /dev/vayu-ctl";
+	case VCTL_ERR_AGENT:    return "usbctld could not do it";
+	case VCTL_ERR_TIMEOUT:  return "the command timed out";
+	case VCTL_ERR_BUSY:     return "the kernel is busy with another command";
+	case VCTL_ERR_NOWINDOW: return "no window";
+	}
+	return "the kernel refused it";
+}
+
+
 /*
  * One command from the host. While a kernel runs on another core (running_live) only what does
  * not disturb it: questions, the screen, the log so far, and "oem stop".
@@ -5611,11 +6250,19 @@ fb_command(char *cmd)
 			if (str_eq(var, "product")) {
 				fb_reply("OKAY", "xnuloader");
 			} else if (str_eq(var, "version")) {
-				fb_reply("OKAY", "2.1");      /* 0.6: idle "oem log" stages the last kernel log; 0.7: USB receive re-armed; 0.8: vayu-ufs; 0.9: USB stack restarted after cable changes; 1.0: restart after 120 s without a host command; 1.1: usb_handover=1; 1.2: fb_spare=N frames below 4 GB; 1.3: the vayu train (cam/bt/jack/nfc pin paths, all opt-in by cmdline); 1.4: vayu_ir_pins=1 (TLMM exception 7); 1.5: vayu_ir_clk=1 (GCC exception 7a); 1.6: fb_spare frames of 12 MiB (zero-copy surfaces); 1.7: fb_spare clear of the vendor's reserved ranges, oem fbspare / oem fbtouch; 1.8: logdump kept at boot if it holds the last run's log, oem prevlog; 1.8a: idle reset 600 s with usb_handover=1; 1.9: the whole command line in /chosen hakios-bootargs; 2.0: vayu darwin (sda33) known, writes served with ufs_write=1; 2.1: vayu_cam_pins also sets GPIO 24 (rear VAF enable) */
+				fb_reply("OKAY", "2.5");      /* 0.6: idle "oem log" stages the last kernel log; 0.7: USB receive re-armed; 0.8: vayu-ufs; 0.9: USB stack restarted after cable changes; 1.0: restart after 120 s without a host command; 1.1: usb_handover=1; 1.2: fb_spare=N frames below 4 GB; 1.3: the vayu train (cam/bt/jack/nfc pin paths, all opt-in by cmdline); 1.4: vayu_ir_pins=1 (TLMM exception 7); 1.5: vayu_ir_clk=1 (GCC exception 7a); 1.6: fb_spare frames of 12 MiB (zero-copy surfaces); 1.7: fb_spare clear of the vendor's reserved ranges, oem fbspare / oem fbtouch; 1.8: logdump kept at boot if it holds the last run's log, oem prevlog; 1.8a: idle reset 600 s with usb_handover=1; 1.9: the whole command line in /chosen hakios-bootargs; 2.0: vayu darwin (sda33) known, writes served with ufs_write=1; 2.1: vayu_cam_pins also sets GPIO 24 (rear VAF enable); 2.3: usbctl -- oem touch/swipe/key/sh/pull through the kernel (bsd/dev/vayu_ctl.c, /redwood/bin/usbctld), on the 2.1 base; the in-run USB receive changes of 2.2 are not included; 2.4: getvar uctl (the numbers the fastboot client does not print), oem touch X Y [MS]; 2.5: standalone boot (payload entries "standalone" and "resident": no time limit without a host, vayu-dev 2.2/2.3), darwin's layout block (the ufs_var_ and ufs_stage_ boot-args for the kernel, BLOCK_OP_WRITE_FAST/FLUSH inside var), a staged boot image written into boot with flash_stage=1 (vayu-dev 2.8), flush_blocks checked on every write */
 			} else if (str_eq(var, "max-download-size")) {
 				fb_reply("OKAY", download_to_ramdisk ? "0xffffffff" : "0x03f00000");
 			} else if (str_eq(var, "result")) {
 				fb_reply("OKAY", last_result);
+			} else if (str_eq(var, "uctl")) {
+				/*
+				 * What the last "oem touch|swipe|key|sh|pull|uctl" answered: the same
+				 * numbers its OKAY carried, which the fastboot client does not print.
+				 * "0 0 0" for a touch, "<code> <len> <flags>" for sh, "<total> <len>
+				 * <next> <last>" for pull, "0|1" for uctl.
+				 */
+				fb_reply("OKAY", vctl_last);
 			} else if (str_eq(var, "screen") && SCREEN.base != 0) {
 				/* width height bytes-per-row */
 				uint32_t mark = log_len;
@@ -5720,6 +6367,181 @@ fb_command(char *cmd)
 				memset((void *)(uintptr_t)SCREEN.base, 0, (size_t)SCREEN.stride * SCREEN.height);
 			}
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem touch ") || starts_with(cmd, "oem swipe ") ||
+		    starts_with(cmd, "oem key ") || starts_with(cmd, "oem sh ") || starts_with(cmd, "oem pull ") ||
+		    starts_with(cmd, "oem uctl")) {
+			/*
+			 * usbctl: the kernel does the work (bsd/dev/vayu_ctl.c), the agent runs the
+			 * commands (usbctld).  The answers' bytes land in the kernel's window and are
+			 * staged here, exactly as "oem screenshot" stages the framebuffer: "fastboot
+			 * get_staged" after the command fetches them.
+			 */
+			int64_t v[6] = { 0, 0, 0, 0, 0, 0 };
+			int64_t code = 0;
+			struct vayu_ctl_mbox *m = vctl_mailbox();
+			int r;
+
+			vctl_last[0] = 0;               /* a failed command leaves no numbers to read */
+			if (!busy) {
+				fb_reply("FAIL", "no kernel is running");
+				return;
+			}
+			if (m == NULL) {
+				fb_reply("FAIL", "the kernel has no usbctl (boot-arg usbctl=0?)");
+				return;
+			}
+			if (starts_with(cmd, "oem touch ")) {
+				int n = vctl_parse_numbers(cmd + 10, v, 3);
+				uint64_t ms = n >= 3 ? (uint64_t)v[2] : VCTL_TOUCH_MS_DEFAULT;
+
+				if (n < 2 ||
+				    v[0] >= (int64_t)vctl_panel_width() || v[1] >= (int64_t)vctl_panel_height()) {
+					fb_reply("FAIL", "usage: oem touch X Y [MS] (panel pixels)");
+					return;
+				}
+				if (ms < VCTL_TOUCH_MS_MIN || ms > VCTL_TOUCH_MS_MAX) {
+					ms = VCTL_TOUCH_MS_DEFAULT;
+				}
+				r = vctl_call(VCTL_CMD_TOUCH, NULL, vctl_axis(v[0], vctl_panel_width()),
+				    vctl_axis(v[1], vctl_panel_height()), ms, 0, 0, 10000, &code);
+			} else if (starts_with(cmd, "oem swipe ")) {
+				int n = vctl_parse_numbers(cmd + 10, v, 5);
+
+				if (n < 4) {
+					fb_reply("FAIL", "usage: oem swipe X1 Y1 X2 Y2 [MS]");
+					return;
+				}
+				if (n == 4) {
+					v[4] = 300;
+				}
+				if (v[0] >= (int64_t)vctl_panel_width() || v[1] >= (int64_t)vctl_panel_height() ||
+				    v[2] >= (int64_t)vctl_panel_width() || v[3] >= (int64_t)vctl_panel_height()) {
+					fb_reply("FAIL", "the points are outside the panel");
+					return;
+				}
+				r = vctl_call(VCTL_CMD_SWIPE, NULL, vctl_axis(v[0], vctl_panel_width()),
+				    vctl_axis(v[1], vctl_panel_height()), vctl_axis(v[2], vctl_panel_width()),
+				    vctl_axis(v[3], vctl_panel_height()), (uint64_t)v[4],
+				    (uint64_t)v[4] + 10000, &code);
+			} else if (starts_with(cmd, "oem key ")) {
+				const char *name = cmd + 8;
+				uint64_t which;
+
+				while (*name == ' ') {
+					name++;
+				}
+				if (str_eq(name, "home")) {
+					which = VCTL_KEY_HOME;
+				} else if (str_eq(name, "power") || str_eq(name, "lock")) {
+					which = VCTL_KEY_POWER;
+				} else if (str_eq(name, "volup")) {
+					which = VCTL_KEY_VOLUP;
+				} else if (str_eq(name, "voldown")) {
+					which = VCTL_KEY_VOLDOWN;
+				} else {
+					fb_reply("FAIL", "usage: oem key home|power|volup|voldown");
+					return;
+				}
+				r = vctl_call(VCTL_CMD_KEY, NULL, which, 0, 0, 0, 0, 10000, &code);
+			} else if (starts_with(cmd, "oem sh ")) {
+				r = vctl_call(VCTL_CMD_SH, cmd + 7, 0, 0, 0, 0, 0, VCTL_SH_TIMEOUT_MS, &code);
+				if (r > 0 && code < 0) {
+					fb_reply("FAIL", vctl_reason(code));
+					return;
+				}
+				if (r > 0) {
+					uint64_t numbers[3];
+
+					staged_data = (const char *)(uintptr_t)m->data_pa;
+					staged_len = m->data_len;
+					numbers[0] = (uint64_t)code;
+					numbers[1] = m->data_len;
+					numbers[2] = m->flags;          /* bit 0: the output was truncated */
+					vctl_hex_list(vctl_last, sizeof(vctl_last), numbers, 3);
+					fb_reply("OKAY", vctl_last);
+					return;
+				}
+				fb_reply("FAIL", r == 0 ? "the kernel has no usbctl (boot-arg usbctl=0?)" :
+				    "the kernel did not answer");
+				return;
+			} else if (starts_with(cmd, "oem pull ")) {
+				const char *path = cmd + 9;
+				uint64_t off = 0;
+				int n;
+
+				while (*path == ' ') {
+					path++;
+				}
+				/* the path runs to the last optional number: "oem pull /a b/c.png [offset]" */
+				if (str_eq(path, "")) {
+					fb_reply("FAIL", "usage: oem pull PATH [OFFSET]");
+					return;
+				}
+				{
+					const char *end = path;
+					const char *num;
+
+					while (*end != 0) {
+						end++;
+					}
+					num = end;
+					while (num > path && num[-1] >= '0' && num[-1] <= '9') {
+						num--;
+					}
+					if (num > path + 1 && num[-1] == ' ') {
+						n = (int)(end - num);
+						if (n > 0 && n < 12) {
+							for (int i = 0; i < n; i++) {
+								off = off * 10 + (uint64_t)(num[i] - '0');
+							}
+							((char *)path)[num - path - 1] = 0;
+						}
+					}
+				}
+				r = vctl_call(VCTL_CMD_PULL, path, off, 4 * 1024 * 1024, 0, 0, 0,
+				    VCTL_PULL_TIMEOUT_MS, &code);
+				if (r > 0 && code < 0) {
+					fb_reply("FAIL", vctl_reason(code));
+					return;
+				}
+				if (r > 0) {
+					uint64_t numbers[4];
+
+					staged_data = (const char *)(uintptr_t)m->data_pa;
+					staged_len = m->data_len;
+					numbers[0] = m->total;
+					numbers[1] = m->data_len;
+					numbers[2] = off + m->data_len;
+					numbers[3] = (m->flags & 2) ? 1 : 0;
+					vctl_hex_list(vctl_last, sizeof(vctl_last), numbers, 4);
+					fb_reply("OKAY", vctl_last);
+					return;
+				}
+				fb_reply("FAIL", r == 0 ? "the kernel has no usbctl (boot-arg usbctl=0?)" :
+				    "the kernel did not answer");
+				return;
+			} else {
+				r = vctl_call(VCTL_CMD_STATUS, NULL, 0, 0, 0, 0, 0, 5000, &code);
+				if (r > 0) {
+					uint64_t numbers[1];
+
+					numbers[0] = code > 0 ? 1 : 0;      /* usbctld has the device open */
+					vctl_hex_list(vctl_last, sizeof(vctl_last), numbers, 1);
+					fb_reply("OKAY", vctl_last);
+				} else {
+					fb_reply("FAIL", "the kernel did not answer");
+				}
+				return;
+			}
+			if (r > 0 && code >= 0) {
+				vctl_set_last(0, 0, 0);
+				fb_reply("OKAY", vctl_last);
+			} else if (r > 0) {
+				fb_reply("FAIL", vctl_reason(code));
+			} else {
+				fb_reply("FAIL", r == 0 ? "the kernel has no usbctl (boot-arg usbctl=0?)" :
+				    "the kernel did not answer");
+			}
 		} else if (starts_with(cmd, "oem run") || starts_with(cmd, "oem selftest")) {
 			int selftest = starts_with(cmd, "oem selftest");
 			const char *arg = cmd + 7;
@@ -5807,7 +6629,7 @@ usb_poll_command(void)
 	uint32_t msg = UsbDeviceEventNoEvent;
 	uint64_t size = 0, n;
 	usb_device_event_data data;
-	char cmd[128];
+	char cmd[512];              /* "oem sh" carries a command line: the whole receive, 511 bytes */
 
 	if (USB == NULL) {
 		return;         /* this run was not started over USB */
@@ -5860,7 +6682,7 @@ usb_command_loop(void)
 {
 	screen_quiet = 1;
 	for (;;) {
-		char cmd[128];
+		char cmd[512];
 		int64_t n;
 
 		if (!usb_connected) {
@@ -5966,6 +6788,213 @@ ramfb_phone_screen(void)
 	SCREEN.stride = PHONE_WIDTH * 4;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Standalone boot (2.5): the image in the phone's boot partition, no host  */
+
+/*
+ * A boot image staged by iOS (after vayu-dev's loader 2.8 and its userland flash_stage), written into boot
+ * at this start: an update of the system from iOS itself, with no computer and no buttons. Only with
+ * flash_stage=1 on the command line of the image that is starting (without it a staged image is left alone
+ * and nothing is written), only from where darwin's layout puts it (stage, stagehead), and only into the
+ * boot partition the platform names (PLAT->boot: its name, GUIDs, LBAs and unit, from this phone's GPT).
+ *
+ * The header ("XNUFLASH", u64 first block, u64 bytes, u64 FNV-1a 64 of the bytes) is cleared first, so that
+ * whatever happens next the following start is an ordinary one. The image is then read through once: its
+ * place, size, magic ("ANDROID!") and sum are checked, and if one of them is wrong nothing is written and
+ * this start goes on as ever. Then boot's present contents are kept in memory and the image is written a
+ * megabyte at a time, each piece flushed and read back; if a piece does not come back the same, the old
+ * contents go back the same way and this start goes on (the payload in memory is untouched). Done: a reset
+ * into the new image.
+ */
+#define STAGE_CHUNK     (1024 * 1024)
+
+static int
+stage_copy(efi_block_io *to, const uint8_t *from, uint64_t at, uint64_t n, uint8_t *check)
+{
+	efi_status s = to->write_blocks(to, to->media->media_id, at / 4096, n, (void *)from);
+
+	if (!EFI_ERROR(s)) {
+		s = to->flush_blocks(to);
+	}
+	if (!EFI_ERROR(s)) {
+		s = to->read_blocks(to, to->media->media_id, at / 4096, n, check);
+	}
+	wdt_pet();
+	return !EFI_ERROR(s) && memcmp(check, from, n) == 0;
+}
+
+static void
+standalone_staged_flash(const struct payload_info *pi)
+{
+	static uint8_t head[4096] __attribute__((aligned(4096)));
+	efi_block_io *darwin = layout.bio, *boot;
+	uint64_t first, bytes, fnv, rounded, at, sum, boot_bytes, saved_pa = 0;
+	uint8_t *chunk = NULL, *check = NULL, *saved;
+	const char *why = NULL;
+	efi_status s;
+
+	if (layout.state != 1 || layout.stage_blocks == 0 ||
+	    EFI_ERROR(darwin->read_blocks(darwin, darwin->media->media_id, layout.stage_head, sizeof(head), head)) ||
+	    memcmp(head, "XNUFLASH", 8) != 0) {
+		return;                 /* (nothing staged: the usual start) */
+	}
+	if (!aud_word(pi->cmdline, "flash_stage=1")) {
+		print("staged flash: a boot image is staged in darwin, and flash_stage=1 is not on this image's command line: "
+		    "left alone\n");
+		return;
+	}
+	first = le64(head + 8);
+	bytes = le64(head + 16);
+	fnv = le64(head + 24);
+	memset(head, 0, sizeof(head));
+	s = darwin->write_blocks(darwin, darwin->media->media_id, layout.stage_head, sizeof(head), head);
+	if (!EFI_ERROR(s)) {
+		s = darwin->flush_blocks(darwin);
+	}
+	if (EFI_ERROR(s)) {
+		print("staged flash: the header could not be cleared (%x): not flashed\n", (uint64_t)s);
+		return;
+	}
+	print("staged flash: %d bytes at darwin block %d, fnv %x; the header is cleared\n", bytes, first, fnv);
+	rounded = (bytes + 4095) / 4096 * 4096;
+	boot = part_by_identity("boot", PLAT->boot, &why);
+	if (boot == NULL) {
+		print("staged flash: boot not written: %s\n", why);
+		return;
+	}
+	boot_bytes = (boot->media->last_block + 1) * boot->media->block_size;
+	if (first != layout.stage_first || bytes < 4096 || rounded > layout.stage_blocks * 4096 || rounded > boot_bytes) {
+		print("staged flash: the header is not one to trust (its place or size): not flashed\n");
+		return;
+	}
+	if (EFI_ERROR(BS->allocate_pool(EfiLoaderData, STAGE_CHUNK, (void **)&chunk)) ||
+	    EFI_ERROR(BS->allocate_pool(EfiLoaderData, STAGE_CHUNK, (void **)&check)) ||
+	    EFI_ERROR(BS->allocate_pages(AllocateAnyPages, EfiLoaderData, rounded >> 12, &saved_pa))) {
+		print("staged flash: no memory for it: not flashed\n");
+		saved_pa = 0;
+		goto out;
+	}
+	saved = (uint8_t *)(uintptr_t)saved_pa;
+	/* once through: the image is what its header says, and an Android boot image */
+	sum = 0xcbf29ce484222325ULL;
+	for (at = 0; at < rounded && why == NULL; at += STAGE_CHUNK) {
+		uint64_t n = rounded - at < STAGE_CHUNK ? rounded - at : STAGE_CHUNK;
+
+		if (EFI_ERROR(darwin->read_blocks(darwin, darwin->media->media_id, first + at / 4096, n, chunk))) {
+			why = "the staged image could not be read";
+		} else if (at == 0 && memcmp(chunk, "ANDROID!", 8) != 0) {
+			why = "the staged image is not an Android boot image";
+		} else {
+			sum = ufs_fnv(sum, chunk, bytes - at < n ? bytes - at : n);
+		}
+		wdt_pet();
+	}
+	if (why == NULL && sum != fnv) {
+		print("staged flash: fnv %x, the header says %x\n", sum, fnv);
+		why = "the staged image's sum is not the header's";
+	}
+	for (at = 0; at < rounded && why == NULL; at += STAGE_CHUNK) {
+		uint64_t n = rounded - at < STAGE_CHUNK ? rounded - at : STAGE_CHUNK;
+
+		if (EFI_ERROR(boot->read_blocks(boot, boot->media->media_id, at / 4096, n, saved + at))) {
+			why = "boot's present contents could not be read (to put back if the write went wrong)";
+		}
+	}
+	if (why != NULL) {
+		print("staged flash: not flashed: %s\n", why);
+		goto out;
+	}
+	print("staged flash: writing boot (%d bytes of %d), a megabyte at a time, each piece read back\n", rounded, boot_bytes);
+	flush_log();
+	sum = 0xcbf29ce484222325ULL;
+	for (at = 0; at < rounded && why == NULL; at += STAGE_CHUNK) {
+		uint64_t n = rounded - at < STAGE_CHUNK ? rounded - at : STAGE_CHUNK;
+
+		if (EFI_ERROR(darwin->read_blocks(darwin, darwin->media->media_id, first + at / 4096, n, chunk))) {
+			why = "the staged image could not be read again";
+			break;
+		}
+		if (bytes - at < n) {
+			memset(chunk + (bytes - at), 0, n - (bytes - at));      /* (the last block's rest: zeros) */
+		}
+		sum = ufs_fnv(sum, chunk, bytes - at < n ? bytes - at : n);
+		if (!stage_copy(boot, chunk, at, n, check)) {
+			print("staged flash: the piece at byte %d did not read back the same\n", at);
+			why = "a piece of boot did not read back the same";
+		}
+	}
+	if (why == NULL && sum != fnv) {
+		why = "the staged image changed while it was written";
+	}
+	if (why == NULL) {
+		print("staged flash: boot written, read back the same; restarting into it\n");
+		flush_log();
+		BS->stall(1500000);     /* (a moment to read it on the screen) */
+		reboot();
+	}
+	print("staged flash: %s: boot's old contents go back\n", why);
+	for (at = 0, why = NULL; at < rounded && why == NULL; at += STAGE_CHUNK) {
+		uint64_t n = rounded - at < STAGE_CHUNK ? rounded - at : STAGE_CHUNK;
+
+		if (!stage_copy(boot, saved + at, at, n, check)) {
+			why = "NOT put back";
+		}
+	}
+	print("staged flash: boot's old contents %s; this start goes on without the new image\n",
+	    why == NULL ? "are back, read back the same" : "were NOT all put back: the next start from boot may fail "
+	    "(stock fastboot with the buttons, fastboot flash boot a saved image)");
+	flush_log();
+out:
+	if (saved_pa != 0) {
+		BS->free_pages(saved_pa, rounded >> 12);
+	}
+	if (check != NULL) {
+		BS->free_pool(check);
+	}
+	if (chunk != NULL) {
+		BS->free_pool(chunk);
+	}
+}
+
+/* A "resident" entry of a one-shot payload: copied where the host would have put it ("oem ramdisk"). */
+static void
+resident_from_payload(const struct payload_info *pi)
+{
+	if (pi->resident == NULL) {
+		return;
+	}
+	if (!choose_window(pi) || win_size <= RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE ||
+	    pi->resident_size > win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE) {
+		print("standalone: no room for the resident image (%x bytes): not started\n", (uint64_t)pi->resident_size);
+		flush_log();
+		BS->stall(10000000);    /* (the line stays on the screen a while) */
+		reboot();
+	}
+	memcpy((void *)(win_base + RESIDENT_RD_OFFSET), pi->resident, pi->resident_size);
+	resident_rd_size = pi->resident_size;
+	print("standalone: resident image (%x bytes) copied to pa %x\n", (uint64_t)pi->resident_size,
+	    win_base + RESIDENT_RD_OFFSET);
+}
+
+/*
+ * A standalone start: the image has a "standalone" entry (the phone's own boot partition, or the same image
+ * tried from RAM with "fastboot boot"). Before the kernel: darwin's layout, a staged boot image if
+ * flash_stage=1 lets it be written, and -- usb_handover=1 (vayu-dev's 2.3) -- this loader's USB stack, which
+ * the kernel's USB networking asks for about half a minute in and can only be handed if it was started.
+ */
+static void
+standalone_start(const struct payload_info *pi)
+{
+	standalone_boot = 1;
+	print("standalone: the image boots by itself (no host)\n");
+	layout_load();
+	standalone_staged_flash(pi);
+	if (aud_word(pi->cmdline, "usb_handover=1") && USB == NULL) {
+		print("standalone: usb_handover=1: %s\n", usb_start() ? "USB started, for the kernel to take" :
+		    "USB did not start: the kernel will have none");
+	}
+}
+
 efi_status EFIAPI
 efi_main(efi_handle image, efi_system_table *st)
 {
@@ -6028,6 +7057,10 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
+		if (pi.standalone) {
+			standalone_start(&pi);
+		}
+		resident_from_payload(&pi);
 		run_kernel(0, 0);
 	}
 	reboot();

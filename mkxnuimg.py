@@ -10,9 +10,13 @@ The boot shim copies the FD to its base and the payload to PAYLOAD_BASE.
 The UEFI pieces are taken from a Mu-Silicium tree built here (Mu-Silicium/, see devices/poco-x5-pro/uefi/README.md)
 or, when there is none, from devices/poco-x5-pro/prebuilt/.
 
-usage: mkxnuimg.py [-p payload.bin] [-o out.img]
+With --uefi-from IMAGE the boot shim, the UEFI, the device tree and the ramdisk are those of an image built
+this way before (host/new/mkboot-usbctl.sh's recipe): for a phone whose prebuilt/ has no BootShim.bin and
+SILICIUM_UEFI.fd, such as the POCO X3 Pro's (its images carry the right ones for its FD_BASE/FD_SIZE).
+
+usage: mkxnuimg.py [-p payload.bin] [-o out.img] [--uefi-from IMAGE]
 """
-import argparse, gzip, os, subprocess, sys
+import argparse, gzip, os, struct, subprocess, sys, tempfile, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MU = os.path.join(HERE, 'Mu-Silicium')
@@ -36,10 +40,37 @@ ap = argparse.ArgumentParser()
 ap.add_argument('-p', '--payload')
 ap.add_argument('-o', '--output', default=os.path.join(HERE, 'xnu-redwood.img'))
 ap.add_argument('--mode', default='RELEASE')
+ap.add_argument('--uefi-from', help='an earlier image of this phone: its shim, UEFI, device tree and ramdisk')
 args = ap.parse_args()
 
+
+def pieces_of(image):
+    """shim, FD, DTB and ramdisk of an Android boot image (header v1) whose kernel is gzip(shim + FD + XNUP) + DTB"""
+    d = open(image, 'rb').read()
+    magic, ks, _, rs, _, _, _, _, ps, hv = struct.unpack_from('<8s9I', d, 0)
+    if magic != b'ANDROID!' or hv != 1:
+        sys.exit(f'mkxnuimg.py: {image} is not an Android boot image of header version 1')
+    z = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    blob = z.decompress(d[ps:ps + ks])
+    dtb = z.unused_data
+    fv = blob.find(b'_FVH') - 0x28
+    if dtb[:4] != b'\xd0\x0d\xfe\xed' or fv <= 0:
+        sys.exit(f'mkxnuimg.py: {image}: no device tree after the kernel, or no UEFI volume in it')
+    fvlen, = struct.unpack_from('<I', blob, fv + 0x20)
+    roff = ps + (ks + ps - 1) // ps * ps
+    return blob[:fv], blob[fv:fv + fvlen], dtb, d[roff:roff + rs]
+
+
 fd_path = os.path.join(MU, f'Build/{UEFI_TARGET}Pkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
-if os.path.isfile(fd_path):
+tmp = tempfile.mkdtemp(prefix='mkxnuimg.')
+if args.uefi_from:
+    shim, fd, dtb, ramdisk = pieces_of(args.uefi_from)
+    for name, data in (('shim', shim), ('fd', fd), ('dtb', dtb), ('ramdisk', ramdisk)):
+        open(os.path.join(tmp, name), 'wb').write(data)
+    parts = {'shim': os.path.join(tmp, 'shim'), 'fd': os.path.join(tmp, 'fd'), 'dtb': os.path.join(tmp, 'dtb'),
+             'ramdisk': os.path.join(tmp, 'ramdisk'), 'mkbootimg': os.path.join(HERE, 'host', 'new', 'mkbootimg.py')}
+    print(f'uefi from {args.uefi_from}: shim {len(shim)}, fd {len(fd)}, dtb {len(dtb)}, ramdisk {len(ramdisk)}')
+elif os.path.isfile(fd_path):
     shim_dir = os.path.join(MU, 'BootShim')
     for f in ('BootShim.elf', 'BootShim.bin'):
         try: os.unlink(os.path.join(shim_dir, f))
@@ -83,4 +114,7 @@ try:
                            '--header_version', '1', '-o', args.output])
 finally:
     os.unlink(kernel)
+    for f in os.listdir(tmp):
+        os.unlink(os.path.join(tmp, f))
+    os.rmdir(tmp)
 print(f'{args.output}: {os.path.getsize(args.output)} bytes (shim {len(shim)}, uncompressed {len(blob)})')

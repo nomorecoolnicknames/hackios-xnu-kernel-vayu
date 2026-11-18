@@ -73,6 +73,16 @@
  *                        without this the FW_READY wait can only run out.  Every re-run keeps the
  *                        same bounded timeouts; the wait for the new port is
  *                        vayu_wifi_reattach_wait ms (default 20000, clamped 1000..60000).
+ *   vayu_wifi_recover=N  1 (default): after a PFR or an SMP2P early-crash-ind that followed the
+ *                        CE/HTC/WMI stage, reset the CE/HTC state without a register access, wait
+ *                        for WLFW on its new port, clear the latches and run the whole sequence
+ *                        again (IND_REGISTER -> ... -> WLAN_MODE -> CE -> HTC -> WMI -> scan/join).
+ *                        N = 1..3 attempts; 0 disables.  Every attempt is bounded and refuses to
+ *                        start if the new firmware still carries the early-crash-ind.
+ *   vayu_wifi_ce_stock=0 1 (default): use the stock WCN3990 host_ce_config_wlan (CE5 is a
+ *                        host->target source pipe, CE7/CE8 have no host rings, CE2 = 128 entries,
+ *                        CE4 = 2048).  0 selects k28's table, including the W21h 511-buffer CE5
+ *                        RX posting, for an A/B run only.
  *   vayu_wifi_bdf=3      the stock flow: no HOST_CAP, no board file, no cal_report, then wait for
  *                        FW_READY for vayu_wifi_bdf_wait ms.  This is the whole pre-FW_READY
  *                        sequence of the vayu stock driver: icnss.c:955-1050 powers the rails and
@@ -279,6 +289,9 @@ static uint32_t wifi_probe;               /* vayu_wifi_probe=N: post-cap variant
 static uint32_t wifi_reattach;            /* vayu_wifi_reattach=N: re-run on a new WLFW server */
 static uint32_t wifi_reattach_wait_ms = 20000; /* vayu_wifi_reattach_wait=MS: wait for that port */
 static uint32_t wifi_reattach_runs;       /* how many times the sequence was re-run */
+static uint32_t wifi_recover = 1;         /* vayu_wifi_recover=N: 0 off; N = attempts after a PFR */
+static uint32_t wifi_recover_runs;        /* how many recoveries were actually started */
+static uint32_t wifi_ce_stock = 1;        /* vayu_wifi_ce_stock=0: k28 CE table (A/B only) */
 static uint32_t wifi_regdb;               /* vayu_wifi_regdb=1: after BDF; 2: after CAL_REPORT */
 static uint32_t wifi_dynmask;             /* vayu_wifi_dynmask=1: QMI 0x003B after CAP (stock icnss) */
 static uint32_t wifi_stock2;              /* vayu_wifi_stock2=1: stock WLFW with a second client (W12) */
@@ -307,6 +320,10 @@ static uint32_t wifi_listen_s;
 static bool wifi_started;
 static bool wifi_stopping;
 static volatile bool vayu_pdm_pfr_seen;      /* a pd-mapper PFR was received: no new CE work */
+
+/* K25: defined with the SMP2P section below; the PFR handler (earlier in this file) calls it once
+ * so a run says whether the firmware's own early-crash-ind accompanied the PDR report. */
+static void vayu_wifi_smp2p_at_pfr(void);
 
 /*
  * The WLFW step in progress, for the pd-mapper's PFR line: the firmware's crash report arrives at
@@ -757,6 +774,26 @@ pdm_receive(void *context __unused, uint32_t node, uint32_t from_port, const voi
 		struct vayu_pdm_pfr_req req = { 0 };
 		struct vayu_pdm_pfr_resp resp = { 0 };
 		int ret;
+
+		/*
+		 * K25: the decoded line says what the firmware reported, not who reported it.  The
+		 * sender (node 0 is the modem, node 5 the ADSP) and the raw message belong in the
+		 * log too: they tell which PDR client observed the crash and whether the message
+		 * carries a TLV this decoder does not name.  Read-only, and always printed: a PFR is
+		 * rare, and the line is exactly what a failed run needs.
+		 */
+		{
+			char hex[3 * 48 + 1];
+			size_t n = length < 48 ? length : 48;
+
+			for (size_t i = 0; i < n; i++) {
+				snprintf(hex + 3 * i, 4, " %02x", message[i]);
+			}
+			hex[3 * n] = 0;
+			say("vayu-wifi: pd-mapper: pfr from node %u port %u, %zu bytes:%s%s\n",
+			    node, from_port, length, hex, length > n ? " ..." : "");
+		}
+		vayu_wifi_smp2p_at_pfr();
 
 		ret = hakios_qmi_decode(message, length, vayu_pdm_pfr_req_ei, &req);
 		if (ret < 0) {
@@ -3009,9 +3046,17 @@ wlfw_new_server(struct qmi_handle *qmi, struct qmi_service *service)
 }
 
 static void
-wlfw_del_server(struct qmi_handle *qmi __unused, struct qmi_service *service __unused)
+wlfw_del_server(struct qmi_handle *qmi __unused, struct qmi_service *service)
 {
-	wlfw.server = false;
+	/*
+	 * K29 recovery: a late service-down for the dead port must not clear a
+	 * server that has already re-announced on a new port (the modem in the
+	 * PFR logs goes 88 -> 104 without a down event, but the race is cheap to
+	 * close).
+	 */
+	if (service == NULL || service->port == wlfw.port) {
+		wlfw.server = false;
+	}
 }
 
 static void
@@ -3139,10 +3184,12 @@ wlfw2_new_server(struct qmi_handle *qmi, struct qmi_service *service)
 }
 
 static void
-wlfw2_del_server(struct qmi_handle *qmi __unused, struct qmi_service *service __unused)
+wlfw2_del_server(struct qmi_handle *qmi __unused, struct qmi_service *service)
 {
 	say("vayu-wifi: wlfw2: WLFW server delete\n");
-	wlfw2_server = false;
+	if (service == NULL || service->port == wlfw2_port) {
+		wlfw2_server = false;
+	}
 }
 
 static void
@@ -4120,11 +4167,72 @@ vayu_wifi_smp2p_poll(const char *where)
 	return value;
 }
 
+/*
+ * K25: one line at the PFR with the firmware's own wlan in-bits.  The PDR report (pd-mapper) and
+ * the SMP2P early-crash-ind are independent channels; if the firmware set the bit, the stock
+ * driver would have treated it as FW down before any QMI PFR.  A PFR with wlan == 0 means only the
+ * modem's PDR path saw the death.  Read-only, and only when vayu_wifi_smp2p is on.
+ */
+static void
+vayu_wifi_smp2p_at_pfr(void)
+{
+	uint32_t bits;
+
+	if (wifi_smp2p == 0 || !wifi_smp2p_armed) {
+		return;
+	}
+	bits = vayu_wifi_smp2p_poll("the PFR");
+	say("vayu-wifi: pd-mapper: pfr: smp2p wlan %#x at the PFR (force-fatal-error %u, "
+	    "early-crash-ind %u, %u change(s))\n", bits, (bits & VAYU_WIFI_SMP2P_FATAL) != 0,
+	    (bits & VAYU_WIFI_SMP2P_CRASH) != 0, wifi_smp2p_changes);
+}
+
 /* What the wait loops check after vayu_wifi_smp2p_poll(): true means stop waiting. */
 static bool
 vayu_wifi_smp2p_stop(void)
 {
 	return wifi_smp2p != 0 && wifi_smp2p_crashed && wifi_smp2p_abort != 0;
+}
+
+/*
+ * K29 recovery: the latch and the pd-mapper flag belong to the firmware
+ * instance that died.  Clear them only after the modem has announced a new
+ * WLFW service, and refuse to go on if the new instance already carries the
+ * wlan early-crash-ind: a firmware that comes back crashed must not be driven.
+ */
+static bool
+vayu_wifi_smp2p_recover_clear(void)
+{
+	uint32_t item_at = 0, value_at = 0, value = 0, slave = 0;
+	uint32_t waited;
+
+	vayu_pdm_pfr_seen = false;
+	wifi_smp2p_crashed = false;
+	if (wifi_smp2p == 0 || !wifi_smp2p_armed) {
+		return true;
+	}
+	if (vayu_wifi_smp2p_read(&item_at, &value_at, &value, &slave) < 0) {
+		say("vayu-wifi: recover: the SMP2P wlan item is gone; treating the restart as clean\n");
+		return true;
+	}
+	/* The new instance may clear the bit a little after it re-announces WLFW. */
+	for (waited = 0; waited < 2000 && (value & VAYU_WIFI_SMP2P_CRASH) != 0; waited += 100) {
+		delay_for_interval(100, NSEC_PER_MSEC);
+		if (vayu_wifi_smp2p_read(&item_at, &value_at, &value, &slave) < 0) {
+			break;
+		}
+	}
+	wifi_smp2p_last = value;
+	wifi_smp2p_slave = slave;
+	if ((value & VAYU_WIFI_SMP2P_CRASH) != 0) {
+		say("vayu-wifi: recover: SMP2P wlan is still %#x (early-crash-ind set after %u ms); "
+		    "the new firmware instance is not healthy, not restarting the handshake\n", value,
+		    waited);
+		return false;
+	}
+	say("vayu-wifi: recover: SMP2P wlan is %#x (early-crash-ind clear after %u ms), PFR "
+	    "latch cleared\n", value, waited);
+	return true;
 }
 
 /*
@@ -4181,8 +4289,12 @@ vayu_wifi_wait_new_server(void)
 	if (wlfw.server && wlfw.port != wlfw.used_port) {
 		return true;
 	}
-	say("vayu-wifi: wlfw: reattach %u/%u: waiting up to %u ms for the WLFW service to come back "
-	    "on another port\n", wifi_reattach_runs + 1, wifi_reattach, limit);
+	if (wifi_recover_runs != 0 || wifi_reattach == 0) {
+		say("vayu-wifi: wlfw: recovery: waiting up to %u ms for WLFW on a new port\n", limit);
+	} else {
+		say("vayu-wifi: wlfw: reattach %u/%u: waiting up to %u ms for the WLFW service to "
+		    "come back on another port\n", wifi_reattach_runs + 1, wifi_reattach, limit);
+	}
 	for (waited = 0; waited < limit; waited += 100) {
 		delay_for_interval(100, NSEC_PER_MSEC);
 		if (wlfw.server && wlfw.port != wlfw.used_port) {
@@ -4190,11 +4302,10 @@ vayu_wifi_wait_new_server(void)
 		}
 	}
 	if (!wlfw.server || wlfw.port == wlfw.used_port) {
-		say("vayu-wifi: wlfw: reattach: no new WLFW server after %u ms (port %u)\n", waited,
-		    wlfw.port);
+		say("vayu-wifi: wlfw: no new WLFW server after %u ms (port %u)\n", waited, wlfw.port);
 		return false;
 	}
-	say("vayu-wifi: wlfw: reattach: new WLFW server at port %u after %u ms\n", wlfw.port, waited);
+	say("vayu-wifi: wlfw: new WLFW server at port %u after %u ms\n", wlfw.port, waited);
 	return true;
 }
 
@@ -4322,8 +4433,13 @@ wlfw_sequence:
 		memset(&msa_resp, 0, sizeof(msa_resp));
 		memset(&info_req, 0, sizeof(info_req));
 		memset(&info_resp, 0, sizeof(info_resp));
-		say("vayu-wifi: wlfw: reattach %u/%u: re-running the pre-FW_READY sequence on port %u\n",
-		    wlfw.attempts - 1, wifi_reattach, wlfw.port);
+		if (wifi_recover_runs != 0) {
+			say("vayu-wifi: recover: re-running the pre-FW_READY sequence on port %u "
+			    "(recovery attempt %u/%u)\n", wlfw.port, wifi_recover_runs, wifi_recover);
+		} else {
+			say("vayu-wifi: wlfw: reattach %u/%u: re-running the pre-FW_READY sequence on "
+			    "port %u\n", wlfw.attempts - 1, wifi_reattach, wlfw.port);
+		}
 	}
 	wlfw.used_port = wlfw.port;
 
@@ -4834,13 +4950,17 @@ wlfw_sequence:
 				/*
 				 * W15-A.  Only after both QMI answers are 0/0; the stage itself
 				 * waits 100 ms after MISSION, requires a stage-1 context that this
-				 * driver installed, and refuses on a PFR/early-crash/stop.  At most
-				 * one attempt per boot, and no CE register is written before every
-				 * gate passed.
+				 * driver installed, and refuses on a PFR/early-crash/stop.  One
+				 * attempt per firmware instance (a recovery re-runs it on the new
+				 * one), and no CE register is written before every gate passed.
 				 */
 				ce_result = vayu_wifi_ce_stage(
 				    wlan_cfg_ret == 0 && wlan_mode_ret == 0, vayu_wifi_ce_abort);
 			}
+		}
+		if (ce_result == VAYU_CE_READY && wifi_recover_runs != 0) {
+			say("vayu-wifi: recovered after PFR: CE/HTC/WMI reached READY on recovery "
+			    "attempt %u\n", wifi_recover_runs);
 		}
 		if (wifi_stock2 != 0) {
 			snprintf(wlfw.summary, sizeof(wlfw.summary),
@@ -4916,6 +5036,36 @@ wlfw_sequence:
 		say("vayu-wifi: wlfw: stopped after cap (vayu_wifi_bdf=0); no BDF, no wlan mode\n");
 	}
 
+	/*
+	 * K29 recovery.  A PFR / SMP2P early-crash after WLAN_MODE leaves the
+	 * station loop (it returned a moment ago), the CE rings and the HTC
+	 * endpoints pointing at a dead firmware instance.  Reset that state
+	 * without a register access, wait for the modem to re-announce WLFW on
+	 * its new port, clear the latches, and run the whole sequence again:
+	 * IND_REGISTER -> CAP -> BDF -> CAL_REPORT -> FW_READY -> WLAN_CFG ->
+	 * WLAN_MODE -> CE -> HTC -> WMI INIT/READY -> vdev/scan/join.
+	 */
+	if (wifi_stock2 == 0 && wifi_recover != 0 && wifi_recover_runs < wifi_recover &&
+	    !wlfw.stop && (vayu_pdm_pfr_seen || (wifi_smp2p != 0 && vayu_wifi_smp2p_stop()))) {
+		const char *why = vayu_pdm_pfr_seen ? "pd-mapper PFR" : "SMP2P early-crash-ind";
+
+		say("vayu-wifi: recover %u/%u: %s after the CE stage; resetting CE/HTC and "
+		    "waiting for a new WLFW\n", wifi_recover_runs + 1, wifi_recover, why);
+		vayu_wifi_ce_reset(why);
+		vayu_wifi_htcc_reset(why);
+		if (vayu_wifi_wait_new_server() && vayu_wifi_smp2p_recover_clear()) {
+			wifi_recover_runs++;
+			say("vayu-wifi: recovered after PFR: new WLFW at port %u; re-running the "
+			    "handshake, CE and WMI on the new instance\n", wlfw.port);
+			wlfw.fw_ready = false;
+			wlfw.msa_ready = false;
+			wlfw.cap_ok = false;
+			goto wlfw_sequence;
+		}
+		say("vayu-wifi: recover: giving up (no new WLFW server or the crash bit is still "
+		    "set); the CE stage stays stopped\n");
+	}
+
 out_release:
 	if (wlfw2_live) {
 		qmi_handle_release(&wlfw2_handle);
@@ -4952,6 +5102,9 @@ vayu_wifi_start(struct vayu_qrtr *q, uint32_t listen_s)
 	wifi_reattach = 0;
 	wifi_reattach_wait_ms = 20000;
 	wifi_reattach_runs = 0;
+	wifi_recover = 1;
+	wifi_recover_runs = 0;
+	wifi_ce_stock = 1;
 	wifi_regdb = 0;
 	wifi_bdf_wait_ms = 15000;
 	wifi_bdf_file[0] = 0;
@@ -4971,10 +5124,15 @@ vayu_wifi_start(struct vayu_qrtr *q, uint32_t listen_s)
 	PE_parse_boot_argn("vayu_wifi_reattach", &wifi_reattach, sizeof(wifi_reattach));
 	PE_parse_boot_argn("vayu_wifi_reattach_wait", &wifi_reattach_wait_ms,
 	    sizeof(wifi_reattach_wait_ms));
+	wifi_recover = 1;
+	PE_parse_boot_argn("vayu_wifi_recover", &wifi_recover, sizeof(wifi_recover));
+	wifi_ce_stock = 1;
+	PE_parse_boot_argn("vayu_wifi_ce_stock", &wifi_ce_stock, sizeof(wifi_ce_stock));
 	if (wifi_probe > 5) wifi_probe = 0;
 	if (wifi_reattach > 3) wifi_reattach = 3;
 	if (wifi_reattach_wait_ms < 1000) wifi_reattach_wait_ms = 1000;
 	if (wifi_reattach_wait_ms > 60000) wifi_reattach_wait_ms = 60000;
+	if (wifi_recover > 3) wifi_recover = 3;
 	PE_parse_boot_argn("vayu_wifi_regdb", &wifi_regdb, sizeof(wifi_regdb));
 	PE_parse_boot_argn("vayu_wifi_dynmask", &wifi_dynmask, sizeof(wifi_dynmask));
 	PE_parse_boot_argn("vayu_wifi_dynmask_bits", &wifi_dynmask_bits, sizeof(wifi_dynmask_bits));
@@ -5058,7 +5216,7 @@ vayu_wifi_start(struct vayu_qrtr *q, uint32_t listen_s)
 	    "smp2p_item=%u smp2p_host=%u smp2p_abort=%u smp2p_clear=%u vayu_wifi_msa_kb=%u "
 	    "fw_ready_wait=%u cal_wait=%u msa_wait=%u power_settle=%u bdf_file=%s listen=%u s "
 	    "probe=%u reattach=%u reattach_wait=%u arc=%u cxmx_mv=%u bus=%u census=%u "
-	    "dynmask=%u dynmask_bits=%#x stock2=%u qdss=%u mac=%u\n",
+	    "dynmask=%u dynmask_bits=%#x stock2=%u qdss=%u mac=%u recover=%u ce_stock=%u\n",
 	    wifi_level, wifi_hostcap, wifi_cap, wifi_bdf, wifi_bdf_wait_ms, wifi_wlan, wifi_cal_report,
 	    wifi_regdb, wifi_msa_fixed_perm, wifi_rail, wifi_smmu, wifi_ce, wifi_smp2p,
 	    wifi_smp2p_item,
@@ -5066,7 +5224,8 @@ vayu_wifi_start(struct vayu_qrtr *q, uint32_t listen_s)
 	    wifi_cal_wait_ms, wifi_msa_wait_ms, wifi_power_settle_ms,
 	    wifi_bdf_file[0] != 0 ? wifi_bdf_file : "(default)", listen_s, wifi_probe, wifi_reattach,
 	    wifi_reattach_wait_ms, wifi_arc_level, wifi_cxmx_mv, wifi_bus, wifi_census,
-	    wifi_dynmask, wifi_dynmask_bits, wifi_stock2, wifi_qdss, wifi_mac);
+	    wifi_dynmask, wifi_dynmask_bits, wifi_stock2, wifi_qdss, wifi_mac, wifi_recover,
+	    wifi_ce_stock);
 	if (wifi_level == 0) {
 		return;
 	}

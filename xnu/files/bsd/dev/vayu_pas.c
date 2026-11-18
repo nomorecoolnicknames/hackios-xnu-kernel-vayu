@@ -34,6 +34,7 @@
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/arm64/board_config.h>
 #include <sys/kauth.h>
 #include <sys/errno.h>
 #include <sys/systm.h>
@@ -43,6 +44,9 @@
 #include <sys/vayu_scm.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
+
+/* osfmk/arm64/psci_smp.h is not among the headers bsd/ is built with: its one function used here */
+extern boolean_t psci_smp_is_quiesced(void);
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
@@ -69,7 +73,6 @@ static LCK_MTX_DECLARE(pas_lock, &pas_lock_group);      /* a processor being sta
 static LCK_MTX_DECLARE(rpmh_tcs_lock, &pas_lock_group);
 static const char *rpmh_tcs_holder;                     /* who holds it now (a name in vayu_rpmh_send's calls) */
 static uint64_t rpmh_tcs_held_since;                    /* and when it was taken, in us */
-static bool rpmh_tcs_gave_up;                           /* the last wait hit RPMH_TCS_GIVE_UP_US */
 
 /* vayu_ipa_pas= (sys/vayu_pas.h): the IPA path's steps, so one run can leave one out. */
 static uint32_t pas_steps = VAYU_PAS_STEPS_DEFAULT;
@@ -231,7 +234,7 @@ vayu_smem_peek(uint64_t offset, void *to, uint32_t size)
 	if (smem == NULL) {
 		smem = (const volatile uint8_t *)ml_io_map_unmappable(SMEM_PHYS, SMEM_SIZE, VM_WIMG_WCOMB);
 	}
-	if (smem == NULL || offset + size > SMEM_SIZE) {
+	if (smem == NULL || offset > SMEM_SIZE || size > SMEM_SIZE - offset) {
 		return false;
 	}
 	for (uint32_t i = 0; i < size; i++) {
@@ -252,7 +255,7 @@ vayu_smem_word(uint32_t offset)
 void
 vayu_smem_poke(uint32_t offset, uint32_t value)
 {
-	if (smem != NULL && offset + 4 <= SMEM_SIZE) {
+	if (smem != NULL && offset <= SMEM_SIZE - 4) {
 		wr((vm_offset_t)smem + offset, value);
 	}
 }
@@ -276,7 +279,8 @@ smem_partition(uint16_t one, uint16_t other, uint32_t *cacheline)
 		if (!((entry.host0 == one && entry.host1 == other) || (entry.host0 == other && entry.host1 == one))) {
 			continue;
 		}
-		if ((uint64_t)entry.offset + entry.size > SMEM_SIZE - 0x1000 || !vayu_smem_peek(entry.offset, &header, sizeof(header)) ||
+		if (entry.size < sizeof(header) || (uint64_t)entry.offset + entry.size > SMEM_SIZE - 0x1000 ||
+		    !vayu_smem_peek(entry.offset, &header, sizeof(header)) ||
 		    memcmp(header.magic, "$PRT", 4) != 0 || header.size != entry.size) {
 			return 0;
 		}
@@ -288,43 +292,71 @@ smem_partition(uint16_t one, uint16_t other, uint32_t *cacheline)
 
 /* Where an item is in one partition (uncached items from the front, cached ones from the back); 0: not there. */
 static uint32_t
-smem_find(uint32_t partition, uint32_t cacheline, uint32_t item, uint32_t *size)
+smem_find(uint32_t partition, uint32_t cacheline, uint32_t item, uint32_t *size, bool *corrupt)
 {
 	struct smem_partition header;
 	struct smem_entry entry;
 	uint32_t at, step_back;
 
-	if (partition == 0 || !vayu_smem_peek(partition, &header, sizeof(header)) || header.free_uncached > header.size ||
-	    header.free_cached > header.size) {
+	if (partition == 0) {
 		return 0;
 	}
-	for (at = sizeof(header); at + sizeof(entry) <= header.free_uncached;) {
-		if (!vayu_smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > header.size) {
-			break;
+	if (!vayu_smem_peek(partition, &header, sizeof(header)) || memcmp(header.magic, "$PRT", 4) != 0 ||
+	    header.size < sizeof(header) || (uint64_t)partition + header.size > SMEM_SIZE ||
+	    header.free_uncached < sizeof(header) || header.free_uncached > header.free_cached ||
+	    header.free_cached > header.size) {
+		goto bad;
+	}
+	for (at = sizeof(header); at < header.free_uncached;) {
+		uint64_t end;
+
+		if (sizeof(entry) > header.free_uncached - at ||
+		    !vayu_smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY ||
+		    entry.padding_data > entry.size) {
+			goto bad;
+		}
+		end = (uint64_t)at + sizeof(entry) + entry.padding_header + entry.size;
+		if (end > header.free_uncached) {
+			goto bad;
 		}
 		if (entry.item == item) {
 			*size = entry.size - entry.padding_data;
 			return partition + at + sizeof(entry) + entry.padding_header;
 		}
-		at += sizeof(entry) + entry.padding_header + entry.size;
+		at = (uint32_t)end;
 	}
-	if (cacheline == 0 || (cacheline & (cacheline - 1))) {
+	if (header.free_cached == header.size) {
 		return 0;
 	}
+	if (cacheline == 0 || (cacheline & (cacheline - 1))) {
+		return 0;               /* (no cache line from the table: the cached list is not walked, as before) */
+	}
+	if (cacheline > header.size) {
+		goto bad;
+	}
 	step_back = ((uint32_t)sizeof(entry) + cacheline - 1) & ~(cacheline - 1);
-	for (at = header.size - step_back; at > header.free_cached && at < header.size;) {
-		if (!vayu_smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > at) {
-			break;
+	if (step_back > header.size - header.free_cached) {
+		goto bad;
+	}
+	for (at = header.size - step_back; at > header.free_cached;) {
+		if (sizeof(entry) > header.size - at ||
+		    !vayu_smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY ||
+		    entry.padding_data > entry.size || entry.size > at - header.free_cached) {
+			goto bad;
 		}
 		if (entry.item == item) {
 			*size = entry.size - entry.padding_data;
 			return partition + at - entry.size;
 		}
-		if (entry.size + step_back > at) {
+		if (entry.size + step_back > at - header.free_cached) {
 			break;
 		}
 		at -= entry.size + step_back;
 	}
+	return 0;
+bad:
+	say("smem: partition %#x: corrupt header, padding or item range while looking for item %u\n", partition, item);
+	*corrupt = true;
 	return 0;
 }
 
@@ -566,20 +598,29 @@ vayu_smem_census_all(const char *who)
 }
 
 /* An item we share with that host: in the partition of the two, or else in the global one. */
-uint32_t
-vayu_smem_item(uint16_t host, uint32_t item, uint32_t *size)
+static uint32_t
+smem_item(uint16_t host, uint32_t item, uint32_t *size, bool *corrupt)
 {
 	const uint16_t hosts[2][2] = { { VAYU_SMEM_HOST_APPS, host }, { VAYU_SMEM_HOST_GLOBAL, VAYU_SMEM_HOST_GLOBAL } };
 
+	*corrupt = false;
 	for (unsigned h = 0; h < 2; h++) {
 		uint32_t cacheline = 0, partition = smem_partition(hosts[h][0], hosts[h][1], &cacheline);
-		uint32_t at = smem_find(partition, cacheline, item, size);
+		uint32_t at = smem_find(partition, cacheline, item, size, corrupt);
 
-		if (at != 0) {
+		if (at != 0 || *corrupt) {
 			return at;
 		}
 	}
 	return 0;
+}
+
+uint32_t
+vayu_smem_item(uint16_t host, uint32_t item, uint32_t *size)
+{
+	bool corrupt;
+
+	return smem_item(host, item, size, &corrupt);
 }
 
 struct cmd_db_slave {
@@ -867,6 +908,81 @@ vayu_rpmh_address(const char *name)
 	return 0;
 }
 
+/*
+ * The level table of that resource, as the boot loader's command database carries it. Linux's
+ * rail_position()/here only needs the first level >= a voltage; the IPA clock vote needs the whole
+ * table, because the same 16-bit word means an index into it on one BCM and a value on another.
+ */int
+vayu_rpmh_levels(const char *name, uint32_t *address, uint16_t *levels, unsigned max)
+{
+	char id[8] = { 0 };
+	unsigned n = 0;
+
+	if (!cmd_db_there()) {
+		return -1;
+	}
+	memcpy(id, name, strnlen(name, sizeof(id)));
+	for (unsigned s = 0; s < 8; s++) {
+		const struct cmd_db_slave *slave = &cmd_db->slave[s];
+		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
+
+		if (slave->id == 0 || slave->count > 512) {
+			continue;
+		}
+		for (unsigned i = 0; i < slave->count; i++) {
+			const uint8_t *data;
+
+			if (memcmp(entry[i].id, id, sizeof(id)) != 0) {
+				continue;
+			}
+			if ((unsigned)slave->data_offset + entry[i].offset + entry[i].length > CMD_DB_SIZE - 0x1000) {
+				return -1;
+			}
+			data = cmd_db->data + slave->data_offset + entry[i].offset;
+			*address = entry[i].address;
+			for (unsigned l = 0; l < entry[i].length / 2u && n < max; l++) {
+				levels[n++] = (uint16_t)(data[2 * l] | data[2 * l + 1] << 8);
+			}
+			return (int)n;
+		}
+	}
+	return -1;
+}
+
+/* The index-th BCM entry of the command database, in the order the database lists them. */
+bool
+vayu_rpmh_bcm_name(unsigned index, char name[9], uint32_t *address, int *levels)
+{
+	unsigned seen = 0;
+
+	if (!cmd_db_there()) {
+		return false;
+	}
+	for (unsigned s = 0; s < 8; s++) {
+		const struct cmd_db_slave *slave = &cmd_db->slave[s];
+		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
+
+		if (slave->id != 5 /* cmd-db.h: the bus clock managers */ || slave->count > 512) {
+			continue;
+		}
+		for (unsigned i = 0; i < slave->count; i++) {
+			if (seen++ != index) {
+				continue;
+			}
+			for (unsigned c = 0; c < 8; c++) {
+				char at = entry[i].id[c];
+
+				name[c] = at > 0x20 && at < 0x7f ? at : 0;
+			}
+			name[8] = 0;
+			*address = entry[i].address;
+			*levels = entry[i].length / 2;
+			return true;
+		}
+	}
+	return false;
+}
+
 #define RPMH_TCS_WARN_US        1000000ull      /* 1 s: say who holds the slot */
 #define RPMH_TCS_REPORT_US      5000000ull      /* then every 5 s */
 #define RPMH_TCS_GIVE_UP_US     60000000ull     /* 60 s: fail the request rather than wedge the thread */
@@ -878,23 +994,34 @@ vayu_rpmh_address(const char *name)
  * vayu_cpufreq.c's bandwidth vote, vayu_qup_spi.c's QUP vote, vayu_wifi.c's and vayu_bt.c's rails,
  * and hakios.adsp.c's / hakios.mpss.c's): one request at a time, through this one lock.
  *
- * Returns true: taken, for vayu_rsc_tcs_unlock(). False: not taken, and then either the caller is
- * on its way out (leaving, or interrupts off: the other processors are already stopped, and a
- * mutex cannot be taken there) or the wait ran out (vayu_rsc_tcs_gave_up()): a driver of a research
- * bench says so and goes on rather than holding a thread of the boot for ever.
+ * Returns HELD (taken, for vayu_rsc_tcs_unlock()), FAILED (the wait ran out: the caller writes
+ * nothing), or SHUTDOWN (not taken, and the caller goes on without it: on its way out -- leaving,
+ * or interrupts off, where a mutex cannot be taken). The verdict is this call's own: a global flag
+ * that another thread reset between the wait and its reading let a timed-out caller write unlocked.
  *
  * The wait says who holds the slot when it lasts over a second: that is the line run 182129 did not
  * have, when vayu-wifi's ldoc11 vote stopped after "rpmh: ldoc11 at 0x41a00" and never said "about
  * to ask".
  */
-bool
+enum vayu_rsc_tcs_result
 vayu_rsc_tcs_lock(const char *who)
 {
 	uint64_t began, waited, next;
 
-	rpmh_tcs_gave_up = false;               /* (this wait's verdict, not the last one's) */
 	if (leaving || !ml_get_interrupts_enabled()) {
-		return false;
+#if defined(GENERIC_PSCI_SMP)
+		if (psci_smp_is_quiesced()) {
+			return VAYU_RSC_TCS_SHUTDOWN;
+		}
+#endif
+		/*
+		 * Not known to be alone (a core that did not stop, or a caller with its interrupts off): the
+		 * request goes on without the lock, as it always did here -- the regulators and DSPs given back
+		 * at the end of a run matter more than the wait this lock is for. Said, so that a log shows it.
+		 */
+		say("rpmh: %s: TCS taken without its lock (interrupts off, the other cores not known to have stopped)\n",
+		    who != NULL ? who : "?");
+		return VAYU_RSC_TCS_SHUTDOWN;
 	}
 	if (!lck_mtx_try_lock(&rpmh_tcs_lock)) {
 		began = now_us();
@@ -918,18 +1045,16 @@ vayu_rsc_tcs_lock(const char *who)
 				next = waited + RPMH_TCS_REPORT_US;
 			}
 			if (waited >= RPMH_TCS_GIVE_UP_US) {
-				rpmh_tcs_gave_up = true;
 				say("rpmh: TCS %u of %#x: %s gives up after %llu ms; this request is not made\n", RPMH_TCS,
 				    rsc.phys, who != NULL ? who : "?", waited / 1000);
-				return false;
+				return VAYU_RSC_TCS_FAILED;
 			}
 			sleep_us(RPMH_TCS_POLL_US);     /* (the wait itself: no lock is held here) */
 		}
 	}
-	rpmh_tcs_gave_up = false;
 	rpmh_tcs_holder = who;
 	rpmh_tcs_held_since = now_us();
-	return true;
+	return VAYU_RSC_TCS_HELD;
 }
 
 void
@@ -937,14 +1062,6 @@ vayu_rsc_tcs_unlock(void)
 {
 	rpmh_tcs_holder = NULL;
 	lck_mtx_unlock(&rpmh_tcs_lock);
-}
-
-/* True: the last vayu_rsc_tcs_lock() failed because the slot was held for RPMH_TCS_GIVE_UP_US, not
- * because there was nobody to wait for. The caller must then leave the slot alone. */
-bool
-vayu_rsc_tcs_gave_up(void)
-{
-	return rpmh_tcs_gave_up;
 }
 
 /* The slot's done bit for those commands. A spin, not a sleep: the caller holds the TCS lock, and a
@@ -966,15 +1083,18 @@ rpmh_tcs_wait_done(uint32_t mask, uint64_t *spent)
 	}
 }
 
-/* Raw writes of those values to those addresses through TCS 0, waited for; true: RPMh has said done. */
-bool
-vayu_rpmh_send(const uint32_t addresses[], const uint32_t values[], unsigned count, const char *who)
+/* Raw writes of those values to those addresses through TCS 0, waited for; true: RPMh has said done.
+ * pace: the loader pause before the slot is taken (the diagnostic pacing of the PAS line);
+ * quiet: only failures are printed. The IPA init votes its clock before every group of accesses;
+ * a paced, chatty vote there would put the very gap it is meant to remove between two registers. */
+static bool
+rpmh_send(const uint32_t addresses[], const uint32_t values[], unsigned count, const char *who, bool pace, bool quiet)
 {
 	char line[400];
 	uint32_t done = 0, mask;
 	uint64_t began;
 	int at;
-	bool held;
+	enum vayu_rsc_tcs_result held;
 
 	if (count == 0 || count > 4) {
 		say("rpmh: %s asks for %u commands: one to four at a time: not asked\n", who, count);
@@ -987,16 +1107,16 @@ vayu_rpmh_send(const uint32_t addresses[], const uint32_t values[], unsigned cou
 		}
 	}
 	need(&rsc);
-	hold();                                 /* (the step pause, if any, before the lock: other voters do not wait it out) */
+	if (pace) hold();                       /* (the step pause, if any, before the lock: other voters do not wait it out) */
 	held = vayu_rsc_tcs_lock(who);
-	if (!held && vayu_rsc_tcs_gave_up()) {
+	if (held == VAYU_RSC_TCS_FAILED) {
 		say("rpmh: %s: TCS %u was not taken: nothing is written\n", who, RPMH_TCS);
 		return false;
 	}
 	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0) {
 		say("rpmh: TCS %u is busy (status %#x, control %#x): not asked\n", RPMH_TCS, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS),
 		    rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL));
-		if (held) {
+		if (held == VAYU_RSC_TCS_HELD) {
 			vayu_rsc_tcs_unlock();
 		}
 		return false;
@@ -1005,7 +1125,7 @@ vayu_rpmh_send(const uint32_t addresses[], const uint32_t values[], unsigned cou
 	for (unsigned r = 0; r < count; r++) {
 		at += snprintf(line + at, sizeof(line) - (size_t)at, "%s %#x = %u", r == 0 ? "" : r + 1 == count ? " and" : ",", addresses[r], values[r]);
 	}
-	say("%s\n", line);
+	if (!quiet) say("%s\n", line);
 	mask = (1u << count) - 1;
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	for (unsigned r = 0; r < count; r++) {
@@ -1020,19 +1140,35 @@ vayu_rpmh_send(const uint32_t addresses[], const uint32_t values[], unsigned cou
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_ACTIVE_MODE);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_TRIGGER);
 	done = rpmh_tcs_wait_done(1u << RPMH_TCS, &began);
-	at = snprintf(line, sizeof(line), "rpmh: %s after %llu us; the commands' status", done ? "DONE" : "HAS NOT SAID DONE",
-	    began);
-	for (unsigned r = 0; r < count; r++) {
-		at += snprintf(line + at, sizeof(line) - (size_t)at, " %#x", rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 12));
+	if (!quiet || done == 0) {
+		at = snprintf(line, sizeof(line), "rpmh: %s after %llu us; the commands' status", done ? "DONE" : "HAS NOT SAID DONE",
+		    began);
+		for (unsigned r = 0; r < count; r++) {
+			at += snprintf(line + at, sizeof(line) - (size_t)at, " %#x", rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 12));
+		}
+		say("%s\n", line);
 	}
-	say("%s\n", line);
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
-	if (held) {
+	if (held == VAYU_RSC_TCS_HELD) {
 		vayu_rsc_tcs_unlock();
 	}
 	return done != 0;
+}
+
+bool
+vayu_rpmh_send(const uint32_t addresses[], const uint32_t values[], unsigned count, const char *who)
+{
+	return rpmh_send(addresses, values, count, who, true, false);
+}
+
+/* The same, without the loader pause and without the two routine lines: for a vote that has to sit
+ * next to the register it protects, not seconds before it. */
+bool
+vayu_rpmh_send_now(const uint32_t addresses[], const uint32_t values[], unsigned count, const char *who)
+{
+	return rpmh_send(addresses, values, count, who, false, true);
 }
 
 /* Those resources at that level (Linux's proxy vote), or given back (level 0). True: RPMh has said done. */
@@ -2484,6 +2620,11 @@ vayu_glink_prepare(struct vayu_glink *g)
 	}
 	g->ours = vayu_smem_item(g->rp->smem_host, ITEM_GLINK_OUR_QUEUE, &size);
 	g->ours_size = size & ~7u;
+	if (g->descriptor > SMEM_SIZE - 32 || g->ours == 0 || g->ours > SMEM_SIZE ||
+	    size > SMEM_SIZE - g->ours || g->ours_size < 1024) {
+		say("%s: glink: invalid descriptor or transmit queue range\n", g->rp->name);
+		return false;
+	}
 	vayu_smem_poke(g->descriptor + GLINK_OUR_HEAD, 0);
 	vayu_smem_poke(g->descriptor + GLINK_THEIR_TAIL, 0);
 	settle();
@@ -2494,21 +2635,42 @@ vayu_glink_prepare(struct vayu_glink *g)
 	return g->ours_size >= 1024;
 }
 
+static void
+glink_bad(struct vayu_glink *g, const char *why)
+{
+	say("%s: glink: %s: queue closed\n", g->rp->name, why);
+	g->broken = true;
+	g->up = false;
+	g->thread_wanted = false;
+	for (unsigned c = 0; c < g->channels; c++) {
+		g->channel[c].open = false;
+	}
+}
+
 static bool
 glink_theirs_queue(struct vayu_glink *g)
 {
 	uint32_t size = 0;
+	bool corrupt;
 
 	if (g->theirs != 0) {
 		return true;
 	}
-	g->theirs = vayu_smem_item(g->rp->smem_host, ITEM_GLINK_THEIR_QUEUE, &size);
+	g->theirs = smem_item(g->rp->smem_host, ITEM_GLINK_THEIR_QUEUE, &size, &corrupt);
+	if (corrupt) {
+		glink_bad(g, "corrupt SMEM item");
+		return false;
+	}
 	g->theirs_size = size & ~7u;
-	if (g->theirs != 0 && g->theirs_size >= 1024) {
+	if (g->theirs != 0) {
+		if (g->theirs_size < 1024 || g->theirs > SMEM_SIZE || size > SMEM_SIZE - g->theirs) {
+			glink_bad(g, "invalid receive queue range");
+			g->theirs = 0;
+			return false;
+		}
 		say("%s: glink: its queue (480): %u bytes at %#lx\n", g->rp->name, g->theirs_size, SMEM_PHYS + g->theirs);
 		return true;
 	}
-	g->theirs = 0;
 	return false;
 }
 
@@ -2533,7 +2695,8 @@ glink_waiting(struct vayu_glink *g)
 	}
 	head = vayu_smem_word(g->descriptor + GLINK_THEIR_HEAD);
 	tail = vayu_smem_word(g->descriptor + GLINK_THEIR_TAIL);
-	if (head >= g->theirs_size || tail >= g->theirs_size) {
+	if (head >= g->theirs_size || tail >= g->theirs_size || ((head | tail) & 7)) {
+		glink_bad(g, "invalid receive queue head or tail");
 		return 0;
 	}
 	return head >= tail ? head - tail : g->theirs_size - tail + head;
@@ -2647,30 +2810,32 @@ glink_pump(struct vayu_glink *g)
 	char name[33];
 
 	while (g->up && !g->broken) {
-		uint32_t waiting = glink_waiting(g), length = sizeof(message);
+		uint32_t waiting = glink_waiting(g), length;
+		uint64_t wide = sizeof(message);
 
 		if (waiting < sizeof(message)) {
 			return;
 		}
 		glink_peek(g, &message, 0, sizeof(message));
 		if (message.command == GLINK_OPEN) {
-			length += message.param2;
+			wide += message.param2;
 		} else if (message.command == GLINK_INTENT) {
-			length += 8 * message.param2;
+			wide += 8ull * message.param2;
 		} else if (message.command == GLINK_DATA || message.command == GLINK_DATA_MORE) {
 			if (waiting < 16) {
 				return;
 			}
 			glink_peek(g, words, 8, 8);
-			length = 16 + words[0];
+			wide = 16ull + words[0];
 		}
-		length = (length + 7) & ~7u;
-		if (length > g->theirs_size - 8) {
-			say("%s: glink: A MESSAGE OF %u BYTES (%s %u %#x): not believed, and nothing more is read\n", g->rp->name, length,
+		wide = (wide + 7) & ~7ull;
+		if (wide < sizeof(message) || g->theirs_size < sizeof(message) || wide > g->theirs_size - sizeof(message)) {
+			say("%s: glink: A MESSAGE OF %llu BYTES (%s %u %#x): not believed, and nothing more is read\n", g->rp->name, wide,
 			    glink_name(message.command), message.param1, message.param2);
-			g->broken = true;
+			glink_bad(g, "invalid message length");
 			return;
 		}
+		length = (uint32_t)wide;
 		if (waiting < length) {
 			return;
 		}
@@ -2837,7 +3002,7 @@ glink_pump(struct vayu_glink *g)
 		default:
 			say("%s: glink: A MESSAGE THIS DOES NOT KNOW (%u, %u, %#x): nothing more is read\n", g->rp->name, message.command,
 			    message.param1, message.param2);
-			g->broken = true;
+			glink_bad(g, "unknown message command");
 			return;
 		}
 		for (unsigned c = 0; c < g->channels; c++) {
@@ -3060,8 +3225,13 @@ struct qrtr_control {
 /* A port of our node (sys/hakios.qrtr.h): what the QMI helpers hold while they speak. */
 struct hakios_qrtr_port {
 	uint32_t number;                        /* 0: free */
-	struct vayu_qrtr *router;               /* the router it speaks through: bound by its first send, datagram or server
-	                                         * callback (NULL: not yet); its callbacks come from that router's thread only */
+	struct vayu_qrtr *router;               /* the router it speaks through by default: bound by its first send, datagram
+	                                         * or server callback (NULL: not yet).  A published port (shared) may still be
+	                                         * reached by every router: this is only the fallback for a send whose
+	                                         * destination node no route names */
+	bool shared;                            /* published by us: every attached router may deliver to it */
+	lck_mtx_t serving;                      /* one callback at a time, whichever router's thread brings it */
+	thread_t serving_thread;                /* who holds it (a close from inside its own callback cannot wait on itself) */
 	hakios_qrtr_receive_t receive;
 	hakios_qrtr_server_t server;
 	void *context;
@@ -3076,14 +3246,19 @@ struct hakios_qrtr_port {
  * More than one router at a time (the modem's, the sensors DSP's, the audio DSP's): our node is one, so
  * its ports and the services it publishes are shared by all of them. A datagram goes out through the
  * router behind its destination node (the peer itself, or a node one of its services is at), else
- * through the port's own; a lookup is answered from every router, and the first answer binds the port
- * to that router (a port speaks through one router); our services are told to each.
+ * through the port's own; a lookup is answered from every router. Our services are told to each.
+ * A port that is not published (the QMI helpers' own) keeps speaking through the one router that first
+ * used it; a published one (the pd-mapper, tftp, rmtfs, the IPA host port) is reachable from all of
+ * them, because a peer does not know which other peer touched the port before it. The callbacks of a
+ * port are serialized by its `serving' lock, so a server written for one thread stays safe with several
+ * routers (and its static answer buffers stay single-use).
  * Linux does the same with one node and several endpoints (net/qrtr/af_qrtr.c qrtr_node_lookup()).
  */
 #define QRTR_ROUTERS            4
 static LCK_MTX_DECLARE(qrtr_lock, &pas_lock_group);     /* the routers, the ports and the published table */
 static struct vayu_qrtr *qrtr_routers[QRTR_ROUTERS];
 static uint32_t qrtr_next_port = QRTR_FIRST_PORT;
+static uint32_t qrtr_lookup_announce_service;    /* vayu_ipa_seq: NEW_LOOKUP for this service; 0: none */
 static struct hakios_qrtr_port qrtr_ports[16];
 static struct {
 	struct hakios_qrtr_port *port;
@@ -3123,6 +3298,39 @@ qrtr_bind(struct hakios_qrtr_port *port, struct vayu_qrtr *q)
 		port->router = q;
 	}
 	return port->router == q;
+}
+
+/* Under qrtr_lock: a published port hears from every router (its `router' is only the send fallback). */
+static bool
+qrtr_deliverable(struct hakios_qrtr_port *port, struct vayu_qrtr *q)
+{
+	if (!port->shared) {
+		return qrtr_bind(port, q);
+	}
+	if (port->router == NULL) {
+		port->router = q;
+	}
+	return true;
+}
+
+/* One callback of a port at a time: its `serving' lock, then the caller's check under qrtr_lock.  A close
+ * that runs inside a callback of the same port cannot wait for it (the callback is what it is closing). */
+static bool
+qrtr_serve_wait(struct hakios_qrtr_port *port)
+{
+	if (port->serving_thread == current_thread()) {
+		return false;
+	}
+	lck_mtx_lock(&port->serving);
+	port->serving_thread = current_thread();
+	return true;
+}
+
+static void
+qrtr_serve_done(struct hakios_qrtr_port *port)
+{
+	port->serving_thread = NULL;
+	lck_mtx_unlock(&port->serving);
 }
 
 static bool
@@ -3211,12 +3419,16 @@ qrtr_tell(struct vayu_qrtr *q, uint32_t service, uint32_t instance, uint32_t nod
 			int slot;
 
 			lck_mtx_lock(&q->calling);      /* (a close from another thread waits for this callback) */
+			if (!qrtr_serve_wait(&qrtr_ports[p])) {
+				lck_mtx_unlock(&q->calling);
+				continue;
+			}
 			lck_mtx_lock(&qrtr_lock);
 			slot = qrtr_slot(q);
 			if (slot >= 0 && qrtr_ports[p].number != 0 && qrtr_ports[p].lookups[l].asked &&
 			    !(qrtr_ports[p].lookups[l].fresh & (1u << slot)) && qrtr_ports[p].lookups[l].service == service &&
 			    (qrtr_ports[p].lookups[l].instance == 0 || qrtr_ports[p].lookups[l].instance == instance) &&
-			    (arrived ? qrtr_bind(&qrtr_ports[p], q) : qrtr_ports[p].router == q)) {
+			    qrtr_deliverable(&qrtr_ports[p], q)) {
 				server = qrtr_ports[p].server;
 				context = qrtr_ports[p].context;
 			}
@@ -3224,6 +3436,7 @@ qrtr_tell(struct vayu_qrtr *q, uint32_t service, uint32_t instance, uint32_t nod
 			if (server != NULL) {
 				server(context, arrived, service, instance & 0xff, instance >> 8, node, port);
 			}
+			qrtr_serve_done(&qrtr_ports[p]);
 			lck_mtx_unlock(&q->calling);
 		}
 	}
@@ -3231,7 +3444,7 @@ qrtr_tell(struct vayu_qrtr *q, uint32_t service, uint32_t instance, uint32_t nod
 
 /* One of ours to q's peer: Linux ns.c's service_announce_new() and service_announce_del(), through the control port. */
 static void
-qrtr_announce(struct vayu_qrtr *q, unsigned index, bool new)
+qrtr_announce(struct vayu_qrtr *q, unsigned index, bool new, uint32_t to_node, bool need_hello)
 {
 	struct qrtr_control announce = { .command = new ? QRTR_NEW_SERVER : QRTR_DEL_SERVER };
 	const char *who;
@@ -3256,26 +3469,48 @@ qrtr_announce(struct vayu_qrtr *q, unsigned index, bool new)
 	announce.words[1] = instance;
 	announce.words[2] = QRTR_US;
 	announce.words[3] = port;
-	send = q->peer_known && q->hellos != 0 && port != 0;
+	/*
+	 * Node 0 is a node like any other here: it is the modem's (bad-1052: "HELLO FROM NODE 0" and
+	 * "client node 0 ...").  k23 took 0 for "no destination" and sent it nothing (every control
+	 * packet to the modem was "NOT SENT").  Whether there is a destination at all is the caller's
+	 * business: each passes a node only from a HELLO or from a peer it has heard from.
+	 */
+	send = q->peer_known && port != 0 && (!need_hello || q->hellos != 0);
 	if (send) {
-		error = qrtr_out_packet(q, announce.command, QRTR_CONTROL, q->peer, QRTR_CONTROL, &announce, sizeof(announce));
+		error = qrtr_out_packet(q, announce.command, QRTR_CONTROL, to_node, QRTR_CONTROL, &announce, sizeof(announce));
 	}
 	if (new) {
-		say("%s: qrtr: ours announced: service %u (%#x) instance word %#x at port %u: %s\n", who, service, service, instance, port,
-		    send && error == 0 ? "SENT" : "NOT SENT");
+		say("%s: qrtr: ours announced: service %u (%#x) instance word %#x at port %u to node %u: %s\n", who, service,
+		    service, instance, port, to_node, send && error == 0 ? "SENT" : "NOT SENT");
 	} else {
-		say("%s: qrtr: ours withdrawn: service %u (%#x) instance word %#x at port %u: %s\n", who, service, service, instance, port,
-		    send && error == 0 ? "SENT" : "NOT SENT");
+		say("%s: qrtr: ours withdrawn: service %u (%#x) instance word %#x at port %u from node %u: %s\n", who, service,
+		    service, instance, port, to_node, send && error == 0 ? "SENT" : "NOT SENT");
 	}
 }
 
-/* ... to every attached router. */
+/* The empty NEW_SERVER that ends the answer to a NEW_LOOKUP (Linux ns.c lookup_notify(..., NULL, false)). */
+static void
+qrtr_announce_empty(struct vayu_qrtr *q, uint32_t to_node)
+{
+	struct qrtr_control empty = { .command = QRTR_NEW_SERVER };
+	int error;
+
+	if (q == NULL) {
+		return;                                 /* (node 0 is the modem: it is a destination like any other) */
+	}
+	error = qrtr_out_packet(q, QRTR_NEW_SERVER, QRTR_CONTROL, to_node, QRTR_CONTROL, &empty, sizeof(empty));
+	if (error != 0) {
+		say("%s: qrtr: the empty NEW_SERVER to node %u: %d\n", q->glink->rp->name, to_node, error);
+	}
+}
+
+/* ... to every attached router that said HELLO (Linux ns.c announce_servers(), once per node). */
 static void
 qrtr_announce_all(unsigned index, bool new)
 {
 	for (unsigned r = 0; r < QRTR_ROUTERS; r++) {
-		if (qrtr_routers[r] != NULL) {
-			qrtr_announce(qrtr_routers[r], index, new);
+		if (qrtr_routers[r] != NULL && qrtr_routers[r]->peer_known) {
+			qrtr_announce(qrtr_routers[r], index, new, qrtr_routers[r]->peer, true);
 		}
 	}
 }
@@ -3318,13 +3553,18 @@ qrtr_fresh(struct vayu_qrtr *q)
 					continue;
 				}
 				lck_mtx_lock(&q->calling);      /* (a close from another thread waits for this callback) */
+				if (!qrtr_serve_wait(&qrtr_ports[p])) {
+					lck_mtx_unlock(&q->calling);
+					break;
+				}
 				lck_mtx_lock(&qrtr_lock);
-				open = qrtr_ports[p].number == number && qrtr_slot(q) >= 0 && qrtr_bind(&qrtr_ports[p], q);
+				open = qrtr_ports[p].number == number && qrtr_slot(q) >= 0 && qrtr_deliverable(&qrtr_ports[p], q);
 				lck_mtx_unlock(&qrtr_lock);
 				if (open) {
 					server(context, true, q->servers[i].service, q->servers[i].instance & 0xff,
 					    q->servers[i].instance >> 8, q->servers[i].node, q->servers[i].port);
 				}
+				qrtr_serve_done(&qrtr_ports[p]);
 				lck_mtx_unlock(&q->calling);
 				if (!open) {
 					break;
@@ -3356,12 +3596,21 @@ qrtr_control(struct vayu_qrtr *q, const struct qrtr_header *header, const struct
 
 	switch (control->command) {
 	case QRTR_HELLO:
-		if (q->hellos++ != 0) {
-			break;
+		/*
+		 * Linux ns.c: answer the HELLO once (two nodes that answer every HELLO never end), but tell the
+		 * node of every service of ours on *every* HELLO: a peer that restarted without a BYE, or that
+		 * missed an earlier NEW_SERVER, has to hear them again.
+		 */
+		if (q->hellos++ == 0) {
+			error = qrtr_out_packet(q, QRTR_HELLO, QRTR_CONTROL, header->from_node, QRTR_CONTROL, &hello, sizeof(hello));
+			say("%s: qrtr: HELLO FROM NODE %u; ours to it: %s\n", who, header->from_node,
+			    error == 0 ? "SENT" : "NOT SENT");
+		} else {
+			say("%s: qrtr: HELLO FROM NODE %u again; ours to it: not answered\n", who, header->from_node);
 		}
-		error = qrtr_out_packet(q, QRTR_HELLO, QRTR_CONTROL, header->from_node, QRTR_CONTROL, &hello, sizeof(hello));
-		say("%s: qrtr: HELLO FROM NODE %u; ours to it: %s\n", who, header->from_node, error == 0 ? "SENT" : "NOT SENT");
 		if (ours) {
+			unsigned announced = 0;
+
 			for (unsigned i = 0; i < sizeof(qrtr_published) / sizeof(qrtr_published[0]); i++) {
 				bool there;
 
@@ -3369,8 +3618,12 @@ qrtr_control(struct vayu_qrtr *q, const struct qrtr_header *header, const struct
 				there = qrtr_published[i].there;
 				lck_mtx_unlock(&qrtr_lock);
 				if (there) {
-					qrtr_announce(q, i, true);
+					qrtr_announce(q, i, true, header->from_node, true);
+					announced++;
 				}
+			}
+			if (announced != 0) {
+				say("%s: qrtr: announcing %u server(s) to node %u\n", who, announced, header->from_node);
 			}
 		}
 		break;
@@ -3409,12 +3662,39 @@ qrtr_control(struct vayu_qrtr *q, const struct qrtr_header *header, const struct
 			}
 		}
 		break;
-	case QRTR_NEW_LOOKUP:
+	case QRTR_NEW_LOOKUP: {
+		/*
+		 * Linux ns.c ctrl_cmd_new_lookup(): answer from the list as it is now, then an empty
+		 * NEW_SERVER.  A peer that never saw our NEW_SERVER (it said HELLO late, or missed it) asks
+		 * this instead of waiting forever.
+		 */
+		unsigned matches = 0;
+
+		if (ours) {
+			for (unsigned i = 0; i < sizeof(qrtr_published) / sizeof(qrtr_published[0]); i++) {
+				uint32_t service, instance;
+				bool there;
+
+				lck_mtx_lock(&qrtr_lock);
+				there = qrtr_published[i].there;
+				service = qrtr_published[i].service;
+				instance = qrtr_published[i].instance;
+				lck_mtx_unlock(&qrtr_lock);
+				if (there && (control->words[0] == 0 || control->words[0] == service) &&
+				    (control->words[1] == 0 || control->words[1] == instance)) {
+					qrtr_announce(q, i, true, header->from_node, false);      /* (it asked: no HELLO needed) */
+					matches++;
+				}
+			}
+			qrtr_announce_empty(q, header->from_node);
+		}
 		if (q->lookups++ < 16) {
-			say("%s: qrtr: it looks for service %u (%#x), instance %u: nobody here offers it\n", who, control->words[0],
-			    control->words[0], control->words[1]);
+			say("%s: qrtr: it looks for service %u (%#x), instance %u: %u of ours announced to node %u%s\n", who,
+			    control->words[0], control->words[0], control->words[1], matches, header->from_node,
+			    ours ? "" : " (not attached: nothing to announce)");
 		}
 		break;
+	}
 	case QRTR_DEL_CLIENT:
 		if (qrtr_gone++ < 16) {
 			say("%s: qrtr: client node %u port %u has gone\n", who, control->words[0], control->words[1]);
@@ -3493,18 +3773,30 @@ vayu_qrtr_input(void *context, const uint8_t *data, uint32_t length)
 	if (qrtr_is_attached(q) && header.type == QRTR_DATA) {
 		hakios_qrtr_receive_t receive = NULL;
 		void *where = NULL;
+		struct hakios_qrtr_port *port = NULL;
 
 		lck_mtx_lock(&q->calling);
-		lck_mtx_lock(&qrtr_lock);
-		for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]) && qrtr_slot(q) >= 0; p++) {
-			if (qrtr_ports[p].number == header.to_port && qrtr_bind(&qrtr_ports[p], q)) {
-				receive = qrtr_ports[p].receive;
-				where = qrtr_ports[p].context;
+		for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
+			struct hakios_qrtr_port *candidate = &qrtr_ports[p];
+
+			if (!qrtr_serve_wait(candidate)) {
+				continue;
 			}
+			lck_mtx_lock(&qrtr_lock);
+			if (candidate->number == header.to_port && qrtr_slot(q) >= 0 && qrtr_deliverable(candidate, q)) {
+				receive = candidate->receive;
+				where = candidate->context;
+				port = candidate;
+			}
+			lck_mtx_unlock(&qrtr_lock);
+			if (port != NULL) {
+				break;
+			}
+			qrtr_serve_done(candidate);
 		}
-		lck_mtx_unlock(&qrtr_lock);
 		if (receive != NULL) {
 			receive(where, header.from_node, header.from_port, data + at, header.size);
+			qrtr_serve_done(port);
 		}
 		lck_mtx_unlock(&q->calling);
 		if (receive != NULL) {
@@ -3524,11 +3816,14 @@ qrtr_open(hakios_qrtr_receive_t receive, hakios_qrtr_server_t server, void *cont
 	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]) && port == NULL && qrtr_any_attached(); p++) {
 		if (qrtr_ports[p].number == 0) {
 			port = &qrtr_ports[p];
-			bzero(port, sizeof(*port));
-			port->number = qrtr_next_port++;
+			port->router = NULL;
+			port->shared = false;
+			port->serving_thread = NULL;
+			bzero(port->lookups, sizeof(port->lookups));
 			port->receive = receive;
 			port->server = server;
 			port->context = context;
+			port->number = qrtr_next_port++;
 		}
 	}
 	lck_mtx_unlock(&qrtr_lock);
@@ -3546,10 +3841,19 @@ qrtr_send(struct hakios_qrtr_port *port, uint32_t node, uint32_t to, const void 
 	}
 	lck_mtx_lock(&qrtr_lock);
 	q = qrtr_route(node);
-	if (q == NULL) {
+	if (q != NULL) {
+		/*
+		 * The route wins over the port's default router: a published port is reached through
+		 * several routers, and its answer has to go back through the one the node is behind.
+		 */
+		bound = qrtr_is_attached(q);
+		if (port->router == NULL) {
+			port->router = q;
+		}
+	} else {
 		q = port->router;
+		bound = q != NULL && qrtr_is_attached(q) && qrtr_bind(port, q);
 	}
-	bound = q != NULL && qrtr_is_attached(q) && qrtr_bind(port, q);
 	lck_mtx_unlock(&qrtr_lock);
 	if (q == NULL || !qrtr_is_attached(q)) {
 		return ENXIO;
@@ -3562,10 +3866,17 @@ qrtr_send(struct hakios_qrtr_port *port, uint32_t node, uint32_t to, const void 
 	return qrtr_out_packet(q, QRTR_DATA, port->number, node, to, data, (uint32_t)length);
 }
 
+void
+vayu_qrtr_lookup_announce(uint32_t service)
+{
+	qrtr_lookup_announce_service = service;
+}
+
 static int
 qrtr_lookup(struct hakios_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance)
 {
 	int error = ENOSPC;
+	uint32_t word = instance != 0 ? (version & 0xff) | instance << 8 : 0;
 
 	if (!qrtr_any_attached()) {
 		return ENXIO;
@@ -3574,29 +3885,60 @@ qrtr_lookup(struct hakios_qrtr_port *port, uint32_t service, uint32_t version, u
 	for (unsigned l = 0; l < 4 && error != 0 && port != NULL && port->number != 0; l++) {
 		if (!port->lookups[l].asked) {
 			port->lookups[l].service = service;
-			port->lookups[l].instance = instance != 0 ? (version & 0xff) | instance << 8 : 0;
+			port->lookups[l].instance = word;
 			port->lookups[l].asked = true;
 			port->lookups[l].fresh = (uint8_t)((1u << QRTR_ROUTERS) - 1);
 			error = 0;
 		}
 	}
 	lck_mtx_unlock(&qrtr_lock);
+	/*
+	 * vayu_ipa_seq: the same packet Linux's qmi_add_lookup() sends to the QRTR name service
+	 * (QRTR_NEW_LOOKUP, the service/instance asked for and the asking port). Without it the peer
+	 * only ever hears DATA from this port; with it the modem's QMI framework sees a client ask
+	 * for the service and calls that service's connect callback, which is where the IPA server
+	 * stores the connection handle 0x21 is checked against. Off unless a boot arg asks for it.
+	 */
+	if (error == 0 && port != NULL && port->number != 0 && qrtr_lookup_announce_service != 0 &&
+	    service == qrtr_lookup_announce_service) {
+		for (unsigned r = 0; r < QRTR_ROUTERS; r++) {
+			struct qrtr_control lookup = { .command = QRTR_NEW_LOOKUP };
+			struct vayu_qrtr *q = qrtr_routers[r];
+			int sent;
+
+			if (q == NULL || !q->peer_known) {
+				continue;
+			}
+			lookup.words[0] = service;
+			lookup.words[1] = word;
+			lookup.words[2] = QRTR_US;
+			lookup.words[3] = port->number;
+			sent = qrtr_out_packet(q, QRTR_NEW_LOOKUP, QRTR_CONTROL, q->peer, QRTR_CONTROL, &lookup,
+			    sizeof(lookup));
+			say("%s: qrtr: NEW_LOOKUP service %u (%#x) instance word %#x from port %u to node %u: %s\n",
+			    q->glink->rp->name, service, service, word, port->number, q->peer,
+			    sent == 0 ? "SENT" : "NOT SENT");
+		}
+	}
 	return error;
 }
 
 /*
- * No callback comes after this has returned. A bound port hears only from its router's thread: from any
- * other thread this waits for that router's running callback. An unbound one may hear from any router: from
- * outside every link thread this waits for all of them (in address order). From inside a callback of the
- * port's own router it must not wait. (A close from router A's callback of a port bound to router B, while
- * B's callback closes one bound to A, would wait on each other: no driver does that. Nor does any close an
- * unbound port from a link thread, where another router's thread could still bind it and call back.)
+ * No callback comes after this has returned. A port that is not published hears only from its router's
+ * thread: from any other thread this waits for that router's running callback. A published one may hear
+ * from every router, so from outside every link thread this waits for all of them (in address order);
+ * its own `serving' lock then waits for the one callback that may be running. From inside a callback the
+ * port's `serving' lock is already held by this thread: it must not wait on itself. (A close from router
+ * A's callback of a port bound to router B, while B's callback closes one bound to A, would wait on each
+ * other: no driver does that. Nor does any close an unbound port from a link thread, where another
+ * router's thread could still bind it and call back.)
  */
 static void
 qrtr_close(struct hakios_qrtr_port *port)
 {
 	struct qrtr_control gone = { .command = QRTR_DEL_CLIENT, .words = { QRTR_US, 0 } };
 	struct vayu_qrtr *held[QRTR_ROUTERS] = { NULL }, *router;
+	bool shared, served;
 	unsigned count = 0;
 	uint32_t number;
 
@@ -3604,12 +3946,14 @@ qrtr_close(struct hakios_qrtr_port *port)
 		return;
 	}
 	lck_mtx_lock(&qrtr_lock);
+	if (port->number == 0) {
+		lck_mtx_unlock(&qrtr_lock);
+		return;                                 /* (closed already: nothing of its is left to withdraw) */
+	}
 	router = port->router;
-	if (router != NULL) {
-		if (current_thread() != router->link_thread) {
-			held[count++] = router;
-		}
-	} else if (!qrtr_on_link_thread()) {
+	shared = port->shared;
+	if ((shared || router == NULL) && !qrtr_on_link_thread()) {
+		/* every router may have a callback of this port: wait for all of them, in address order */
 		for (unsigned r = 0; r < QRTR_ROUTERS; r++) {
 			if (qrtr_routers[r] != NULL) {
 				unsigned at = count++;
@@ -3621,11 +3965,14 @@ qrtr_close(struct hakios_qrtr_port *port)
 				held[at] = qrtr_routers[r];
 			}
 		}
+	} else if (router != NULL && current_thread() != router->link_thread) {
+		held[count++] = router;
 	}
 	lck_mtx_unlock(&qrtr_lock);
 	for (unsigned h = 0; h < count; h++) {
 		lck_mtx_lock(&held[h]->calling);        /* (a callback of the port's that is running ends first) */
 	}
+	served = qrtr_serve_wait(port);             /* (false: a callback of this port is closing it) */
 	lck_mtx_lock(&qrtr_lock);
 	number = port->number;
 	router = port->router;
@@ -3645,6 +3992,7 @@ qrtr_close(struct hakios_qrtr_port *port)
 		lck_mtx_lock(&qrtr_lock);
 		port->number = 0;
 		port->router = NULL;
+		port->shared = false;
 		for (unsigned i = 0; i < sizeof(qrtr_published) / sizeof(qrtr_published[0]); i++) {
 			if (qrtr_published[i].port == port) {
 				bzero(&qrtr_published[i], sizeof(qrtr_published[i]));
@@ -3652,13 +4000,16 @@ qrtr_close(struct hakios_qrtr_port *port)
 		}
 		lck_mtx_unlock(&qrtr_lock);
 	}
+	if (served) {
+		qrtr_serve_done(port);
+	}
 	for (unsigned h = count; h-- > 0;) {
 		lck_mtx_unlock(&held[h]->calling);
 	}
 	for (unsigned r = 0; r < QRTR_ROUTERS && number != 0; r++) {
 		struct vayu_qrtr *q = qrtr_routers[r];
 
-		if (q != NULL && q->peer_known && (router == NULL || router == q)) {
+		if (q != NULL && q->peer_known && (shared || router == NULL || router == q)) {
 			gone.words[1] = number;
 			qrtr_out_packet(q, QRTR_DEL_CLIENT, number, q->peer, QRTR_CONTROL, &gone, sizeof(gone));
 		}
@@ -3699,6 +4050,9 @@ vayu_qrtr_attach(struct vayu_qrtr *q)
 	if (slot >= 0) {
 		if (first) {
 			bzero(qrtr_ports, sizeof(qrtr_ports));
+			for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
+				lck_mtx_init(&qrtr_ports[p].serving, &pas_lock_group, LCK_ATTR_NULL);
+			}
 			bzero(qrtr_published, sizeof(qrtr_published));
 		}
 		qrtr_routers[slot] = q;
@@ -3713,7 +4067,7 @@ vayu_qrtr_attach(struct vayu_qrtr *q)
 	hakios_qmi_set_transport(&vayu_qrtr_ops);
 	/* our services, if a peer that said HELLO before is told of them only now */
 	for (unsigned i = 0; i < sizeof(qrtr_published) / sizeof(qrtr_published[0]) && !first && q->hellos != 0; i++) {
-		qrtr_announce(q, i, true);
+		qrtr_announce(q, i, true, q->peer, true);
 	}
 }
 
@@ -3734,9 +4088,11 @@ vayu_qrtr_detach(struct vayu_qrtr *q)
 	if (last) {
 		hakios_qmi_set_transport(NULL);        /* (first, as with one router: no new QMI client while the ports close) */
 	}
-	/* its ports; with the last router, the ports that never spoke through any too */
+	/* its ports (a published one serves every router, so only the last takes it down); with the last
+	 * router, the ports that never spoke through any too */
 	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
-		if (qrtr_ports[p].number != 0 && (qrtr_ports[p].router == q || (last && qrtr_ports[p].router == NULL))) {
+		if (qrtr_ports[p].number != 0 &&
+		    (last || (!qrtr_ports[p].shared && qrtr_ports[p].router == q))) {
 			qrtr_close(&qrtr_ports[p]);
 		}
 	}
@@ -3785,6 +4141,7 @@ vayu_qrtr_publish(struct hakios_qrtr_port *port, uint32_t service, uint32_t vers
 			qrtr_published[i].service = service;
 			qrtr_published[i].instance = (version & 0xff) | instance << 8;
 			qrtr_published[i].there = true;
+			port->shared = true;            /* reachable from every attached router (a peer is not alone) */
 			break;
 		}
 	}

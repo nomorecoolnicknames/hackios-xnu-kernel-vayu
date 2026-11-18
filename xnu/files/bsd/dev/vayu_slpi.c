@@ -42,8 +42,9 @@
  *                      (bsd/dev/vayu_ssc.c; the first QMI requests sent to the SLPI)
  *   vayu_ssc_secs=S    level 5: how long each sensor is streamed (default 10, at most 60)
  *   vayu_ssc_hz=N      level 5: the sample rate asked for (default 50; read by vayu_ssc.c)
- *   vayu_ssc_late=S    level 4+: if no SUID answers, keep asking for the registry and accel
- *                      every 10 s for up to S seconds (default 60; read by vayu_ssc.c)
+ *   vayu_ssc_late=S    level 4+: until the accelerometer has a UID, keep asking for the
+ *                      registry and accel every 10 s for up to S seconds (default 90; read by
+ *                      vayu_ssc.c)
  *   vayu_slpi_wait=S   how long vayu_pas_start watches for "ready" (default 15)
  *   vayu_slpi_listen=S QRTR listening time (default 20, at most 120)
  *   vayu_slpi_secs=S   kept up after step 2 when the level is 2 (default 2, at most 60)
@@ -288,6 +289,8 @@ step_link(void)
 static void
 slpi_thread(void *arg __unused, wait_result_t wr __unused)
 {
+	bool stopped, released = true;
+
 	if (level >= 2) {
 		/* (the firmware may be in /fw of the root, which is not mounted yet when this begins: a minute at most) */
 		for (unsigned waited = 0; waited < 300 && rootvnode == NULLVP; waited++) {
@@ -310,13 +313,15 @@ slpi_thread(void *arg __unused, wait_result_t wr __unused)
 	if (glink_prepared) {
 		vayu_glink_down(&glink);
 	}
+	stopped = !slpi.started;
 	if (slpi.started) {
-		vayu_pas_stop(&slpi, "the probe is over");
+		stopped = vayu_pas_stop(&slpi, "the probe is over");
 	}
 	if (frpc >= 1) {
-		vayu_fastrpc_release();		/* the SLPI is stopped: the SMMU entry goes back */
+		released = vayu_fastrpc_release(stopped);
 	}
-	say("vayu-slpi: everything taken down\n");
+	say("vayu-slpi: %s\n", stopped && released ? "everything taken down" :
+	    "shutdown incomplete; FastRPC memory and SMMU state retained");
 	thread_terminate(current_thread());
 }
 

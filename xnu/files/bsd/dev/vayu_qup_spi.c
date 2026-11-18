@@ -48,11 +48,8 @@
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include <sys/vayu_pas.h>
 #include <vm/vm_kern.h>
-
-extern bool vayu_rsc_tcs_lock(const char *who);  /* vayu_pas.c: THE lock of TCS 0 of the apps RSC */
-extern void vayu_rsc_tcs_unlock(void);
-extern bool vayu_rsc_tcs_gave_up(void);
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
@@ -2161,19 +2158,20 @@ static bool
 qup_bcm_vote(uint32_t address, uint32_t data)
 {
 	vm_offset_t tcs = qup_rsc_tcs();
-	bool held, done;
+	bool done;
+	enum vayu_rsc_tcs_result held;
 
 	if (tcs == 0) {
 		QUP_LOG("bcm: cannot map the RSC\n");
 		return false;
 	}
 	held = vayu_rsc_tcs_lock("qup-spi");
-	if (!held && vayu_rsc_tcs_gave_up()) {
+	if (held == VAYU_RSC_TCS_FAILED) {
 		QUP_LOG("bcm: TCS 0 was not taken: not voting\n");
 		return false;
 	}
 	done = qup_bcm_vote_locked(tcs, address, data);
-	if (held) {
+	if (held == VAYU_RSC_TCS_HELD) {
 		vayu_rsc_tcs_unlock();
 	}
 	return done;

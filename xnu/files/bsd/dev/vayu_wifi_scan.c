@@ -43,10 +43,12 @@
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
 #include <pexpert/pexpert.h>
+#include <kern/clock.h>
 #include <kern/locks.h>
 #include <sys/vayu_wifi_net.h>
 #include <sys/vayu_wifi_rsn.h>
 #include <sys/vayu_wifi_scan.h>
+#include <sys/vayu_wifi_htc_connect.h>
 #include <sys/vayu_wifi_smmu.h>
 
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
@@ -155,10 +157,19 @@ struct reg_rule {
 	uint32_t flags;
 };
 
+/* W25r: everything a scan result needs, not only what the log prints.  A name is kept as it came:
+ * the log shows a printable copy, iOS is given the bytes (a name may be Cyrillic, or anything else). */
 struct bss {
 	uint8_t bssid[6];
 	uint8_t chan;
-	uint16_t seen;
+	uint16_t seen;                          /* how many beacons or probe responses from it */
+	int16_t rssi;
+	uint16_t bintval;                       /* the beacon interval field, units of 1024 us */
+	uint16_t capab;
+	uint8_t ssid[32], ssid_len;
+	uint16_t ie_len;
+	uint64_t seen_ms;                       /* when it was last heard, for the age iOS shows */
+	uint8_t ie[VAYU_SCAN_IE_MOST];          /* the information elements after the fixed header */
 };
 
 static int (*slog)(const char *format, ...) __printflike(1, 2);
@@ -175,6 +186,10 @@ static struct {
 	uint32_t nbss;
 	struct bss bss[NBSS];
 	uint8_t chan_seen[200];
+	/* W25r: the channels this scan was asked for (what Apple80211's channel list is answered from) */
+	uint32_t freq_count;
+	uint16_t freqs[MAX_CHANS];
+	bool vdev_created;                      /* vdev 0 exists: a later scan needs no VDEV_CREATE */
 	/* htt */
 	bool htt_version;
 	uint32_t ring_n, htt_reposts;
@@ -191,6 +206,9 @@ static struct {
 /* W25: the HTT TX pool and the bank slots it uses (ids 0..TX_SLOTS-1 of the frag bank). */
 static LCK_GRP_DECLARE(tx_lck_grp, "vayu-wifi-tx");
 static LCK_MTX_DECLARE(tx_lock, &tx_lck_grp);
+/* W25r: the list a scan leaves behind is read by the station's thread (bsd/dev/vayu_wifi_net.c) while
+ * the HTT/WMI path may still be taking beacons; one lock around the list is enough. */
+static LCK_MTX_DECLARE(bss_lock, &tx_lck_grp);
 static const struct vayu_scan_ops *tx_ops;
 static uint64_t tx_pool_pa;
 static vm_offset_t tx_pool_va;
@@ -214,6 +232,16 @@ static uint32_t
 rd16(const uint8_t *p)
 {
 	return (uint32_t)p[0] | (uint32_t)p[1] << 8;
+}
+
+/* W25r: uptime in milliseconds, for the age of a scan result (the same conversion as vayu_wifi_net.c). */
+static uint64_t
+scan_now_ms(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000000ULL;
 }
 
 static uint32_t
@@ -416,6 +444,8 @@ mgmt_rx(const uint8_t *t, uint32_t len)
 	uint32_t o, l, tag, flen = 0, chan, snr, status, i;
 	int32_t rssi;
 	char ssid[33];
+	uint8_t rawname[32];
+	uint32_t rawlen = 0;
 	struct bss *b = NULL;
 	bool fresh = false;
 
@@ -458,9 +488,12 @@ mgmt_rx(const uint8_t *t, uint32_t len)
 		if (f[o] == 0) {
 			uint32_t n = f[o + 1] < 32 ? f[o + 1] : 32;
 
+			/* (the log gets a printable copy; iOS gets these bytes untouched) */
+			rawlen = n;
 			for (i = 0; i < n; i++) {
 				uint8_t ch = f[o + 2 + i];
 
+				rawname[i] = ch;
 				ssid[i] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '?';
 			}
 			ssid[n] = 0;
@@ -475,6 +508,7 @@ mgmt_rx(const uint8_t *t, uint32_t len)
 	if (chan < sizeof(sc.chan_seen)) {
 		sc.chan_seen[chan] = 1;
 	}
+	lck_mtx_lock(&bss_lock);
 	for (i = 0; i < sc.nbss && b == NULL; i++) {
 		uint32_t k;
 
@@ -494,12 +528,36 @@ mgmt_rx(const uint8_t *t, uint32_t len)
 	if (b != NULL) {
 		b->seen++;
 		b->chan = (uint8_t)chan;
+		b->rssi = (int16_t)rssi;
+		/* W26: the fixed fields are *after* the 24-byte 802.11 header: timestamp 0..7 (24..31),
+		 * beacon interval 32..33, capability 34..35, the IEs from 36 (the loop above).  Reading
+		 * them at 8/10 took the last four bytes of addr1 (the broadcast address, ff:ff:ff:ff, so
+		 * the interval was always 65535) and the first two bytes of addr2 (the BSSID): iOS saw
+		 * the AP's own address as its capability and, with the Privacy bit (0x0010) missing,
+		 * called every WPA2 network open and asked for no passphrase.  Seen in d12b: bcn 65535,
+		 * cap 0x92fe/0x9202/0xa74a = the first two bytes of fe:92:../02:92:../4a:a7:.. exactly. */
+		b->bintval = (uint16_t)rd16(f + 32);
+		b->capab = (uint16_t)rd16(f + 34);
+		b->ssid_len = (uint8_t)rawlen;
+		if (rawlen != 0) {
+			for (i = 0; i < rawlen; i++) {
+				b->ssid[i] = rawname[i];
+			}
+		}
+		/* the information elements after the 24-byte header and the 12 fixed bytes */
+		b->ie_len = (uint16_t)(flen - 36 > VAYU_SCAN_IE_MOST ? VAYU_SCAN_IE_MOST : flen - 36);
+		for (i = 0; i < b->ie_len; i++) {
+			b->ie[i] = f[36 + i];
+		}
+		b->seen_ms = scan_now_ms();
 	}
+	lck_mtx_unlock(&bss_lock);
 	if (fresh || sc.logged < 32) {
 		sc.logged++;
-		slog("vayu-wifi: w22: %s ch %u rssi %d bssid xx:xx:xx:xx:%02x:%02x ssid '%s' status %#x%s\n",
+		slog("vayu-wifi: w22: %s ch %u rssi %d bssid xx:xx:xx:xx:%02x:%02x ssid '%s' status %#x "
+		    "bcn %u cap %#06x%s\n",
 		    (f[0] >> 4) == 8 ? "beacon" : "probe_resp", chan, rssi, f[20], f[21], ssid, status,
-		    fresh ? " (new)" : "");
+		    (unsigned)rd16(f + 32), (unsigned)rd16(f + 34), fresh ? " (new)" : "");
 	}
 }
 
@@ -1066,12 +1124,66 @@ freq_allowed(uint32_t f)
 	return false;
 }
 
+
 static int
 wmi_cmd(const struct vayu_scan_ops *o, uint8_t *m, uint32_t cmd, uint32_t len)
 {
 	(void)put32(m, cmd);
 	return o->wmi_send(m, len, CREDIT_WAIT_MS);
 }
+
+/* WMI_START_SCAN: flame scan_send_start.  The channel list is the caller's: the first scan's own
+ * table, or the one it kept in sc.freqs, so a rescan is the same request.  Returns 0 when the
+ * message went out. */
+static int
+scan_start_send(const struct vayu_scan_ops *o, const uint16_t *freqs, uint32_t n)
+{
+	static uint8_t m[1600];         /* (one caller: the thread that owns the WMI path) */
+	uint8_t *p, *c;
+	uint32_t i;
+	int s;
+
+	zero(m, sizeof(m));
+	c = put_tlv(m + 4, TAG_START_SCAN_CMD, 100);
+	c = put32(c, SCAN_ID);
+	c = put32(c, SCAN_REQ_ID);
+	c = put32(c, 0);                /* vdev */
+	c = put32(c, 1);                /* priority low */
+	c = put32(c, SCAN_EV_STARTED | SCAN_EV_COMPLETED | SCAN_EV_BSS_CHANNEL | SCAN_EV_FOREIGN |
+	    SCAN_EV_FOREIGN_EXIT | SCAN_EV_DEQUEUED);
+	c = put32(c, DWELL_ACTIVE_MS);
+	c = put32(c, DWELL_PASSIVE_MS);
+	c = put32(c, 50);               /* min rest */
+	c = put32(c, 500);              /* max rest */
+	c = put32(c, 0);
+	c = put32(c, 0);
+	c = put32(c, 0);
+	c = put32(c, MAX_SCAN_MS);
+	c = put32(c, 5);                /* probe delay */
+	c = put32(c, (SCAN_PASSIVE | SCAN_CHAN_STAT) ^ SCAN_FILTER_PROBE_REQ);
+	c = put32(c, 0);
+	c = put32(c, n);
+	c = put32(c, 1);                /* bssids */
+	c = put32(c, 0);                /* ssids: none, no probe request */
+	c = put32(c, 0);                /* ie_len */
+	c = put32(c, 3);                /* num_probes (unused: passive) */
+	p = c + 16;                     /* mac addr + mask: zero */
+	c = put_tlv(p, TAG_ARRAY_UINT32, n * 4);
+	for (i = 0; i < n; i++) {
+		c = put32(c, freqs[i]);
+	}
+	p = put_tlv(c, TAG_ARRAY_FIXED_STRUCT, 0);
+	c = put_tlv(p, TAG_ARRAY_FIXED_STRUCT, 8);
+	for (i = 0; i < 6; i++) {
+		c[i] = 0xff;            /* bssid filter: broadcast */
+	}
+	p = put_tlv(c + 8, TAG_ARRAY_BYTE, 0);
+	s = wmi_cmd(o, m, CMD_START_SCAN, (uint32_t)(p - m));
+	o->log("vayu-wifi: w22: start scan passive dwell %u ms, %u channels, max %u ms: %s\n",
+	    DWELL_PASSIVE_MS, n, MAX_SCAN_MS, s != 0 ? "FAILED" : "requested");
+	return s;
+}
+
 
 static bool
 scan_done(void)
@@ -1192,7 +1304,10 @@ vayu_scan_tx_frame(const uint8_t *f, uint32_t len, bool clear)
 	memcpy(p, (const void *)(tx_pool_va + (vm_offset_t)(pa - tx_pool_pa)), pf);
 	rc = tx_ops->htt_send(m, 20 + pf);
 	if (rc != 0) {
-		tx_busy[id >> 6] &= ~(1ULL << (id & 63));
+		/* a descriptor the engine was told of may still be read: the frame's slot waits for its HTT completion */
+		if (rc != VAYU_HTCC_TX_UNKNOWN) {
+			tx_busy[id >> 6] &= ~(1ULL << (id & 63));
+		}
 		tx_drop_send++;
 		lck_mtx_unlock(&tx_lock);
 		return -1;
@@ -1272,7 +1387,6 @@ vayu_scan_run(const struct vayu_scan_ops *o)
 	if (o->tx_ring > 2 && o->tx_ring - 2 < tx_inflight_max) {
 		tx_inflight_max = o->tx_ring - 2;
 	}
-	vayu_net_sta_attach(o->mac);            /* W25o: Apple80211 has a station before the scan */
 	o->log("vayu-wifi: w22: scan stage: reg events %u (rules %u, country %s), freq_avoid events %u\n",
 	    sc.reg_events, sc.nrules, sc.reg_seen ? sc.alpha2 : "-", sc.avoid_events);
 	(void)htt_setup(o);
@@ -1281,6 +1395,14 @@ vayu_scan_run(const struct vayu_scan_ops *o)
 			freqs[n++] = scan_freqs[i];
 		}
 	}
+	/* W25r: the same list, kept for whoever asks the radio what it can tune to (Apple80211's 254/207) */
+	sc.freq_count = n < MAX_CHANS ? n : MAX_CHANS;
+	for (i = 0; i < sc.freq_count; i++) {
+		sc.freqs[i] = freqs[i];
+	}
+	/* W25r: the station boundary is opened once the list is known, so that Apple80211's channel list is
+	 * the one this scan is made on (hakios_sta_attach reads it through sta_channels). */
+	vayu_net_sta_attach(o->mac);
 	/* WMI_SCAN_CHAN_LIST: every channel passive, as flame (nothing is transmitted) */
 	zero(m, sizeof(m));
 	p = put32(put_tlv(m + 4, TAG_SCAN_CHAN_LIST_CMD, 4), n);
@@ -1309,47 +1431,13 @@ vayu_scan_run(const struct vayu_scan_ops *o)
 		c[i] = o->mac[i];
 	}
 	b = wmi_cmd(o, m, CMD_VDEV_CREATE, 4 + 4 + 20);
+	if (b == 0) {
+		sc.vdev_created = true;
+	}
 	o->log("vayu-wifi: w22: vdev create 0 type STA mac xx:xx:xx:xx:%02x:%02x %s\n", o->mac[4], o->mac[5],
 	    b != 0 ? "FAILED" : "ok");
-	/* WMI_START_SCAN: flame scan_send_start */
-	zero(m, sizeof(m));
-	c = put_tlv(m + 4, TAG_START_SCAN_CMD, 100);
-	c = put32(c, SCAN_ID);
-	c = put32(c, SCAN_REQ_ID);
-	c = put32(c, 0);                /* vdev */
-	c = put32(c, 1);                /* priority low */
-	c = put32(c, SCAN_EV_STARTED | SCAN_EV_COMPLETED | SCAN_EV_BSS_CHANNEL | SCAN_EV_FOREIGN |
-	    SCAN_EV_FOREIGN_EXIT | SCAN_EV_DEQUEUED);
-	c = put32(c, DWELL_ACTIVE_MS);
-	c = put32(c, DWELL_PASSIVE_MS);
-	c = put32(c, 50);               /* min rest */
-	c = put32(c, 500);              /* max rest */
-	c = put32(c, 0);
-	c = put32(c, 0);
-	c = put32(c, 0);
-	c = put32(c, MAX_SCAN_MS);
-	c = put32(c, 5);                /* probe delay */
-	c = put32(c, (SCAN_PASSIVE | SCAN_CHAN_STAT) ^ SCAN_FILTER_PROBE_REQ);
-	c = put32(c, 0);
-	c = put32(c, n);
-	c = put32(c, 1);                /* bssids */
-	c = put32(c, 0);                /* ssids: none, no probe request */
-	c = put32(c, 0);                /* ie_len */
-	c = put32(c, 3);                /* num_probes (unused: passive) */
-	p = c + 16;                     /* mac addr + mask: zero */
-	c = put_tlv(p, TAG_ARRAY_UINT32, n * 4);
-	for (i = 0; i < n; i++) {
-		c = put32(c, freqs[i]);
-	}
-	p = put_tlv(c, TAG_ARRAY_FIXED_STRUCT, 0);
-	c = put_tlv(p, TAG_ARRAY_FIXED_STRUCT, 8);
-	for (i = 0; i < 6; i++) {
-		c[i] = 0xff;            /* bssid filter: broadcast */
-	}
-	p = put_tlv(c + 8, TAG_ARRAY_BYTE, 0);
-	s = wmi_cmd(o, m, CMD_START_SCAN, (uint32_t)(p - m));
-	o->log("vayu-wifi: w22: start scan passive dwell %u ms, %u channels, max %u ms: %s\n",
-	    DWELL_PASSIVE_MS, n, MAX_SCAN_MS, s != 0 ? "FAILED" : "requested");
+	/* WMI_START_SCAN: flame scan_send_start (the same request serves a rescan) */
+	s = scan_start_send(o, freqs, n);
 	if (s == 0) {
 		w = o->wait(scan_started, 2000);
 		if (w > 0 && !sc.done) {
@@ -1385,4 +1473,163 @@ vayu_scan_run(const struct vayu_scan_ops *o)
 	    sc.probe_resp, sc.other_mgmt, sc.bad, sc.frames, sc.scan_events, sc.done_event, sc.done_reason,
 	    sc.ring_n, sc.htt_msgs, sc.htt_msdus, sc.htt_reposts);
 	return sc.done && sc.done_event == SCAN_EV_COMPLETED ? 0 : -1;
+}
+
+/*
+ * W25r: a scan asked for by iOS, on the vdev and channel list the first scan left behind.  Nothing
+ * is set up again (the HTT ring and the vdev are there); only the results of the last scan are
+ * cleared.  Called from the station's loop, which owns the WMI/HTT path: not while a link is up.
+ */
+int
+vayu_scan_again(const struct vayu_scan_ops *o)
+{
+	uint16_t freqs[MAX_CHANS];
+	uint32_t n = 0, i;
+	int w;
+
+	if (o == NULL || vayu_scan_mode == 0) {
+		return -1;
+	}
+	tx_ops = o;
+	lck_mtx_lock(&bss_lock);
+	for (i = 0; i < sc.freq_count && n < MAX_CHANS; i++) {
+		freqs[n++] = sc.freqs[i];
+	}
+	lck_mtx_unlock(&bss_lock);
+	if (n == 0) {
+		/* (no first scan to take them from: the same table vayu_scan_run would use) */
+		for (i = 0; i < NFREQ && n < MAX_CHANS; i++) {
+			if (freq_allowed(scan_freqs[i])) {
+				freqs[n++] = scan_freqs[i];
+			}
+		}
+	}
+	if (!sc.vdev_created) {
+		uint8_t m[40], *c;
+
+		zero(m, sizeof(m));
+		c = put_tlv(m + 4, TAG_VDEV_CREATE_CMD, 20);
+		c = put32(c, 0);
+		c = put32(c, VDEV_TYPE_STA);
+		c = put32(c, 0);
+		for (i = 0; i < 6; i++) {
+			c[i] = o->mac[i];
+		}
+		if (wmi_cmd(o, m, CMD_VDEV_CREATE, 4 + 4 + 20) == 0) {
+			sc.vdev_created = true;
+		}
+	}
+	/* The counters and the ended-ness go; the list stays, and this scan's beacons update it (an
+	 * access point that is no longer heard keeps the age of its last beacon).  A scan that fails
+	 * then leaves the last list to iOS rather than an empty one. */
+	lck_mtx_lock(&bss_lock);
+	sc.started = sc.done = false;
+	sc.done_event = sc.done_reason = 0;
+	sc.frames = sc.beacons = sc.probe_resp = sc.bad = sc.other_mgmt = 0;
+	sc.logged = 0;
+	sc.scan_events = sc.foreign = 0;
+	lck_mtx_unlock(&bss_lock);
+	if (scan_start_send(o, freqs, n) != 0) {
+		return -1;
+	}
+	w = o->wait(scan_started, 2000);
+	if (w > 0 && !sc.done) {
+		w = o->wait(scan_done, SCAN_WAIT_MS);
+	}
+	if (w <= 0 && !sc.done) {
+		o->log("vayu-wifi: W25r scan: %s (started %u)\n", w < 0 ? "stopped (CE stage abort)" :
+		    "not completed in time", sc.started ? 1 : 0);
+	}
+	(void)o->wait(NULL, 200);
+	o->log("vayu-wifi: W25r scan: done: %u beacons, %u unique BSSIDs, end %#x reason %u\n",
+	    sc.beacons, sc.nbss, sc.done_event, sc.done_reason);
+	return sc.done && sc.done_event == SCAN_EV_COMPLETED ? 0 : -1;
+}
+
+/* ------------------------------------------------------------ W25r: what a scan leaves behind for iOS */
+
+/*
+ * The station boundary (sys/hakios.sta.h, bsd/dev/vayu_wifi_net.c) answers Apple80211's SCAN_RESULT
+ * from these: what the last scan heard, as the beacons had it.  A name is copied as received; the
+ * information elements are copied as received, because IO80211.framework reads the network's
+ * protection (RSN/WPA) out of them itself.  Reading is by index, one access point at a time, as
+ * Apple80211 asks; each call takes the list's lock only while it copies.
+ */
+
+unsigned
+vayu_scan_bss_count(void)
+{
+	unsigned count;
+
+	lck_mtx_lock(&bss_lock);
+	count = sc.nbss;
+	lck_mtx_unlock(&bss_lock);
+	return count;
+}
+
+bool
+vayu_scan_bss_get(unsigned index, struct vayu_scan_bss *bss, uint8_t *elements, uint32_t elements_size)
+{
+	uint32_t i, n;
+	bool there = false;
+
+	if (bss == NULL) {
+		return false;
+	}
+	lck_mtx_lock(&bss_lock);
+	if (index < sc.nbss) {
+		const struct bss *b = &sc.bss[index];
+
+		memset(bss, 0, sizeof(*bss));
+		for (i = 0; i < 6; i++) {
+			bss->bssid[i] = b->bssid[i];
+		}
+		bss->ssid_length = b->ssid_len;
+		for (i = 0; i < b->ssid_len && i < sizeof(bss->ssid); i++) {
+			bss->ssid[i] = b->ssid[i];
+		}
+		bss->frequency = (uint16_t)(b->chan <= 13 ? 2407 + b->chan * 5 :
+		    b->chan == 14 ? 2484 : 5000 + b->chan * 5);
+		bss->rssi = b->rssi;
+		bss->beacon_interval = b->bintval;
+		bss->capability = b->capab;
+		n = b->ie_len;
+		if (n > elements_size) {
+			n = elements_size;
+		}
+		bss->elements_length = (uint16_t)n;
+		for (i = 0; i < n; i++) {
+			elements[i] = b->ie[i];
+		}
+		bss->age_ms = 0;
+		if (b->seen_ms != 0) {
+			uint64_t now = scan_now_ms();
+
+			bss->age_ms = now > b->seen_ms ? (uint32_t)(now - b->seen_ms) : 0;
+		}
+		there = true;
+	}
+	lck_mtx_unlock(&bss_lock);
+	return there;
+}
+
+/* The channels the scan was made on; before the first scan, the same table the scan would use. */
+unsigned
+vayu_scan_channels(uint16_t *frequencies, unsigned most)
+{
+	unsigned i, count = 0;
+
+	lck_mtx_lock(&bss_lock);
+	if (sc.freq_count != 0) {
+		for (i = 0; i < sc.freq_count && count < most; i++) {
+			frequencies[count++] = sc.freqs[i];
+		}
+		lck_mtx_unlock(&bss_lock);
+		return count;
+	}
+	lck_mtx_unlock(&bss_lock);
+	for (i = 0; i < NFREQ && i < MAX_CHANS && count < most; i++) {
+		frequencies[count++] = scan_freqs[i];
+	}
+	return count;
 }

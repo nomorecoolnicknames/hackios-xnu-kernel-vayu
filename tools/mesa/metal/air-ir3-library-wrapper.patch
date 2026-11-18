@@ -1,0 +1,31 @@
+From another HakiOS port (MIT, Mesa's): oosexgang/hakios-xnu-kernel, branch main, commit 63fc2b4633ba.
+
+ir3_compiler (tools/mesa/air-ir3.patch): compile an air.visible library function through the
+frontend's wrapper.
+
+The hunk upstream HakiOS 63fc2b46 (oosexgang/hakios-xnu-kernel) added to its air-ir3.patch, as a
+patch of its own on top of ours: tools/mesa/air-ir3.patch stays as it is, so the Mesa that
+OpenGL ES is built from (tools/mk-mesa.sh, tools/mesa/*.patch) keeps its sources and its hash.
+This directory is applied only to the Metal driver's builds: tools/air/mk-host.sh (the host
+compiler hakios-metal's tests link) and `METAL=1 tools/mk-mesa.sh` (the iOS archives the
+plug-in links). The tool alone changes; nothing linked into a driver does.
+
+--- a/src/gallium/drivers/freedreno/ir3/ir3_cmdline.c
++++ b/src/gallium/drivers/freedreno/ir3/ir3_cmdline.c
+@@ -282,9 +282,16 @@
+
+    struct air_constant_value *fc;
+    unsigned num_fc = air_module_function_constants(NULL, bitcode, bitcode_size, &fc);
++   /* An air.visible library function is not an entry point; the wrapper makes
++    * one that calls it, so that these 135 modules can be compiled for the
++    * Adreno at all (nir_air.h, docs/air.md section 5). Always on here: this
++    * tool exists to answer "does ir3 accept it", and a module that is not an
++    * entry point has no other way to be asked.
++    */
+    const struct air_to_nir_options options = {
+       .constants = fc,
+       .num_constants = num_fc,
++      .library_wrapper = true,
+    };
+    struct air_shader_info info;
+    nir_shader *nir = air_to_nir(NULL, bitcode, bitcode_size, NULL, &options,

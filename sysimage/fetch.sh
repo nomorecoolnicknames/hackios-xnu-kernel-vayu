@@ -30,6 +30,9 @@ UNZBM=../xnu-deps/host/bin/unzbm
 for tool in python3 7z cc; do
 	command -v $tool >/dev/null || { echo "fetch.sh: $tool is not installed"; exit 1; }
 done
+# an older 7z (p7zip 16.02 of Ubuntu 22.04) lists an APFS image as nothing and the build goes on with no files
+SEVENZ=$(7z | sed -n 's/^7-Zip[^0-9]*\([0-9][0-9]*\)\..*/\1/p' | head -n 1)
+[ "${SEVENZ:-0}" -ge 23 ] || { echo "fetch.sh: 7z is version ${SEVENZ:-unknown}; 7-Zip 23 or newer is needed (it reads APFS)"; exit 1; }
 # 7z leaves files compressed with LZBITMAP as an empty file and two attribute files; unzbm finishes them
 if [ ! -x $UNZBM ]; then
 	mkdir -p "$(dirname $UNZBM)"

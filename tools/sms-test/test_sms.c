@@ -330,7 +330,7 @@ test_qmi_set_event(void)
 static void
 test_qmi_raw_send(void)
 {
-	uint8_t pdu[VAYU_SMS_PDU_MAX], message[512];
+	uint8_t pdu[VAYU_SMS_PDU_MAX], message[512], legacy[512], omitted[512];
 	struct vayu_sms_qmi_raw_send_req request;
 	size_t pdu_length = 0;
 	uint32_t dcs;
@@ -350,6 +350,38 @@ test_qmi_raw_send(void)
 		check((size_t)(message[11] | message[12] << 8) == pdu_length, "raw send pdu length");
 		check(memcmp(message + 13, pdu, pdu_length) == 0, "raw send pdu bytes");
 	}
+	check(length == (int)(17 + pdu_length), "raw send total length: %d", length);
+	check(memcmp(message + 13 + pdu_length, (uint8_t[]){ 0x02, 0x01, 0x00, 0x00 }, 4) == 0,
+	    "raw send SMS-on-IMS TLV 0x02");
+	length = hakios_qmi_encode(QMI_REQUEST, VAYU_SMS_QMI_RAW_SEND, 1, vayu_sms_qmi_raw_send_req_legacy_ei,
+	    &request, legacy, sizeof(legacy));
+	check(length == (int)(17 + pdu_length), "legacy raw send length: %d", length);
+	message[13 + pdu_length] = 0x13;
+	check_bytes(legacy, length > 0 ? (size_t)length : 0, message, 17 + pdu_length, "legacy raw send TLV 0x13");
+	request.sms_on_ims_valid = 0;
+	length = hakios_qmi_encode(QMI_REQUEST, VAYU_SMS_QMI_RAW_SEND, 1, vayu_sms_qmi_raw_send_req_ei,
+	    &request, omitted, sizeof(omitted));
+	message[5] -= 4;
+	check_bytes(omitted, length > 0 ? (size_t)length : 0, message, 13 + pdu_length, "raw send without IMS TLV");
+	check_status(vayu_sms_qmi_raw_send_fill_format(&request, 1, pdu, pdu_length), VAYU_SMS_OK,
+	    "fill raw send format 1");
+	length = hakios_qmi_encode(QMI_REQUEST, VAYU_SMS_QMI_RAW_SEND, 1, vayu_sms_qmi_raw_send_req_ei,
+	    &request, message, sizeof(message));
+	check(length == (int)(17 + pdu_length) && message[10] == 1, "raw send format 1 on wire");
+}
+
+/* A RAW_SEND answer with no Result TLV: a zeroed result must not read as the modem's success. */
+static void
+test_qmi_missing_result(void)
+{
+	static const uint8_t empty[] = { 0x02, 1, 0, 0x20, 0, 0, 0 };
+	static const uint8_t id_only[] = { 0x02, 1, 0, 0x20, 0, 5, 0, 0x01, 2, 0, 42, 0 };
+	struct vayu_sms_qmi_raw_send_resp response = { 0 };
+
+	check(hakios_qmi_decode(empty, sizeof(empty), vayu_sms_qmi_raw_send_resp_ei, &response) < 0,
+	    "RAW_SEND without Result cannot succeed");
+	check(hakios_qmi_decode(id_only, sizeof(id_only), vayu_sms_qmi_raw_send_resp_ei, &response) < 0,
+	    "RAW_SEND message id without Result cannot succeed");
 }
 
 static void
@@ -368,6 +400,59 @@ test_qmi_raw_read(void)
 		check((uint32_t)(message[11] | message[12] << 8 | message[13] << 16 | (uint32_t)message[14] << 24) == 42,
 		    "raw read index");
 	}
+}
+
+static void
+test_qmi_list_request(void)
+{
+	uint8_t message[64];
+	uint8_t want[] = {
+		0x00, 0x04, 0x00, 0x31, 0x00, 0x0c, 0x00,
+		0x01, 0x01, 0x00, 0x00, 0x11, 0x01, 0x00, 0x01, 0x12, 0x01, 0x00, 0x01,
+	};
+	struct vayu_sms_qmi_list_req request = { .storage = 0, .tag = 1, .mode = VAYU_SMS_QMI_MODE_GSM };
+	int length;
+
+	/* SMS4_REPORT: the exact 19-byte List request captured on the phone. */
+	length = hakios_qmi_encode(QMI_REQUEST, VAYU_SMS_QMI_LIST_MESSAGES, 4, vayu_sms_qmi_list_req_ei,
+	    &request, message, sizeof(message));
+	check(length == (int)sizeof(want), "list tag 1 length: %d", length);
+	check_bytes(message, length > 0 ? (size_t)length : 0, want, sizeof(want), "list tag 1 wire bytes");
+	request.tag = 0;
+	want[14] = 0;
+	length = hakios_qmi_encode(QMI_REQUEST, VAYU_SMS_QMI_LIST_MESSAGES, 4, vayu_sms_qmi_list_req_ei,
+	    &request, message, sizeof(message));
+	check(length == (int)sizeof(want), "list tag 0 length: %d", length);
+	check_bytes(message, length > 0 ? (size_t)length : 0, want, sizeof(want), "list tag 0 wire bytes");
+}
+
+static void
+test_qmi_raw_send_resp(void)
+{
+	static const uint8_t refused[] = {
+		0x02, 0x01, 0x00, 0x20, 0x00, 0x07, 0x00,
+		0x02, 0x04, 0x00, 0x01, 0x00, 0x30, 0x00,
+	};
+	static const uint8_t success[] = {
+		0x02, 0x01, 0x00, 0x20, 0x00, 0x12, 0x00,
+		0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x02, 0x00, 0x34, 0x12,
+		0x12, 0x03, 0x00, 0x00, 0x00, 0x00,
+	};
+	struct vayu_sms_qmi_raw_send_resp decoded;
+
+	memset(&decoded, 0, sizeof(decoded));
+	check_decoded(hakios_qmi_decode(refused, sizeof(refused), vayu_sms_qmi_raw_send_resp_ei, &decoded),
+	    (int)sizeof(refused), "decode raw send refusal");
+	check(decoded.result.result == 1 && decoded.result.error == 48, "raw send refusal result/error");
+	check(!decoded.message_id_valid, "raw send refusal without message id");
+	memset(&decoded, 0, sizeof(decoded));
+	check_decoded(hakios_qmi_decode(success, sizeof(success), vayu_sms_qmi_raw_send_resp_ei, &decoded),
+	    (int)sizeof(success), "decode raw send success");
+	check(decoded.result.result == 0 && decoded.result.error == 0 && decoded.message_id_valid &&
+	    decoded.message_id == 0x1234, "raw send success and message id");
+	check(decoded.cause_valid && decoded.cause.rp_cause == 0 && decoded.cause.tp_cause == 0,
+	    "raw send GW cause");
 }
 
 static void
@@ -396,6 +481,22 @@ test_qmi_list_decode(void)
 
 	/* a count that overruns the payload is refused */
 	check_status(vayu_sms_qmi_list_parse(decoded.list, 9, &list), VAYU_SMS_ERR_MALFORMED, "short list");
+
+	{
+		uint8_t message10[sizeof(message)];
+
+		memcpy(message10, message, sizeof(message));
+		message10[14] = 0x10;
+		memset(&decoded, 0, sizeof(decoded));
+		check_decoded(hakios_qmi_decode(message10, sizeof(message10), vayu_sms_qmi_list_resp_ei, &decoded),
+		    (int)sizeof(message10), "decode list TLV 0x10");
+		check(decoded.list10_valid && !decoded.list_valid, "list TLV 0x10 present without 0x01");
+		check_status(vayu_sms_qmi_list_parse(decoded.list10, 4 + 2 * 5, &list), VAYU_SMS_OK, "parse list 0x10");
+		check(list.count == 2, "list 0x10 count: %u", list.count);
+		check(list.entry[0].index == 42 && list.entry[0].tag == 1, "list 0x10 entry 0");
+		check(list.entry[1].index == 43 && list.entry[1].tag == 0, "list 0x10 entry 1");
+	}
+
 }
 
 static void
@@ -508,6 +609,9 @@ main(void)
 	test_submit_limits();
 	test_qmi_set_event();
 	test_qmi_raw_send();
+	test_qmi_missing_result();
+	test_qmi_raw_send_resp();
+	test_qmi_list_request();
 	test_qmi_raw_read();
 	test_qmi_list_decode();
 	test_qmi_event_decode();

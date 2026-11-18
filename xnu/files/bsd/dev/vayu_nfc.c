@@ -53,6 +53,12 @@
  *   vayu_nfc_pause=MS      sleep before step 1, time for the loader's log (default 2000).
  *   vayu_nfc_ios=N         iOS side (MiniAppleStockholm): N >= 2 starts the nfcd bridge on this
  *                          bus; N = 1 keeps the log-only stand-in. The probe need not be asked for.
+ *   vayu_nfc_idle_ms=N     (o6; default 0: every 2 ms, as before) the bridge looks at the IRQ line
+ *                          every N ms (3..100) once nothing has gone either way for
+ *                          vayu_nfc_idle_after_ms (default 1000), and every 2 ms again from the next
+ *                          packet. The controller holds the line high until it is read, so a packet
+ *                          is only later, not lost; 500 wakes a second for as long as nfcd runs is
+ *                          what the 2 ms cost.
  *
  * What each step does:
  *   1  reads pins 39, 40, 47, 48 and 102 into the loader's log and prints a verdict: VEN on,
@@ -405,7 +411,9 @@ bus_failed(void)
 {
 	if (++bus_fail_run >= 3) {
 		bus_dead = true;
-		say("i2c: bus_take failed %u times in a row: stopping\n", bus_fail_run);
+		if (!i2c_quiet) {
+			say("i2c: bus_take failed %u times in a row: stopping\n", bus_fail_run);
+		}
 	}
 }
 
@@ -422,8 +430,10 @@ bus_take(void)
 	function_sda = (taken_cfg[0] >> TLMM_CFG_FUNC_SHIFT) & TLMM_CFG_FUNC_MASK;
 	function_scl = (taken_cfg[1] >> TLMM_CFG_FUNC_SHIFT) & TLMM_CFG_FUNC_MASK;
 	if (function_sda != 0 || function_scl != 0) {
-		say("i2c: gpio%u function %u, gpio%u function %u: not taken (need function 0, loader vayu_nfc_pins=1)\n",
-		    PIN_SDA, function_sda, PIN_SCL, function_scl);
+		if (!i2c_quiet) {
+			say("i2c: gpio%u function %u, gpio%u function %u: not taken (need function 0, loader vayu_nfc_pins=1)\n",
+			    PIN_SDA, function_sda, PIN_SCL, function_scl);
+		}
 		bus_failed();
 		return false;
 	}
@@ -431,8 +441,10 @@ bus_take(void)
 	line(PIN_SCL, true);
 	half_bit();
 	if (!pin_high(PIN_SDA) || !pin_high(PIN_SCL)) {
-		say("i2c: the bus is not at rest (gpio%u reads %u, gpio%u reads %u): not touched\n",
-		    PIN_SDA, pin_high(PIN_SDA), PIN_SCL, pin_high(PIN_SCL));
+		if (!i2c_quiet) {
+			say("i2c: the bus is not at rest (gpio%u reads %u, gpio%u reads %u): not touched\n",
+			    PIN_SDA, pin_high(PIN_SDA), PIN_SCL, pin_high(PIN_SCL));
+		}
 		wr(gpio_io(PIN_SDA), taken_io[0] & TLMM_IO_OUT);
 		wr(gpio_io(PIN_SCL), taken_io[1] & TLMM_IO_OUT);
 		wr(gpio_cfg(PIN_SDA), taken_cfg[0]);
@@ -577,10 +589,12 @@ nfc_read(uint8_t *bytes, unsigned count)
 		    rd(gpio_cfg(PIN_SDA)), rd(gpio_cfg(PIN_SCL)));
 	}
 	if (i2c_late) {
-		say("i2c: read 0x28 -> %u bytes: deadline passed\n", count);
+		if (!i2c_quiet) {
+			say("i2c: read 0x28 -> %u bytes: deadline passed\n", count);
+		}
 		return false;
 	}
-	if (!answered) {
+	if (!answered && !i2c_quiet) {
 		say("i2c: read 0x28 -> %u bytes: not acknowledged\n", count);
 	}
 	return answered;
@@ -620,7 +634,9 @@ nfc_recv(uint8_t *packet, unsigned capacity, unsigned timeout_ms)
 		delay_for_interval(1, NSEC_PER_MSEC);
 	}
 	if (!nfc_read(header, 3)) {
-		say("rx: the 3-byte header is not read\n");
+		if (!i2c_quiet) {
+			say("rx: the 3-byte header is not read\n");
+		}
 		return 0;
 	}
 	/*
@@ -629,18 +645,24 @@ nfc_recv(uint8_t *packet, unsigned capacity, unsigned timeout_ms)
 	 * 0xff from such a header would pull 255 more garbage bytes, so the header is dropped here.
 	 */
 	if ((header[0] >> 5) > 3) {
-		say("rx: header %02x %02x %02x is not NCI (MT %u): empty read, dropped\n",
-		    header[0], header[1], header[2], header[0] >> 5);
+		if (!i2c_quiet) {
+			say("rx: header %02x %02x %02x is not NCI (MT %u): empty read, dropped\n",
+			    header[0], header[1], header[2], header[0] >> 5);
+		}
 		return 0;
 	}
 	length = header[2];
 	if (3 + (unsigned)length > capacity) {
-		say("rx: %u bytes do not fit the %u-byte buffer: dropped\n", 3 + length, capacity);
+		if (!i2c_quiet) {
+			say("rx: %u bytes do not fit the %u-byte buffer: dropped\n", 3 + length, capacity);
+		}
 		return 0;
 	}
 	memcpy(packet, header, 3);
 	if (length > 0 && !nfc_read(packet + 3, length)) {
-		say("rx: the %u-byte payload is not read\n", length);
+		if (!i2c_quiet) {
+			say("rx: the %u-byte payload is not read\n", length);
+		}
 		return 0;
 	}
 	log_packet("rx", packet, 3 + length);
@@ -1808,6 +1830,9 @@ static vayu_nfc_rx_fn bridge_rx;
 static volatile bool bridge_running;
 static volatile unsigned bridge_generation;      /* a stop makes every older thread exit */
 static uint32_t bridge_packets_in, bridge_packets_out;
+static uint32_t bridge_idle_ms;                  /* vayu_nfc_idle_ms (0: every 2 ms) */
+static uint64_t bridge_idle_after_abs;           /* ... after vayu_nfc_idle_after_ms with no packet */
+static volatile uint64_t bridge_last_abs;        /* the last packet either way */
 
 /*
  * One packet at a time while the IRQ is high: the receive helper already returns at once when
@@ -1819,26 +1844,65 @@ bridge_thread(void *parameter, __unused wait_result_t result_thread)
 {
 	unsigned generation = (unsigned)(uintptr_t)parameter;
 	uint8_t packet[NFC_BUF];
+	unsigned failures = 0, backoff_ms = 10;
+	uint64_t last_error = 0;
+	bool error_logged = false;
 
 	while (bridge_running && generation == bridge_generation) {
 		if (irq_high()) {
 			unsigned length = 0;
+			bool dead;
 
 			nfc_bus_lock();
 			if (bridge_running && generation == bridge_generation) {
 				i2c_quiet = true;
 				length = nfc_recv(packet, sizeof(packet), 0);
 			}
+			dead = bus_dead;
 			nfc_bus_unlock();
+			if (!bridge_running || generation != bridge_generation) {
+				break;
+			}
+			if (length == 0) {
+				/*
+				 * IRQ high and nothing read (no ACK, a header that is not NCI): it used to be read again at
+				 * once, for ever, and over a dead bus that is a core spinning and a line per try (R2.6). Now
+				 * 10, 20 .. 160 ms between tries, a line at most once a second, and over a dead bus (latched:
+				 * nothing will be read again) the bridge stops; sends then return EIO.
+				 */
+				failures++;
+				if (!error_logged || ms_since(last_error) >= 1000) {
+					last_error = mach_absolute_time();
+					error_logged = true;
+					say("bridge: RX failed (%u in a row, bus dead %u): %s\n", failures, dead ? 1U : 0U,
+					    dead ? "the bridge stops" : "backing off");
+				}
+				if (dead) {
+					bridge_running = false;
+					break;
+				}
+				delay_for_interval(backoff_ms, NSEC_PER_MSEC);
+				if (backoff_ms < 160) {
+					backoff_ms *= 2;
+				}
+				continue;
+			}
+			failures = 0;
+			backoff_ms = 10;
 			if (length != 0 && bridge_running && generation == bridge_generation) {
 				vayu_nfc_rx_fn rx = bridge_rx;
 
 				bridge_packets_in++;
+				bridge_last_abs = mach_absolute_time();
 				if (rx != NULL) {
 					rx(packet, length);
 				}
 			}
+		} else if (bridge_idle_ms != 0 && mach_absolute_time() > bridge_last_abs + bridge_idle_after_abs) {
+			delay_for_interval(bridge_idle_ms, NSEC_PER_MSEC);
 		} else {
+			failures = 0;
+			backoff_ms = 10;
 			delay_for_interval(2, NSEC_PER_MSEC);
 		}
 	}
@@ -1850,6 +1914,7 @@ vayu_nfc_bridge_start(vayu_nfc_rx_fn rx)
 {
 	thread_t thread;
 	unsigned generation;
+	bool dead;
 
 	if (rx == NULL) {
 		return EINVAL;
@@ -1876,7 +1941,26 @@ vayu_nfc_bridge_start(vayu_nfc_rx_fn rx)
 	if (bridge_running) {
 		return EBUSY;
 	}
+	nfc_bus_lock();
+	dead = bus_dead;
+	nfc_bus_unlock();
+	if (dead) {
+		return EIO;
+	}
 
+	{
+		uint32_t idle = 0, after = 1000;
+
+		PE_parse_boot_argn("vayu_nfc_idle_ms", &idle, sizeof(idle));
+		PE_parse_boot_argn("vayu_nfc_idle_after_ms", &after, sizeof(after));
+		bridge_idle_ms = idle == 0 ? 0 : idle < 3 ? 3 : idle > 100 ? 100 : idle;
+		nanoseconds_to_absolutetime((uint64_t)(after > 60000 ? 60000 : after) * NSEC_PER_MSEC, &bridge_idle_after_abs);
+		bridge_last_abs = mach_absolute_time();
+		if (bridge_idle_ms != 0) {
+			say("bridge: the IRQ line every %u ms after %u ms with no packet (vayu_nfc_idle_ms), every 2 ms otherwise\n",
+			    bridge_idle_ms, after);
+		}
+	}
 	bridge_generation++;
 	generation = bridge_generation;
 	bridge_rx = rx;
@@ -1916,6 +2000,7 @@ vayu_nfc_bridge_send(const uint8_t *packet, unsigned length)
 	sent = nfc_write(packet, length);
 	if (sent) {
 		bridge_packets_out++;
+		bridge_last_abs = mach_absolute_time();
 	}
 	nfc_bus_unlock();
 	return sent ? 0 : EIO;

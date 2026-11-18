@@ -1,0 +1,10 @@
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+# Metal on the Adreno 640 (an image built with METAL=1, a boot with metal=1 or metal=3), where nothing can
+# run commands by hand (`xl sh` needs usbctld and a loader with usbctl): the device a program gets and a GPU
+# blit, then a real Metal program (24 checks, "metal_app: ALL PASS") and the ASTC samples, all into the
+# console. Once SpringBoard is up, so that the window server holds the GPU as it does in use.
+/redwood/bin/sound_test springboard
+/redwood/bin/rwtouch wait 10
+/redwood/bin/metal_test device
+/redwood/bin/metal_test app /redwood/share/metal/task9.metallib
+/redwood/bin/metal_test astc /redwood/share/metal/astc.metallib

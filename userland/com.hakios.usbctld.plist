@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.hakios.usbctld</string>
+	<!-- The userland half of usbctl: the host's "xl sh" and "xl pull" reach iOS through
+	     /dev/vayu-ctl, which this program reads and answers (src/usbctld.c).  It has to be
+	     there before a command can arrive, so it starts with the system and stays.  iOS
+	     16.5's own root has no shell; usbctld looks for one and falls back to the built-in
+	     minish (src/minish.c), which is why the job carries no PATH of its own. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/usbctld</string>
+		<!-- one line per command and the shell it chose, into the console (the kernel log):
+		     the first run's evidence, and the answer to "which shell was there" -->
+		<string>-v</string>
+		<string>-t</string>
+		<string>15</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<!-- a device that is not there yet (early boot) is looked for every two seconds by the
+	     program itself; this is for the case where the program is what died -->
+	<key>ThrottleInterval</key>
+	<integer>2</integer>
+	<!-- root, and out of the per-user domain: a job that is not in the System session is
+	     spawned as the console user and cannot open a 0600 root device (com.hakios.tunnel
+	     learned this the hard way) -->
+	<key>LimitLoadToSessionType</key>
+	<string>System</string>
+	<!-- what the agent says about itself, and its errors, into the kernel log the loader
+	     brings back: the only place that survives a run -->
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

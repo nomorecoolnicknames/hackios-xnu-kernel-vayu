@@ -4,12 +4,15 @@
 <dict>
 	<key>Label</key>
 	<string>com.hakios.wifi</string>
-	<!-- with wifi=1 among the kernel's arguments: has configd configure the radio's interface (src/net_test.m,
-	     "wifi"); without, it ends at once -->
+	<!-- Wi-Fi step 5: configd built its network services before en0 existed, so give it one for
+	     the radio's interface once the interface is there (net_test's "wifi-net" step:
+	     /usr/sbin/addNetworkInterface -i en0, then the DHCP fallback); the old "net_test wifi"
+	     ended at once on this phone, because its gate is wifi=1 and the kernel is booted with
+	     vayu_wifi=2 -->
 	<key>ProgramArguments</key>
 	<array>
 		<string>/redwood/bin/net_test</string>
-		<string>wifi</string>
+		<string>wifi-net</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

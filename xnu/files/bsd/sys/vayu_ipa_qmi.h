@@ -155,6 +155,16 @@ static const struct qmi_elem_info vayu_ipa_init_resp_ei[] = {
 	{ .data_type = QMI_EOTI },
 };
 
+/* INDICATION_REGISTER (0x20) answered by the *modem's* IPA service: one mandatory result TLV
+ * (0x02). Used only by vayu_ipa_try bit 0 (the "is the service serving at all?" probe). */
+struct vayu_ipa_reg_resp {
+	struct vayu_cell_result result;
+};
+static const struct qmi_elem_info vayu_ipa_reg_resp_ei[] = {
+	VAYU_IPA_STRUCT(struct vayu_ipa_reg_resp, result, 0x02, vayu_cell_result_ei),
+	{ .data_type = QMI_EOTI },
+};
+
 struct vayu_ipa_init_complete_ind {
 	struct vayu_cell_result master_driver_init_status; /* mandatory TLV 0x02 */
 };

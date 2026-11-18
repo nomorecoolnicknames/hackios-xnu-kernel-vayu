@@ -123,6 +123,12 @@
  * line left asserted on an unhandled SPI is a boot hazard.  M2 installs the handler and
  * unmasks A2HVCODEC (0x8) (hfi_venus.c:456-500).
  *
+ * The power-up order is a plan the host test checks: sys/vayu_venus_pwr.h lists the steps and
+ * vayu_venus_power_plan() orders them.  vayu_venus_pwr=0 is the order above (k25); the phone
+ * stopped in it at the mvs0 MMCC handshake, so 1..3 move the video_cc core and the GCC AXI
+ * clocks before the GDSCs and/or turn the handshake's request from 0 to 1 -- one variable per
+ * run, and the k25 path stays byte-for-byte what it was.
+ *
  * The packets and the queue table are built and parsed by sys/vayu_venus_hfi.h, which
  * tools/venus-hfi compiles and checks word for word on the build machine: the bytes here
  * are the bytes tested there.
@@ -150,6 +156,7 @@
 #include <sys/vayu_scm.h>
 #include <sys/vayu_venus.h>
 #include <sys/vayu_venus_hfi.h>
+#include <sys/vayu_venus_pwr.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
 
@@ -205,6 +212,10 @@ say(const char *format, ...)
 #define WRAPPER_INTR_STATUS     0x0c
 #define WRAPPER_INTR_MASK       0x10
 #define WRAPPER_INTR_CLEAR      0x14
+#define WRAPPER_POWER_STATUS    0x44            /* hfi_venus_io.h:116 */
+#define WRAPPER_CPU_CGC_DIS     0x2010          /* hfi_venus_io.h:129 */
+#define WRAPPER_CPU_STATUS      0x2014          /* hfi_venus_io.h:130; bit 0 WFI */
+#define WRAPPER_CPU_STATUS_WFI  (1u << 0)
 #define WRAPPER_VCODEC0_STATUS  0x90            /* hfi_venus_io.h:139-144 */
 #define WRAPPER_VCODEC0_CTRL    0x94
 #define WRAPPER_VCODEC1_STATUS  0x110
@@ -282,6 +293,9 @@ static uint32_t g_xo;                   /* vayu_venus_xo=1: no PLL0 */
 static uint32_t g_gdsc_mask = 1;        /* vayu_venus_gdsc: bit 0 mvsc, 1 mvs0, 2 mvs1 */
 static uint32_t g_debug = 0x18;         /* vayu_venus_debug: ERROR | FATAL */
 static uint32_t g_bcm = 1;              /* vayu_venus_bcm=0: no video NoC/DDR BCM vote */
+static uint32_t g_pwr = VAYU_VENUS_POWER_LEGACY;  /* vayu_venus_pwr: the power-up order and MMCC polarity */
+static uint32_t g_memprot;              /* vayu_venus_memprot: 0 none, 1/2 the CP ranges of TrustZone */
+static uint32_t g_regs;                 /* vayu_venus_regs=1: dump the power registers after a good power-up */
 
 /* The one frame of M3: 1080p30 NV12 to HEVC unless the boot args say otherwise. */
 static uint32_t g_codec = VAYU_HFI_CODEC_HEVC;  /* vayu_venus_codec: 0 H.264, 1 HEVC */
@@ -614,6 +628,8 @@ gdsc_up(struct venus_gdsc *g)
 {
 	uint32_t value;
 	unsigned index = (unsigned)(g - g_gdsc);
+	int mmcc = vayu_venus_mmcc_control(g_pwr);
+	bool acked = false, turned_on = false;
 
 	if ((g_gdsc_mask & g->mask) == 0) {
 		say("vayu-venus: 1: %s GDSC: not asked for (vayu_venus_gdsc %#x), left as found (%#x)\n",
@@ -625,6 +641,7 @@ gdsc_up(struct venus_gdsc *g)
 		say("vayu-venus: 1: %s GDSC: on already (%#x), left on\n", g->name, value);
 	} else {
 		g_gdsc_ours[index] = true;
+		turned_on = true;
 		if (g->hw_trigger) {
 			gdsc_hw_record(g, index);
 		}
@@ -636,8 +653,13 @@ gdsc_up(struct venus_gdsc *g)
 			return false;
 		}
 		say("vayu-venus: 1: %s GDSC on (%#x)\n", g->name, value);
-		if (g->hw_trigger) {
-			/* now the firmware may collapse it itself (gdsc.c:197-210) */
+		/*
+		 * The k25 order handed the domain back to the hardware trigger here.  With the MMCC
+		 * handshake asked for (vayu_venus_pwr 1/3), the trigger is set only after the
+		 * handshake acknowledged: a hardware-triggered domain whose MMCC has not asked for
+		 * power is collapsed by the trigger again.
+		 */
+		if (g->hw_trigger && mmcc < 0) {
 			wr(videoc_va + g->offset, rd(videoc_va + g->offset) | (1u << 1));
 			delay(1);
 			say("vayu-venus: 1: %s GDSC hardware trigger on (gdscr %#x)\n", g->name,
@@ -647,13 +669,36 @@ gdsc_up(struct venus_gdsc *g)
 	if (g->ctrl != 0) {
 		g_wrapper_old[index] = rd(venus_va + WRAPPER_BASE + g->ctrl);
 		g_wrapper_ours[index] = true;
-		wr(venus_va + WRAPPER_BASE + g->ctrl, 0);
-		if (!wait_bits(venus_va + WRAPPER_BASE, g->status, 1u << 1, true, 1000, &value)) {
-			say("vayu-venus: 1: FAILED: %s MMCC handshake did not acknowledge (status %#x)\n", g->name, value);
-			return false;
+		say("vayu-venus: 1: %s MMCC: status %#x, control %#x before; writing %d%s\n", g->name,
+		    rd(venus_va + WRAPPER_BASE + g->status), g_wrapper_old[index],
+		    mmcc < 0 ? 0 : mmcc, mmcc < 0 ? " (the k25 handshake, a missing ack is fatal)" : "");
+		wr(venus_va + WRAPPER_BASE + g->ctrl, mmcc < 0 ? 0 : (uint32_t)mmcc);
+		acked = wait_bits(venus_va + WRAPPER_BASE, g->status, 1u << 1, true,
+		    mmcc < 0 ? 1000 : 2000, &value);
+		if (!acked) {
+			if (mmcc < 0) {
+				say("vayu-venus: 1: FAILED: %s MMCC handshake did not acknowledge (status %#x)\n",
+				    g->name, value);
+				return false;
+			}
+			/*
+			 * The tolerant modes go on: PWR_ON is what the ARM9 and its AXI port need, and a
+			 * wrong polarity guess must not hide the rest of the bring-up (VIDC_CTRL_INIT,
+			 * SYS_INIT).  The domain is left under software control, never to the trigger.
+			 */
+			say("vayu-venus: 1: %s MMCC handshake: control %d, status %#x after 2 ms: NO ACK; "
+			    "the domain stays under software control (gdscr %#x)\n", g->name,
+			    mmcc < 0 ? 0 : mmcc, value, rd(videoc_va + g->offset));
+		} else {
+			say("vayu-venus: 1: %s MMCC handshake: control %#x -> %d, status %#x (acknowledged)\n",
+			    g->name, g_wrapper_old[index], mmcc < 0 ? 0 : mmcc, value);
 		}
-		say("vayu-venus: 1: %s MMCC handshake: control %#x -> 0, status %#x\n",
-		    g->name, g_wrapper_old[index], value);
+	}
+	if (g->hw_trigger && mmcc >= 0 && acked && turned_on) {
+		wr(videoc_va + g->offset, rd(videoc_va + g->offset) | (1u << 1));
+		delay(1);
+		say("vayu-venus: 1: %s GDSC hardware trigger on after the handshake (gdscr %#x)\n", g->name,
+		    rd(videoc_va + g->offset));
 	}
 	return true;
 }
@@ -895,6 +940,22 @@ cc_branch_up(struct venus_cc_branch *b)
 	}
 	*b->ours = true;
 	wr(videoc_va + b->cbcr, value | 1u);
+	if (b->voted) {
+		/*
+		 * BRANCH_HALT_VOTED: the CBCR has no CLK_OFF bit to poll (the vendor driver's
+		 * clk_branch does not wait on one either); the enable bit is the whole answer.
+		 * k25 waited on bit 31 here, which a voted branch never sets.
+		 */
+		delay(10);
+		value = rd(videoc_va + b->cbcr);
+		if ((value & 1u) == 0) {
+			say("vayu-venus: 1: FAILED: %s does not take its enable (voted branch, cbcr %#x = %#x)\n",
+			    b->name, b->cbcr, value);
+			return false;
+		}
+		say("vayu-venus: 1: %s: cbcr %#x -> %#x (on, voted branch)\n", b->name, b->cbcr, value);
+		return true;
+	}
 	if (!wait_bits(videoc_va, b->cbcr, 1u << 31, false, 500, &value)) {
 		say("vayu-venus: 1: FAILED: %s does not come on (cbcr %#x = %#x)\n", b->name, b->cbcr, value);
 		return false;
@@ -941,67 +1002,147 @@ blocks_map(void)
 	return true;
 }
 
-static bool
-venus_power_up(void)
+/*
+ * The one-line-per-block picture a failure needs: what every branch, GDSC, PLL and wrapper
+ * register reads at this moment.  Called on the failure paths and, with vayu_venus_regs=1, at
+ * the end of a good power-up too (a run that works is the baseline the next one is read against).
+ */
+static void
+venus_regs_dump(const char *when)
 {
-	if (!blocks_map()) {
-		return false;
+	if (gcc_va != 0) {
+		say("vayu-venus: 1: regs (%s) gcc: ahb %#x, xo %#x, axic %#x, axi0 %#x, axi1 %#x\n", when,
+		    rd(gcc_va + 0xb004), rd(gcc_va + 0xb040), rd(gcc_va + 0xb02c), rd(gcc_va + 0xb024),
+		    rd(gcc_va + 0xb028));
 	}
-	g_power_started = true;
-	if (!rails_up()) {
-		return false;
+	if (videoc_va != 0) {
+		say("vayu-venus: 1: regs (%s) video_cc: xo %#x, iris_ahb %#x, mvsc %#x, mvs0 %#x, mvs1 %#x\n", when,
+		    rd(videoc_va + 0x984), rd(videoc_va + 0x8f4), rd(videoc_va + 0x850), rd(videoc_va + 0x890),
+		    rd(videoc_va + 0x8d0));
+		say("vayu-venus: 1: regs (%s) video_cc: pll0 mode %#x, iris cfg %#x, gdscr mvsc %#x, mvs0 %#x, mvs1 %#x\n",
+		    when, rd(videoc_va + VIDEOC_PLL0 + PLL_MODE), rd(videoc_va + VIDEOC_IRIS_CFG),
+		    rd(videoc_va + 0x814), rd(videoc_va + 0x874), rd(videoc_va + 0x8b4));
 	}
-	if (!bcm_up()) {                        /* the NoC/DDR path the ARM9's fetch and the queues need */
-		return false;
+	if (venus_va != 0) {
+		say("vayu-venus: 1: regs (%s) wrapper: hw %#x, power %#x, mmcc0 status %#x control %#x, "
+		    "mmcc1 status %#x control %#x, intr status %#x mask %#x\n", when,
+		    rd(venus_va + WRAPPER_BASE + WRAPPER_HW_VERSION), rd(venus_va + WRAPPER_BASE + WRAPPER_POWER_STATUS),
+		    rd(venus_va + WRAPPER_BASE + WRAPPER_VCODEC0_STATUS), rd(venus_va + WRAPPER_BASE + WRAPPER_VCODEC0_CTRL),
+		    rd(venus_va + WRAPPER_BASE + WRAPPER_VCODEC1_STATUS), rd(venus_va + WRAPPER_BASE + WRAPPER_VCODEC1_CTRL),
+		    rd(venus_va + WRAPPER_BASE + WRAPPER_INTR_STATUS), rd(venus_va + WRAPPER_BASE + WRAPPER_INTR_MASK));
+		if (g_power_up) {
+			say("vayu-venus: 1: regs (%s) cpu: arg0 %#x, arg1 %#x, arg2 %#x, uc %#x/%#x, sfr %#x, "
+			    "status %#x%s, cgc_dis %#x\n", when,
+			    rd(venus_va + CPU_CS_BASE + CPU_CS_SCIACMDARG0), rd(venus_va + CPU_CS_BASE + CPU_CS_SCIACMDARG1),
+			    rd(venus_va + CPU_CS_BASE + CPU_CS_SCIACMDARG2), rd(venus_va + CPU_CS_BASE + UC_REGION_ADDR),
+			    rd(venus_va + CPU_CS_BASE + UC_REGION_SIZE), rd(venus_va + CPU_CS_BASE + SFR_ADDR),
+			    rd(venus_va + WRAPPER_BASE + WRAPPER_CPU_STATUS),
+			    (rd(venus_va + WRAPPER_BASE + WRAPPER_CPU_STATUS) & WRAPPER_CPU_STATUS_WFI) != 0 ? " (WFI)" : "",
+			    rd(venus_va + WRAPPER_BASE + WRAPPER_CPU_CGC_DIS));
+		}
 	}
-	if (!gcc_video_ahb_up()) {
-		return false;
-	}
-	if (!gdsc_up(&g_gdsc[0])) {
-		return false;
-	}
-	if (!gdsc_up(&g_gdsc[1])) {
-		return false;
-	}
-	if (!gdsc_up(&g_gdsc[2])) {
-		return false;
-	}
-	if (!gcc_video_rest_up()) {
-		return false;
-	}
-	if (!cc_branch_up(&g_cc[0])) {         /* video_cc XO, the register interface's own clock */
-		return false;
-	}
-	if (!pll0_up()) {
-		return false;
-	}
-	if (!iris_rcg_up()) {
-		return false;
-	}
-	if (!cc_branch_up(&g_cc[1])) {         /* iris AHB */
-		return false;
-	}
-	if (!cc_branch_up(&g_cc[2])) {         /* mvsc core: the ARM9's clock */
-		return false;
-	}
-	if ((g_gdsc_mask & 2u) != 0 && !cc_branch_up(&g_cc[3])) {        /* mvs0 core */
-		return false;
-	}
-	if ((g_gdsc_mask & 4u) != 0 && !cc_branch_up(&g_cc[4])) {        /* mvs1 core */
-		return false;
-	}
+}
+
+/* The four block resets, then the firmware's line masked and its leftovers acknowledged. */
+static void
+venus_resets(void)
+{
 	venus_reset_pulse(gcc_va, "gcc video_axic", 0xb02c);
 	venus_reset_pulse(videoc_va, "video_cc mvsc_core", 0x850);
 	venus_reset_pulse(gcc_va, "gcc video_axi0", 0xb024);
 	venus_reset_pulse(gcc_va, "gcc video_axi1", 0xb028);
-	/* The firmware's line is masked before it is let out of reset: M1 polls the queue. */
 	wr(venus_va + WRAPPER_BASE + WRAPPER_INTR_MASK, 0);
 	wr(venus_va + CPU_CS_BASE + CPU_CS_A2HSOFTINTCLR, 1);
 	wr(venus_va + WRAPPER_BASE + WRAPPER_INTR_CLEAR, VENUS_INTR_ALL);
+}
+
+/* One step of vayu_venus_power_plan().  False stops the power-up; the teardown runs in reverse. */
+static bool
+venus_power_step(uint32_t step)
+{
+	switch (step) {
+	case VAYU_VENUS_POWER_RAILS:
+		return rails_up();
+	case VAYU_VENUS_POWER_BCM:
+		return bcm_up();
+	case VAYU_VENUS_POWER_GCC_AHB:
+		return gcc_video_ahb_up();
+	case VAYU_VENUS_POWER_GCC_REST:
+		return gcc_video_rest_up();
+	case VAYU_VENUS_POWER_CC_XO:
+		return cc_branch_up(&g_cc[0]);
+	case VAYU_VENUS_POWER_PLL0:
+		return pll0_up();
+	case VAYU_VENUS_POWER_IRIS_RCG:
+		return iris_rcg_up();
+	case VAYU_VENUS_POWER_IRIS_AHB:
+		return cc_branch_up(&g_cc[1]);
+	case VAYU_VENUS_POWER_MVSC_CORE:
+		return cc_branch_up(&g_cc[2]);
+	case VAYU_VENUS_POWER_MVS0_CORE:
+		if ((g_gdsc_mask & 2u) == 0) {
+			say("vayu-venus: 1: video_cc_mvs0_core: not asked for (vayu_venus_gdsc %#x), left as found\n",
+			    g_gdsc_mask);
+			return true;
+		}
+		return cc_branch_up(&g_cc[3]);
+	case VAYU_VENUS_POWER_MVS1_CORE:
+		if ((g_gdsc_mask & 4u) == 0) {
+			say("vayu-venus: 1: video_cc_mvs1_core: not asked for (vayu_venus_gdsc %#x), left as found\n",
+			    g_gdsc_mask);
+			return true;
+		}
+		return cc_branch_up(&g_cc[4]);
+	case VAYU_VENUS_POWER_GDSC_MVSC:
+		return gdsc_up(&g_gdsc[0]);
+	case VAYU_VENUS_POWER_GDSC_MVS0:
+		return gdsc_up(&g_gdsc[1]);
+	case VAYU_VENUS_POWER_GDSC_MVS1:
+		return gdsc_up(&g_gdsc[2]);
+	case VAYU_VENUS_POWER_RESETS:
+		venus_resets();
+		return true;
+	default:
+		say("vayu-venus: 1: FAILED: power step %u is not one of the plan's\n", step);
+		return false;
+	}
+}
+
+static bool
+venus_power_up(void)
+{
+	uint8_t plan[VAYU_VENUS_POWER_STEPS];
+	unsigned steps;
+
+	if (!blocks_map()) {
+		return false;
+	}
+	g_power_started = true;
+	steps = vayu_venus_power_plan(g_pwr, plan, sizeof(plan));
+	if (steps == 0) {
+		say("vayu-venus: 1: FAILED: no power plan for vayu_venus_pwr=%u\n", g_pwr);
+		return false;
+	}
+	say("vayu-venus: 1: power-up plan %u (%s, MMCC control %d): %u steps\n", g_pwr,
+	    vayu_venus_clocks_first(g_pwr) ? "clocks first" : "the k25 order",
+	    vayu_venus_mmcc_control(g_pwr), steps);
+	for (unsigned i = 0; i < steps; i++) {
+		say("vayu-venus: 1: power step %u/%u: %s\n", i + 1, steps,
+		    vayu_venus_power_step_name(plan[i]));
+		if (!venus_power_step(plan[i])) {
+			say("vayu-venus: 1: FAILED: power step %u/%u (%s); the teardown runs in reverse\n",
+			    i + 1, steps, vayu_venus_power_step_name(plan[i]));
+			venus_regs_dump("the failed step");
+			return false;
+		}
+	}
 	g_power_up = true;
-	say("vayu-venus: 1: powered: rails, BCM%s, GCC, GDSCs %#x, PLL0 %s, iris RCG, branches; "
-	    "the firmware's interrupt is masked\n", g_bcm_voted ? " (video NoC/DDR)" : "", g_gdsc_mask,
-	    g_xo ? "skipped" : "at 2 x the iris rate");
+	if (g_regs) {
+		venus_regs_dump("after power-up");
+	}
+	say("vayu-venus: 1: powered: rails, BCM%s, GCC, GDSCs %#x, PLL0 %s, iris RCG, branches, %u-step "
+	    "plan %u; the firmware's interrupt is masked\n", g_bcm_voted ? " (video NoC/DDR)" : "", g_gdsc_mask,
+	    g_xo ? "skipped" : "at 2 x the iris rate", steps, g_pwr);
 	return true;
 }
 
@@ -2524,6 +2665,7 @@ venus_run(void)
 	if (arg0 == 0 || arg0 == 0xffffffffu) {
 		say("vayu-venus: 1: FAILED: the firmware did not answer VIDC_CTRL_INIT (arg0 %#x after 100 ms: "
 		    "no clock, no power, or nothing behind the bus)\n", arg0);
+		venus_regs_dump("VIDC_CTRL_INIT");
 		return false;
 	}
 	if ((arg0 & 0xfe) == 4) {
@@ -2531,9 +2673,12 @@ venus_run(void)
 		return false;
 	}
 	version = rd(venus_va + WRAPPER_BASE + WRAPPER_HW_VERSION);
-	say("vayu-venus: 1: the firmware took VIDC_CTRL_INIT (arg0 %#x); wrapper version %u.%u.%u%s\n", arg0,
+	say("vayu-venus: 1: the firmware took VIDC_CTRL_INIT (arg0 %#x); wrapper version %u.%u.%u%s; "
+	    "cpu status %#x%s\n", arg0,
 	    (version >> 28) & 0xf, (version >> 16) & 0xfff, version & 0xffff,
-	    version == 0xffffffffu ? " (ALL ONES: the block may not be powered)" : "");
+	    version == 0xffffffffu ? " (ALL ONES: the block may not be powered)" : "",
+	    rd(venus_va + WRAPPER_BASE + WRAPPER_CPU_STATUS),
+	    (rd(venus_va + WRAPPER_BASE + WRAPPER_CPU_STATUS) & WRAPPER_CPU_STATUS_WFI) != 0 ? " (WFI)" : "");
 	return true;
 }
 
@@ -2561,6 +2706,91 @@ venus_scm(uint64_t convention, uint64_t command, uint64_t arguments, uint64_t fi
 	 * without that lock: this is the one place that must not sleep or wait.
 	 */
 	return vayu_scm_call(function, arguments, first, second, third, 0, answer);
+}
+
+/*
+ * TrustZone's MEM_PROTECT_VIDEO_VAR: the ranges the video firmware may keep for content
+ * protection, given once before it is authenticated (mainline venus firmware.c calls
+ * qcom_scm_mem_protect_video_var() from venus_boot(), with the SoC's cp_* table).  The port
+ * does not need it for a non-secure session, which is all M2/M3 opens, so it is behind
+ * vayu_venus_memprot and its failure never stops the boot -- but the answer is logged, because
+ * a secure session later would need it.
+ *
+ * Two namings of the same call are tried: the vendor BSP's SMC service (0x0c, the one this
+ * kernel's MEM_PROT_ASSIGN uses, vayu_pas.c:1647-1660) and mainline's QCOM_SCM_SVC_MP 0x04 /
+ * 0x0d.  The four values are plain VAL arguments: vayu_scm.c puts the type word in x1, so the
+ * layout here is 4 << 0 | 1 << 4 | 1 << 8 | 1 << 12 | 1 << 16.
+ */
+#define SCM_FOUR_VALUES          0x11114ull
+#define SCM_MP_VIDEO_VAR_VENDOR  SCM_CALL(0x0c, 0x02)
+#define SCM_MP_VIDEO_VAR_LINUX   SCM_CALL(0x04, 0x0d)
+
+struct venus_memprot_range {
+	const char *name;
+	uint32_t cp_start, cp_size, nonpixel_start, nonpixel_size;
+};
+
+/*
+ * The SoC's table.  Mainline has no sm8150 entry; the two HFI 4xx parts that carry one -- sdm845
+ * v2 (core.c:998-1001) and sc7180 (:1049-1052) -- both say 0x70800000, and the HFI 6xx sc7280
+ * (:1173-1176) says 0x25800000.  Every one of them puts the *non-pixel* range at
+ * 0x01000000+0x24800000, which ends exactly at the 0x25800000 this port maps the HFI block and
+ * the buffer pool behind (VENUS_IOVA): the non-secure side of the map is the same everywhere,
+ * only the protected size differs.  So 0x70800000 is asked first, sc7280's second.
+ */
+static const struct venus_memprot_range g_memprot_ranges[] = {
+	{ "0x70800000, the HFI 4xx tables (sdm845 v2, sc7180)", 0, 0x70800000, 0x01000000, 0x24800000 },
+	{ "0x25800000, the HFI 6xx sc7280's table", 0, 0x25800000, 0x01000000, 0x24800000 },
+};
+
+/* The one call with four values (vayu_scm_call() itself takes four; venus_scm()'s callers use three). */
+static int32_t
+venus_scm4(uint64_t convention, uint64_t command, uint64_t first, uint64_t second, uint64_t third,
+    uint64_t fourth, uint64_t *answer)
+{
+	uint64_t function = convention | SCM_SIP | command;
+
+	return vayu_scm_call(function, SCM_FOUR_VALUES, first, second, third, fourth, answer);
+}
+
+static bool
+venus_mem_protect(void)
+{
+	static const struct {
+		uint64_t command;
+		const char *name;
+	} commands[] = {
+		{ SCM_MP_VIDEO_VAR_VENDOR, "svc 0x0c cmd 0x02 (the vendor BSP's service, as MEM_PROT_ASSIGN)" },
+		{ SCM_MP_VIDEO_VAR_LINUX, "svc 0x04 cmd 0x0d (mainline qcom_scm's)" },
+	};
+	const struct venus_memprot_range *range;
+
+	if (g_memprot == 0 || g_memprot > sizeof(g_memprot_ranges) / sizeof(g_memprot_ranges[0])) {
+		return true;
+	}
+	range = &g_memprot_ranges[g_memprot - 1];
+	say("vayu-venus: 1: TrustZone memprot: CP %#x+%#x, nonpixel %#x+%#x (%s)\n", range->cp_start,
+	    range->cp_size, range->nonpixel_start, range->nonpixel_size, range->name);
+	for (unsigned c = 0; c < sizeof(commands) / sizeof(commands[0]); c++) {
+		for (unsigned attempt = 0; attempt < 2; attempt++) {
+			uint64_t convention = attempt == 0 ? g_scm_convention : 0;
+			uint64_t answer = ~0ull;
+			int32_t result = venus_scm4(convention, commands[c].command, range->cp_start,
+			    range->cp_size, range->nonpixel_start, range->nonpixel_size, &answer);
+
+			say("vayu-venus: 1: TrustZone memprot, %s, %s: %d, answer %#llx\n", commands[c].name,
+			    convention == SCM_64 ? "SMC64" : "SMC32", result, answer);
+			if (result == 0 && answer == 0) {
+				return true;
+			}
+			if (result != -1) {     /* a real refusal: the other convention will not help */
+				break;
+			}
+		}
+	}
+	say("vayu-venus: 1: TrustZone did not take the memprot ranges; going on without them: a "
+	    "non-secure session (M2/M3) does not need them, a secure one would\n");
+	return false;
 }
 
 /*
@@ -2605,6 +2835,8 @@ firmware_up(void)
 		say("vayu-venus: 1: FAILED: Venus's image is not loaded\n");
 		return false;
 	}
+	/* Before TrustZone authenticates it: the ranges it may keep (mainline venus_boot()'s order). */
+	(void)venus_mem_protect();
 	if (!auth_and_reset()) {
 		return false;
 	}
@@ -2880,6 +3112,17 @@ vayu_venus_init(void)
 	}
 	PE_parse_boot_argn("vayu_venus_debug", &g_debug, sizeof(g_debug));
 	PE_parse_boot_argn("vayu_venus_bcm", &g_bcm, sizeof(g_bcm));
+	PE_parse_boot_argn("vayu_venus_pwr", &g_pwr, sizeof(g_pwr));
+	if (g_pwr >= VAYU_VENUS_POWER_MODES) {
+		say("vayu-venus: vayu_venus_pwr=%u is not one of 0/1/2/3; 0 (the k25 order) is used\n", g_pwr);
+		g_pwr = VAYU_VENUS_POWER_LEGACY;
+	}
+	PE_parse_boot_argn("vayu_venus_memprot", &g_memprot, sizeof(g_memprot));
+	if (g_memprot > 2) {
+		say("vayu-venus: vayu_venus_memprot=%u is not 0/1/2; 0 (no call) is used\n", g_memprot);
+		g_memprot = 0;
+	}
+	PE_parse_boot_argn("vayu_venus_regs", &g_regs, sizeof(g_regs));
 	if (g_level >= 2) {
 		uint32_t codec = 1, width = g_width, height = g_height, fps = g_fps;
 		uint32_t bitrate = g_bitrate, frame_ms = g_frame_ms, dump = g_dump;
@@ -2918,8 +3161,10 @@ vayu_venus_init(void)
 		g_frame_ms = frame_ms;
 		g_dump = dump != 0;
 	}
-	say("vayu-venus: vayu_venus=%u wait=%u secs=%u rails=%u level=%u rate=%u xo=%u gdsc=%#x debug=%#x bcm=%u\n",
-	    g_level, g_wait_ms, g_secs, g_rails, g_rail_level, g_rate_mhz, g_xo, g_gdsc_mask, g_debug, g_bcm);
+	say("vayu-venus: vayu_venus=%u wait=%u secs=%u rails=%u level=%u rate=%u xo=%u gdsc=%#x debug=%#x bcm=%u "
+	    "pwr=%u memprot=%u regs=%u\n",
+	    g_level, g_wait_ms, g_secs, g_rails, g_rail_level, g_rate_mhz, g_xo, g_gdsc_mask, g_debug, g_bcm,
+	    g_pwr, g_memprot, g_regs);
 	if (g_level >= 2) {
 		say("vayu-venus: M2/M3: %s %ux%u at %u fps, %u bit/s, %u ms for one frame, dump %s, session %#x\n",
 		    g_codec == VAYU_HFI_CODEC_HEVC ? "HEVC" : "H.264", g_width, g_height, g_fps,

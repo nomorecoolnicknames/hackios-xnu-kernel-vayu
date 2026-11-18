@@ -38,7 +38,14 @@
  * the rear IMX582, sensor 2 the front S5K3T2, and each has two modes: mode 0 (the usual one, step
  * 4's) is the IMX582's res3 1920x1080 at 60.08 fps or the S5K3T2's res2 1280x720 at 120.41 fps;
  * mode 1 is the vendor's full 4:3 stills mode, res1 4000x3000 at 30.03 fps or res1 2592x1940 at
- * 30.13 fps. HAKIOS_CAMERA_SENSOR's a is the sensor and b the mode: 0 or ~0 is mode 0, 1 is mode
+ * 30.13 fps. With vayu_cam_uw=1 there is a third: sensor 3, the ultrawide OV8856 on CSIPHY0 at
+ * 0x0ac65000, TWO data lanes (its module's laneAssign 0x10; vayu_cam_uw_lanes=4 is the falsifier),
+ * two modes from the vendor module's own blocks -- mode 0 the binned 1632x1224 RAW10 the vendor
+ * init leaves it in (~60 fps), mode 1 res0 3264x2448 (~30 fps) -- whose exposure and gain are the
+ * block's own (0x3501/0x3508, no AE write of ours), behind the same CSID-lite 0 RDI 0 / IFE-lite 0.
+ * It needs gpio 94 (its VANA enable), which this port drives only under vayu_cam_uw_pin=1 (or when
+ * the loader has made it an output): the pin is outside TLMM exception 3.
+ * HAKIOS_CAMERA_SENSOR's a is the sensor and b the mode: 0 or ~0 is mode 0, 1 is mode
  * 1, anything else is EINVAL, and so is a mode whose block (res1) is not in the image's vendor
  * table -- that check happens before the switch, so the running session is not touched (the
  * userland then takes the photograph from the preview's frames). Every other SENSOR command is a

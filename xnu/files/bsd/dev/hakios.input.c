@@ -21,6 +21,7 @@
 #include <sys/vayu_nfc.h>
 #include <sys/vayu_wled.h>
 #include <sys/vayu_mdp.h>
+#include <sys/vayu_panel.h>
 #include <sys/vayu_ir.h>
 #include <sys/vayu_usbnet.h>
 #include <sys/vayu_cell_net.h>
@@ -147,12 +148,26 @@ hakios_touch_synthetic(uint32_t *samples, uint32_t *down)
  */
 static volatile uint32_t driver_samples;
 static volatile uint32_t driver_down;
+static volatile uint64_t driver_samples_total;
 
 void
 hakios_touch_driver(uint32_t *samples, uint32_t *down)
 {
 	*samples = os_atomic_xchg(&driver_samples, 0, relaxed);
 	*down = os_atomic_load(&driver_down, relaxed) != 0;
+}
+
+/*
+ * scroll120: the same samples, counted since the machine started, and the fingers down now. The
+ * display driver's once-a-second "finger" line is printed from the touch thread (bsd/dev/vayu_nvt.c)
+ * so that it still appears when no frame reaches the panel at all -- the case the S5FPS window
+ * cannot show, because it is closed by the next frame.
+ */
+void
+hakios_touch_driver_total(uint64_t *samples, uint32_t *down)
+{
+	*samples = os_atomic_load(&driver_samples_total, relaxed);
+	*down = os_atomic_load(&driver_down, relaxed);
 }
 
 static void
@@ -194,6 +209,7 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time
 		count_fingers(type, finger);
 		if (finger < 32 && (type == HAKIOS_TOUCH_DOWN || type == HAKIOS_TOUCH_MOVE || type == HAKIOS_TOUCH_UP)) {
 			os_atomic_inc(&driver_samples, relaxed);
+			os_atomic_inc(&driver_samples_total, relaxed);
 			if (type == HAKIOS_TOUCH_DOWN) {
 				os_atomic_or(&driver_down, 1u << finger, relaxed);
 			} else if (type == HAKIOS_TOUCH_UP) {
@@ -233,8 +249,8 @@ hakios_touch_idle_abs(void)
 	return last == 0 || now < last ? ~0ULL : now - last;
 }
 
-void
-hakios_touch_post_at(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time)
+static void
+touch_post_at(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time, bool from_driver)
 {
 	uint32_t panel_h = os_atomic_load(&hakios_display_crop[5], acquire);
 
@@ -255,7 +271,40 @@ hakios_touch_post_at(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uin
 		x = (uint32_t)((px + hakios_display_crop[0]) * 65535 / hakios_display_crop[2]);
 		y = (uint32_t)((py + hakios_display_crop[1]) * 65535 / hakios_display_crop[3]);
 	}
-	touch_post(type, finger, x, y, time, true);
+	touch_post(type, finger, x, y, time, from_driver);
+}
+
+void
+hakios_touch_post_at(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time)
+{
+	touch_post_at(type, finger, x, y, time, true);
+}
+
+/*
+ * usbctl (bsd/dev/vayu_ctl.c, boot-arg usbctl=1): the same crop and the same queue as a
+ * write() to /dev/hakios-touch, but counted as a program's samples (from_driver false), so
+ * that the five-finger way out of a run and the display driver's "screen touch" counters do
+ * not mistake a host's tap for a finger.  x and y are fractions of the panel, as the touch
+ * driver's are.
+ */
+void
+hakios_touch_post_synthetic(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
+{
+	touch_post_at(type, finger, x, y, mach_absolute_time(), false);
+}
+
+/* The panel's size in pixels, for a caller that has panel pixels (the host's "oem touch"). */
+void
+hakios_touch_panel_size(uint32_t *width, uint32_t *height)
+{
+	uint32_t w = 0, h = 0;
+
+	if (hakios_display_crop[2] != 0 && hakios_display_crop[4] != 0) {
+		w = hakios_display_crop[4];
+	}
+	h = os_atomic_load(&hakios_display_crop[5], acquire);
+	*width = w != 0 ? w : 1080;             /* vayu's panel, when fb_fit is not on */
+	*height = h != 0 ? h : 2400;
 }
 
 void
@@ -347,6 +396,7 @@ hakios_input_init(void)
 	vayu_nfc_init();                /* boot-arg vayu_nfc=N: the PN553 NFC controller, steps 1-4 (see bsd/dev/vayu_nfc.c) */
 	vayu_wled_init();               /* boot-arg vayu_wled=1: the backlight looked at; =2: off/on with iOS's display power */
 	vayu_mdp_init();                /* boot-arg vayu_mdp=1: the display controller as UEFI left it, read only */
+	vayu_panel_init();              /* boot-arg vayu_panel=1: the panel's real rate (INTF counter, TE pin), read only */
 	vayu_usbnet_init();             /* boot-arg vayu_usbnet=1: a read-only look at the USB controller as the loader's UEFI runs it */
 	vayu_ir_init();                 /* boot-arg vayu_ir=1: the IR blaster (QUP0 SE1 SPI), /dev/vayu-ir */
 	hakios_virtio_input_init();
@@ -354,6 +404,7 @@ hakios_input_init(void)
 	hakios_buttons_init();
 	hakios_battery_init();
 	hakios_ufs_init();
+	vayu_ctl_init();                /* /dev/vayu-ctl: oem touch/swipe/key/sh/pull over the loader's USB */
 	hakios_net_init();
 	vayu_cell_net_init();           /* boot-arg vayu_cell_net=1: en1 raw IPv4 over the IPA/QMAP path */
 	hakios_adreno_init();

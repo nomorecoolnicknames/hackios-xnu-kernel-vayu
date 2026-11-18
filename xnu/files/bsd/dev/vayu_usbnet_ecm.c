@@ -293,8 +293,8 @@ ep0_stall(void)
 
 static void
 usbnet_data_stop(void);
-static void usbnet_alt(uint32_t alt);
-static void usbnet_configured(void);
+static bool usbnet_alt(uint32_t alt);
+static bool usbnet_configured(void);
 static void usbnet_link(bool up);
 
 /* One SETUP has arrived and its eight bytes are in the buffer: answer it (ep0.c: dwc3_ep0_inspect_setup). */
@@ -356,8 +356,11 @@ ep0_setup(void)
 		if (value == 1) {
 			usbnet_data_stop();     /* (a second SET_CONFIGURATION: nothing may still run) */
 			ep0_alt = 0;
-			usbnet_configured();
-			ep0_configured = true;
+			ep0_configured = usbnet_configured();
+			if (!ep0_configured) {
+				ep0_stall();    /* (the host sees the failure: no configured link over dead endpoints) */
+				return;
+			}
 			printf("vayu-usbnet: configured: the endpoints are on\n");
 		} else if (value == 0) {
 			usbnet_data_stop();
@@ -389,7 +392,10 @@ ep0_setup(void)
 		if (index == 0 && value == 0) {
 			/* (the control interface has one setting) */
 		} else if (index == 1 && value <= 1) {
-			usbnet_alt(value);
+			if (!usbnet_alt(value)) {
+				ep0_stall();
+				return;
+			}
 		} else {
 			printf("vayu-usbnet: interface %u setting %u: not here\n", index, value);
 			ep0_stall();
@@ -633,21 +639,22 @@ notify_send(uint32_t phase)
 		data[7] = 0x00;
 		length = 8;
 	} else {
-		/* CONNECTION_SPEED_CHANGE (6.3.2): 480 Mbit/s each way */
+		/* CONNECTION_SPEED_CHANGE (6.3.2): the 8-byte header, then 480 Mbit/s each way (the rates were two
+		 * bytes early, over wIndex/wLength, and the last two bytes never set: R4.7) */
 		data[0] = 0xa1;
 		data[1] = 0x2a;
-		data[2] = 0x00;
+		data[2] = 0x00;                 /* wValue */
 		data[3] = 0x00;
-		data[4] = 0x08;                 /* wLength: two 32-bit rates */
+		data[4] = 0x00;                 /* wIndex: the control interface */
 		data[5] = 0x00;
-		data[6] = 0x00;                 /* 480000000, little endian */
-		data[7] = 0x38;
-		data[8] = 0x9c;
-		data[9] = 0x1c;
-		data[10] = 0x00;
-		data[11] = 0x38;
-		data[12] = 0x9c;
-		data[13] = 0x1c;
+		data[6] = 0x08;                 /* wLength: two 32-bit rates */
+		data[7] = 0x00;
+		for (unsigned i = 0; i < 2; i++) {
+			data[8 + 4 * i] = 0x00;         /* 480000000 = 0x1c9c3800, little endian */
+			data[9 + 4 * i] = 0x38;
+			data[10 + 4 * i] = 0x9c;
+			data[11 + 4 * i] = 0x1c;
+		}
 		length = 16;
 	}
 	vayu_usbnet_clean((vm_offset_t)data, length);
@@ -661,8 +668,8 @@ notify_send(uint32_t phase)
 	}
 }
 
-/* SET_CONFIGURATION(1): the three endpoints of the ECM function (gadget.c:670, f_ecm.c). */
-static void
+/* SET_CONFIGURATION(1): the three endpoints of the ECM function (gadget.c:670, f_ecm.c). False: not configured. */
+static bool
 usbnet_configured(void)
 {
 	uint32_t bits = (1u << USB_EP_NOTIFY) | (1u << USB_EP_OUT) | (1u << USB_EP_IN);
@@ -677,10 +684,11 @@ usbnet_configured(void)
 	    vayu_usbnet_ep_config(USB_EP_OUT, USB_DEPCFG_TYPE_BULK, USB_MAXPACKET, 0, 0, true, 0) != 0 ||
 	    vayu_usbnet_ep_config(USB_EP_IN, USB_DEPCFG_TYPE_BULK, USB_MAXPACKET, USB_EP_NUMBER_IN, 0, true, 0) != 0) {
 		printf("vayu-usbnet: the endpoints cannot be configured\n");
-		return;
+		return false;
 	}
 	vayu_usbnet_wr(USB_DALEPENA, vayu_usbnet_rd(USB_DALEPENA) | bits);
 	printf("vayu-usbnet: endpoints: ep1 IN notify %u bytes, ep2 OUT and IN %u\n", USB_MAXPACKET_NOTIFY, USB_MAXPACKET);
+	return true;
 }
 
 /* The IN ring empty: no data TRB armed, the link TRB back to the first. */
@@ -751,15 +759,19 @@ usbnet_data_stop(void)
 	}
 }
 
-static void
+/* False only when the endpoints cannot be set up again (an OUT ring that does not start is retried at XFERNOTREADY). */
+static bool
 usbnet_data_start(void)
 {
 	if (usbnet_ifp == NULL || !ep0_configured) {
 		printf("vayu-usbnet: interface 1 alternate 1: no data path\n");
-		return;
+		return ep0_configured;          /* (level 2 enumerates without a network interface) */
 	}
 	/* the bulk endpoints anew (data toggles from DATA0, as after f_ecm's set_alt) */
-	usbnet_configured();
+	if (!usbnet_configured()) {
+		ep0_configured = false;
+		return false;
+	}
 	usbnet_out_fill();
 	lck_mtx_lock(&usbnet_lock);
 	in_fill();
@@ -769,17 +781,20 @@ usbnet_data_start(void)
 	lck_mtx_unlock(&usbnet_lock);
 	usbnet_link(true);
 	notify_send(1);
+	return true;
 }
 
-static void
+static bool
 usbnet_alt(uint32_t alt)
 {
 	/* (f_ecm's set_alt: whatever ran stops first, then alternate 1 starts afresh) */
 	usbnet_data_stop();
-	ep0_alt = alt;
-	if (alt == 1) {
-		usbnet_data_start();
+	ep0_alt = 0;
+	if (alt == 1 && !usbnet_data_start()) {
+		return false;
 	}
+	ep0_alt = alt;
+	return true;
 }
 
 /*

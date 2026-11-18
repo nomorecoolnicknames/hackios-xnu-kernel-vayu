@@ -12,6 +12,14 @@
 #                        makes Mesa build it where there is no DRM). The library takes the GPU when the
 #                        kernel has one and the environment does not say OSMESA_SOFTWARE=1.
 #
+#   METAL=1              (vayu) the Metal driver's compiler instead: Mesa's ir3, NIR and the AIR frontend as
+#                        the static archives userland/build.sh links into HakiosMetal.bundle (hakios-metal
+#                        tools/compiler.mk, HAKIOS_METAL_IOS_MESA_LIBS), in xnu-deps/build/mesa-metal of its
+#                        own, with tools/mesa/metal/*.patch on top of tools/mesa/*.patch (upstream HakiOS
+#                        63fc2b46's ir3 fixes for Metal's 8/16-bit buffer access and negative offsets).
+#                        A separate tree so that the OpenGL ES library keeps exactly the Mesa it was built
+#                        from: those patches never reach libOSMesa, and its built-from hash stays the same.
+#
 # What comes out, in xnu-deps/build/mesa/out:
 #   libOSMesa.8.dylib    everything in one library (install name /redwood/lib/libOSMesa.8.dylib): the
 #                        OpenGL (ES) entry points gl*, the compiler of the shading language, the drivers,
@@ -44,6 +52,7 @@ SHA256=592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 source "$ROOT/xnu-env.sh"
 B=$ROOT/xnu-deps/build/mesa
+[ "${METAL:-}" = 1 ] && B=$ROOT/xnu-deps/build/mesa-metal
 SDK=$THEOS/sdks/iPhoneOS16.5.sdk
 CC=$ROOT/xnu-deps/host/bin/xnu-clang
 mkdir -p "$B/out"
@@ -52,13 +61,17 @@ cd "$B"
 # The sources are the archive's with tools/mesa/*.patch on top. When the patches change, a tree that was
 # patched with the earlier ones is of no use (and builds without a word into a library that does not match
 # the rest): the sources are taken from the archive again and everything is built anew, about a minute.
-PATCHES=$(cat "$ROOT"/tools/mesa/*.patch | sha256sum | cut -d' ' -f1)
+MORE=; [ "${METAL:-}" = 1 ] && MORE=$(ls "$ROOT"/tools/mesa/metal/*.patch)
+PATCHES=$(cat "$ROOT"/tools/mesa/*.patch $MORE | sha256sum | cut -d' ' -f1)
 if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.hakios-patches 2>/dev/null)" != "$PATCHES" ]; then
+	# (METAL=1: the OpenGL ES build's download, when it has one)
+	[ -f mesa-$VERSION.tar.xz ] || [ ! -f "$ROOT/xnu-deps/build/mesa/mesa-$VERSION.tar.xz" ] ||
+		cp "$ROOT/xnu-deps/build/mesa/mesa-$VERSION.tar.xz" .
 	[ -f mesa-$VERSION.tar.xz ] || curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
 	rm -rf mesa-$VERSION build-*
 	tar xJf mesa-$VERSION.tar.xz
-	for p in "$ROOT"/tools/mesa/*.patch; do patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p"; done
+	for p in "$ROOT"/tools/mesa/*.patch $MORE; do patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p"; done
 	echo "$PATCHES" > mesa-$VERSION/.hakios-patches
 fi
 # ours, kept in the repository: always the current ones
@@ -109,6 +122,17 @@ BUILD=build-${DRIVERS//,/-}
 	-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
 	-Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
 	-Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false > meson-setup.log
+if [ "${METAL:-}" = 1 ]; then
+	# the compiler alone, as hakios-metal links it: libair (not a default target) and ir3_disasm's link line
+	ninja -C $BUILD src/compiler/air/libair.a src/freedreno/ir3/libfreedreno_ir3.a src/freedreno/isa/libir3encode.a \
+		src/freedreno/isa/libir3decode.a src/compiler/isaspec/libisaspec.a src/compiler/nir/libnir.a \
+		src/compiler/libcompiler.a src/freedreno/fdl/libfreedreno_layout.a src/freedreno/common/libfreedreno_common.a \
+		src/util/libmesa_util.a src/util/libmesa_util_sse41.a src/util/blake3/libblake3.a \
+		src/c11/impl/libmesa_util_c11.a > ninja.log
+	echo "mk-mesa.sh: Mesa $VERSION, the Metal driver's compiler: $B/$BUILD ($(ls "$ROOT"/tools/mesa/metal/*.patch | wc -l)" \
+		"patches of tools/mesa/metal on top)"
+	exit 0
+fi
 ninja -C $BUILD > ninja.log
 # air_run draws with a translated Metal shader and reads the pixels back; it is
 # the only way to find out whether the Adreno takes work that did not come from

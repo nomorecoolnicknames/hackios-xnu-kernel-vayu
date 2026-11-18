@@ -40,7 +40,7 @@
  * (default 30, never more than 120), after which it stays off until it is asked for anew (0, then
  * more); while it is on, ten times a second, the module's fault and over-temperature flags, the
  * PMIC's temperature alarm and the battery's temperature (at most 45 C; from the audio DSP's battery
- * manager with adsp=1, or the firmware's with battery=1; with neither the other two guard): any of
+ * manager with adsp=1, or the firmware's with battery=1; unknown, or no fresh one for 30 s, refuses the light): any of
  * them, a read that fails or a write that does not read back, and the light goes off and stays off
  * for the rest of the run. At the run's end (and on a panic's way out) it goes off.
  *
@@ -88,6 +88,8 @@ extern void loader_log_putc(char c);
 
 static uint32_t level;
 static bool broken, leaving;
+/* set only while dark() runs: the "turn off" writes may pass the `broken' latch (a lit LED must always get its off writes) */
+static volatile bool forcing;
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -412,7 +414,8 @@ put_verified(uint8_t reg, uint8_t value, uint8_t verify)
 			allowed |= writable_regs[i] == reg;
 		}
 	}
-	if (broken || !allowed || !flash.writable || flash.write == 0) {
+	/* (the latch does not stop dark(): after a failed write the final "off" would otherwise do nothing and the LED stay on) */
+	if ((broken && !forcing) || !allowed || !flash.writable || flash.write == 0) {
 		give_up(allowed ? "a write that may not be made" : "a register that is not to be written");
 		return false;
 	}
@@ -479,6 +482,16 @@ put_bits(uint8_t reg, uint8_t mask, uint8_t value)
 	return (now & mask) == (value & mask) || put_verified(reg, (uint8_t)((now & ~mask) | (value & mask)), mask);
 }
 
+/* An "off" step that says what it did: after a failure the next ones are still tried, and the log shows which landed. */
+static bool
+off_bits(uint8_t reg, uint8_t mask)
+{
+	bool ok = put_bits(reg, mask, 0);
+
+	say("torch: off %#04x mask %#04x: %s\n", reg, mask, ok ? "verified" : "FAILED");
+	return ok;
+}
+
 static void
 find_channel(struct peripheral *p, uint32_t channels)
 {
@@ -530,6 +543,7 @@ trouble(void)
 {
 	static char why[180];
 	uint8_t rt = 0, status1 = 0, status2 = 0, alarm_status = 0, stage;
+	int temperature;
 
 	uint8_t bad2 = v2 ? V2_STATUS2_OTST | V2_STATUS2_VPH_DROOP : STATUS2_OTST1 | STATUS2_OTST2 | STATUS2_VPH_LOW;
 
@@ -568,8 +582,12 @@ trouble(void)
 		    more[2], more[3], more[4], more[5], more[6], more[7], latched[0], stage);
 		return why;
 	}
-	if (hakios_battery_temperature() >= HOTTEST_BATTERY_C) {
-		snprintf(why, sizeof(why), "the battery is at %d C", hakios_battery_temperature());
+	temperature = hakios_battery_temperature();
+	if (temperature == -273) {
+		return "the battery temperature is unknown or stale: the light is not safe to run";
+	}
+	if (temperature >= HOTTEST_BATTERY_C) {
+		snprintf(why, sizeof(why), "the battery is at %d C", temperature);
 		return why;
 	}
 	return NULL;
@@ -602,14 +620,20 @@ v2_configure(void)
 static bool
 v2_dark(void)
 {
-	bool ok = put_bits(V2_EN_LED_CTRL, (uint8_t)v2_leds, 0x00) && put_bits(V2_MITIGATION_SW, 0x10, 0x00) &&
-	    put_bits(V2_MOD_CTRL, 0x80, 0x00);
+	bool ok;
 
-	for (unsigned n = 0; n < 2 && ok; n++) {
+	/* every step is tried even if an earlier one failed, and none is stopped by `broken': a half-done "off" leaves the LED on */
+	forcing = true;
+	ok = off_bits(V2_EN_LED_CTRL, (uint8_t)v2_leds);
+	ok = off_bits(V2_MITIGATION_SW, 0x10) && ok;
+	ok = off_bits(V2_MOD_CTRL, 0x80) && ok;
+	for (unsigned n = 0; n < 2; n++) {
 		if (v2_leds & (1u << n)) {
-			ok = put_bits(V2_TGR_CURRENT(n), 0x7f, 0x00) && put_bits(V2_SAFETY_TMR(n), 0xff, V2_SAFETY_TMR_OFF);
+			ok = put_bits(V2_TGR_CURRENT(n), 0x7f, 0x00) && ok;
+			ok = put_bits(V2_SAFETY_TMR(n), 0xff, V2_SAFETY_TMR_OFF) && ok;
 		}
 	}
+	forcing = false;
 	lit = !ok && lit;
 	return ok;
 }
@@ -711,10 +735,13 @@ light(uint32_t permille)
 	if (!configure() || !put_bits(FLASH_IRESOLUTION, 0x01, 0x00) || !put_bits(FLASH_ITARGET0, 0x7f, (uint8_t)code)) {
 		return false;
 	}
-	if (!lit && (!put(FLASH_MODULE_EN, 0x80) || !put_bits(FLASH_EN_LED_CTRL, 0x01, 0x01))) {
-		return false;
+	if (!lit) {
+		/* lit is set before the enabling writes: one that lands but fails its read-back must still get a dark() later */
+		lit = true;
+		if (!put(FLASH_MODULE_EN, 0x80) || !put_bits(FLASH_EN_LED_CTRL, 0x01, 0x01)) {
+			return false;
+		}
 	}
-	lit = true;
 	return true;
 }
 
@@ -727,9 +754,13 @@ dark(void)
 	if (v2) {
 		return v2_dark();
 	}
-	ok = put_bits(FLASH_EN_LED_CTRL, 0x01, 0x00) && put(FLASH_MODULE_EN, 0x00) && put_bits(FLASH_ITARGET0, 0x7f, 0x00) &&
-	    put_bits(FLASH_SAFETY_TIMER0, 0x80, 0x00);
-
+	/* every step is tried even if an earlier one failed, and none is stopped by `broken': a half-done "off" leaves the LED on */
+	forcing = true;
+	ok = off_bits(FLASH_EN_LED_CTRL, 0x01);
+	ok = put(FLASH_MODULE_EN, 0x00) && ok;
+	ok = put_bits(FLASH_ITARGET0, 0x7f, 0x00) && ok;
+	ok = put_bits(FLASH_SAFETY_TIMER0, 0x80, 0x00) && ok;
+	forcing = false;
 	lit = !ok && lit;
 	return ok;
 }
@@ -969,6 +1000,9 @@ torch_thread(__unused void *parameter, __unused wait_result_t result)
 				note("off again after %u s", secs);
 			}
 			show_registers();
+		} else if (lit) {
+			/* light() failed after it may have enabled the channel: switch it off again */
+			(void)dark();
 		}
 	} else {
 		serve();

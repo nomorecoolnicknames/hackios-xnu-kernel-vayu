@@ -1,0 +1,29 @@
+--- !tapi-tbd-v3
+archs:           [ arm64 ]
+platform:        ios
+install-name:    '/usr/lib/system/libxpc.dylib'
+current-version: 1
+compatibility-version: 1
+exports:
+  - archs: [ arm64 ]
+    symbols:
+      - _xpc_connection_create_mach_service
+      - _xpc_connection_set_event_handler
+      - _xpc_connection_resume
+      - _xpc_connection_send_message
+      - _xpc_connection_get_pid
+      - _xpc_retain
+      - _xpc_dictionary_create
+      - _xpc_dictionary_set_bool
+      - _xpc_dictionary_set_int64
+      - _xpc_dictionary_set_string
+      - _xpc_dictionary_get_string
+      - _xpc_dictionary_get_bool
+      - _xpc_dictionary_get_value
+      - _xpc_get_type
+      - _xpc_copy_description
+      - _xpc_release
+      - __xpc_type_connection
+      - __xpc_type_error
+      - __xpc_type_dictionary
+...

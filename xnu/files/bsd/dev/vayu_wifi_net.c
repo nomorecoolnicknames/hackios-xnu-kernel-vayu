@@ -38,6 +38,7 @@
 #include <sys/vayu_wifi_net.h>
 #include <sys/vayu_wifi_rsn.h>
 #include <sys/vayu_wifi_scan.h>
+#include <sys/vayu_wifi_sta.h>
 
 #define ETH_HLEN                14U
 #define ETH_TYPE_IP             0x0800U
@@ -55,6 +56,7 @@ enum dhcp_state { DHCP_OFF, DHCP_INIT, DHCP_SELECTING, DHCP_REQUESTING, DHCP_BOU
 
 static struct {
 	bool started, linked, sta_attached, dhcp_on, keep;
+	bool protected;                 /* the pairwise key is in: data frames Protected and encrypted, else (open) neither */
 	uint32_t dhcp_mode;             /* 0 off, 1 at once, 2 fallback after 30 s */
 	uint32_t keep_secs;             /* vayu_wifi_keep_secs: hold time, 0 = until the run ends */
 	bool fallback_armed, fallback_said, fallback_bound;
@@ -76,6 +78,13 @@ static struct {
 	int (*tx80211)(const uint8_t *frame, uint32_t len, bool clear);
 	int (*log)(const char *format, ...) __printflike(1, 2);
 } net;
+
+/* W25r: en0 exists as soon as the radio's address is known, not only when a join has come through.
+ * iOS's wifid finds the interface and its IO80211 services from this alone (HakiosWLANStart is
+ * called by hakios_net_attach), asks it for the channels and for a scan, and shows the list even
+ * when no network is joined.  The link can be down: the interface is there, frames are refused. */
+static struct hakios_net_link net_if_link;
+static bool net_if_attached;
 
 static uint64_t
 now_ms(void)
@@ -126,7 +135,7 @@ net_send_eth(const uint8_t *frame, uint32_t len)
 	/* Ethernet -> native wifi: 24-byte data header, to DS, LLC/SNAP, then the payload */
 	memset(f, 0, 24);
 	f[0] = 0x08;
-	f[1] = 0x41;                            /* to DS + protected (the pairwise key is in) */
+	f[1] = net.protected ? 0x41 : 0x01;     /* to DS, + protected with the pairwise key (an open network: not) */
 	memcpy(f + 4, net.bssid, 6);            /* addr1: the AP */
 	memcpy(f + 10, net.mac, 6);             /* addr2: us */
 	memcpy(f + 16, frame, 6);               /* addr3: the destination */
@@ -141,7 +150,7 @@ net_send_eth(const uint8_t *frame, uint32_t len)
 	memcpy(f + 32, frame + ETH_HLEN, len - ETH_HLEN);
 	flen = len - ETH_HLEN + 32;
 	{
-		int rc = net.tx80211(f, flen, false);
+		int rc = net.tx80211(f, flen, !net.protected);
 
 		if (rc != 0) {
 			if (rc != -2) {
@@ -661,30 +670,75 @@ sta_power(bool on)
 static int
 sta_scan(const struct hakios_sta_scan *what)
 {
-	(void)what;
-	return EOPNOTSUPP;              /* the scan is the boot-arg one; wifid is told so */
+	unsigned count;
+	int error;
+
+	if (vayu_scan_mode == 0) {
+		return EOPNOTSUPP;              /* (no radio, or the scan is off: wifid is told so) */
+	}
+	/* W25r: the station's loop owns the WMI/HTT path, so a scan is asked of it.  It is a new scan
+	 * when there is no link (the radio is free) and the last one's results when there is one. */
+	if (vayu_sta_serving()) {
+		error = vayu_sta_ask_scan(what);
+		return error;
+	}
+	count = vayu_scan_bss_count();
+	net.log("vayu-wifi: W25r scan: %u network(s) from the scan at boot, given to Apple80211\n", count);
+	return 0;
 }
 
 static void
 sta_heard(void (*each)(const struct hakios_sta_bss *bss, void *context), void *context)
 {
-	(void)each;
-	(void)context;
+	static struct hakios_sta_bss bss;
+	static uint8_t elements[HAKIOS_STA_ELEMENTS_MOST];
+	struct vayu_scan_bss found;
+	unsigned i, n;
+
+	if (each == NULL) {
+		return;
+	}
+	n = vayu_scan_bss_count();
+	for (i = 0; i < n; i++) {
+		if (!vayu_scan_bss_get(i, &found, elements, sizeof(elements))) {
+			continue;
+		}
+		memset(&bss, 0, sizeof(bss));
+		memcpy(bss.bssid, found.bssid, sizeof(bss.bssid));
+		bss.ssid_length = found.ssid_length;
+		memcpy(bss.ssid, found.ssid, found.ssid_length <= sizeof(bss.ssid) ? found.ssid_length : sizeof(bss.ssid));
+		bss.frequency = found.frequency;
+		bss.rssi = found.rssi;
+		bss.beacon_interval = found.beacon_interval;
+		bss.capability = found.capability;
+		bss.age_ms = found.age_ms;
+		bss.elements_length = found.elements_length;
+		memcpy(bss.elements, elements, found.elements_length);
+		each(&bss, context);
+	}
 }
 
 static int
 sta_join(const struct hakios_sta_join *what)
 {
-	if (what == NULL || what->ssid_length != net.ssid_len || memcmp(what->ssid, net.ssid, net.ssid_len) != 0) {
-		return ENOENT;
+	if (what == NULL || what->ssid_length == 0 || what->ssid_length > 32) {
+		return EINVAL;
 	}
-	return net.linked ? 0 : EAGAIN;
+	if (!vayu_sta_serving()) {
+		net.log("vayu-wifi: W25r join: ERROR the station's loop is not running\n");
+		return ENODEV;
+	}
+	/* (the station's loop joins: the address, the access point and the key stay there; the log
+	 * gets lengths only) */
+	net.log("vayu-wifi: W25r join: a name of %u bytes, security %d, a passphrase of %u bytes, asked for by iOS\n",
+	    what->ssid_length, what->security, what->passphrase_length);
+	return vayu_sta_ask_join(what);
 }
 
 static int
 sta_leave(void)
 {
-	return 0;
+	return vayu_sta_serving() ? vayu_sta_ask_leave() : 0;
 }
 
 static void
@@ -707,9 +761,25 @@ sta_state(struct hakios_sta_state *state)
 static unsigned
 sta_channels(struct hakios_sta_channel *channels, unsigned most)
 {
-	(void)channels;
-	(void)most;
-	return 0;
+	uint16_t frequencies[96];
+	unsigned i, n, count;
+
+	if (channels == NULL) {
+		return 0;
+	}
+	/* W25r: the channels the kernel's scan is made on, so that Apple80211's channel list (254, 207)
+	 * is answered instead of ENXIO -- wifid asks that before it will scan at all.  All of them are
+	 * listen-only: the scan never transmits (vayu_wifi_scan.c, SCAN_PASSIVE). */
+	n = vayu_scan_channels(frequencies, sizeof(frequencies) / sizeof(frequencies[0]));
+	count = n < most ? n : most;
+	for (i = 0; i < count; i++) {
+		channels[i].frequency = frequencies[i];
+		channels[i].flags = HAKIOS_STA_CHANNEL_PASSIVE;
+		if (frequencies[i] >= 5260 && frequencies[i] <= 5720) {
+			channels[i].flags |= HAKIOS_STA_CHANNEL_RADAR;  /* DFS: a radar may be there */
+		}
+	}
+	return count;
 }
 
 /* version of the station ops: the address is a copy, filled at attach */
@@ -717,7 +787,11 @@ static struct hakios_sta_ops net_sta_ops;
 
 /* ---- start / stop ------------------------------------------------------------------------------- */
 
-static uint32_t wifi_a80211;          /* W25q: 0 = attach at S4, no events (the 150920 behaviour: iOS ran DHCP) */
+/* W25q: 0 = attach at S4, no events (the 150920 behaviour: iOS ran DHCP).  W25r: 1 = join-done and
+ * link events, 2 = the link's events only -- the kernel joined the network itself, so a join-done
+ * would tell iOS a join it never asked for is over; the link's event is the one its status bar and
+ * Settings need (sb-wifi's _linkDidChange). */
+static uint32_t wifi_a80211;
 
 void
 vayu_net_reset(int (*log)(const char *format, ...) __printflike(1, 2))
@@ -742,6 +816,10 @@ vayu_net_reset(int (*log)(const char *format, ...) __printflike(1, 2))
 		net.log("vayu-wifi: keep: %u s (0 = until the run ends)\n", net.keep_secs);
 	}
 	PE_parse_boot_argn("vayu_wifi_a80211", &wifi_a80211, sizeof(wifi_a80211));
+	if (wifi_a80211 != 0) {
+		net.log("vayu-wifi: W25r a80211=%u: %s\n", wifi_a80211, wifi_a80211 == 2 ?
+		    "link events only, no join-done" : "join-done and link events");
+	}
 }
 
 bool
@@ -768,26 +846,47 @@ vayu_net_set_tx(int (*tx80211)(const uint8_t *frame, uint32_t len, bool clear),
 }
 
 /* W25o: the radio is there as soon as the MAC is known (before the scan and the join), so
- * wifid finds a powered station instead of an interface with nothing behind it. */
+ * wifid finds a powered station instead of an interface with nothing behind it.  W25r: and en0
+ * itself, with the IO80211 services, is made here -- not when a join comes through -- so the
+ * network list exists even when the boot join found nothing. */
 static void sta_attach_now(void);
+
+static bool
+net_if_make(void)
+{
+	if (net_if_attached) {
+		return true;
+	}
+	if (net.mac[0] == 0) {
+		return false;
+	}
+	memset(&net_if_link, 0, sizeof(net_if_link));
+	net_if_link.name = "vayu-wifi";
+	net_if_link.unit = 0;
+	memcpy(net_if_link.address, net.mac, 6);
+	net_if_link.wireless = true;
+	net_if_link.up = false;                 /* (the link comes up with vayu_net_start) */
+	net_if_link.transmit = net_transmit;
+	if (!hakios_net_attach(&net_if_link)) {
+		net.log("vayu-wifi: W25r en0: ERROR the interface was not attached\n");
+		return false;
+	}
+	net_if_attached = true;
+	net.log("vayu-wifi: W25r en0: attached on the radio's address, link down (iOS can ask for the "
+	    "channels and a scan now)\n");
+	return true;
+}
 
 void
 vayu_net_sta_attach(const uint8_t *mac)
 {
-	if (wifi_a80211 == 0) {
-		if (mac != NULL && net.mac[0] == 0) {
-			memcpy(net.mac, mac, 6);
-		}
-		return;
-	}
-	if (net.mac[0] != 0 && mac != NULL) {
-		return;                         /* (already attached) */
-	}
-	if (mac != NULL) {
+	if (mac != NULL && net.mac[0] == 0) {
 		memcpy(net.mac, mac, 6);
 	}
-	sta_attach_now();
-	hakios_apple80211_event(HAKIOS_STA_POWER, 1);
+	(void)net_if_make();
+	if (!net.sta_attached) {
+		sta_attach_now();               /* (hakios_sta_attach posts the POWER event itself) */
+	}
 }
 
 static void
@@ -806,53 +905,41 @@ sta_attach_now(void)
 	net.sta_attached = true;
 }
 
-/* Called after the keys are in: en0 comes up and the data path is open. */
+/* Called after the keys are in: the link comes up and the data path is open.  The interface has
+ * been there since the MAC was known; a second join only fills the link's details in again. */
 int
 vayu_net_start(const uint8_t *mac, const uint8_t *bssid, const uint8_t *ssid, uint32_t ssid_len,
     uint32_t chan, int32_t rssi)
 {
-	static struct hakios_net_link wifi_link;
-	int error;
-
-	if (net.started) {
-		return 0;
+	if (mac != NULL) {
+		memcpy(net.mac, mac, 6);
 	}
-	memcpy(net.mac, mac, 6);
 	memcpy(net.bssid, bssid, 6);
 	net.ssid_len = ssid_len > sizeof(net.ssid) ? (uint32_t)sizeof(net.ssid) : ssid_len;
 	memcpy(net.ssid, ssid, net.ssid_len);
 	net.chan = chan;
 	net.rssi = rssi;
 
-	memset(&wifi_link, 0, sizeof(wifi_link));
-	wifi_link.name = "vayu-wifi";
-	wifi_link.unit = 0;
-	memcpy(wifi_link.address, net.mac, 6);
-	wifi_link.wireless = true;
-	wifi_link.up = false;
-	wifi_link.transmit = net_transmit;
-	wifi_link.poll = NULL;
-
-	if (!hakios_net_attach(&wifi_link)) {
+	if (!net_if_make()) {
 		net.log("vayu-wifi: W25 S4 link: ERROR en0 not attached\n");
 		return -1;
 	}
+	if (!net.sta_attached) {
+		sta_attach_now();
+	}
 	net.started = true;
+	net.protected = vayu_rsn_keyed();
 	net.linked = true;
 	hakios_net_link_state(true);
 	net.log("vayu-wifi: W25 S4 link: OK en0 up, MAC xx:xx:xx:xx:%02x:%02x, 802.11 to xx:xx:xx:xx:%02x:%02x\n",
 	    net.mac[4], net.mac[5], net.bssid[4], net.bssid[5]);
-	/* W25o: wifid learns that the station joined from these events as well as from the state
-	 * request; without them the interface is "up" but nothing tells iOS's Wi-Fi side that a
-	 * network is associated. */
-	if (!net.sta_attached) {
-		sta_attach_now();
-	}
-	if (wifi_a80211 != 0) {
-		hakios_apple80211_event(HAKIOS_STA_JOIN_DONE, 0);
-		hakios_apple80211_event(HAKIOS_STA_LINK, 1);
-	}
+	/* (the join and link events are the caller's: a join the kernel made for itself is mode 1/2,
+	 * one iOS asked for is answered by bsd/dev/hakios.sta.c) */
 	net.link_ms = now_ms();
+	net.dhcp_seen = 0;
+	net.probe_stage = 0;
+	net.fallback_bound = false;
+	net.dhcp_state = DHCP_OFF;
 	if (net.dhcp_mode == 1) {
 		net.dhcp_state = DHCP_INIT;
 		net.dhcp_tries = 0;
@@ -872,7 +959,32 @@ vayu_net_stop(void)
 	if (net.linked) {
 		net.linked = false;
 		hakios_net_link_state(false);
+		/* W25r: the link is gone (the access point showed us the door, another network is being
+		 * joined, or the run is ending): iOS's Wi-Fi side is told, so that the status bar's Wi-Fi
+		 * icon leaves "connected" when the link does. */
+		if (wifi_a80211 != 0 && net.sta_attached) {
+			hakios_apple80211_event(HAKIOS_STA_LINK, 0);
+		}
 	}
+	/* a later join starts the lease afresh */
+	net.dhcp_state = DHCP_OFF;
+	net.dhcp_tries = 0;
+	net.fallback_armed = false;
+	net.fallback_said = false;
+	net.fallback_bound = false;
+	net.probe_stage = 0;
+}
+
+bool
+vayu_net_a80211_join_done(void)
+{
+	return wifi_a80211 == 1;
+}
+
+bool
+vayu_net_a80211_link(void)
+{
+	return wifi_a80211 != 0;
 }
 
 bool

@@ -1,5 +1,6 @@
 # Copyright © 2026 Darwin on redwood contributors
 # SPDX-License-Identifier: MIT
+# As oosexgang/hakios-xnu-kernel, branch main, commit 63fc2b4633ba has it, by way of telegdyd/ios-vayu, branch vayu-dev, commit 061e5a82d023.
 
 # The AIR (Metal) frontend. In the Darwin on redwood repository this
 # directory is tools/mesa/air, copied to src/compiler/air by the build
@@ -13,6 +14,7 @@ files_libair = files(
   'air_module.c',
   'air_module.h',
   'air_print.c',
+  'air_stitch.c',
   'air_private.h',
   'air_to_nir.c',
   'air_intrinsics.c',

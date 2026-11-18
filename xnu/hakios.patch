@@ -61,11 +61,29 @@ index a4d25040f38f..aad72993d139 100644
  kern_csr.o_INCFLAGS += -I$(SRCROOT)/osfmk
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index 4b83160780c3..d26319d82640 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -588,5 +588,13 @@ do_build_all:: do_all
+ 
+ %RULES
+ 
++# HakiOS: HFS Plus built in (bsd/hfs, Apple's hfs-627.100.6; from Scion-Project/scion-kernel), compiled as its kext
++# was: against the kernel's KPI, not its insides (no XNU/BSD/MACH_KERNEL_PRIVATE), kext-config.h first, its own
++# headers beside it, and its warnings its own (it is Apple's code as it was published, not this kernel's)
++HFS_OBJS = $(patsubst %.c,%.o,$(notdir $(wildcard $(SRCROOT)/bsd/hfs/*.c)))
++$(foreach o,$(HFS_OBJS),$(eval $(o)_CFLAGS_ADD += -UXNU_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UMACH_KERNEL_PRIVATE \
++	-include $(SRCROOT)/bsd/hfs/kext-config.h -I$(SRCROOT)/bsd/hfs -idirafter $(SDKROOT)/usr/include))
++$(foreach o,$(HFS_OBJS),$(eval $(o)_CWARNFLAGS_ADD += -w))
++
+ include $(MakeInc_rule)
+ include $(MakeInc_dir)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..ef4e0d1eedd2 100644
+index 44274016a4cf..8cc5e7e8a29c 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,69 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,83 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -117,6 +135,8 @@ index 44274016a4cf..ef4e0d1eedd2 100644
 +bsd/dev/vayu_rmtfs.c		standard
 +bsd/dev/vayu_cell.c		standard
 +bsd/dev/vayu_cell_data.c	standard
++bsd/dev/vayu_sms.c		standard
++bsd/dev/vayu_voice.c		standard
 +bsd/dev/vayu_gnss.c		standard
 +bsd/dev/vayu_bt.c		standard
 +bsd/dev/vayu_slpi.c		standard
@@ -126,16 +146,28 @@ index 44274016a4cf..ef4e0d1eedd2 100644
 +bsd/dev/vayu_venus.c		standard
 +bsd/dev/vayu_wled.c		standard
 +bsd/dev/vayu_mdp.c		standard
++bsd/dev/vayu_panel.c		standard
 +bsd/dev/vayu_wifi.c		standard
++bsd/dev/vayu_wifi_smmu.c	standard
++bsd/dev/vayu_wifi_ce_wire.c	standard
++bsd/dev/vayu_wifi_htc.c		standard
++bsd/dev/vayu_wifi_ce.c		standard
++bsd/dev/vayu_wifi_htc_connect.c	standard
++bsd/dev/vayu_wifi_wmi.c	standard
++bsd/dev/vayu_wifi_scan.c	standard
++bsd/dev/vayu_wifi_sta.c	standard
++bsd/dev/vayu_wifi_rsn.c	standard
++bsd/dev/vayu_wifi_net.c	standard
 +bsd/dev/vayu_jack.c		standard
 +bsd/dev/vayu_nfc.c		standard
 +bsd/dev/vayu_usbnet.c		standard
++bsd/dev/vayu_ctl.c		standard
 +bsd/dev/vayu_ir.c		standard
 +bsd/dev/vayu_usbnet_ecm.c		standard
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +215,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +232,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -147,10 +179,48 @@ index 44274016a4cf..ef4e0d1eedd2 100644
 +bsd/miscfs/apfs/apfs_vfsops.c		optional apfs
 +bsd/miscfs/apfs/apfs_vnops.c		optional apfs
 +bsd/miscfs/ramfs/ramfs.c			optional ramfs
++bsd/hfs/BTree.c		optional hfs
++bsd/hfs/BTreeAllocate.c		optional hfs
++bsd/hfs/BTreeMiscOps.c		optional hfs
++bsd/hfs/BTreeNodeOps.c		optional hfs
++bsd/hfs/BTreeNodeReserve.c		optional hfs
++bsd/hfs/BTreeScanner.c		optional hfs
++bsd/hfs/BTreeTreeOps.c		optional hfs
++bsd/hfs/BTreeWrapper.c		optional hfs
++bsd/hfs/CatalogUtilities.c		optional hfs
++bsd/hfs/FileExtentMapping.c		optional hfs
++bsd/hfs/FileIDsServices.c		optional hfs
++bsd/hfs/MacOSStubs.c		optional hfs
++bsd/hfs/UnicodeWrappers.c		optional hfs
++bsd/hfs/VolumeAllocation.c		optional hfs
++bsd/hfs/hfs_attrlist.c		optional hfs
++bsd/hfs/hfs_btreeio.c		optional hfs
++bsd/hfs/hfs_builtin.c		optional hfs
++bsd/hfs/hfs_catalog.c		optional hfs
++bsd/hfs/hfs_chash.c		optional hfs
++bsd/hfs/hfs_cnode.c		optional hfs
++bsd/hfs/hfs_cprotect.c		optional hfs
++bsd/hfs/hfs_endian.c		optional hfs
++bsd/hfs/hfs_extents.c		optional hfs
++bsd/hfs/hfs_fsinfo.c		optional hfs
++bsd/hfs/hfs_hotfiles.c		optional hfs
++bsd/hfs/hfs_journal.c		optional hfs
++bsd/hfs/hfs_link.c		optional hfs
++bsd/hfs/hfs_lookup.c		optional hfs
++bsd/hfs/hfs_notification.c		optional hfs
++bsd/hfs/hfs_quota.c		optional hfs
++bsd/hfs/hfs_readwrite.c		optional hfs
++bsd/hfs/hfs_resize.c		optional hfs
++bsd/hfs/hfs_search.c		optional hfs
++bsd/hfs/hfs_vfsops.c		optional hfs
++bsd/hfs/hfs_vfsutils.c		optional hfs
++bsd/hfs/hfs_vnops.c		optional hfs
++bsd/hfs/hfs_xattr.c		optional hfs
++bsd/hfs/rangelist.c		optional hfs
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +429,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +484,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -158,7 +228,7 @@ index 44274016a4cf..ef4e0d1eedd2 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +452,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +507,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -166,13 +236,15 @@ index 44274016a4cf..ef4e0d1eedd2 100644
  bsd/kern/kern_event.c			standard
  bsd/kern/kern_control.c			optional networking
  bsd/kern/kern_exec.c			standard
-@@ -594,3 +664,6 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
+@@ -594,3 +719,8 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
  bsd/skywalk/packet/pbufpool.c			optional skywalk
  bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
  bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
 +bsd/dev/vayu_ipa.c	standard
++bsd/dev/vayu_ipa_data.c	standard
 +bsd/dev/vayu_ipa_qmi.c	standard
 +bsd/dev/vayu_ipa_smmu.c	standard
++bsd/dev/vayu_cell_net.c	standard
 diff --git a/bsd/dev/arm/km.c b/bsd/dev/arm/km.c
 index fd7a94b20794..69eaceedd248 100644
 --- a/bsd/dev/arm/km.c
@@ -392,10 +464,10 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..7b2359579504 100644
+index 4df41ba1f61b..534722cdcd74 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -147,6 +147,13 @@
+@@ -147,6 +147,14 @@
  #include <net/if_ether.h>               /* for ether_family_init() */
  #include <net/if_gif.h>                 /* for gif_init() */
  #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
@@ -406,10 +478,11 @@ index 4df41ba1f61b..7b2359579504 100644
 +#if APFS
 +#include <sys/hakios.apfs_check.h>
 +#endif
++extern void vayu_bb_init(void);         /* boot-arg vayu_bb: the CommCenter baseband stubs */
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +497,7 @@ bsd_init(void)
+@@ -490,7 +498,7 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -418,13 +491,14 @@ index 4df41ba1f61b..7b2359579504 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +983,15 @@ bsd_init(void)
+@@ -976,6 +984,16 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
 +		hakios_input_init();           /* /dev/hakios-touch */
 +		vayu_nvt_init();             /* boot-args touchscreen=1 touch_driver=nvt: vayu's panel */
 +		hakios_audio_init();           /* /dev/hakios-audio */
++		vayu_bb_init();                /* boot-arg vayu_bb=1: Apple baseband stubs */
 +		hakios_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
 +		hakios_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
 +#if APFS
@@ -448,7 +522,7 @@ index 95192dd62449..b00da803b5b4 100644
  
  	/*
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 1d71c66629fb..1d5025f32b88 100644
+index 1d71c66629fb..f563490bb217 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -1157,6 +1157,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
@@ -641,7 +715,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  	ret = persona_proc_adopt(p, persona, cred);
  
  	kauth_cred_unref(&cred);
-@@ -5586,10 +5685,75 @@ bad:
+@@ -5586,10 +5685,76 @@ bad:
   * Note:	The argument and environment vectors are user space pointers
   *		to arrays of user space pointers.
   */
@@ -655,7 +729,8 @@ index 1d71c66629fb..1d5025f32b88 100644
 + * from a job description, which is why the kernel adds this one. Set once by our init (from
 + * etc/inject.conf) before it hands over to launchd.
 + */
-+static char exec_inject_conf[512];
++/* Merged inject.conf exceeds 511 bytes; keep the 4 KB userland limit. */
++static char exec_inject_conf[4096];
 +SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
 +    "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
 +
@@ -717,7 +792,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  	int error = 0;
  	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
  	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
-@@ -5759,6 +5923,33 @@ exec_extract_strings(struct image_params *imgp)
+@@ -5759,6 +5924,33 @@ exec_extract_strings(struct image_params *imgp)
  		imgp->ip_envc++;
  	}
  
@@ -751,7 +826,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  	/* Save space for envv[] NULL terminator */
  	if (imgp->ip_argspace < new_ptr_size) {
  		error = E2BIG;
-@@ -6636,7 +6827,23 @@ handle_mac_transition:
+@@ -6636,7 +6828,23 @@ handle_mac_transition:
  	}
  
  	/* Update the process' identity version and set the security token */
@@ -776,7 +851,7 @@ index 1d71c66629fb..1d5025f32b88 100644
  	task_set_uniqueid(task);
  	set_security_token_task_internal(p, task);
  
-@@ -7538,6 +7745,11 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -7538,6 +7746,11 @@ process_signature(proc_t p, struct image_params *imgp)
  	}
  
  done:
@@ -788,6 +863,30 @@ index 1d71c66629fb..1d5025f32b88 100644
  	if (0 == error) {
  		/*
  		 * Update the new process's signature-dependent process state.
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index 1161432246f9..de4bf61b664c 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1848,6 +1848,19 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);
+ 	}
++	{
++		/* boot-arg exitlog=N (kern_sig.c): how a process that did not simply exit 0 ends */
++		extern bool exitlog_take(int kind);
++
++		if ((rv != 0 || PROC_HAS_EXITREASON(p)) && exitlog_take(1)) {
++			char *description = exit_reason_get_string_desc(p->p_exit_reason);
++
++			printf("exitlog: %s[%d] ends: signal %d, exit status %d, reason namespace %d code %#llx: %s\n", p->p_comm,
++			    proc_getpid(p), WTERMSIG(rv), WEXITSTATUS(rv), PROC_HAS_EXITREASON(p) ? (int)p->p_exit_reason->osr_namespace : -1,
++			    PROC_HAS_EXITREASON(p) ? (unsigned long long)p->p_exit_reason->osr_code : 0ULL,
++			    description != NULL ? description : "-");
++		}
++	}
+ 
+ 	/*
+ 	 * Generate a corefile/crashlog if:
 diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
 index 1750d3a52d3c..0373d0dd160f 100644
 --- a/bsd/kern/kern_memorystatus.c
@@ -905,10 +1004,53 @@ index 20d9d475e0b9..5b84b7a4a77a 100644
  	 * Notify the power management root domain that the system will shut down.
  	 */
 diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
-index ae4a5f33df1e..986b517dfd18 100644
+index ae4a5f33df1e..eee052e3fef0 100644
 --- a/bsd/kern/kern_sig.c
 +++ b/bsd/kern/kern_sig.c
-@@ -1099,6 +1099,14 @@ __pthread_kill(__unused proc_t p, struct __pthread_kill_args *uap,
+@@ -383,6 +383,42 @@ cansignal(proc_t src, kauth_cred_t uc_src, proc_t dst, int signum)
+  */
+ static TUNABLE(unsigned, sigrestrict_arg, "sigrestrict", 0);
+ 
++/*
++ * hakios bring-up, boot-arg exitlog=N (after another HakiOS port, APSL 2.0: Scion-Project/scion-kernel, branch
++ * main, commit a40a96524a51, its "SWEET SIG"/"SWEET EXIT" lines;
++ * a journal only, no limit is changed): who sends a fatal signal to whom -- kill(2), terminate_with_reason,
++ * launchd, jetsam -- here in psignal_internal, and how a process that did not simply exit 0 ends
++ * (proc_prepareexit, kern_exit.c), so a daemon or an application that vanishes says who took it. At most
++ * N lines of each kind (exitlog=1: 400); 0, the default, says nothing.
++ */
++static TUNABLE(uint32_t, exitlog_lines, "exitlog", 0);
++static uint32_t exitlog_said[2];
++
++bool exitlog_take(int kind);    /* 0: a signal, 1: an end (kern_exit.c) */
++bool
++exitlog_take(int kind)
++{
++	uint32_t budget = exitlog_lines == 1 ? 400 : exitlog_lines;
++
++	return exitlog_lines != 0 && (kind == 0 || kind == 1) && os_atomic_inc_orig(&exitlog_said[kind], relaxed) < budget;
++}
++
++static void
++exitlog_signal(proc_t to, int signum, os_reason_t reason)
++{
++	proc_t from = current_proc();
++
++	if (to == PROC_NULL || (signum != SIGKILL && signum != SIGTERM && signum != SIGABRT && signum != SIGQUIT &&
++	    signum != SIGHUP && signum != SIGINT && signum != SIGSEGV && signum != SIGBUS && signum != SIGSTOP) ||
++	    !exitlog_take(0)) {
++		return;
++	}
++	printf("exitlog: %s[%d] -> %s[%d] signal %d, reason namespace %d code %#llx\n",
++	    from != PROC_NULL ? from->p_comm : "?", from != PROC_NULL ? proc_getpid(from) : -1, to->p_comm,
++	    proc_getpid(to), signum, reason != OS_REASON_NULL ? (int)reason->osr_namespace : -1,
++	    reason != OS_REASON_NULL ? (unsigned long long)reason->osr_code : 0ULL);
++}
++
+ #if XNU_PLATFORM_WatchOS
+ static int
+ sigrestrictmask(void)
+@@ -1099,6 +1135,14 @@ __pthread_kill(__unused proc_t p, struct __pthread_kill_args *uap,
  	thread_t target_act;
  	int error = 0;
  	int signum = uap->sig;
@@ -923,6 +1065,14 @@ index ae4a5f33df1e..986b517dfd18 100644
  	struct uthread *uth;
  
  	target_act = (thread_t)port_name_to_thread(uap->thread_port,
+@@ -2051,6 +2095,7 @@ psignal_internal(proc_t p, task_t task, thread_t thread, int flavor, int signum,
+ 
+ 	mask = sigmask(signum);
+ 	prop = sigprop[signum];
++	exitlog_signal(p, signum, signal_reason);
+ 
+ #if SIGNAL_DEBUG
+ 	if (rdebug_proc && (p != PROC_NULL) && (p == rdebug_proc)) {
 diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
 index 9ba4ffbfef03..c0f752937989 100644
 --- a/bsd/kern/kern_sysctl.c
@@ -980,6 +1130,19 @@ index 52992d4cd0af..140fed3bcb71 100755
  				tempname, munge_ret, argssize, size32) > sysent
  		printf("#endif\n") > sysent
  		
+diff --git a/bsd/kern/subr_log_stream.c b/bsd/kern/subr_log_stream.c
+index e994afaf0d8a..6fe136ee249f 100644
+--- a/bsd/kern/subr_log_stream.c
++++ b/bsd/kern/subr_log_stream.c
+@@ -653,7 +653,7 @@ log_stream_teardown(log_stream_t *ls)
+ 		kfree_data(ls->ls_buf, buf_size);
+ 	}
+ 	if (ls->ls_blk) {
+-		kfree_type(uint8_t, ls->ls_blk_count, ls->ls_blk);
++		kfree_data(ls->ls_blk, ls->ls_blk_count);   /* vayu: allocated with kalloc_data in log_stream_setup */
+ 	}
+ 	bzero(ls, sizeof(*ls));
+ }
 diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
 index 4ca22ee4371a..e95e618b4cb6 100644
 --- a/bsd/kern/sys_generic.c
@@ -1129,6 +1292,51 @@ index e00012622e77..4f993b3cd47f 100644
  			}
  		}
  
+diff --git a/bsd/netinet6/in6_ifattach.c b/bsd/netinet6/in6_ifattach.c
+index 656e514c52c6..7f5a483caf5e 100644
+--- a/bsd/netinet6/in6_ifattach.c
++++ b/bsd/netinet6/in6_ifattach.c
+@@ -92,6 +92,9 @@
+ #include <net/net_osdep.h>
+ #include <dev/random/randomdev.h>
+ 
++/* hakios.net.c: vayu_ipv4_only=1, the owner's "no IPv6 on this phone" boot arg. */
++extern int hakios_ipv4_only;
++
+ u_int32_t in6_maxmtu = 0;
+ 
+ #if IP6_AUTO_LINKLOCAL
+@@ -667,9 +670,30 @@ int
+ in6_domifattach(struct ifnet *ifp)
+ {
+ 	int error;
++	const char *name;
+ 
+ 	VERIFY(ifp != NULL);
+ 
++	/*
++	 * vayu_ipv4_only=1: the owner's rule is that this phone has no IPv6 at all. Refusing the
++	 * protocol plumb on the Wi-Fi and cellular interfaces means no link-local address, no
++	 * router advertisement, no SLAAC and no DHCPv6 on them. Only the names this kernel makes
++	 * (en0, en1) and the one iOS's baseband stack would make (pdp_ip0) are refused; loopback
++	 * and the rest keep the stack's normal behaviour.
++	 */
++	name = if_name(ifp);
++	if (hakios_ipv4_only != 0 &&
++	    (strcmp(name, "en0") == 0 || strcmp(name, "en1") == 0 || strcmp(name, "pdp_ip0") == 0)) {
++		static int said;
++
++		if (said == 0) {
++			said = 1;
++			log(LOG_INFO, "hakios: vayu_ipv4_only=1: no IPv6 is attached to %s (en0/en1/pdp_ip0 are IPv4-only)\n",
++			    name);
++		}
++		return EOPNOTSUPP;
++	}
++
+ 	error = proto_plumb(PF_INET6, ifp);
+ 	if (error != 0) {
+ 		if (error != EEXIST) {
 diff --git a/bsd/nfs/nfs_serv.c b/bsd/nfs/nfs_serv.c
 index 6ae9b6bc3fde..58556c324b67 100644
 --- a/bsd/nfs/nfs_serv.c
@@ -1256,16 +1464,20 @@ index cbaa0b221894..78315a2d54cf 100644
  	int eofflag;
  	uint64_t options;
 diff --git a/bsd/vfs/vfs_conf.c b/bsd/vfs/vfs_conf.c
-index bae70cda3a96..031613b10643 100644
+index bae70cda3a96..da0c5ec62ae2 100644
 --- a/bsd/vfs/vfs_conf.c
 +++ b/bsd/vfs/vfs_conf.c
-@@ -103,6 +103,15 @@ extern  struct vfsops mockfs_vfsops;
+@@ -103,6 +103,19 @@ extern  struct vfsops mockfs_vfsops;
  extern  int mockfs_mountroot(mount_t, vnode_t, vfs_context_t);
  #endif /* MOCKFS */
  
 +#if RAMFS
 +extern  struct vfsops ramfs_vfsops;
 +#endif /* RAMFS */
++
++#if HFS
++extern  struct vfsops hfs_vfsops;
++#endif /* HFS */
 +
 +#if APFS
 +extern  struct vfsops apfs_vfsops;
@@ -1275,18 +1487,19 @@ index bae70cda3a96..031613b10643 100644
  enum fs_type_num {
  	FT_NFS = 2,
  	FT_DEVFS = 19,
-@@ -110,7 +119,9 @@ enum fs_type_num {
+@@ -110,7 +123,10 @@ enum fs_type_num {
  	FT_ROUTEFS = 21,
  	FT_NULLFS = 22,
  	FT_BINDFS = 23,
 -	FT_MOCKFS  = 0x6D6F636B
 +	FT_MOCKFS  = 0x6D6F636B,
 +	FT_RAMFS   = 0x72616D66,
++	FT_HFS     = 0x11,
 +	FT_APFS    = 0x61706673
  };
  
  int fstypenumstart = FT_BINDFS + 1;
-@@ -194,6 +205,54 @@ static struct vfstable vfstbllist[] = {
+@@ -194,6 +210,81 @@ static struct vfstable vfstbllist[] = {
  	},
  #endif /* BINDFS */
  
@@ -1308,6 +1521,33 @@ index bae70cda3a96..031613b10643 100644
 +		.vfc_sysctl = NULL
 +	},
 +#endif /* RAMFS */
++
++#if HFS
++	/*
++	 * HFS Plus, read-write, built in rather than a kext (bsd/hfs, Apple's hfs-627.100.6): the data volume on the
++	 * phone's flash, /private/var, where ramfs keeps it in memory.  Its own arguments (struct hfs_mount_args) and
++	 * local ones, as the kext registered itself: the kernel looks up the device named by their first field and
++	 * hands its vnode to hfs_mount().  Mounted by init, from user space.  (From other HakiOS ports, APSL 2.0:
++	 * oosexgang/hakios-xnu-kernel, branch main, commit 83aceb83817c, also in Scion-Project/scion-kernel, as
++	 * telegdyd/ios-vayu, branch vayu-dev, commit 74cfdfa7d258 has it.)
++	 */
++	{
++		.vfc_vfsops = &hfs_vfsops,
++		.vfc_name = "hfs",
++		.vfc_typenum = FT_HFS,
++		.vfc_refcount = 0,
++		.vfc_flags = MNT_LOCAL | MNT_DOVOLFS,
++		.vfc_mountroot = NULL,
++		.vfc_next = NULL,
++		.vfc_reserved1 = 0,
++		.vfc_reserved2 = 0,
++		.vfc_vfsflags = VFC_VFSLOCALARGS | VFC_VFSREADDIR_EXTENDED | VFC_VFS64BITREADY | VFC_VFSVNOP_PAGEOUTV2 |
++		    VFC_VFSVNOP_PAGEINV2 | VFC_VFSNATIVEXATTR,
++		.vfc_descptr = NULL,
++		.vfc_descsize = 0,
++		.vfc_sysctl = NULL
++	},
++#endif /* HFS */
 +
 +#if APFS
 +	/*
@@ -1341,7 +1581,7 @@ index bae70cda3a96..031613b10643 100644
  #if MOCKFS
  	/* If we are configured for it, mockfs should always be the last standard entry (and thus the last FS we attempt mountroot with) */
  	{
-@@ -298,6 +357,15 @@ extern const struct vnodeopv_desc devfs_fdesc_vnodeop_opv_desc;
+@@ -298,6 +389,21 @@ extern const struct vnodeopv_desc devfs_fdesc_vnodeop_opv_desc;
  extern const struct vnodeopv_desc mockfs_vnodeop_opv_desc;
  #endif /* MOCKFS */
  
@@ -1350,6 +1590,12 @@ index bae70cda3a96..031613b10643 100644
 +extern const struct vnodeopv_desc ramfs_vnodeop_opv_desc;
 +#endif /* RAMFS */
 +
++#if HFS
++extern const struct vnodeopv_desc hfs_vnodeop_opv_desc;
++extern const struct vnodeopv_desc hfs_specop_opv_desc;
++extern const struct vnodeopv_desc hfs_fifoop_opv_desc;
++#endif /* HFS */
++
 +#if APFS
 +extern const struct vnodeopv_desc apfs_vnodeop_opv_desc;
 +#endif /* APFS */
@@ -1357,13 +1603,18 @@ index bae70cda3a96..031613b10643 100644
  extern const struct vnodeopv_desc nullfs_vnodeop_opv_desc;
  extern const struct vnodeopv_desc bindfs_vnodeop_opv_desc;
  
-@@ -327,5 +395,11 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
+@@ -327,5 +433,16 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
  #if MOCKFS
  	&mockfs_vnodeop_opv_desc,
  #endif /* MOCKFS */
 +#if RAMFS
 +	&ramfs_vnodeop_opv_desc,
 +#endif /* RAMFS */
++#if HFS
++	&hfs_vnodeop_opv_desc,
++	&hfs_specop_opv_desc,
++	&hfs_fifoop_opv_desc,
++#endif /* HFS */
 +#if APFS
 +	&apfs_vnodeop_opv_desc,
 +#endif /* APFS */
@@ -1568,20 +1819,21 @@ index 60c8b9eedd50..b0029de5ef21 100644
  					("shared_region: %p [%d(%s)] map(%p:'%s'): "
  					"not on process' root volume nor preboot volume\n",
 diff --git a/config/MASTER b/config/MASTER
-index 07147cb3188b..e937e62bf4c3 100644
+index 07147cb3188b..86e9eefb5ec7 100644
 --- a/config/MASTER
 +++ b/config/MASTER
-@@ -113,6 +113,8 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
+@@ -113,6 +113,9 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
  #	4.4 filesystems
  #
  options		MOCKFS		# Boot from an executable	# <mockfs>
 +options		APFS		# Apple File System, read only	# <apfs>
 +options		RAMFS		# Read-write filesystem in memory	# <ramfs>
++options		HFS		# HFS Plus, read-write: the data volume on the flash	# <hfs>
  options		FIFO		# fifo support			# <fifo>
  options		FDESC		# fdesc_fs support		# <fdesc>
  options		DEVFS		# devfs support			# <devfs>
 diff --git a/config/MASTER.arm64.bcm2837 b/config/MASTER.arm64.bcm2837
-index 1ed75eea2052..54c5e12d2271 100644
+index 1ed75eea2052..56de7ac82488 100644
 --- a/config/MASTER.arm64.bcm2837
 +++ b/config/MASTER.arm64.bcm2837
 @@ -16,15 +16,15 @@
@@ -1600,7 +1852,7 @@ index 1ed75eea2052..54c5e12d2271 100644
 -#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs]
 +#  BSD_DEV =        [ BSD_BASE config_netboot config_imageboot config_coredump config_vnguard ]
 +#  BSD_DEBUG =      [ BSD_BASE config_netboot config_imageboot config_coredump config_vnguard ]
-+#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs mockfs ramfs apfs ]
++#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs mockfs ramfs apfs hfs ]
  #  FILESYS_RELEASE= [ FILESYS_BASE ]
  #  FILESYS_DEV =    [ FILESYS_BASE config_union_mounts fdesc ]
  #  FILESYS_DEBUG =  [ FILESYS_BASE config_union_mounts fdesc ]
@@ -1832,10 +2084,10 @@ index 5219fb0d9ed6..29978e9cff43 100644
  		}
  	}
 diff --git a/iokit/conf/files b/iokit/conf/files
-index 5fb0a52062e0..0ffbe273ab75 100644
+index 5fb0a52062e0..03354fc1b00f 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,15 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,17 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
@@ -1845,6 +2097,8 @@ index 5fb0a52062e0..0ffbe273ab75 100644
 +iokit/Kernel/hakios.gpu.cpp				optional iokitcpp
 +iokit/Kernel/hakios.wlan.cpp			optional iokitcpp
 +iokit/Kernel/hakios.battery.cpp			optional iokitcpp
++iokit/Kernel/vayu.bt.dt.cpp			optional iokitcpp
++iokit/Kernel/VayuBaseband.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
 +iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleStockholm.cpp			optional iokitcpp
@@ -2910,6 +3164,23 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
 +osfmk/arm64/user_exception_trace.c	standard
 +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
 +osfmk/arm64/psci_smp.c	optional nos_arm_asm
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index e5b23f2a2fbf..63fa17558d33 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -164,11 +164,8 @@ console_io_allowed(void)
+ 	    !console_suspended &&
+ 	    startup_phase >= STARTUP_SUB_EARLY_BOOT &&
+ 	    !ml_get_interrupts_enabled()) {
+-#if defined(__arm64__) || DEBUG || DEVELOPMENT
+-		panic("Console I/O from interrupt-disabled context");
+-#else
++		/* vayu: drop the output (as RELEASE does) instead of panicking on the loader-return path */
+ 		return false;
+-#endif
+ 	}
+ 
+ 	return true;
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 index 384118e8d7a9..2573d2ebd4e6 100644
 --- a/osfmk/console/video_console.c
@@ -3286,7 +3557,7 @@ index 8b46efb05c86..e161ca426b1a 100644
  kern_work_interval_set_workload_id(mach_port_name_t port_name,
      struct kern_work_interval_workload_id_args *workload_id_args);
 diff --git a/pexpert/arm/pe_bootargs.c b/pexpert/arm/pe_bootargs.c
-index c6b87b081d2f..584be7afd766 100644
+index c6b87b081d2f..890aa69efcf0 100644
 --- a/pexpert/arm/pe_bootargs.c
 +++ b/pexpert/arm/pe_bootargs.c
 @@ -3,10 +3,41 @@

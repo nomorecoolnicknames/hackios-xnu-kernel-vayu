@@ -34,8 +34,20 @@
  *   vayu_gnss=1            one session, as above
  *   vayu_gnss_wait=S       seconds to wait for the LOC service and for DMS to say ONLINE
  *                          (default 30, 1..120)
- *   vayu_gnss_run=S        seconds a session runs after LOC_START is accepted (default 120, 5..600)
+ *   vayu_gnss_run=S        seconds a session runs after LOC_START is accepted (default 120, 5..600);
+ *                          0: until the modem goes down (vayu_gnss_stop()), for iOS's location
  *   vayu_gnss_interval_ms=N  minimum interval between fixes (default 1000, 200..60000)
+ *   vayu_gnss_v02=1        the LOC v02 sequence of xreactx/oneplus-6t-upstream 12d310ec3 (a fix in
+ *                          Compass on the 6T; sys/vayu_gnss_qmi.h has the messages): before Register
+ *                          Events the engine lock lifted (Set Engine Lock 0x3a: none), the engine made
+ *                          standalone (Set Operation Mode 0x4a: 4) and the time given from the
+ *                          calendar (Inject UTC Time 0x38, again whenever the engine asks with 0x28);
+ *                          the events mask also takes the time request and the engine and fix-session
+ *                          states (0x197); LOC_START first in the v02 form (periodic, high accuracy,
+ *                          intermediate reports, the interval) and only then in the three forms
+ *                          below; the position report read by its v02 TLVs first. Each of the three
+ *                          preparing requests is logged with the modem's answer and the session goes
+ *                          on whatever it says. Off by default: without it nothing of this is sent.
  *
  * Privacy: the log keeps two decimals of a coordinate (about a kilometre) and never a payload --
  * the TLV map of the first position report and of the first SV-info report is types and lengths
@@ -47,6 +59,10 @@
  * expects (and a double rather than a float); that it emits NMEA at all without a Set NMEA Types
  * request, and in which of its TLVs it puts the sentences (any TLV that begins with '$' is read).
  * Each of those fails visibly: one line in the log, and the record says what was not learned.
+ *
+ * From another HakiOS port (APSL 2.0, as this file): vayu_gnss_v02=1's LOC v02 sequence -- its message ids, TLVs
+ * and values -- is xreactx/hakios-xnu-kernel, branch oneplus-6t-upstream, commit 12d310ec3b2e
+ * (drivers/modem/hakios.mpss.c there).
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -109,6 +125,9 @@ struct vayu_gnss_state {
 	uint8_t position_source;
 	bool said_position_map, said_sv_map, said_nmea_layout, said_nmea_read, said_bad_checksum;
 	bool running, started;
+	bool v02;                               /* vayu_gnss_v02=1 */
+	volatile bool time_wanted;              /* the engine asked for the time (0x0028): the thread gives it */
+	uint32_t said_states;                   /* engine/session state and request indications logged so far */
 	struct vayu_gnss_record record;
 };
 
@@ -454,6 +473,7 @@ gnss_server(void *context __unused, bool arrived, uint32_t service, uint32_t ver
 }
 
 static void gnss_message(const void *data, size_t length);
+static void gnss_v02_indication(uint16_t id, const uint8_t *message, size_t length);
 
 /* A datagram for our port: the reply to the transaction in flight, or an indication. */
 static void
@@ -618,8 +638,21 @@ gnss_message(const void *data, size_t length)
 	incoming.quality = VAYU_GNSS_QUALITY_UNKNOWN;
 
 	switch (id) {
+	case VAYU_GNSS_LOC_EVENT_INJECT_TIME_REQ:
+	case VAYU_GNSS_LOC_EVENT_ENGINE_STATE:
+	case VAYU_GNSS_LOC_EVENT_FIX_SESSION_STATE:
+	case VAYU_GNSS_LOC_INJECT_UTC_TIME:
+	case VAYU_GNSS_LOC_SET_ENGINE_LOCK:
+	case VAYU_GNSS_LOC_SET_OPERATION_MODE:
+	case VAYU_GNSS_LOC_REG_EVENTS:
+	case VAYU_GNSS_LOC_START:
+		if (gnss.v02) {
+			gnss_v02_indication(id, message, length);
+		}
+		return;
 	case VAYU_GNSS_LOC_EVENT_POSITION_REPORT:
-		position = vayu_gnss_parse_position_report(message, length, &incoming);
+		position = (gnss.v02 && vayu_gnss_parse_position_v02(message, length, &incoming)) ||
+		    vayu_gnss_parse_position_report(message, length, &incoming);
 		if (!position && !gnss.said_position_map) {
 			struct vayu_gnss_tlv_map map;
 			char text[96];
@@ -693,6 +726,76 @@ gnss_message(const void *data, size_t length)
 	}
 }
 
+/*
+ * vayu_gnss_v02=1: LOC v02 answers a request twice, a reply ("taken") and later an indication with
+ * the same id whose TLV 0x01 is the outcome (0 success); the engine's and the fix session's states
+ * come the same way. Each is said (the first 40); the time request is left to the thread, which may
+ * send a request (this runs on the transport's receive path, which a request's reply also needs).
+ */
+static void
+gnss_v02_indication(uint16_t id, const uint8_t *message, size_t length)
+{
+	uint32_t status = 0xffffffffu;
+	bool has = vayu_gnss_ind_status(message, length, &status);
+
+	if (id == VAYU_GNSS_LOC_EVENT_INJECT_TIME_REQ) {
+		gnss.time_wanted = gnss.v02;
+	}
+	if (gnss.said_states >= 40) {
+		return;
+	}
+	gnss.said_states++;
+	say("vayu-gnss: indication %#x (%s): status %s%u%s\n", (unsigned int)id,
+	    id == VAYU_GNSS_LOC_EVENT_INJECT_TIME_REQ ? "the engine asks for the time" :
+	    id == VAYU_GNSS_LOC_EVENT_ENGINE_STATE ? "engine state: 1 on, 2 off" :
+	    id == VAYU_GNSS_LOC_EVENT_FIX_SESSION_STATE ? "fix session state: 1 started, 2 finished" :
+	    id == VAYU_GNSS_LOC_INJECT_UTC_TIME ? "the time given" : id == VAYU_GNSS_LOC_SET_ENGINE_LOCK ? "engine lock" :
+	    id == VAYU_GNSS_LOC_SET_OPERATION_MODE ? "operation mode" : id == VAYU_GNSS_LOC_REG_EVENTS ? "register events" :
+	    "start", has ? "" : "(none) ", has ? (unsigned int)status : 0u,
+	    id == VAYU_GNSS_LOC_EVENT_ENGINE_STATE || id == VAYU_GNSS_LOC_EVENT_FIX_SESSION_STATE ||
+	    id == VAYU_GNSS_LOC_EVENT_INJECT_TIME_REQ ? "" : " (0 success)");
+}
+
+/* The calendar's time to the engine (vayu_gnss_v02=1), uncertain by 10 s; not when it is unset. */
+static void
+gnss_inject_time(void)
+{
+	struct vayu_gnss_utc_req request = { .uncertainty_ms = 10000 };
+	clock_sec_t seconds;
+	clock_usec_t microseconds;
+	int ret;
+
+	clock_get_calendar_microtime(&seconds, &microseconds);
+	if (seconds < 1700000000) {
+		say("vayu-gnss: the calendar is not set (%lu s since 1970): no time is given\n", (unsigned long)seconds);
+		return;
+	}
+	request.time_ms = (uint64_t)seconds * 1000u + microseconds / 1000u;
+	ret = gnss_transaction("inject UTC time", gnss.loc_node, gnss.loc_port, VAYU_GNSS_LOC_INJECT_UTC_TIME,
+	    vayu_gnss_utc_req_ei, &request, VAYU_GNSS_REPLY_MS);
+	say("vayu-gnss: Inject UTC Time (0x38): %llu ms since 1970, uncertain by 10 s: %s (%d)\n",
+	    (unsigned long long)request.time_ms, ret == 0 ? "taken" : "NOT taken", ret);
+}
+
+/*
+ * vayu_gnss_v02=1, before Register Events: no engine lock, standalone, the time. A refusal is said
+ * and the session is tried all the same (the 6T's modem took all three).
+ */
+static void
+gnss_v02_prepare(void)
+{
+	struct vayu_gnss_u32_req lock = { .value = VAYU_GNSS_LOCK_NONE }, mode = { .value = VAYU_GNSS_MODE_STANDALONE };
+	int ret;
+
+	ret = gnss_transaction("set engine lock", gnss.loc_node, gnss.loc_port, VAYU_GNSS_LOC_SET_ENGINE_LOCK,
+	    vayu_gnss_u32_req_ei, &lock, VAYU_GNSS_REPLY_MS);
+	say("vayu-gnss: Set Engine Lock (0x3a) to 1 (none): %s (%d)\n", ret == 0 ? "taken" : "NOT taken", ret);
+	ret = gnss_transaction("set operation mode", gnss.loc_node, gnss.loc_port, VAYU_GNSS_LOC_SET_OPERATION_MODE,
+	    vayu_gnss_u32_req_ei, &mode, VAYU_GNSS_REPLY_MS);
+	say("vayu-gnss: Set Operation Mode (0x4a) to 4 (standalone): %s (%d)\n", ret == 0 ? "taken" : "NOT taken", ret);
+	gnss_inject_time();
+}
+
 /* ---- the session ------------------------------------------------------------------------------- */
 
 /*
@@ -706,7 +809,8 @@ static int
 gnss_register_events(void)
 {
 	struct vayu_gnss_reg_events_req request = {
-		.mask = VAYU_GNSS_EVENT_POSITION | VAYU_GNSS_EVENT_SV_INFO | VAYU_GNSS_EVENT_NMEA,
+		.mask = VAYU_GNSS_EVENT_POSITION | VAYU_GNSS_EVENT_SV_INFO | VAYU_GNSS_EVENT_NMEA |
+	    (gnss.v02 ? VAYU_GNSS_EVENT_TIME_REQ | VAYU_GNSS_EVENT_ENGINE_STATE | VAYU_GNSS_EVENT_FIX_STATE : 0),
 	};
 	struct vayu_gnss_reg_events_req32 narrow = { .mask = (uint32_t)request.mask };
 	int ret;
@@ -746,10 +850,29 @@ gnss_start_session(void)
 		.min_interval_ms = gnss.interval_ms,
 	};
 	struct vayu_gnss_start_min_req minimal = { .session = gnss.session_id };
+	struct vayu_gnss_start_v02_req v02 = {
+		.session = gnss.session_id,
+		.recurrence = VAYU_GNSS_RECURRENCE_PERIODIC,
+		.accuracy = VAYU_GNSS_ACCURACY_HIGH,
+		.intermediate = 1,
+		.min_interval_ms = gnss.interval_ms,
+	};
 	int ret;
 
 	say("vayu-gnss: LOC_START: session %u, minimum interval %u ms\n", (unsigned int)gnss.session_id,
 	    (unsigned int)gnss.interval_ms);
+	if (gnss.v02) {
+		ret = gnss_transaction("start (v02: session, periodic, high accuracy, intermediate, interval)", gnss.loc_node,
+		    gnss.loc_port, VAYU_GNSS_LOC_START, vayu_gnss_start_v02_req_ei, &v02, VAYU_GNSS_START_REPLY_MS);
+		if (ret == 0) {
+			return 0;
+		}
+		if (ret != -EIO || (gnss.last_error != QMI_ERR_MALFORMED_MSG_V01 && gnss.last_error != QMI_ERR_ENCODING_V01)) {
+			return ret;
+		}
+		say("vayu-gnss: the v02 form was refused as malformed (error %u): the other forms\n",
+		    (unsigned int)gnss.last_error);
+	}
 	ret = gnss_transaction("start (session, interval, intermediate, fix mode)", gnss.loc_node, gnss.loc_port,
 	    VAYU_GNSS_LOC_START, vayu_gnss_start_req_ei, &full, VAYU_GNSS_START_REPLY_MS);
 	if (ret == 0) {
@@ -833,11 +956,11 @@ gnss_make_node(void)
 {
 	int major = cdevsw_add(-1, &gnss_cdevsw);
 
-	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, VAYU_GNSS_DEVICE) == NULL) {
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0660, VAYU_GNSS_DEVICE) == NULL) {
 		say("vayu-gnss: /dev/%s cannot be made\n", VAYU_GNSS_DEVICE);
 		return false;
 	}
-	say("vayu-gnss: /dev/%s (0666) is made: the record is %u bytes\n", VAYU_GNSS_DEVICE,
+	say("vayu-gnss: /dev/%s (0660) is made: the record is %u bytes\n", VAYU_GNSS_DEVICE,
 	    (unsigned int)sizeof(struct vayu_gnss_record));
 	return true;
 }
@@ -946,6 +1069,9 @@ gnss_thread(void *argument __unused, wait_result_t wait __unused)
 		goto out;
 	}
 	gnss_set_state(VAYU_GNSS_WAITING);
+	if (gnss.v02) {
+		gnss_v02_prepare();
+	}
 	if (gnss_register_events() != 0) {
 		say("vayu-gnss: the events were not registered: no indication would come, so LOC_START is "
 		    "not sent\n");
@@ -961,18 +1087,27 @@ gnss_thread(void *argument __unused, wait_result_t wait __unused)
 	gnss.start_done = true;
 	gnss.started_ms = now_ms();
 	gnss_set_state(VAYU_GNSS_RUNNING);
-	say("vayu-gnss: the session is on: a fix every %u ms at most, %u s, then LOC_STOP\n",
-	    (unsigned int)gnss.interval_ms, (unsigned int)gnss.run_s);
+	if (gnss.run_s != 0) {
+		say("vayu-gnss: the session is on: a fix every %u ms at most, %u s, then LOC_STOP\n",
+		    (unsigned int)gnss.interval_ms, (unsigned int)gnss.run_s);
+	} else {
+		say("vayu-gnss: the session is on: a fix every %u ms at most, until the modem goes down\n",
+		    (unsigned int)gnss.interval_ms);
+	}
 
 	progress_ms = gnss.started_ms;
 	while (!gnss_stop) {
 		uint64_t now = now_ms();
 
-		if (now - gnss.started_ms >= (uint64_t)gnss.run_s * 1000) {
+		if (gnss.run_s != 0 && now - gnss.started_ms >= (uint64_t)gnss.run_s * 1000) {
 			say("vayu-gnss: %u s are up: the session ends\n", (unsigned int)gnss.run_s);
 			break;
 		}
-		if (now - progress_ms >= VAYU_GNSS_PROGRESS_MS) {
+		if (gnss.time_wanted) {
+			gnss.time_wanted = false;
+			gnss_inject_time();
+		}
+		if (now - progress_ms >= (now - gnss.started_ms > 600000 ? 6u : 1u) * VAYU_GNSS_PROGRESS_MS) {
 			char last[16];
 
 			progress_ms = now;
@@ -1013,7 +1148,7 @@ void
 vayu_gnss_start(struct vayu_qrtr *q)
 {
 	thread_t thread;
-	uint32_t level = 0, wait_s = 30, run_s = 120, interval_ms = 1000;
+	uint32_t level = 0, wait_s = 30, run_s = 120, interval_ms = 1000, v02 = 0;
 
 	if (gnss.started) {
 		say("vayu-gnss: already started\n");
@@ -1037,12 +1172,13 @@ vayu_gnss_start(struct vayu_qrtr *q)
 		wait_s = 120;
 	}
 	PE_parse_boot_argn("vayu_gnss_run", &run_s, sizeof(run_s));
-	if (run_s < 5) {
+	if (run_s != 0 && run_s < 5) {
 		run_s = 5;
 	}
 	if (run_s > 600) {
 		run_s = 600;
 	}
+	PE_parse_boot_argn("vayu_gnss_v02", &v02, sizeof(v02));
 	PE_parse_boot_argn("vayu_gnss_interval_ms", &interval_ms, sizeof(interval_ms));
 	if (interval_ms < 200) {
 		interval_ms = 200;
@@ -1059,11 +1195,12 @@ vayu_gnss_start(struct vayu_qrtr *q)
 	gnss.run_s = run_s;
 	gnss.interval_ms = interval_ms;
 	gnss.session_id = 0;
+	gnss.v02 = v02 != 0;
 	gnss.running = true;
 	gnss.started = true;
 	gnss_stop = false;
-	say("vayu-gnss: vayu_gnss=1 vayu_gnss_wait=%u vayu_gnss_run=%u vayu_gnss_interval_ms=%u\n",
-	    wait_s, run_s, interval_ms);
+	say("vayu-gnss: vayu_gnss=1 vayu_gnss_wait=%u vayu_gnss_run=%u%s vayu_gnss_interval_ms=%u vayu_gnss_v02=%u\n",
+	    wait_s, run_s, run_s == 0 ? " (until the modem goes down)" : "", interval_ms, v02 != 0 ? 1u : 0u);
 	say("vayu-gnss: LOC 0x%x (register events, start, stop), DMS 0x%x (operating mode only); "
 	    "the fix is logged with two decimals, /dev/%s holds all of it\n",
 	    VAYU_GNSS_LOC_SERVICE, VAYU_GNSS_DMS_SERVICE, VAYU_GNSS_DEVICE);

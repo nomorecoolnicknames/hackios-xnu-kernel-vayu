@@ -15,6 +15,9 @@
 #   src/compiler/air/air2nir                           the frontend alone
 #   src/gallium/drivers/freedreno/ir3_compiler         AIR -> NIR -> Adreno
 #   src/gallium/drivers/freedreno/air_run              AIR -> NIR -> drawn, pixel read back
+#
+# With another HakiOS port's changes (MIT): telegdyd/ios-vayu, branch vayu-dev, commit 061e5a82d023 (meson >= 1.1, the
+# glibc 2.41 guard).
 set -e
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
 VERSION=25.0.7
@@ -29,7 +32,10 @@ cd "$B"
 # column comes from and where its Adreno instructions are read, so a host ir3 that differs from the
 # device's would make both of those say something about a compiler nothing runs. The other patches
 # in tools/mesa are for the Darwin cross build and are deliberately left out.
-PATCHES=$(cat "$ROOT"/tools/mesa/air*.patch "$ROOT"/tools/mesa/ir3-*.patch | sha256sum | cut -d' ' -f1)
+# (vayu) tools/mesa/metal/*.patch are the Metal driver's own fixes to ir3 and the tool (upstream
+# 63fc2b46's): on top of the rest, here and in `METAL=1 tools/mk-mesa.sh`, the build the phone's
+# plug-in links -- not in the OpenGL ES library's Mesa, which stays as it was.
+PATCHES=$(cat "$ROOT"/tools/mesa/air*.patch "$ROOT"/tools/mesa/ir3-*.patch "$ROOT"/tools/mesa/metal/*.patch | sha256sum | cut -d' ' -f1)
 if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.air-patches" 2>/dev/null)" != "$PATCHES" ]; then
 	if [ ! -f mesa-$VERSION.tar.xz ]; then
 		# the cross build may already have fetched it
@@ -43,7 +49,7 @@ if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.air-patches" 2>/dev/null)" != "$PATCHES" ]
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
 	rm -rf "$SRC" build
 	tar xJf mesa-$VERSION.tar.xz
-	for p in "$ROOT"/tools/mesa/air-*.patch "$ROOT"/tools/mesa/ir3-*.patch; do
+	for p in "$ROOT"/tools/mesa/air-*.patch "$ROOT"/tools/mesa/ir3-*.patch "$ROOT"/tools/mesa/metal/*.patch; do
 		patch -s --no-backup-if-mismatch -d "$SRC" -p1 < "$p"
 	done
 
@@ -56,7 +62,8 @@ if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.air-patches" 2>/dev/null)" != "$PATCHES" ]
 		p = root + '/src/c11/threads.h'
 		s = open(p).read()
 		old = "typedef pthread_once_t  once_flag;\n#  define ONCE_FLAG_INIT PTHREAD_ONCE_INIT\n"
-		new = ("#  if defined(__GLIBC__) && __GLIBC_USE(ISOC23) && !defined(__cplusplus)\n"
+		# (2.41's _GNU_SOURCE already says ISOC23 without declaring call_once: the version decides)
+		new = ("#  if defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 43) && __GLIBC_USE(ISOC23) && !defined(__cplusplus)\n"
 		       "#    define C11_LIBC_HAS_CALL_ONCE 1\n"
 		       "#  else\n"
 		       "typedef pthread_once_t  once_flag;\n"
@@ -87,6 +94,10 @@ fi
 if [ ! -x venv/bin/python3 ]; then
 	python3 -m venv venv
 	venv/bin/pip -q install mako pyyaml packaging
+fi
+# Mesa 25 wants meson >= 1.1 (Debian 12 has 1.0.1, or none): one in the venv, as tools/mk-mesa.sh does
+if [ ! -x venv/bin/meson ]; then
+	venv/bin/pip -q install 'meson>=1.1,<1.6'
 fi
 export PATH=$B/venv/bin:$PATH
 

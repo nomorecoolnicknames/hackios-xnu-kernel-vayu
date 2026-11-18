@@ -12,12 +12,14 @@
  *   WMS 0x05  Event Report      0x0001  indication: 0x10 {storage,index},
  *                                       0x11 {ack,transaction,format,raw}, 0x12 mode,
  *                                       0x16 SMS-on-IMS
- *   WMS 0x05  Raw Send          0x0020  TLV 0x01 {format, u16 length, PDU};
+ *   WMS 0x05  Raw Send          0x0020  TLV 0x01 {format, u16 length, PDU},
+ *                                       0x02 SMS-on-IMS u8;
  *                                       reply 0x01 message id, 0x12 GSM cause
  *   WMS 0x05  Raw Read          0x0022  TLV 0x01 {storage,index}, 0x10 mode;
  *                                       reply 0x01 {tag,format,u16 length,PDU}
- *   WMS 0x05  List Messages     0x0031  input 0x01 storage; reply 0x01 array of
- *                                       {index u32, tag u8}, u32 count prefix
+ *   WMS 0x05  List Messages     0x0031  input 0x01 storage, 0x11 tag, 0x12 mode;
+ *                                       reply 0x10 array of {index u32, tag u8},
+ *                                       u32 count prefix (0x01 also accepted)
  *   WMS 0x05  Delete            0x0024  TLV 0x01 storage, 0x10 index, 0x11 tag
  *   WMS 0x05  Set/Get Routes    0x0032/0x0033  array of
  *                                       {type,class,storage,receipt action}, u16 count
@@ -1075,11 +1077,33 @@ static const struct qmi_elem_info vayu_sms_qmi_raw_message_ei[] = {
 
 struct vayu_sms_qmi_raw_send_req {
 	struct vayu_sms_qmi_raw_message message;        /* TLV 0x01 */
-	uint8_t sms_on_ims_valid;                       /* TLV 0x13: optional */
+	uint8_t sms_on_ims_valid;                       /* TLV 0x02 (0x13 in the k25 form) */
 	uint8_t sms_on_ims;                             /* 0: 3GPP CS/NAS, not IMS */
 };
 
+/*
+ * Raw Send input: 0x01 Raw Message Data {format, u16 length, bytes}, then
+ * 0x02 SMS on IMS (optional, one byte; 0 = the 3GPP CS/NAS path, not IMS).
+ *
+ * k25 sent the second field as TLV 0x13, which is Set Event Report's
+ * "report message mode".  An unknown TLV is normally ignored, so this is not
+ * proof of the error 48 the run saw; vayu_sms_ims_tlv=19 keeps the old form for
+ * an A/B on the phone, and 0 leaves the TLV out.
+ */
 static const struct qmi_elem_info vayu_sms_qmi_raw_send_req_ei[] = {
+	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_raw_message),
+	  .array_type = NO_ARRAY, .tlv_type = 0x01,
+	  .offset = offsetof(struct vayu_sms_qmi_raw_send_req, message),
+	  .ei_array = vayu_sms_qmi_raw_message_ei },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x02, .offset = offsetof(struct vayu_sms_qmi_raw_send_req, sms_on_ims_valid) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x02, .offset = offsetof(struct vayu_sms_qmi_raw_send_req, sms_on_ims) },
+	{ .data_type = QMI_EOTI },
+};
+
+/* The k25 wire form: the same structure with SMS-on-IMS under TLV 0x13. */
+static const struct qmi_elem_info vayu_sms_qmi_raw_send_req_legacy_ei[] = {
 	{ .data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct vayu_sms_qmi_raw_message),
 	  .array_type = NO_ARRAY, .tlv_type = 0x01,
 	  .offset = offsetof(struct vayu_sms_qmi_raw_send_req, message),
@@ -1216,16 +1240,19 @@ static const struct qmi_elem_info vayu_sms_qmi_raw_read_resp_ei[] = {
  * List Messages input: storage (0x01), optional tag (0x11) and message mode
  * (0x12).  The mode is not optional for a GW modem: without it this one answers
  * result 1 error 17 (MISSING_ARGUMENT, qmi-errors.h), as the 142105 run did.
- * The tag is left out so every tag is listed.
+ * The tag is sent explicitly: MT_NOT_READ (1), as in the k25 modem trace.
  */
 struct vayu_sms_qmi_list_req {
 	uint8_t storage;                /* TLV 0x01; a value, not a wildcard */
+	uint8_t tag;                    /* TLV 0x11: MT_READ (0), MT_NOT_READ (1) */
 	uint8_t mode;                   /* TLV 0x12: QMI_WMS_MESSAGE_MODE_GSM_WCDMA = 1 */
 };
 
 static const struct qmi_elem_info vayu_sms_qmi_list_req_ei[] = {
 	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
 	  .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_list_req, storage) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x11, .offset = offsetof(struct vayu_sms_qmi_list_req, tag) },
 	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
 	  .tlv_type = 0x12, .offset = offsetof(struct vayu_sms_qmi_list_req, mode) },
 	{ .data_type = QMI_EOTI },
@@ -1247,12 +1274,18 @@ struct vayu_sms_qmi_message_list {
  * List Messages is the one WMS reply whose count prefix is 32 bits (guint32 in
  * qmi-service-wms.json), while sys/hakios.qmi.h's QMI_DATA_LEN supports only 8- and
  * 16-bit prefixes.  A top-level QMI_STRING element copies a whole TLV value, so the
- * 0x01 TLV is taken as 512 opaque bytes and parsed by vayu_sms_qmi_list_parse().
+ * list TLV is taken as 512 opaque bytes and parsed by vayu_sms_qmi_list_parse().
+ *
+ * The list TLV is 0x10 in qmi-service-wms.json ("Message List", the same family as
+ * the Event Report's 0x10 MT message).  k25 named it 0x01; a firmware that answers
+ * 0x01 is still understood here, and the log says which one arrived.
  */
 struct vayu_sms_qmi_list_resp {
 	struct vayu_sms_qmi_result result;      /* TLV 0x02 */
-	uint8_t list_valid;                     /* TLV 0x01 */
+	uint8_t list_valid;                     /* TLV 0x01: the k25 name for the list */
 	char list[VAYU_SMS_QMI_LIST_RAW];
+	uint8_t list10_valid;                   /* TLV 0x10: the qmi-service-wms.json name */
+	char list10[VAYU_SMS_QMI_LIST_RAW];
 };
 
 static const struct qmi_elem_info vayu_sms_qmi_list_resp_ei[] = {
@@ -1263,6 +1296,10 @@ static const struct qmi_elem_info vayu_sms_qmi_list_resp_ei[] = {
 	  .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_list_resp, list_valid) },
 	{ .data_type = QMI_STRING, .elem_len = VAYU_SMS_QMI_LIST_RAW, .elem_size = sizeof(char),
 	  .array_type = NO_ARRAY, .tlv_type = 0x01, .offset = offsetof(struct vayu_sms_qmi_list_resp, list) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_list_resp, list10_valid) },
+	{ .data_type = QMI_STRING, .elem_len = VAYU_SMS_QMI_LIST_RAW, .elem_size = sizeof(char),
+	  .array_type = NO_ARRAY, .tlv_type = 0x10, .offset = offsetof(struct vayu_sms_qmi_list_resp, list10) },
 	{ .data_type = QMI_EOTI },
 };
 
@@ -1432,10 +1469,13 @@ static const struct qmi_elem_info vayu_sms_qmi_get_routes_resp_ei[] = {
 
 /*
  * Fill a Raw Send request from a complete PDU (the form vayu_sms_pdu_encode_submit()
- * produces).  No bytes leave the machine here.
+ * produces).  No bytes leave the machine here.  `format` is the QMI message format
+ * byte: 0x06 is the GSM point-to-point one this modem has accepted, 0x01 is the
+ * "GW P2P" value some firmware wants instead; vayu_sms_format picks it at boot.
  */
 static __inline__ int
-vayu_sms_qmi_raw_send_fill(struct vayu_sms_qmi_raw_send_req *request, const uint8_t *pdu, size_t pdu_length)
+vayu_sms_qmi_raw_send_fill_format(struct vayu_sms_qmi_raw_send_req *request, uint8_t format, const uint8_t *pdu,
+    size_t pdu_length)
 {
 	if (request == NULL || pdu == NULL) {
 		return VAYU_SMS_ERR_ARGUMENT;
@@ -1444,12 +1484,18 @@ vayu_sms_qmi_raw_send_fill(struct vayu_sms_qmi_raw_send_req *request, const uint
 		return VAYU_SMS_ERR_TOO_LONG;
 	}
 	memset(request, 0, sizeof(*request));
-	request->message.format = VAYU_SMS_QMI_FORMAT_GSM_P2P;
+	request->message.format = format;
 	request->message.raw_length = (uint32_t)pdu_length;
 	memcpy(request->message.raw, pdu, pdu_length);
 	request->sms_on_ims_valid = 1;          /* send on 3GPP CS/NAS, not IMS */
 	request->sms_on_ims = 0;
 	return VAYU_SMS_OK;
+}
+
+static __inline__ int
+vayu_sms_qmi_raw_send_fill(struct vayu_sms_qmi_raw_send_req *request, const uint8_t *pdu, size_t pdu_length)
+{
+	return vayu_sms_qmi_raw_send_fill_format(request, VAYU_SMS_QMI_FORMAT_GSM_P2P, pdu, pdu_length);
 }
 
 #endif /* _SYS_VAYU_SMS_QMI_H_ */

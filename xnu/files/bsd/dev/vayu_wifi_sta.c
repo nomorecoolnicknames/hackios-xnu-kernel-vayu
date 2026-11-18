@@ -1,5 +1,5 @@
 /*
- * W23a: open-system AUTH + ASSOC to the test AP (target_ssid) after the W22 scan
+ * W23a: open-system AUTH + ASSOC to the test AP (vayu_wifi_ssid) after the W22 scan
  * (boot-arg vayu_wifi_join=1, only with vayu_wifi_scan=1).  Ported from ios-flame
  * phone/wifi/radio.c (commit 745c4341): w_channel, w_vdev_start, w_vdev_simple,
  * w_peer, w_ps_off, w_mgmt_tx, w_ap_rates, w_mgmt_hdr, w_send_auth,
@@ -7,8 +7,8 @@
  * and its completion event as Linux ath10k wmi-tlv.c / wmi-tlv.h
  * (wmi_tlv_mgmt_tx_cmd, WMI_TLV_MGMT_TX_COMPLETION_EVENTID 0x7006,
  * WMI_TLV_VDEV_STOPPED_EVENTID 0x5002).
- * Changes: synchronous and bounded; only the beacon with SSID target_ssid on
- * channel TARGET_CHAN whose BSSID ends in TARGET_B4:TARGET_B5 is a target (nothing is sent otherwise);
+ * Changes: synchronous and bounded; only a 5 GHz beacon with the SSID of vayu_wifi_ssid (and, with
+ * vayu_wifi_bssid_tail=XX:XX, a BSSID ending in those two bytes) is a target (nothing is sent otherwise);
  * no PEER_ASSOC / VDEV_UP / EAPOL / keys: after "assoc status 0" the RX is counted
  * for 3 s, then DEAUTH (reason 3), PEER_DELETE, VDEV_STOP.  BSSIDs masked in the log.
  *
@@ -39,9 +39,15 @@
 #include <stddef.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
+#include <kern/locks.h>
+#include <kern/sched_prim.h>
+#include <kern/thread.h>
+#include <libkern/libkern.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
 #include <pexpert/pexpert.h>
+#include <sys/errno.h>
+#include <sys/hakios.sta.h>
 #include <sys/vayu_wifi_htc_connect.h>
 #include <sys/vayu_wifi_net.h>
 #include <sys/vayu_wifi_rsn.h>
@@ -112,22 +118,49 @@ extern uint32_t vayu_net_keep_secs(void);
 #define TX_LOG_MAX              16U
 #define RX_LOG_MAX              8U
 #define IE_MAX                  768U
-/* the only AP this code may talk to: the test network's SSID, channel and BSSID tail, set before a build */
-#define TARGET_CHAN             64U
-#define TARGET_B4               0x00U
-#define TARGET_B5               0x00U
-static const char target_ssid[] = "vayu-ap";
-#define TARGET_SSID_LEN         7U
+/* The only AP the boot join may talk to: its SSID (vayu_wifi_ssid=; none, no boot join) and, if
+ * vayu_wifi_bssid_tail=XX:XX is given, the last two bytes of its BSSID.  A network's name and its
+ * router are the owner's, not the code's, so neither has a default. */
+static char target_ssid[33];
+static uint32_t target_ssid_len;
+static uint8_t target_tail[2];
+static bool target_tail_set;
 
 enum { ST_IDLE, ST_START, ST_AUTH, ST_ASSOC, ST_WINDOW, ST_DONE };
 
 uint32_t vayu_sta_mode;
 
 static int (*tlog)(const char *format, ...) __printflike(1, 2);
+/* W25r: the station's side of the boundary is up (the scan may use the WMI path): WMI events are
+ * parsed even when the boot join is off, because iOS may ask for a scan or a join at any time. */
+static bool sta_active;
+
+/* ---- W25r: what iOS asks for, done by the thread that owns the WMI/HTT path -------------------
+ *
+ * The station boundary (bsd/dev/hakios.sta.c) calls the ops of bsd/dev/vayu_wifi_net.c from its
+ * own thread; the WMI and HTT rings, however, may only be touched by the thread that is polling
+ * them (the one in vayu_htcc_run()).  So a request is left here and this thread picks it up in
+ * its loop, does it, and wakes the asker with the outcome.
+ */
+enum { STA_REQ_NONE, STA_REQ_SCAN, STA_REQ_JOIN, STA_REQ_LEAVE };
+
+static LCK_GRP_DECLARE(sta_req_lck_grp, "vayu-wifi-sta-req");
+static LCK_MTX_DECLARE(sta_req_lock, &sta_req_lck_grp);
+static struct {
+	bool service;                   /* the loop below is running */
+	bool pending;                   /* a request is waiting for it */
+	bool done;                      /* ... and this one has been answered */
+	int kind;
+	struct hakios_sta_scan scan;
+	struct hakios_sta_join join;
+	int result;
+} req;
 static struct {
 	/* the beacon */
 	bool have;
 	uint8_t bssid[6];
+	uint8_t ssid[32];               /* W25r: the name asked for (a boot target, or iOS's) */
+	uint32_t ssid_len;
 	uint32_t chan, beacons, mismatch;
 	int32_t rssi;
 	uint16_t bintval, capab;
@@ -233,25 +266,84 @@ find_ie(const uint8_t *ies, uint32_t len, uint8_t id)
 	return NULL;
 }
 
+/* "XX:XX" (hex, either case) -> two bytes */
+static bool
+parse_tail(const char *text, uint8_t out[2])
+{
+	uint32_t i, v[4];
+
+	if (strlen(text) != 5 || text[2] != ':') {
+		return false;
+	}
+	for (i = 0; i < 4; i++) {
+		char c = text[i < 2 ? i : i + 1];
+
+		v[i] = (c >= '0' && c <= '9') ? (uint32_t)(c - '0') :
+		    ((c | 0x20) >= 'a' && (c | 0x20) <= 'f') ? (uint32_t)((c | 0x20) - 'a' + 10) : 0xffU;
+		if (v[i] == 0xffU) {
+			return false;
+		}
+	}
+	out[0] = (uint8_t)(v[0] << 4 | v[1]);
+	out[1] = (uint8_t)(v[2] << 4 | v[3]);
+	return true;
+}
+
 void
 vayu_sta_reset(int (*log)(const char *format, ...))
 {
 	uint32_t mode = 0;
+	char ssid[sizeof(target_ssid) + 1];
+	char tail[8];
 
+	target_ssid[0] = 0;
+	target_ssid_len = 0;
+	target_tail_set = false;
 	zero(&st, (uint32_t)sizeof(st));
 	tlog = log;
 	vayu_sta_mode = 0;
+	sta_active = tlog != NULL;
+	if (tlog == NULL) {
+		return;
+	}
+	/* (the data path's and the handshake's state is read even when the boot join is off: iOS may
+	 * ask for a join, and en0 and the station must exist for it to ask) */
+	vayu_rsn_reset(log);
+	vayu_net_reset(log);
+	if (PE_parse_boot_arg_str("vayu_wifi_ssid", ssid, sizeof(ssid))) {
+		uint32_t len = (uint32_t)strlen(ssid);
+
+		if (len != 0 && len < sizeof(target_ssid)) {
+			strlcpy(target_ssid, ssid, sizeof(target_ssid));
+			target_ssid_len = len;
+			tlog("vayu-wifi: w23: vayu_wifi_ssid='%s' (%u bytes) from the boot arguments\n",
+			    target_ssid, target_ssid_len);
+		} else {
+			tlog("vayu-wifi: w23: vayu_wifi_ssid of %u bytes is not 1..%u; no SSID\n",
+			    len, (uint32_t)sizeof(target_ssid) - 1);
+		}
+	}
+	if (PE_parse_boot_arg_str("vayu_wifi_bssid_tail", tail, sizeof(tail))) {
+		if (parse_tail(tail, target_tail)) {
+			target_tail_set = true;
+			tlog("vayu-wifi: w23: vayu_wifi_bssid_tail: only a BSSID ending in ..%02x:%02x\n",
+			    target_tail[0], target_tail[1]);
+		} else {
+			tlog("vayu-wifi: w23: vayu_wifi_bssid_tail='%s' is not XX:XX; any BSSID of the SSID\n", tail);
+		}
+	}
 	PE_parse_boot_argn("vayu_wifi_join", &mode, sizeof(mode));
-	if (mode == 0 || tlog == NULL) {
+	if (mode == 0) {
+		return;
+	}
+	if (target_ssid_len == 0) {
+		tlog("vayu-wifi: w23: vayu_wifi_join=%u without vayu_wifi_ssid: no boot join; joins iOS asks for "
+		    "are served\n", mode);
 		return;
 	}
 	vayu_sta_mode = (mode == 1 && vayu_scan_mode != 0) ? 1 : 0;
-	vayu_rsn_reset(log);
-	vayu_net_reset(log);
-	tlog("vayu-wifi: w23: vayu_wifi_join=%u%s: open auth + assoc to '%s' 5 GHz (any ch, was %u) bssid xx:xx:xx:xx:%02x:%02x "
-	    "after the scan, %u ms rx count, deauth; no EAPOL/keys\n", mode,
-	    vayu_sta_mode != 0 ? "" : (mode != 1 ? " (unknown, off)" : " (needs vayu_wifi_scan=1, off)"),
-	    target_ssid, TARGET_CHAN, TARGET_B4, TARGET_B5, WINDOW_MS);
+	tlog("vayu-wifi: w23: vayu_wifi_join=%u%s: auth + assoc to '%s' after the scan; with iOS asking, "
+	    "any network it names\n", mode, vayu_sta_mode != 0 ? "" : " (unknown, off)", target_ssid);
 }
 
 /* ------------------------------------------------------------ RX */
@@ -263,14 +355,14 @@ capture(const uint8_t *f, uint32_t flen, uint32_t chan, int32_t rssi)
 	const uint8_t *s, *ht;
 	uint32_t i, n;
 
-	if (flen < 36) {
+	if (flen < 36 || target_ssid_len == 0) {
 		return;
 	}
 	s = find_ie(f + 36, flen - 36, 0);
-	if (s == NULL || s[1] != TARGET_SSID_LEN) {
+	if (s == NULL || s[1] != target_ssid_len) {
 		return;
 	}
-	for (i = 0; i < TARGET_SSID_LEN; i++) {
+	for (i = 0; i < target_ssid_len; i++) {
 		if (s[2 + i] != (uint8_t)target_ssid[i]) {
 			return;
 		}
@@ -279,11 +371,11 @@ capture(const uint8_t *f, uint32_t flen, uint32_t chan, int32_t rssi)
 	if (ht != NULL && ht[1] >= 1) {
 		chan = ht[2];           /* HT operation: primary channel */
 	}
-	if (f[20] != TARGET_B4 || f[21] != TARGET_B5 || chan < 36U || chan > 177U) {
+	if ((target_tail_set && (f[20] != target_tail[0] || f[21] != target_tail[1])) || chan < 36U || chan > 177U) {
 		if (st.mismatch++ < 2) {
-			tlog("vayu-wifi: w23: '%s' heard on ch %u bssid xx:xx:xx:xx:%02x:%02x: not the owner's "
-			    "AP (want 5 GHz, ..%02x:%02x); ignored\n", target_ssid, chan, f[20], f[21],
-			    TARGET_B4, TARGET_B5);
+			tlog("vayu-wifi: w23: '%s' heard on ch %u bssid xx:xx:xx:xx:%02x:%02x: not the target "
+			    "(want 5 GHz%s); ignored\n", target_ssid, chan, f[20], f[21],
+			    target_tail_set ? ", vayu_wifi_bssid_tail" : "");
 		}
 		return;
 	}
@@ -298,6 +390,10 @@ capture(const uint8_t *f, uint32_t flen, uint32_t chan, int32_t rssi)
 		st.bssid[i] = f[16 + i];
 	}
 	st.chan = chan;
+	st.ssid_len = target_ssid_len;
+	for (i = 0; i < target_ssid_len; i++) {
+		st.ssid[i] = (uint8_t)target_ssid[i];
+	}
 	st.rssi = rssi;
 	st.bintval = (uint16_t)rd16(f + 32);
 	st.capab = (uint16_t)rd16(f + 34);
@@ -411,7 +507,7 @@ vayu_sta_wmi_rx(uint32_t id, const uint8_t *p, uint32_t len)
 {
 	uint32_t v[5], l;
 
-	if (vayu_sta_mode == 0 || tlog == NULL) {
+	if (!sta_active || tlog == NULL) {
 		return;
 	}
 	switch (id) {
@@ -462,7 +558,7 @@ vayu_sta_wmi_rx(uint32_t id, const uint8_t *p, uint32_t len)
 void
 vayu_sta_htt_rx(const uint8_t *p, uint32_t len)
 {
-	if (vayu_sta_mode == 0 || st.state != ST_WINDOW || len == 0) {
+	if (!sta_active || st.state != ST_WINDOW || len == 0) {
 		return;
 	}
 	st.w_htt_msgs++;
@@ -489,6 +585,9 @@ mgmt_pool(const struct vayu_scan_ops *o)
 	kern_return_t kr;
 	uint64_t pa;
 
+	if (st.mgmt_va != 0) {
+		return true;            /* W25r: the page outlives a join; a second one would only leak */
+	}
 	kr = kmem_alloc_contig(kernel_map, &kva, PAGE_SIZE, PAGE_MASK,
 	    (ppnum_t)((MGMT_POOL_LIMIT >> PAGE_SHIFT) - 1), 0,
 	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT);
@@ -527,7 +626,12 @@ mgmt_tx(const struct vayu_scan_ops *o, const uint8_t *f, uint32_t len, const cha
 	int rc;
 
 	if (st.mgmt_va == 0 || len < 24 || len > MGMT_SLOT - 4 || !same6(f + 4, st.bssid)) {
-		return -1;              /* addr1 must be the target AP */
+		/* W26: say why, not just -1: a silent refusal here looked exactly like "the AP did not
+		 * answer the auth" in the log (d12b: "ERROR auth none status 0"). */
+		o->log("vayu-wifi: w23: mgmt tx %s NOT sent: %s (%u bytes)\n", what,
+		    st.mgmt_va == 0 ? "no mgmt pool" : !same6(f + 4, st.bssid) ? "addr1 is not the AP" :
+		    "length", len);
+		return -1;
 	}
 	st.desc++;
 	slot = st.desc % MGMT_SLOTS;
@@ -616,9 +720,9 @@ build_assoc(uint8_t *f)
 	p = put16(p, cap);
 	p = put16(p, 10);               /* listen interval */
 	*p++ = 0;
-	*p++ = TARGET_SSID_LEN;
-	for (k = 0; k < TARGET_SSID_LEN; k++) {
-		*p++ = (uint8_t)target_ssid[k];
+	*p++ = (uint8_t)st.ssid_len;
+	for (k = 0; k < st.ssid_len; k++) {
+		*p++ = st.ssid[k];
 	}
 	*p++ = 1;
 	*p++ = (uint8_t)(n < 8 ? n : 8);
@@ -704,6 +808,10 @@ rsn_parse(const struct vayu_scan_ops *o)
 	uint8_t group = 4, *q;
 
 	if (ie == NULL) {
+		if ((st.capab & 0x10U) != 0) {
+			o->log("vayu-wifi: w23: privacy without a supported RSN IE (WEP or WPA1): stop\n");
+			return -1;
+		}
 		o->log("vayu-wifi: w23: rsn none (privacy %u): open system, no RSN IE in the assoc request\n",
 		    (st.capab & 0x10U) != 0 ? 1 : 0);
 		st.rsn = false;
@@ -808,6 +916,7 @@ vdev_start(const struct vayu_scan_ops *o)
 	static uint8_t m[4 + 4 + 72 + 4 + 24 + 4];
 	const uint8_t *tim = find_ie(st.ie, st.ie_len, 5);
 	uint32_t bcn = st.bintval != 0 ? st.bintval : 100, dtim = 1;
+	uint32_t freq = join_freq(), mode = freq < 4000U ? 1U : 0U, width = freq < 4000U ? 20U : 40U;
 	uint8_t *p, *c;
 
 	if (tim != NULL && tim[1] >= 2 && tim[3] != 0) {
@@ -821,13 +930,13 @@ vdev_start(const struct vayu_scan_ops *o)
 	p = put32(p, dtim);
 	p = put32(p, 0);                /* flags */
 	p += 36 + 16;                   /* ssid (empty for a station), tx rate/power, noa, hw ack */
-	c = put_tlv(p, TAG_CHANNEL, 24);        /* flame w_channel: 11A, no passive/DFS flag (STA) */
-	c = put32(c, join_freq());
-	c = put32(c, join_freq());
+	c = put_tlv(p, TAG_CHANNEL, 24);        /* flame w_channel: no passive/DFS flag (STA); 11G on 2.4 GHz */
+	c = put32(c, freq);
+	c = put32(c, freq);
 	c = put32(c, 0);
-	c = put32(c, 0);                /* MODE_11A */
-	c = put32(c, (40U << 8) | (40U << 16));
-	c = put32(c, 40U << 8);
+	c = put32(c, mode);
+	c = put32(c, (width << 8) | (width << 16));
+	c = put32(c, width << 8);
 	p = put_tlv(c, TAG_ARRAY_STRUCT, 0);
 	o->log("vayu-wifi: w23: VDEV_START vdev 0 ch %u bcn %u dtim %u\n", st.chan, bcn, dtim);
 	return wmi_cmd(o, m, CMD_VDEV_START, (uint32_t)(p - m));
@@ -925,40 +1034,233 @@ ps_off(const struct vayu_scan_ops *o)
 	return wmi_cmd(o, m, CMD_STA_PS_MODE, sizeof(m));
 }
 
+/* ------------------------------------------------------------ W25r: a join for iOS, and the loop that stays */
+
+/* Everything a join decides, cleared; what outlives a join (the address, the management page) stays. */
+static void
+join_reset(void)
+{
+	st.have = false;
+	st.beacons = st.mismatch = 0;
+	st.chan = 0;
+	st.rssi = 0;
+	st.bintval = 0;
+	st.capab = 0;
+	st.ie_len = 0;
+	st.ssid_len = 0;
+	st.start_resp = st.stopped = st.auth_reply = st.assoc_reply = st.ap_left = false;
+	st.start_status = 0;
+	st.auth_status = st.assoc_status = st.aid = st.assoc_cap = st.ap_reason = st.ap_fc = 0;
+	st.state = ST_IDLE;
+	st.rsn = false;
+	zero(st.rsn_ie, sizeof(st.rsn_ie));
+}
+
+/* The access point of that name in what the last scan heard: the one given if one was, else the
+ * strongest.  The association and the RSN IE are built from the beacon's own elements. */
+static bool
+pick_bss(const struct hakios_sta_join *what)
+{
+	static struct vayu_scan_bss found;
+	static uint8_t elements[IE_MAX];
+	bool have = false, given = false;
+	int32_t best = -1000;
+	uint32_t i, n;
+	int k;
+
+	for (k = 0; k < 6; k++) {
+		given |= what->bssid[k] != 0;
+	}
+	n = vayu_scan_bss_count();
+	for (i = 0; i < n; i++) {
+		if (!vayu_scan_bss_get(i, &found, elements, sizeof(elements))) {
+			continue;
+		}
+		if (found.ssid_length != what->ssid_length ||
+		    memcmp(found.ssid, what->ssid, what->ssid_length) != 0) {
+			continue;
+		}
+		if (given && memcmp(found.bssid, what->bssid, 6) != 0) {
+			continue;
+		}
+		if (have && found.rssi <= best) {
+			continue;
+		}
+		best = found.rssi;
+		have = true;
+		memcpy(st.bssid, found.bssid, sizeof(st.bssid));
+		st.chan = found.frequency == 2484 ? 14 : found.frequency < 4000 ?
+		    (found.frequency - 2407U) / 5U : (found.frequency - 5000U) / 5U;
+		st.rssi = found.rssi;
+		st.bintval = found.beacon_interval;
+		st.capab = found.capability;
+		st.ie_len = found.elements_length <= sizeof(st.ie) ? found.elements_length : sizeof(st.ie);
+		memcpy(st.ie, elements, st.ie_len);
+		st.ssid_len = found.ssid_length;
+		memcpy(st.ssid, found.ssid, found.ssid_length);
+	}
+	st.have = have;
+	return have;
+}
+
+/* The requests in the loop below, from the station boundary's thread (bsd/dev/hakios.sta.c by way
+ * of bsd/dev/vayu_wifi_net.c).  They wait: a scan takes a second, a join several. */
 int
-vayu_sta_run(const struct vayu_scan_ops *o)
+vayu_sta_ask_scan(const struct hakios_sta_scan *what)
+{
+	int result;
+
+	lck_mtx_lock(&sta_req_lock);
+	if (!req.service) {
+		lck_mtx_unlock(&sta_req_lock);
+		return ENODEV;
+	}
+	req.kind = STA_REQ_SCAN;
+	req.scan = *what;
+	req.pending = true;
+	req.done = false;
+	req.result = 0;
+	lck_mtx_unlock(&sta_req_lock);
+	thread_wakeup((event_t)&req);
+	lck_mtx_lock(&sta_req_lock);
+	while (!req.done) {
+		lck_mtx_sleep(&sta_req_lock, LCK_SLEEP_DEFAULT, (event_t)&req, THREAD_UNINT);
+	}
+	result = req.result;
+	req.done = false;
+	req.kind = STA_REQ_NONE;
+	lck_mtx_unlock(&sta_req_lock);
+	return result;
+}
+
+int
+vayu_sta_ask_join(const struct hakios_sta_join *what)
+{
+	int result;
+
+	lck_mtx_lock(&sta_req_lock);
+	if (!req.service) {
+		lck_mtx_unlock(&sta_req_lock);
+		return ENODEV;
+	}
+	req.kind = STA_REQ_JOIN;
+	req.join = *what;
+	req.pending = true;
+	req.done = false;
+	req.result = 0;
+	lck_mtx_unlock(&sta_req_lock);
+	thread_wakeup((event_t)&req);
+	lck_mtx_lock(&sta_req_lock);
+	while (!req.done) {
+		lck_mtx_sleep(&sta_req_lock, LCK_SLEEP_DEFAULT, (event_t)&req, THREAD_UNINT);
+	}
+	result = req.result;
+	req.done = false;
+	req.kind = STA_REQ_NONE;
+	zero(&req.join, sizeof(req.join));
+	lck_mtx_unlock(&sta_req_lock);
+	return result;
+}
+
+int
+vayu_sta_ask_leave(void)
+{
+	int result;
+
+	lck_mtx_lock(&sta_req_lock);
+	if (!req.service) {
+		lck_mtx_unlock(&sta_req_lock);
+		return ENODEV;
+	}
+	req.kind = STA_REQ_LEAVE;
+	req.pending = true;
+	req.done = false;
+	req.result = 0;
+	lck_mtx_unlock(&sta_req_lock);
+	thread_wakeup((event_t)&req);
+	lck_mtx_lock(&sta_req_lock);
+	while (!req.done) {
+		lck_mtx_sleep(&sta_req_lock, LCK_SLEEP_DEFAULT, (event_t)&req, THREAD_UNINT);
+	}
+	result = req.result;
+	req.done = false;
+	req.kind = STA_REQ_NONE;
+	lck_mtx_unlock(&sta_req_lock);
+	return result;
+}
+
+bool
+vayu_sta_serving(void)
+{
+	bool serving;
+
+	lck_mtx_lock(&sta_req_lock);
+	serving = req.service;
+	lck_mtx_unlock(&sta_req_lock);
+	return serving;
+}
+
+/* The end of a join that did not come through, or of a network left: the same steps the old
+ * W25 S2 path took on its way out. */
+static void
+join_finish(const struct vayu_scan_ops *o, bool started, bool peered, bool authed, bool associated)
+{
+	if ((authed || associated) && !st.ap_left) {
+		(void)send_deauth(o);
+		if (o->wait(NULL, 200) < 0) {
+			goto out;
+		}
+	}
+	if (associated) {
+		(void)vdev_simple(o, CMD_VDEV_DOWN, TAG_VDEV_DOWN);
+		(void)o->wait(NULL, 50);
+	}
+	if (peered) {
+		o->log("vayu-wifi: W25 S2 join: PEER_DELETE %s\n", peer(o, false) == 0 ? "ok" : "FAILED");
+	}
+	if (started) {
+		o->log("vayu-wifi: W25 S2 join: VDEV_STOP %s\n",
+		    vdev_simple(o, CMD_VDEV_STOP, TAG_VDEV_STOP) == 0 ? "sent" : "FAILED");
+		(void)o->wait(stop_done, 1000);
+	}
+out:
+	vayu_rsn_stop();
+	st.state = ST_IDLE;
+	st.have = false;
+}
+
+/* AUTH + ASSOC + the 4-way, then en0: 0 when frames can pass, -errno otherwise. */
+static int
+sta_join_do(const struct vayu_scan_ops *o)
 {
 	static uint8_t assoc[256];
-	uint32_t alen = 0, tries, keep_secs;
-	uint64_t waited;                        /* ms; 64-bit so an endless keep cannot wrap it */
-	bool started = false, peered = false, authed = false, associated = false, up = false;
-	int w = 0, rc = -1;
+	uint32_t alen, tries, waited;
+	bool started = false, peered = false, authed = false, associated = false;
+	int w = 0, fail = -EIO;
 
-	if (o == NULL || vayu_sta_mode == 0) {
-		return -1;
+	if (!st.have || st.ssid_len == 0) {
+		return -ENOENT;
 	}
-	st.mac = o->mac;
-	vayu_net_set_tx(vayu_scan_tx_frame, o->log);
-	vayu_net_sta_attach(o->mac);                  /* W25o: Apple80211 sees a powered station early */
-	if (!st.have) {
-		o->log("vayu-wifi: W25 S2 join: ERROR no beacon from '%s' (ch %u) bssid ..%02x:%02x in the scan\n",
-		    target_ssid, TARGET_CHAN, TARGET_B4, TARGET_B5);
-		return -1;
-	}
-	o->log("vayu-wifi: W25 S2 join: OK target '%s' bssid xx:xx:xx:xx:%02x:%02x ch %u rssi %d bcn %u cap %#x ies %u "
-	    "(%u beacons)\n", target_ssid, st.bssid[4], st.bssid[5], st.chan, st.rssi, st.bintval, st.capab,
-	    st.ie_len, st.beacons);
-	if (rsn_parse(o) != 0 || !mgmt_pool(o)) {
-		o->log("vayu-wifi: W25 S2 join: ERROR rsn/mgmt pool\n");
-		return -1;
+	o->log("vayu-wifi: W25 S2 join: OK target of %u bytes bssid xx:xx:xx:xx:%02x:%02x ch %u rssi %d bcn %u "
+	    "cap %#x ies %u (%u beacons)\n", st.ssid_len, st.bssid[4], st.bssid[5], st.chan, st.rssi,
+	    st.bintval, st.capab, st.ie_len, st.beacons);
+	/* W26: the page the AUTH/ASSOC frames are built in.  merge-all took it here (line 951:
+	 * "rsn_parse(o) != 0 || !mgmt_pool(o)"); the W25r restructuring split that function into
+	 * sta_join_request()/sta_join_do() and the call was lost, so mgmt_tx() refused every frame
+	 * (st.mgmt_va == 0, an early return with no log).  Both callers now come through here: a
+	 * boot join (vayu_sta_run) and a join iOS asks for (sta_join_request). */
+	if (!mgmt_pool(o)) {
+		o->log("vayu-wifi: W25 S2 join: ERROR no mgmt pool (a page below 32 GiB for the frames)\n");
+		st.state = ST_IDLE;
+		return -ENOMEM;
 	}
 	alen = build_assoc(assoc);
 	(void)ps_off(o);
 	st.state = ST_START;
 	if (vdev_start(o) != 0) {
 		o->log("vayu-wifi: W25 S2 join: ERROR VDEV_START not sent\n");
-		st.state = ST_DONE;
-		return -1;
+		st.state = ST_IDLE;
+		return -EIO;
 	}
 	started = true;
 	w = o->wait(start_done, START_WAIT_MS);
@@ -1019,7 +1321,7 @@ vayu_sta_run(const struct vayu_scan_ops *o)
 		struct vayu_rsn_ops rops;
 
 		if (!vayu_rsn_armed()) {
-			o->log("vayu-wifi: W25 S3 4way: ERROR no usable PMK (vayu_wifi_pmk_file)\n");
+			o->log("vayu-wifi: W25 S3 4way: ERROR no usable PMK (a file, or one for this join)\n");
 			goto teardown;
 		}
 		zero(&rops, (uint32_t)sizeof(rops));
@@ -1046,6 +1348,7 @@ vayu_sta_run(const struct vayu_scan_ops *o)
 		}
 		if (!vayu_rsn_keyed()) {
 			o->log("vayu-wifi: W25 S3 4way: ERROR no keys in %u ms\n", RSN_WAIT_MS);
+			fail = -EAUTH;          /* (the framework turns this into "invalid PMK": a wrong passphrase) */
 			goto teardown;
 		}
 	} else {
@@ -1053,82 +1356,212 @@ vayu_sta_run(const struct vayu_scan_ops *o)
 	}
 
 	/* W25 S4: en0 over the link */
-	if (vayu_net_start(st.mac, st.bssid, (const uint8_t *)target_ssid, TARGET_SSID_LEN, st.chan,
-	    st.rssi) != 0) {
+	if (vayu_net_start(st.mac, st.bssid, st.ssid, st.ssid_len, st.chan, st.rssi) != 0) {
 		goto teardown;
 	}
-	up = true;
-	rc = 0;
-
-	/* W25 S5/S6: let iOS see the link, and prove the path with our own DHCP when asked */
-	waited = 0;
-	keep_secs = vayu_net_keep_secs();         /* 0 = no limit, the old default is 180 */
-	for (;;) {
-		bool stopped_now = false;
-		int d = vayu_net_poll();
-
-		(void)d;
-		if (o->wait(NULL, 100) < 0) {
-			stopped_now = true;
-		}
-		waited += 100;
-		if (stopped_now) {
-			break;
-		}
-		if (vayu_net_keep()) {
-			/* the AP left: there is no link left to hold */
-			if (st.ap_left) {
-				break;
-			}
-			/* 0: stay joined until the run ends (CE stage abort) or the AP leaves */
-			if (keep_secs != 0 && waited >= (uint64_t)keep_secs * 1000U) {
-				break;
-			}
-			if (waited % 10000U == 0) {
-				vayu_scan_tx_stats(vayu_htcc_credits(), vayu_net_tx_queue_depth());
-			}
-			if (waited % 30000U == 0) {
-				vayu_net_summary();
-			}
-		} else if (waited >= NET_WINDOW_MS) {
-			break;
-		}
-	}
-	vayu_net_summary();
+	st.state = ST_WINDOW;
+	o->log("vayu-wifi: W25 S2 join: OK done (auth %u, assoc %u aid %u, mgmt tx %u completions %u)\n",
+	    st.auth_status, st.assoc_status, st.aid, st.desc, st.tx_compl);
+	return 0;
 
 teardown:
-	st.state = ST_DONE;
-	if (up) {
-		vayu_net_stop();
-	}
-	vayu_rsn_stop();
-	if ((authed || associated) && !st.ap_left) {
-		(void)send_deauth(o);
-		if (o->wait(NULL, 200) < 0) {
-			goto stopped;
-		}
-	}
-	if (associated) {
-		(void)vdev_simple(o, CMD_VDEV_DOWN, TAG_VDEV_DOWN);
-		(void)o->wait(NULL, 50);
-	}
-	if (peered) {
-		o->log("vayu-wifi: W25 S2 join: PEER_DELETE %s\n", peer(o, false) == 0 ? "ok" : "FAILED");
-	}
-	if (started) {
-		o->log("vayu-wifi: W25 S2 join: VDEV_STOP %s\n",
-		    vdev_simple(o, CMD_VDEV_STOP, TAG_VDEV_STOP) == 0 ? "sent" : "FAILED");
-		if (o->wait(stop_done, 1000) < 0) {
-			goto stopped;
-		}
-	}
-	if (rc == 0) {
-		o->log("vayu-wifi: W25 S2 join: OK done (auth %u, assoc %u aid %u, mgmt tx %u completions %u)\n",
-		    st.auth_status, st.assoc_status, st.aid, st.desc, st.tx_compl);
-	}
-	return rc;
+	join_finish(o, started, peered, authed, associated);
+	return fail;
 stopped:
 	st.state = ST_DONE;
 	o->log("vayu-wifi: W25 join: ERROR stopped (CE stage abort)\n");
-	return -1;
+	return -ECANCELED;
+}
+
+/* A join iOS asked for: the network must be in what the last scan heard. */
+static int
+sta_join_request(const struct vayu_scan_ops *o, const struct hakios_sta_join *what)
+{
+	bool have_pmk = false;
+	int k, err;
+
+	if (vayu_net_linked()) {
+		/* another network is joined: leave it first (the old link's events are sent by vayu_net_stop) */
+		vayu_net_stop();
+		join_finish(o, st.state != ST_IDLE, true, true, true);
+		vayu_rsn_forget();
+	}
+	join_reset();
+	if (what == NULL || what->ssid_length == 0 || what->ssid_length > sizeof(st.ssid)) {
+		return EINVAL;
+	}
+	if (!pick_bss(what)) {
+		o->log("vayu-wifi: W25r join: ERROR no network of that name in the scan (%u bytes asked for)\n",
+		    what->ssid_length);
+		return ENOENT;
+	}
+	for (k = 0; k < 32; k++) {
+		have_pmk |= what->pmk[k] != 0;
+	}
+	if (what->security == HAKIOS_STA_OPEN) {
+		st.rsn = false;
+		o->log("vayu-wifi: W25r join: an open network of %u bytes, ch %u\n", st.ssid_len, st.chan);
+	} else {
+		if (what->passphrase_length != 0) {
+			if (!vayu_rsn_set_passphrase(what->passphrase, what->passphrase_length, st.ssid, st.ssid_len)) {
+				return EINVAL;
+			}
+		} else if (have_pmk) {
+			if (!vayu_rsn_set_pmk(what->pmk, 32)) {
+				return EINVAL;
+			}
+		} else if (!vayu_rsn_armed()) {
+			o->log("vayu-wifi: W25r join: ERROR no passphrase and no key came with the request\n");
+			return EACCES;
+		}
+		if (rsn_parse(o) != 0) {
+			return EOPNOTSUPP;
+		}
+	}
+	err = sta_join_do(o);
+	return err == 0 ? 0 : -err;
+}
+
+/* A scan iOS asked for: the radio is only free when this station has no link. */
+static int
+sta_scan_request(const struct vayu_scan_ops *o)
+{
+	unsigned n;
+
+	if (vayu_net_linked()) {
+		n = vayu_scan_bss_count();
+		o->log("vayu-wifi: W25r scan: the link is up: %u network(s) from the last scan, given to Apple80211\n", n);
+		return 0;
+	}
+	if (vayu_scan_again(o) != 0) {
+		o->log("vayu-wifi: W25r scan: ERROR the radio did not finish a scan\n");
+		return EIO;
+	}
+	n = vayu_scan_bss_count();
+	o->log("vayu-wifi: W25r scan: OK %u network(s) from a new scan, given to Apple80211\n", n);
+	return 0;
+}
+
+static int
+sta_leave_request(const struct vayu_scan_ops *o)
+{
+	if (vayu_net_linked()) {
+		vayu_net_stop();
+	}
+	join_finish(o, st.state >= ST_START && st.state != ST_DONE,
+	    st.state >= ST_AUTH && st.state != ST_DONE, st.state >= ST_AUTH && st.state != ST_DONE,
+	    st.state >= ST_ASSOC && st.state != ST_DONE);
+	vayu_rsn_forget();
+	o->log("vayu-wifi: W25r leave: OK the network is left\n");
+	return 0;
+}
+
+/*
+ * After the scan: the kernel's own join (vayu_wifi_join, if it is on and the target was heard) and
+ * then the loop that answers iOS -- a scan when there is no link, a join with the passphrase iOS
+ * sends, a leave.  It stays until the CE stage is stopped.  The WMI/HTT rings belong to this thread,
+ * which is why the requests are done here and not where they arrive.
+ */
+int
+vayu_sta_run(const struct vayu_scan_ops *o)
+{
+	bool boot_joined = false;
+
+	if (o == NULL) {
+		return -1;
+	}
+	st.mac = o->mac;
+	sta_active = true;
+	vayu_net_set_tx(vayu_scan_tx_frame, o->log);
+	vayu_net_sta_attach(o->mac);                  /* W25o: Apple80211 sees a powered station early */
+
+	if (vayu_sta_mode != 0) {
+		if (!st.have) {
+			o->log("vayu-wifi: W25 S2 join: ERROR no beacon from '%s' on 5 GHz%s in the scan\n",
+			    target_ssid, target_tail_set ? " with that vayu_wifi_bssid_tail" : "");
+		} else if (rsn_parse(o) != 0 || !vayu_rsn_armed()) {
+			o->log("vayu-wifi: W25 S2 join: ERROR rsn/mgmt pool or no PMK\n");
+		} else if (sta_join_do(o) == 0) {
+			boot_joined = true;
+			/* (the same events the old W25 S4 path sent: mode 1 a join, both modes the link) */
+			if (vayu_net_a80211_join_done()) {
+				hakios_apple80211_event(HAKIOS_STA_JOIN_DONE, 0);
+			}
+			if (vayu_net_a80211_link()) {
+				hakios_apple80211_event(HAKIOS_STA_LINK, 1);
+			}
+		}
+	}
+
+	lck_mtx_lock(&sta_req_lock);
+	req.service = true;
+	req.pending = false;
+	req.done = false;
+	req.kind = STA_REQ_NONE;
+	lck_mtx_unlock(&sta_req_lock);
+	o->log("vayu-wifi: W25r station: ready: %s; scans and joins from iOS are served\n",
+	    boot_joined ? "the boot network is joined" : "no link (the network list is the last scan)");
+
+	for (;;) {
+		int kind, result = 0;
+		struct hakios_sta_scan scan;
+		struct hakios_sta_join join;
+
+		lck_mtx_lock(&sta_req_lock);
+		kind = req.pending ? req.kind : STA_REQ_NONE;
+		scan = req.scan;
+		join = req.join;
+		if (kind != STA_REQ_NONE) {
+			req.pending = false;
+			zero(&req.join, sizeof(req.join));
+		}
+		lck_mtx_unlock(&sta_req_lock);
+
+		if (kind == STA_REQ_SCAN) {
+			result = sta_scan_request(o);
+		} else if (kind == STA_REQ_JOIN) {
+			result = sta_join_request(o, &join);
+			zero(&join, sizeof(join));
+		} else if (kind == STA_REQ_LEAVE) {
+			result = sta_leave_request(o);
+		}
+		if (kind != STA_REQ_NONE) {
+			lck_mtx_lock(&sta_req_lock);
+			req.result = result;
+			req.done = true;
+			lck_mtx_unlock(&sta_req_lock);
+			thread_wakeup((event_t)&req);
+		}
+
+		/* W25 S5/S6: let iOS see the link, and prove the path with our own DHCP when asked */
+		if (vayu_net_linked() && st.ap_left) {
+			o->log("vayu-wifi: W25r station: the AP is gone (reason %u), the link is down\n", st.ap_reason);
+			vayu_net_stop();
+			join_finish(o, true, true, true, true);
+		}
+		(void)vayu_net_poll();
+		if (o->wait(NULL, 100) < 0) {
+			break;
+		}
+	}
+
+	lck_mtx_lock(&sta_req_lock);
+	req.service = false;
+	if (req.pending) {
+		req.result = ENODEV;
+		req.done = true;
+		req.pending = false;
+	}
+	lck_mtx_unlock(&sta_req_lock);
+	thread_wakeup((event_t)&req);
+	if (vayu_net_linked()) {
+		vayu_net_summary();
+		vayu_net_stop();
+	}
+	join_finish(o, st.state >= ST_START && st.state != ST_DONE,
+	    st.state >= ST_AUTH && st.state != ST_DONE, st.state >= ST_AUTH && st.state != ST_DONE,
+	    st.state >= ST_ASSOC && st.state != ST_DONE);
+	vayu_rsn_stop();
+	o->log("vayu-wifi: W25r station: the run is over\n");
+	return 0;
 }

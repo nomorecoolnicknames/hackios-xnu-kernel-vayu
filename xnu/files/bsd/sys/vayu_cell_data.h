@@ -7,7 +7,8 @@
 
 struct vayu_qrtr;
 
-/* Enabled independently by vayu_cell_data=1 after vayu_cell_start(). */
+/* Enabled by vayu_cell_data=1 (legacy full path) or vayu_cell_lte=1 (control plane after the IPA
+ * QMI handshake; APN internet by default) after vayu_cell_start(). */
 void vayu_cell_data_start(struct vayu_qrtr *q);
 void vayu_cell_data_stop(void);
 /* The NAS client reports the current registration; data setup starts only on true. */

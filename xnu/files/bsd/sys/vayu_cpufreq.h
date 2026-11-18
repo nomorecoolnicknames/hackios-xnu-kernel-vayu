@@ -7,7 +7,10 @@
 #ifndef _SYS_VAYU_CPUFREQ_H_
 #define _SYS_VAYU_CPUFREQ_H_
 
+#include <stdbool.h>
+
 void vayu_cpufreq_init(void);           /* cpufreq=1 cpufreq_vayu=1: cores and L3 top row; vayu_ddr=1: memory bandwidth */
 void vayu_cpufreq_quiesce(void);        /* on the way back to the loader: the row the firmware had left */
+void vayu_cpufreq_display(bool on);     /* iOS's display power (MiniIOMobileFramebuffer): cpufreq_screen_off=1 */
 
 #endif /* _SYS_VAYU_CPUFREQ_H_ */

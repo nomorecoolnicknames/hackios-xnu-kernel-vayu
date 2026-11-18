@@ -11,6 +11,9 @@
  * What is NOT tested here: the modem. Every byte below is this repository's reading of the QMI LOC
  * v02 IDL (sys/vayu_gnss_qmi.h names what is a fact and what is a guess); whether an X24 answers
  * like this is a HYPOTHESIS until vayu_gnss runs on the phone.
+ *
+ * The 6T's requests compared against are xreactx/hakios-xnu-kernel, branch oneplus-6t-upstream, commit
+ * 12d310ec3b2e's (MIT).
  */
 #include <errno.h>
 #include <stdarg.h>
@@ -202,6 +205,127 @@ test_start_forms(void)
 	check_bytes(out, length, want_min, sizeof(want_min), "Start, session alone");
 	length = hakios_qmi_encode(QMI_REQUEST, VAYU_GNSS_LOC_STOP, 4, vayu_gnss_stop_req_ei, &stop, out, sizeof(out));
 	check_bytes(out, length, want_stop, sizeof(want_stop), "Stop");
+}
+
+/*
+ * vayu_gnss_v02=1: the requests as xreactx/oneplus-6t-upstream 12d310ec3 sends them (its loc_advance()
+ * and loc_inject_time() arrays, which the 6T's modem took), byte for byte, but for the session id.
+ */
+static void
+test_v02_requests(void)
+{
+	struct vayu_gnss_start_v02_req start = {
+		.session = 1, .recurrence = VAYU_GNSS_RECURRENCE_PERIODIC, .accuracy = VAYU_GNSS_ACCURACY_HIGH,
+		.intermediate = 1, .min_interval_ms = 1000,
+	};
+	struct vayu_gnss_u32_req lock = { .value = VAYU_GNSS_LOCK_NONE }, mode = { .value = VAYU_GNSS_MODE_STANDALONE };
+	struct vayu_gnss_utc_req utc = { .time_ms = 0x0000019a5b5d1234ull, .uncertainty_ms = 10000 };
+	struct vayu_gnss_reg_events_req events = {
+		.mask = VAYU_GNSS_EVENT_POSITION | VAYU_GNSS_EVENT_SV_INFO | VAYU_GNSS_EVENT_NMEA | VAYU_GNSS_EVENT_TIME_REQ |
+		    VAYU_GNSS_EVENT_ENGINE_STATE | VAYU_GNSS_EVENT_FIX_STATE,
+	};
+	static const uint8_t want_start[] = {
+		0x00, 0x01, 0x00, 0x22, 0x00, 0x20, 0x00,       /* transaction 1, id 0x0022, 32 bytes */
+		0x01, 0x01, 0x00, 0x01,                         /* session 1 */
+		0x10, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00,       /* recurrence: 1 periodic */
+		0x11, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00,       /* accuracy: 3 high */
+		0x12, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00,       /* intermediate reports: 1 on */
+		0x13, 0x04, 0x00, 0xe8, 0x03, 0x00, 0x00,       /* every 1000 ms */
+	};
+	static const uint8_t want_lock[] = {
+		0x00, 0x02, 0x00, 0x3a, 0x00, 0x07, 0x00, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00,
+	};
+	static const uint8_t want_mode[] = {
+		0x00, 0x03, 0x00, 0x4a, 0x00, 0x07, 0x00, 0x01, 0x04, 0x00, 0x04, 0x00, 0x00, 0x00,
+	};
+	static const uint8_t want_utc[] = {
+		0x00, 0x04, 0x00, 0x38, 0x00, 0x12, 0x00,       /* id 0x0038, 18 bytes */
+		0x01, 0x08, 0x00, 0x34, 0x12, 0x5d, 0x5b, 0x9a, 0x01, 0x00, 0x00,
+		0x02, 0x04, 0x00, 0x10, 0x27, 0x00, 0x00,       /* uncertain by 10 s */
+	};
+	static const uint8_t want_events[] = {
+		0x00, 0x05, 0x00, 0x21, 0x00, 0x0b, 0x00, 0x01, 0x08, 0x00, 0x97, 0x01, 0, 0, 0, 0, 0, 0,
+	};
+	uint8_t out[64];
+	int length;
+
+	length = hakios_qmi_encode(QMI_REQUEST, VAYU_GNSS_LOC_START, 1, vayu_gnss_start_v02_req_ei, &start, out, sizeof(out));
+	check_bytes(out, length, want_start, sizeof(want_start), "Start, v02 form");
+	length = hakios_qmi_encode(QMI_REQUEST, VAYU_GNSS_LOC_SET_ENGINE_LOCK, 2, vayu_gnss_u32_req_ei, &lock, out, sizeof(out));
+	check_bytes(out, length, want_lock, sizeof(want_lock), "Set Engine Lock: none");
+	length = hakios_qmi_encode(QMI_REQUEST, VAYU_GNSS_LOC_SET_OPERATION_MODE, 3, vayu_gnss_u32_req_ei, &mode, out,
+	    sizeof(out));
+	check_bytes(out, length, want_mode, sizeof(want_mode), "Set Operation Mode: standalone");
+	length = hakios_qmi_encode(QMI_REQUEST, VAYU_GNSS_LOC_INJECT_UTC_TIME, 4, vayu_gnss_utc_req_ei, &utc, out, sizeof(out));
+	check_bytes(out, length, want_utc, sizeof(want_utc), "Inject UTC Time");
+	length = hakios_qmi_encode(QMI_REQUEST, VAYU_GNSS_LOC_REG_EVENTS, 5, vayu_gnss_reg_events_req_ei, &events, out,
+	    sizeof(out));
+	check_bytes(out, length, want_events, sizeof(want_events), "Register Events, the v02 mask 0x197");
+}
+
+/* A v02 position report: status, then whichever of latitude, longitude, uncertainty, speed and altitude are given. */
+static size_t
+v02_report(uint8_t *message, uint32_t status, bool with_position, float uncertainty, float speed, float altitude)
+{
+	uint8_t body[160], value[8];
+	size_t body_length = 0;
+
+	put_u32(value, status);
+	body_length += put_tlv(body + body_length, VAYU_GNSS_V02_STATUS, value, 4);
+	body_length += put_tlv(body + body_length, 0x02, (const uint8_t *)"\x01", 1);  /* the session id */
+	if (with_position) {
+		put_double(value, 55.7558260);
+		body_length += put_tlv(body + body_length, VAYU_GNSS_V02_LATITUDE, value, 8);
+		put_double(value, 37.6172999);
+		body_length += put_tlv(body + body_length, VAYU_GNSS_V02_LONGITUDE, value, 8);
+	}
+	if (uncertainty >= 0) {
+		put_float(value, uncertainty);
+		body_length += put_tlv(body + body_length, VAYU_GNSS_V02_HOR_UNC_CIRCULAR, value, 4);
+	}
+	put_float(value, speed);
+	body_length += put_tlv(body + body_length, VAYU_GNSS_V02_SPEED_HORIZONTAL, value, 4);
+	put_float(value, altitude);
+	body_length += put_tlv(body + body_length, VAYU_GNSS_V02_ALTITUDE_ELLIPSOID, value, 4);
+	return put_message(message, QMI_INDICATION, VAYU_GNSS_LOC_EVENT_POSITION_REPORT, 0, body, body_length);
+}
+
+static void
+test_position_v02(void)
+{
+	uint8_t message[200];
+	struct vayu_gnss_fix fix;
+	size_t length;
+	uint32_t status = 0;
+
+	memset(&fix, 0, sizeof(fix));
+	length = v02_report(message, 0, true, 3.5f, 1.25f, 156.0f);
+	check(vayu_gnss_parse_position_v02(message, length, &fix), "v02: a final report is a fix");
+	check(fix.position && fix.lat_e7 == 557558260 && fix.lon_e7 == 376172999, "v02: the position (%d, %d)", fix.lat_e7,
+	    fix.lon_e7);
+	check(fix.has_hepe && fix.hepe_cm == 350, "v02: the uncertainty 3.5 m (%u cm)", fix.hepe_cm);
+	check(fix.has_speed && fix.speed_mm_s == 1250, "v02: the speed 1.25 m/s (%u mm/s)", fix.speed_mm_s);
+	check(fix.has_altitude && fix.altitude_mm == 156000, "v02: the altitude 156 m (%d mm)", fix.altitude_mm);
+	check((fix.source & VAYU_GNSS_SOURCE_QMI) != 0, "v02: from the position report");
+
+	memset(&fix, 0, sizeof(fix));
+	length = v02_report(message, 1, true, 12.0f, 0, 0);
+	check(vayu_gnss_parse_position_v02(message, length, &fix), "v02: an intermediate report is a fix too");
+
+	memset(&fix, 0, sizeof(fix));
+	length = v02_report(message, 0, true, -1, 0, 0);
+	check(!vayu_gnss_parse_position_v02(message, length, &fix) && !fix.position,
+	    "v02: no uncertainty is the remembered position, not a fix");
+	length = v02_report(message, 0, true, 0.0f, 0, 0);
+	check(!vayu_gnss_parse_position_v02(message, length, &fix) && !fix.position, "v02: an uncertainty of 0 is not a fix");
+	length = v02_report(message, 2, true, 3.5f, 0, 0);
+	check(!vayu_gnss_parse_position_v02(message, length, &fix) && !fix.position, "v02: status 2 (failure) is not a fix");
+	length = v02_report(message, 0, false, 3.5f, 0, 0);
+	check(!vayu_gnss_parse_position_v02(message, length, &fix) && !fix.position, "v02: no coordinates, no fix");
+	/* the old guess (0x06/0x07) does not read this layout, and this reader does not read that one */
+	length = v02_report(message, 0, true, 3.5f, 0, 0);
+	check(!vayu_gnss_parse_position_report(message, length, &fix), "v02 report: the 0x06/0x07 reader finds nothing");
+	check(vayu_gnss_ind_status(message, length, &status) && status == 0, "v02: the status word of an indication");
 }
 
 static void
@@ -531,6 +655,8 @@ main(void)
 {
 	test_reg_events();
 	test_start_forms();
+	test_v02_requests();
+	test_position_v02();
 	test_reply_result();
 	test_position_report();
 	test_nmea_gga();

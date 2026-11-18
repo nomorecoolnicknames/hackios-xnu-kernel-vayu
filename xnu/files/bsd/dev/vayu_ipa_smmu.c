@@ -1,11 +1,19 @@
 /*
  * IPA SMMU contexts: what the AP and its uC see of memory, before the modem's IPA driver runs.
  *
- * The application SMMU is at 0x15000000 (Arm MMU-500). vayu DT gives IPA_AP SID 0x520 and
- * IPA_UC SID 0x522. Each gets its own context and a small set of page tables: the first 2 GB
- * of DDR, SMEM and IMEM are identity-mapped, so the IPA can reach the SMEM filter table and
- * the reserved IPA firmware memory. The global SMMU configuration is not changed; a stream
- * match register and a context are used only if they are free. Every write is read back.
+ * The application SMMU is at 0x15000000 (Arm MMU-500). vayu's live DT gives three IPA contexts
+ * and stock attaches ALL of them before ipa_fws is loaded (android dmesg 9.035/9.039/9.042:
+ * s1_bypass_arr[AP]=0, [WLAN]=0, [UC]=0, then PIL at 9.048):
+ *   ipa_smmu_ap   SID 0x520  iova 0x20000000+1G, maps the SMEM filter table
+ *   ipa_smmu_wlan SID 0x521  maps the IPA uC RAM 0x1e60000/0x80000 identity (ipa.c:8194)
+ *   ipa_smmu_uc   SID 0x522  iova 0x40400000+
+ * Until 0054 we programmed only 0x520 and 0x522; a transaction from the uC through SID 0x521
+ * after AUTH therefore had no match and could stall the IPA bus (the async hang seen after
+ * AUTH, where the host dies with no further MMIO). Each context gets a small set of page
+ * tables: the first 2 GB of DDR, SMEM, IMEM and the uC RAM are identity-mapped. The global
+ * SMMU configuration is not changed; a match and a context are used only if they are free.
+ * Every write is read back. TTBR0 is always taken after the tables exist (vayu_ipa_ttbrfix is
+ * still parsed for old command lines; it no longer changes anything).
  */
 #include <kern/kalloc.h>
 #include <kern/locks.h>
@@ -54,7 +62,7 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, u
 extern uint64_t kvtophys(vm_offset_t va);
 extern void loader_log_putc(char c);
 extern lck_mtx_t hakios_smmu_lock;     /* QUP/Wi-Fi/audio/camera allocate the same SMRs/contexts */
-static uint32_t ipa_smmu_ttbrfix;      /* vayu_ipa_ttbrfix=1: TTBR0 from the tables after they exist */
+static uint32_t ipa_smmu_ttbrfix;      /* vayu_ipa_ttbrfix: parsed only; TTBR0 is always taken after the tables exist */
 
 static int say(const char *format, ...) __printflike(1, 2);
 static int
@@ -77,7 +85,8 @@ struct ipa_smmu_stream {
 	vm_offset_t tables;
 	bool found, on;
 };
-static struct ipa_smmu_stream ipa_smmu[2];
+static struct ipa_smmu_stream ipa_smmu[3];
+static uint32_t ipa_smmu_wlan = 1;     /* vayu_ipa_smmu_wlan=0: skip SID 0x521 (pre-0064) */
 
 static uint32_t
 rd(vm_offset_t at)
@@ -165,6 +174,10 @@ ipa_smmu_map(struct ipa_smmu_stream *s)
 	 * aligned 2 MiB block as device memory at the same IOVA. */
 	root[0] = kvtophys((vm_offset_t)low_l2) | 3;
 	low_l2[(0x14600000U >> 21) & 0x1ff] = 0x14600000ULL | PTE_DEVICE;
+	/* The IPA uC RAM 0x1e60000/0x80000: stock maps it identity as device memory in the WLAN
+	 * context (sm8150.dtsi ipa_smmu_wlan "ipa-uc ram", ipa.c:8194). Mapping a superset of
+	 * stock in every context cannot create a missing-translation fault. */
+	low_l2[(0x1e60000U >> 21) & 0x1ff] = 0x1e60000ULL | PTE_DEVICE;
 	for (vm_offset_t line = s->tables; line < s->tables + 4 * PAGE_SIZE; line += 64) {
 		__asm__ volatile("dc civac, %0" : : "r" (line));
 	}
@@ -175,20 +188,19 @@ static bool
 ipa_smmu_on(struct ipa_smmu_stream *s)
 {
 	uint32_t smr = SMMU_SMR(s->match), s2cr = SMMU_S2CR(s->match), sees = 1U << 31 | s->sid;
-	uint64_t root = kvtophys(s->tables) | (uint64_t)s->context << 48;
+	uint64_t root, pa;
 	vm_offset_t second = s->second, context = s->context_base;   /* kernel VAs: 32-bit locals truncated them */
 
 	if (!ipa_smmu_map(s)) return false;
-	if (ipa_smmu_ttbrfix == 1) {
-		/* root above may have been taken while s->tables was still 0: take it now that they exist. */
-		root = kvtophys(s->tables) | (uint64_t)s->context << 48;
-		say("vayu-ipa: ttbrfix: SID %#x TTBR0 %#llx (tables PA %#llx)\n", s->sid,
-		    (unsigned long long)root, (unsigned long long)kvtophys(s->tables));
-		if ((root & 0x0000fffffffff000ULL) == 0) {
-			say("vayu-ipa: ttbrfix: SID %#x tables PA is 0; context not programmed\n", s->sid);
-			return false;
-		}
+	/* (taken before ipa_smmu_map() it was the PA of tables not yet allocated: TTBR0 = the ASID alone, R3.5) */
+	pa = kvtophys(s->tables);
+	if (pa == 0 || (pa & PTE_ADDRESS) != pa) {
+		say("vayu-ipa: SID %#x tables PA %#llx is not a table address; context not programmed\n", s->sid,
+		    (unsigned long long)pa);
+		return false;
 	}
+	root = pa | (uint64_t)s->context << 48;
+	say("vayu-ipa: SID %#x TTBR0 %#llx (tables PA %#llx)\n", s->sid, (unsigned long long)root, (unsigned long long)pa);
 	wr(context + SMMU_CB_SCTLR, 0);
 	wr(second + SMMU_CBA2R(s->context), SMMU_CBA2R_64_BIT);
 	wr(second + SMMU_CBAR(s->context), SMMU_CBAR_STAGE_1);
@@ -239,6 +251,7 @@ vayu_ipa_smmu_enable(void)
 		return false;
 	}
 	PE_parse_boot_argn("vayu_ipa_ttbrfix", &ipa_smmu_ttbrfix, sizeof(ipa_smmu_ttbrfix));
+	PE_parse_boot_argn("vayu_ipa_smmu_wlan", &ipa_smmu_wlan, sizeof(ipa_smmu_wlan));
 	idr0 = rd(base + SMMU_IDR0);
 	idr1 = rd(base + SMMU_IDR1);
 	if (rd(base + SMMU_SCR0) & (1U << 3)) {
@@ -248,9 +261,23 @@ vayu_ipa_smmu_enable(void)
 	/* Finding and programming is one transaction with the other SMMU users: a test run had the QUP's GSI
 	 * take match 6/7 and context 4/5 while this driver was taking context 4 too. */
 	lck_mtx_lock(&hakios_smmu_lock);
-	for (unsigned i = 0; i < 2; i++) {
-		ipa_smmu[i].sid = i == 0 ? 0x520 : 0x522;
+	for (unsigned i = 0; i < 3; i++) {
+		if (i == 1 && ipa_smmu_wlan != 1) {
+			say("vayu-ipa: SMMU SID 0x521 (WLAN/uC RAM) skipped (vayu_ipa_smmu_wlan=0)\n");
+			continue;
+		}
+		vayu_ipa_step(i == 0 ? "program the AP SMMU context (SID 0x520)" :
+		    i == 1 ? "program the WLAN SMMU context (SID 0x521, IPA uC RAM 0x1e60000)" :
+		    "program the UC SMMU context (SID 0x522)");
+		ipa_smmu[i].sid = i == 0 ? 0x520 : i == 1 ? 0x521 : 0x522;
 		if (!ipa_smmu_find(&ipa_smmu[i], base, idr0, idr1) || !ipa_smmu_on(&ipa_smmu[i])) {
+			if (i == 1) {
+				/* No free match/context for the third stream: keep the two that stock
+				 * always had and say so; the WLAN/uC context is the one 0064 adds. */
+				say("vayu-ipa: SMMU enable failed for SID %#x; continuing without the WLAN/uC "
+				    "context (run with vayu_ipa_smmu_wlan=0 to silence this)\n", ipa_smmu[i].sid);
+				continue;
+			}
 			say("vayu-ipa: SMMU enable failed for SID %#x\n", ipa_smmu[i].sid);
 			lck_mtx_unlock(&hakios_smmu_lock);
 			return false;

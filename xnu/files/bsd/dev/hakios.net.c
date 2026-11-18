@@ -73,6 +73,8 @@ net_if_unit(unsigned unit)
  */
 #define NAMES_MAX       3000
 static uint32_t net_trace, net_names;
+/* vayu_ipv4_only=1: no IPv6 on en0/en1/pdp_ip0 (bsd/netinet6/in6_ifattach.c asks this). */
+int hakios_ipv4_only;
 
 static void
 trace_frame(const char *way, const uint8_t *frame, size_t length, size_t whole)
@@ -370,6 +372,10 @@ hakios_net_attach(const struct hakios_net_link *link)
 		printf("net: there is no unit %u for %s\n", unit, link->name);
 		return false;
 	}
+	if (n->link == link) {
+		n->up = link->up;               /* (the same link again: its details may have changed) */
+		return true;
+	}
 	if (n->link != NULL) {
 		printf("net: en%u is on %s already; %s is not attached\n", unit, n->link->name, link->name);
 		return false;
@@ -449,7 +455,13 @@ hakios_net_has_ipv4(unsigned unit)
 void
 hakios_net_init(void)
 {
+	int ipv4_only = 0;
+
 	PE_parse_boot_argn("net_trace", &net_trace, sizeof(net_trace));
 	PE_parse_boot_argn("net_names", &net_names, sizeof(net_names));
+	if (PE_parse_boot_argn("vayu_ipv4_only", &ipv4_only, sizeof(ipv4_only)) && ipv4_only != 0) {
+		hakios_ipv4_only = 1;
+		printf("net: vayu_ipv4_only=1: en0/en1/pdp_ip0 are IPv4-only; IPv6 will not be attached to them\n");
+	}
 	hakios_virtio_net_init();
 }

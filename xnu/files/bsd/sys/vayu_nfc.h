@@ -51,7 +51,8 @@ extern void vayu_nfc_init(void);
 /*
  * The nfcd bridge (boot-arg vayu_nfc_ios >= 2): the PN553's raw NCI packets go to the
  * callback, and nfcd's packets are written to the chip. start returns 0 or EBUSY, ENODEV,
- * EPERM; send returns 0 or EIO. stop is safe when no bridge runs.
+ * EPERM, EIO (dead bus); send returns 0 or EIO. RX failures back off; a dead bus stops the bridge.
+ * stop is safe when no bridge runs.
  */
 typedef void (*vayu_nfc_rx_fn)(const uint8_t *packet, unsigned length);
 

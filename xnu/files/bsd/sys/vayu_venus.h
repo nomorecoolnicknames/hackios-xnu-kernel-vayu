@@ -17,7 +17,10 @@
  *      if vayu_venus_gdsc asks for it) the mvs0/mvs1 GDSCs with the wrapper's MMCC
  *      power-control handshake.  mvs0/mvs1 are hardware-triggered on this phone
  *      ("qcom,support-hw-trigger"): HW_CONTROL is cleared to switch them and set again
- *      afterwards, as the vendor GDSC driver does;
+ *      afterwards, as the vendor GDSC driver does.  This is the k25 order, and it is what
+ *      vayu_venus_pwr=0 keeps; on the phone it stopped at the mvs0 MMCC handshake, whose
+ *      status (0xaa0e0090) read 0 and never set bit 1.  vayu_venus_pwr=1..3 change the order
+ *      and/or the handshake's polarity for the next run (see sys/vayu_venus_pwr.h);
  *   3. video_cc's PLL0 (Trion, 2 x the wanted iris rate) and the iris_clk_src RCG, then
  *      the iris AHB and mvsc core branches;
  *   4. venus.mdt + venus.bNN through vayu_pas.c's PAS loader (INIT_IMAGE, MEM_SETUP, the
@@ -51,6 +54,17 @@
  *   vayu_venus_rails=0  no RPMh vote at all (default 1: mmcx.lvl and mx.lvl)
  *   vayu_venus_level=N  that vote's RPMh level, default 384 (TURBO)
  *   vayu_venus_bcm=0    no video NoC/DDR BCM votes (default 1: MM3, SH0, MC0, ACV)
+ *   vayu_venus_pwr=N    the power-up order and the MMCC handshake of the domains, one per run:
+ *                       0 the k25 order, MMCC control <- 0, a missing ack is fatal (default);
+ *                       1 clocks first (GCC AXI/XO, video_cc XO, PLL0, iris RCG, iris AHB,
+ *                         mvsc/mvs0/mvs1 core), then the GDSCs, MMCC control <- 1, a missing
+ *                         ack logged and the domain left under software control;
+ *                       2 the same order, MMCC control <- 0;
+ *                       3 the k25 order, MMCC control <- 1
+ *   vayu_venus_memprot=N  TrustZone's CP ranges before AUTH_AND_RESET: 0 none (default),
+ *                       1 CP 0x0+0x70800000 (the HFI 4xx tables), 2 0x0+0x25800000 (sc7280's).
+ *                       A refusal is logged and does not stop the boot
+ *   vayu_venus_regs=1   dump the GCC/video_cc/wrapper registers after a good power-up too
  *   vayu_venus_rate=N   iris clock in MHz, default 200 (200/225/300/365/432/480)
  *   vayu_venus_xo=1     no PLL0: the iris RCG from XO at 19.2 MHz (a diagnostic)
  *   vayu_venus_gdsc=M   bit 0 mvsc (default), bit 1 mvs0, bit 2 mvs1; level 2 adds mvs0

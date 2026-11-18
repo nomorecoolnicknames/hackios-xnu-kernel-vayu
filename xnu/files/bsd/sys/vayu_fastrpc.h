@@ -11,6 +11,7 @@
 #ifndef _SYS_VAYU_FASTRPC_H_
 #define _SYS_VAYU_FASTRPC_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 struct vayu_glink;
@@ -28,8 +29,8 @@ void vayu_fastrpc_start(struct vayu_glink *g, struct vayu_glink_channel *channel
  * back to the loader calls this). */
 void vayu_fastrpc_quiesce(void);
 
-/* After the SLPI has been stopped: the SMMU entry goes back. A panic leaves it in place -- the
- * DSP is stopped then, so the bypass is harmless. */
-void vayu_fastrpc_release(void);
+/* Pass the confirmed PAS shutdown result. Release only after the worker has also completed;
+ * false retains the packets and SMMU entry. A panic leaves them in place. */
+bool vayu_fastrpc_release(bool dsp_stopped);
 
 #endif /* _SYS_VAYU_FASTRPC_H_ */

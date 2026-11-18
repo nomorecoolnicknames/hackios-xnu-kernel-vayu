@@ -18,6 +18,7 @@
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
@@ -340,11 +341,29 @@ static bool
 cpufreq_wanted(void)
 {
 	uint32_t on = 0, vayu = 0;
+	DTEntry entry;
+	void const *type;
+	unsigned int size;
 
 	if (PE_parse_boot_argn("cpufreq_vayu", &vayu, sizeof(vayu)) && vayu != 0) {
 		return false;
 	}
-	return PE_parse_boot_argn("cpufreq", &on, sizeof(on)) && on != 0;
+	if (!PE_parse_boot_argn("cpufreq", &on, sizeof(on)) || on == 0) {
+		return false;
+	}
+	/* (EPSS at 0x18591000 is redwood's: on vayu, cpufreq=1 alone must not reach it; the loader names the board in /arm-io) */
+	if (SecureDTLookupEntry(NULL, "/arm-io", &entry) == kSuccess &&
+	    SecureDTGetProperty(entry, "device_type", &type, &size) == kSuccess &&
+	    size >= 4 && memcmp(type, "vayu", 4) == 0 && (size == 4 || ((const char *)type)[4] == 0)) {
+		static bool said;
+
+		if (!said) {
+			said = true;
+			tell("cpufreq: vayu: redwood EPSS refused; use cpufreq=1 cpufreq_vayu=1\n");
+		}
+		return false;
+	}
+	return true;
 }
 
 static void

@@ -1,14 +1,18 @@
 /*
  * W25: the WPA2-PSK 4-way handshake of the vayu station (see sys/vayu_wifi_rsn.h).
  *
- * The PMK is read from /redwood/etc/vayu-wifi/wifi.pmk (the payload image, md1) (boot-arg vayu_wifi_pmk_file=1), never
- * from a boot argument: boot arguments are logged by the loader, the kernel, launchd and panics.
+ * The PMK is read from /redwood/etc/vayu-wifi/wifi.pmk (the payload image, md1) (boot-arg vayu_wifi_pmk_file=1; another
+ * file of that directory: vayu_wifi_pmk_name=NAME), never from a boot argument: boot arguments are logged by the loader,
+ * the kernel, launchd and panics.
  *
  * Flow: message 1/4 (pairwise, ack, no MIC) -> SNonce random, PTK = PRF-384(PMK, "Pairwise key
  * expansion", AA|SPA|ANonce|SNonce ordered the standard's way) -> 2/4 with the RSN IE of our
  * assoc request and a HMAC-SHA1-128 MIC under the KCK.  Message 3/4 -> MIC checked, GTK
  * unwrapped with the KEK (RFC 3394), 4/4 sent in the clear, WMI_VDEV_INSTALL_KEY for the
- * pairwise TK (index 0) and the group key, then WMI_PEER_SET_PARAM AUTHORIZE.
+ * pairwise TK (index 0) and the group key, then WMI_PEER_SET_PARAM AUTHORIZE.  Later, a group key
+ * handshake message 1/2 (a new GTK) -> MIC and replay checked, the GTK KDE unwrapped, the new GTK
+ * installed and 2/2 sent back under the pairwise key (vayu_wifi_gtk_rekey, default 1; 0: such a
+ * message is only logged, as before, and the AP ends the link with DEAUTH reason 16).
  *
  * Layouts are ath10k's wmi-tlv (wmi.h: struct wmi_vdev_install_key_cmd, wmi_peer_set_param_cmd)
  * and EAPOL-Key as IEEE 802.1X-2004 7.6 / 8.5.  Nothing secret is printed: no PMK, PTK, KCK,
@@ -55,7 +59,9 @@
 #define WMI_CIPHER_TKIP         2U
 #define WMI_CIPHER_CCMP         4U
 
-#define PMK_PATH                "/redwood/etc/vayu-wifi/wifi.pmk"
+#define PMK_DIR                 "/redwood/etc/vayu-wifi/"
+#define PMK_NAME                "wifi.pmk"      /* vayu_wifi_pmk_name=NAME: another file of PMK_DIR */
+#define PMK_NAME_MAX            64U
 #define PMK_LEN                 32U
 #define PTK_LEN                 48U
 #define KCK_LEN                 16U
@@ -69,6 +75,7 @@ enum rsn_state { RSN_OFF, RSN_WAIT_M1, RSN_WAIT_M3, RSN_KEYED, RSN_FAILED };
 
 static struct {
 	bool pmk_set, pmk_file, tested, armed, started;
+	char pmk_path[sizeof(PMK_DIR) + PMK_NAME_MAX];
 	uint32_t state;
 	uint8_t pmk[PMK_LEN];
 	uint8_t ptk[PTK_LEN], snonce[NONCE_LEN], anonce[NONCE_LEN];
@@ -77,8 +84,9 @@ static struct {
 	uint64_t replay, anonce_replay;
 	uint32_t eapol_ver, key_ver;
 	uint32_t msg1s, msg3s, bad_mic, ignored, late, msg4s, msg4_dumps;
-	uint32_t group_cipher;
-	const struct vayu_rsn_ops *ops;
+	uint32_t group_cipher, invalid_msg3;
+	uint32_t gtk_rekey, group_rekeys, invalid_group;        /* vayu_wifi_gtk_rekey; the group key handshakes */
+	struct vayu_rsn_ops ops;        /* a copy: the station's is a block-local that ends before the late EAPOL does */
 	int (*log)(const char *format, ...) __printflike(1, 2);
 } rsn;
 
@@ -92,6 +100,106 @@ sha1_hmac(const uint8_t *key, uint32_t key_len, const uint8_t *data, uint32_t da
 	}
 	g_crypto_funcs->cchmac_fn(g_crypto_funcs->ccsha1_di, key_len, key, data_len, data, out);
 	return true;
+}
+
+/* PBKDF2-HMAC-SHA1 (RFC 2898), the one thing WPA2-PSK takes of it: PMK = PBKDF2(passphrase,
+ * ssid, 4096, 32).  Two blocks of twenty bytes (the second takes twelve), 4096 rounds each;
+ * libkern's HMAC is the same one the handshake uses.  Nothing is kept here: the caller's
+ * passphrase and the PMK made of it are wiped before this returns. */
+#define PBKDF2_ROUNDS   4096U
+
+static bool
+pbkdf2_sha1(const uint8_t *pass, uint32_t pass_len, const uint8_t *salt, uint32_t salt_len,
+    uint32_t rounds, uint8_t *out, uint32_t out_len)
+{
+	uint8_t block[64], u[20], t[20];
+	uint32_t i, j, have = 0, n = 1;
+
+	if (pass == NULL || salt == NULL || out == NULL || salt_len > sizeof(block) - 4 || rounds == 0) {
+		return false;
+	}
+	while (have < out_len && n <= 0xffffffffU) {
+		memcpy(block, salt, salt_len);
+		block[salt_len] = (uint8_t)(n >> 24);
+		block[salt_len + 1] = (uint8_t)(n >> 16);
+		block[salt_len + 2] = (uint8_t)(n >> 8);
+		block[salt_len + 3] = (uint8_t)n;
+		if (!sha1_hmac(pass, pass_len, block, salt_len + 4, u)) {
+			goto out;
+		}
+		memcpy(t, u, sizeof(t));
+		for (j = 1; j < rounds; j++) {
+			if (!sha1_hmac(pass, pass_len, u, sizeof(u), u)) {
+				goto out;
+			}
+			for (i = 0; i < sizeof(t); i++) {
+				t[i] ^= u[i];
+			}
+		}
+		for (i = 0; i < sizeof(t) && have < out_len; i++) {
+			out[have++] = t[i];
+		}
+		n++;
+	}
+out:
+	memset(block, 0, sizeof(block));
+	memset(u, 0, sizeof(u));
+	memset(t, 0, sizeof(t));
+	return have == out_len;
+}
+
+bool
+vayu_rsn_set_pmk(const uint8_t *pmk, uint32_t len)
+{
+	if (pmk == NULL || len != PMK_LEN) {
+		return false;
+	}
+	memcpy(rsn.pmk, pmk, PMK_LEN);
+	rsn.pmk_set = true;
+	rsn.tested = false;             /* the provider is checked once more, and nothing else uses it before */
+	rsn.armed = false;
+	if (rsn.log != NULL) {
+		rsn.log("vayu-wifi: W25 S0 pmk: OK a key of %u bytes, given for this join\n", len);
+	}
+	return true;
+}
+
+bool
+vayu_rsn_set_passphrase(const uint8_t *passphrase, uint32_t passphrase_len, const uint8_t *ssid, uint32_t ssid_len)
+{
+	uint8_t pmk[PMK_LEN];
+	bool ok;
+
+	if (passphrase == NULL || passphrase_len < 8 || passphrase_len > 63 || ssid == NULL || ssid_len == 0 ||
+	    ssid_len > 32) {
+		if (rsn.log != NULL) {
+			rsn.log("vayu-wifi: W25 S0 pmk: ERROR a passphrase of %u bytes for a name of %u bytes\n",
+			    passphrase_len, ssid_len);
+		}
+		return false;
+	}
+	ok = pbkdf2_sha1(passphrase, passphrase_len, ssid, ssid_len, PBKDF2_ROUNDS, pmk, sizeof(pmk));
+	if (ok) {
+		memcpy(rsn.pmk, pmk, sizeof(pmk));
+		rsn.pmk_set = true;
+		rsn.tested = false;
+		rsn.armed = false;
+	}
+	memset(pmk, 0, sizeof(pmk));
+	if (rsn.log != NULL) {
+		rsn.log("vayu-wifi: W25 S0 pmk: %s from a passphrase of %u bytes and a name of %u bytes, %u rounds\n",
+		    ok ? "OK" : "ERROR", passphrase_len, ssid_len, PBKDF2_ROUNDS);
+	}
+	return ok;
+}
+
+void
+vayu_rsn_forget(void)
+{
+	memset(rsn.pmk, 0, sizeof(rsn.pmk));
+	rsn.pmk_set = false;
+	rsn.armed = false;
+	rsn.tested = false;
 }
 
 /* AES-ECB decrypt, one block at a time: the whole of RFC 3394 needs of the cipher. */
@@ -234,8 +342,8 @@ pmk_read_file(void)
 		rsn.log("vayu-wifi: W25 S0 pmk: ERROR no root volume\n");
 		return false;
 	}
-	if (vnode_lookup(PMK_PATH, 0, &vnode, context) != 0) {
-		rsn.log("vayu-wifi: W25 S0 pmk: ERROR " PMK_PATH " not found\n");
+	if (vnode_lookup(rsn.pmk_path, 0, &vnode, context) != 0) {
+		rsn.log("vayu-wifi: W25 S0 pmk: ERROR %s not found\n", rsn.pmk_path);
 		return false;
 	}
 	VATTR_INIT(&attributes);
@@ -289,16 +397,49 @@ pmk_read_file(void)
 	return true;
 }
 
+/* A file name for PMK_DIR: 1..PMK_NAME_MAX-1 of [A-Za-z0-9._-], not starting with a dot (no path, no ".."). */
+static bool
+pmk_name_ok(const char *name)
+{
+	uint32_t i, len = (uint32_t)strlen(name);
+
+	if (len == 0 || len >= PMK_NAME_MAX || name[0] == '.') {
+		return false;
+	}
+	for (i = 0; i < len; i++) {
+		char c = name[i];
+
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+		    c == '.' || c == '_' || c == '-')) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void
 vayu_rsn_reset(int (*log)(const char *format, ...) __printflike(1, 2))
 {
 	uint32_t enabled = 0;
+	char name[PMK_NAME_MAX + 1];
 
 	memset(&rsn, 0, sizeof(rsn));
 	rsn.log = log;
 	rsn.state = RSN_OFF;
+	rsn.gtk_rekey = 1;
+	snprintf(rsn.pmk_path, sizeof(rsn.pmk_path), "%s%s", PMK_DIR, PMK_NAME);
+	PE_parse_boot_argn("vayu_wifi_gtk_rekey", &rsn.gtk_rekey, sizeof(rsn.gtk_rekey));
 	if (log == NULL) {
 		return;
+	}
+	if (PE_parse_boot_arg_str("vayu_wifi_pmk_name", name, sizeof(name))) {
+		if (pmk_name_ok(name)) {
+			snprintf(rsn.pmk_path, sizeof(rsn.pmk_path), "%s%s", PMK_DIR, name);
+			rsn.log("vayu-wifi: W25 S0 pmk: the file is %s (vayu_wifi_pmk_name)\n", rsn.pmk_path);
+		} else {
+			rsn.log("vayu-wifi: W25 S0 pmk: vayu_wifi_pmk_name is not a file name (1..%u of A-Z a-z 0-9 . _ -, "
+			    "no leading dot); %s stays\n", PMK_NAME_MAX - 1, rsn.pmk_path);
+		}
 	}
 	PE_parse_boot_argn("vayu_wifi_pmk_file", &enabled, sizeof(enabled));
 	rsn.pmk_file = enabled != 0;
@@ -335,6 +476,7 @@ vayu_rsn_stop(void)
 	rsn.gtk_len = 0;
 	rsn.replay = rsn.anonce_replay = 0;
 	rsn.msg1s = rsn.msg3s = rsn.bad_mic = rsn.ignored = 0;
+	rsn.invalid_msg3 = rsn.group_rekeys = rsn.invalid_group = 0;
 	rsn.started = false;
 	rsn.state = RSN_OFF;
 }
@@ -345,7 +487,7 @@ vayu_rsn_start(const struct vayu_rsn_ops *ops)
 	if (ops == NULL || !vayu_rsn_armed()) {
 		return;
 	}
-	rsn.ops = ops;
+	rsn.ops = *ops;
 	rsn.group_cipher = ops->group_cipher != 0 ? ops->group_cipher : WMI_CIPHER_CCMP;
 	rsn.started = true;
 	rsn.state = RSN_WAIT_M1;
@@ -430,9 +572,11 @@ put_mac8(uint8_t *p, const uint8_t *mac)
 	return p + 8;
 }
 
-/* An EAPOL-Key frame over the 802.11 data path: 24-byte header (to DS), LLC/SNAP 88 8e, EAPOL. */
+/* An EAPOL-Key frame over the 802.11 data path: 24-byte header (to DS), LLC/SNAP 88 8e, EAPOL.  The 4-way's
+ * frames go in the clear (no key yet, and the 4/4 before the keys are installed); with `protect' the frame is
+ * Protected and encrypted under the pairwise key like any data frame (the group key handshake's 2/2). */
 static int
-send_eapol(uint16_t key_info, const uint8_t *nonce, const uint8_t *kd, uint16_t kd_len)
+send_eapol(uint16_t key_info, const uint8_t *nonce, const uint8_t *kd, uint16_t kd_len, bool protect)
 {
 	static uint8_t f[24 + 8 + EAPOL_HDR + EAPOL_KEY_FIXED + 64];
 	uint8_t mic[20];
@@ -441,7 +585,7 @@ send_eapol(uint16_t key_info, const uint8_t *nonce, const uint8_t *kd, uint16_t 
 	uint16_t version = rsn.eapol_ver != 0 ? (uint16_t)rsn.eapol_ver : 1;
 	uint8_t desc = rsn.key_ver != 0 ? (uint8_t)rsn.key_ver : 2;
 
-	if (rsn.ops == NULL || rsn.ops->tx_data == NULL || kd_len > 64) {
+	if (rsn.ops.tx_data == NULL || kd_len > 64) {
 		return -1;
 	}
 	/* W25l: the whole buffer, not just the header.  It is static, and W25k left the 2/4 MIC
@@ -450,10 +594,10 @@ send_eapol(uint16_t key_info, const uint8_t *nonce, const uint8_t *kd, uint16_t 
 	 * while the 2/4, built first from a zeroed buffer, was accepted. */
 	memset(f, 0, sizeof(f));
 	f[0] = 0x08;                            /* data */
-	f[1] = 0x01;                            /* to DS */
-	memcpy(f + 4, rsn.ops->bssid, 6);       /* addr1: the AP */
-	memcpy(f + 10, rsn.ops->mac, 6);        /* addr2: us */
-	memcpy(f + 16, rsn.ops->bssid, 6);      /* addr3: the AP */
+	f[1] = protect ? 0x41 : 0x01;           /* to DS (+ protected) */
+	memcpy(f + 4, rsn.ops.bssid, 6);       /* addr1: the AP */
+	memcpy(f + 10, rsn.ops.mac, 6);        /* addr2: us */
+	memcpy(f + 16, rsn.ops.bssid, 6);      /* addr3: the AP */
 	f[24] = 0xaa;
 	f[25] = 0xaa;
 	f[26] = 0x03;
@@ -522,7 +666,7 @@ send_eapol(uint16_t key_info, const uint8_t *nonce, const uint8_t *kd, uint16_t 
 			rsn.log("vayu-wifi: W25 S3 4/4 +%03u: %s\n", row_at, row);
 		}
 	}
-	return rsn.ops->tx_data(f, flen, true);
+	return rsn.ops.tx_data(f, flen, !protect);
 }
 
 static int
@@ -532,13 +676,13 @@ wmi_install_key(bool group, uint32_t idx, uint32_t cipher, const uint8_t *key, u
 	uint8_t *p;
 	uint32_t padded = (key_len + 3) & ~3U;
 
-	if (rsn.ops == NULL || rsn.ops->wmi_send == NULL || key_len > 40) {
+	if (rsn.ops.wmi_send == NULL || key_len > 40) {
 		return -1;
 	}
 	memset(m, 0, sizeof(m));
 	p = put_tlv(m + 4, TAG_VDEV_INSTALL_KEY, 92);
 	p = put32(p, 0);                        /* vdev 0 */
-	p = put_mac8(p, rsn.ops->bssid);
+	p = put_mac8(p, rsn.ops.bssid);
 	p = put32(p, idx);
 	p = put32(p, group ? 1 : 0);            /* key_flags */
 	p = put32(p, cipher);
@@ -549,7 +693,7 @@ wmi_install_key(bool group, uint32_t idx, uint32_t cipher, const uint8_t *key, u
 	p = put_tlv(p, 0x11U, padded);          /* WMI_TLV_TAG_ARRAY_BYTE = 17 (W25g) */
 	memcpy(p, key, key_len);
 	put32(m, CMD_VDEV_INSTALL_KEY);
-	return rsn.ops->wmi_send(m, (uint32_t)(4 + 4 + 92 + 4 + padded), 1000);
+	return rsn.ops.wmi_send(m, (uint32_t)(4 + 4 + 92 + 4 + padded), 1000);
 }
 
 static int
@@ -561,25 +705,25 @@ wmi_peer_authorize(void)
 	memset(m, 0, sizeof(m));
 	p = put_tlv(m + 4, TAG_PEER_SET_PARAM, 20);
 	p = put32(p, 0);                        /* vdev 0 */
-	p = put_mac8(p, rsn.ops->bssid);
+	p = put_mac8(p, rsn.ops.bssid);
 	p = put32(p, PEER_PARAM_AUTHORIZE);
 	(void)put32(p, 1);
 	put32(m, CMD_PEER_SET_PARAM);
-	return rsn.ops->wmi_send(m, sizeof(m), 1000);
+	return rsn.ops.wmi_send(m, sizeof(m), 1000);
 }
 
 /* message 2/4: SNonce, the RSN IE of our assoc request, MIC under the KCK */
 static int
 send_msg2(void)
 {
-	return send_eapol(0x010a, rsn.snonce, rsn.ops->rsn_ie, (uint16_t)rsn.ops->rsn_ie_len);
+	return send_eapol(0x010a, rsn.snonce, rsn.ops.rsn_ie, (uint16_t)rsn.ops.rsn_ie_len, false);
 }
 
 /* message 4/4: no nonce, no key data, MIC under the KCK */
 static int
 send_msg4(void)
 {
-	return send_eapol(0x030a, NULL, NULL, 0);
+	return send_eapol(0x030a, NULL, NULL, 0, false);
 }
 
 /* ---- message 1/4 ------------------------------------------------------------------------------- */
@@ -588,7 +732,7 @@ static void
 handle_msg1(const uint8_t *k, const uint8_t *eapol, uint32_t len, uint64_t replay)
 {
 	uint8_t data[6 + 6 + NONCE_LEN + NONCE_LEN];
-	const uint8_t *aa = rsn.ops->bssid, *spa = rsn.ops->mac, *first_mac, *second_mac;
+	const uint8_t *aa = rsn.ops.bssid, *spa = rsn.ops.mac, *first_mac, *second_mac;
 	const uint8_t *first_nonce, *second_nonce;
 
 	rsn.eapol_ver = eapol[0];
@@ -652,9 +796,36 @@ mic_ok(const uint8_t *eapol, uint32_t len, const uint8_t *k)
 	return ok;
 }
 
+/*
+ * A 3/4 is checked before the replay counter moves or anything is answered: its flags (pairwise, ack,
+ * MIC, install; secure and encrypted key data allowed; descriptor version 2), the ANonce of our 1/4 and
+ * its MIC under our KCK. A retransmit after the keys are in must prove the same. A frame that fails is
+ * dropped without changing the state (a forged one with a large counter used to move the replay counter
+ * and spend the 4/4 budget); the log says so the first time and every 64th.
+ */
+static bool
+msg3_ok(const uint8_t *eapol, uint32_t len, const uint8_t *k, uint16_t info)
+{
+	const uint16_t required = KI_PAIRWISE | KI_ACK | KI_MIC | KI_INSTALL;
+	const uint16_t allowed = required | KI_SECURE | KI_ENC_KD | 7U;
+
+	if ((info & required) == required && (info & ~allowed) == 0 && (info & 7U) == 2 &&
+	    memcmp(k + 13, rsn.anonce, NONCE_LEN) == 0) {
+		if (mic_ok(eapol, len, k)) {
+			return true;
+		}
+		rsn.bad_mic++;
+	}
+	rsn.invalid_msg3++;
+	if (rsn.invalid_msg3 == 1 || rsn.invalid_msg3 % 64 == 0) {
+		rsn.log("vayu-wifi: W25 S3 4way: ignored %u invalid 3/4 (%u bad MIC)\n", rsn.invalid_msg3, rsn.bad_mic);
+	}
+	return false;
+}
+
 /* the GTK KDE (00-0F-AC:1) in the unwrapped key data; RSC follows the key inside the KDE */
 static bool
-gtk_from_kde(const uint8_t *plain, uint32_t len)
+gtk_from_kde(const uint8_t *plain, uint32_t len, uint8_t gtk[GTK_MAX], uint32_t *gtk_len, uint32_t *gtk_idx)
 {
 	uint32_t o;
 
@@ -665,16 +836,16 @@ gtk_from_kde(const uint8_t *plain, uint32_t len)
 		    plain[o + 4] != 0xac || plain[o + 5] != 0x01) {
 			continue;
 		}
-		rsn.gtk_idx = plain[o + 6] & 3U;
 		klen = plain[o + 1] - 6;
-		if (klen > 32) {
-			klen = 32;
+		if (klen > GTK_MAX) {
+			klen = GTK_MAX;
 		}
 		if (klen < 16) {
 			return false;
 		}
-		memcpy(rsn.gtk, plain + o + 8, klen);
-		rsn.gtk_len = klen;
+		*gtk_idx = plain[o + 6] & 3U;
+		memcpy(gtk, plain + o + 8, klen);
+		*gtk_len = klen;
 		return true;
 	}
 	return false;
@@ -692,23 +863,15 @@ handle_msg3(const uint8_t *k, const uint8_t *eapol, uint32_t len, uint64_t repla
 		rsn.ignored++;
 		return;
 	}
-	if (memcmp(k + 13, rsn.anonce, NONCE_LEN) != 0) {
-		rsn.log("vayu-wifi: W25 S3 4way: ERROR 3/4 ANonce differs from 1/4\n");
-		rsn.state = RSN_FAILED;
-		return;
-	}
-	if (!mic_ok(eapol, len, k)) {
-		rsn.bad_mic++;
-		rsn.log("vayu-wifi: W25 S3 4way: ERROR 3/4 MIC wrong (%u)\n", rsn.bad_mic);
-		rsn.state = RSN_FAILED;
-		return;
+	if (!msg3_ok(eapol, len, k, info)) {
+		return;                         /* (still waiting: the station's RSN_WAIT_MS ends a wrong PMK) */
 	}
 	rsn.replay = replay;
 	if ((info & KI_ENC_KD) != 0 && kd_len >= 24 && kd_len <= sizeof(plain) + 8) {
 		if (!aes_unwrap(rsn.ptk + KCK_LEN, k + EAPOL_KEY_FIXED, kd_len, plain)) {
 			rsn.log("vayu-wifi: W25 S3 4way: ERROR GTK unwrap failed (kd %u)\n", kd_len);
 		} else {
-			have_gtk = gtk_from_kde(plain, kd_len - 8);
+			have_gtk = gtk_from_kde(plain, kd_len - 8, rsn.gtk, &rsn.gtk_len, &rsn.gtk_idx);
 			memset(plain, 0, sizeof(plain));
 		}
 	} else if (kd_len != 0) {
@@ -741,6 +904,82 @@ handle_msg3(const uint8_t *k, const uint8_t *eapol, uint32_t len, uint64_t repla
 	    have_gtk ? 1 : 0, rsn.gtk_idx, rsn.group_cipher);
 }
 
+/* ---- the group key handshake (IEEE 802.11-2016 12.7.7) ---------------------------------------- */
+
+static void
+group_invalid(const char *why)
+{
+	rsn.invalid_group++;
+	if (rsn.invalid_group == 1 || rsn.invalid_group % 64 == 0) {
+		rsn.log("vayu-wifi: W25 S5 group: ignored %u invalid 1/2 (%s)\n", rsn.invalid_group, why);
+	}
+}
+
+/*
+ * Message 1/2 of a new group key, with the link up: secure, MIC, ack and encrypted key data, not pairwise,
+ * descriptor version 2; a replay counter beyond the last one; a MIC under our KCK.  The GTK KDE is unwrapped
+ * with the KEK and the new GTK installed -- not again if it is the one already in use (wpa_supplicant's rule
+ * against a reinstall) -- then 2/2 goes back: secure, MIC, the same replay counter, no nonce and no key data,
+ * Protected under the pairwise key.  The counter moves as soon as the MIC is right, so a 1/2 the AP sends
+ * again while the install waits for a WMI credit is a replay.  Run 1078 (k30): the AP sent four of these
+ * (info 0x1382, replay 3..6) at 522-525 s, nothing answered them, and at 589 s it said DEAUTH reason 16,
+ * the group key handshake's timeout.
+ */
+static void
+handle_group1(const uint8_t *k, const uint8_t *eapol, uint32_t len, uint64_t replay, uint16_t info)
+{
+	const uint16_t required = KI_ACK | KI_MIC | KI_SECURE | KI_ENC_KD;
+	const uint16_t allowed = required | KI_INSTALL | 0x0030U | 7U;  /* (bits 4-5: WPA1's key index, 0 in RSN) */
+	uint32_t kd_len = be16(k + 93), gtk_len = 0, gtk_idx = 0;
+	uint8_t plain[256], gtk[GTK_MAX];
+	bool same;
+
+	if ((info & required) != required || (info & ~allowed) != 0 || (info & 7U) != 2) {
+		group_invalid("flags");
+		return;
+	}
+	if (replay <= rsn.replay) {
+		group_invalid("replay counter not beyond the last");
+		return;
+	}
+	if (!mic_ok(eapol, len, k)) {
+		rsn.bad_mic++;
+		group_invalid("MIC");
+		return;
+	}
+	rsn.replay = replay;
+	if (kd_len < 24 || kd_len > sizeof(plain) + 8 || !aes_unwrap(rsn.ptk + KCK_LEN, k + EAPOL_KEY_FIXED, kd_len, plain)) {
+		rsn.log("vayu-wifi: W25 S5 group: ERROR the key data (%u bytes) does not unwrap\n", kd_len);
+		return;
+	}
+	if (!gtk_from_kde(plain, kd_len - 8, gtk, &gtk_len, &gtk_idx)) {
+		memset(plain, 0, sizeof(plain));
+		rsn.log("vayu-wifi: W25 S5 group: ERROR no group key in the key data\n");
+		return;
+	}
+	memset(plain, 0, sizeof(plain));
+	same = gtk_len == rsn.gtk_len && gtk_idx == rsn.gtk_idx && memcmp(gtk, rsn.gtk, gtk_len) == 0;
+	if (!same) {
+		if (wmi_install_key(true, gtk_idx, rsn.group_cipher, gtk, gtk_len) != 0) {
+			memset(gtk, 0, sizeof(gtk));
+			rsn.log("vayu-wifi: W25 S5 group: ERROR new group key install refused (idx %u): 2/2 not sent\n", gtk_idx);
+			return;
+		}
+		memcpy(rsn.gtk, gtk, sizeof(rsn.gtk));
+		rsn.gtk_len = gtk_len;
+		rsn.gtk_idx = gtk_idx;
+	}
+	memset(gtk, 0, sizeof(gtk));
+	if (send_eapol((uint16_t)(KI_SECURE | KI_MIC | (info & 7U)), NULL, NULL, 0, true) != 0) {
+		rsn.log("vayu-wifi: W25 S5 group: ERROR 2/2 not sent\n");
+		return;
+	}
+	rsn.group_rekeys++;
+	rsn.log("vayu-wifi: W25 S5 group: OK 1/2 verified (replay %llu), %s (idx %u, cipher %u), 2/2 sent (#%u)\n",
+	    (unsigned long long)replay, same ? "the group key in use kept" : "new group key installed", rsn.gtk_idx,
+	    rsn.group_cipher, rsn.group_rekeys);
+}
+
 /* ---- the received EAPOL frame ------------------------------------------------------------------ */
 
 void
@@ -751,7 +990,7 @@ vayu_rsn_eapol_rx(const uint8_t *eapol, uint32_t len)
 	uint32_t body, kd_len;
 	uint64_t replay;
 
-	if (!rsn.started || rsn.ops == NULL || rsn.state == RSN_FAILED) {
+	if (!rsn.started || rsn.state == RSN_FAILED) {
 		return;
 	}
 	if (len < EAPOL_HDR + EAPOL_KEY_FIXED || eapol[1] != EAPOL_TYPE_KEY) {
@@ -772,10 +1011,17 @@ vayu_rsn_eapol_rx(const uint8_t *eapol, uint32_t len)
 	}
 	replay = be64(k + 5);
 	if (rsn.state == RSN_KEYED) {
+		if ((info & KI_PAIRWISE) == 0 && (info & KI_ACK) != 0 && rsn.gtk_rekey != 0) {
+			handle_group1(k, eapol, EAPOL_HDR + body, replay, info);
+			return;
+		}
 		/* The AP resending 3/4 after our 4/4 means it did not take the 4/4.  wpa_supplicant
 		 * answers a newer 3/4 with a new 4/4 carrying that replay counter; the keys stay. */
 		if ((info & KI_PAIRWISE) != 0 && (info & KI_ACK) != 0 && (info & KI_MIC) != 0 &&
 		    (info & KI_INSTALL) != 0 && replay > rsn.replay && rsn.msg4s < 8) {
+			if (!msg3_ok(eapol, EAPOL_HDR + body, k, info)) {
+				return;
+			}
 			rsn.replay = replay;
 			rsn.log("vayu-wifi: W25 S3 4way: OK 3/4 again with replay %llu, 4/4 sent again (no "
 			    "keys reinstalled)\n", (unsigned long long)replay);

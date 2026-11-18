@@ -1,10 +1,12 @@
 /*
- * en1: the modem's raw IPv4 data path as a real interface, for the POCO X3 Pro (vayu, SM8150-AC).
+ * en1 / pdp_ip0: the modem's raw IPv4 data path as a real interface, for the POCO X3 Pro
+ * (vayu, SM8150-AC). vayu_cell_net=1 keeps the bring-up name en1; vayu_wds=1 creates pdp_ip0,
+ * the name configd and a CommCenter-less stack look for, and disables IPv6 on it.
  *
  * The control plane (bsd/dev/vayu_cell_data.c) leaves an IPv4 session behind: WDS says the
  * address, mask, gateway, DNS and MTU, and WDA says the packets are raw IP inside QMAP on mux 1.
  * This file is the smallest interface that can carry that: no Ethernet header, no ARP, no DHCP,
- * no link-layer address, no CommCenter and no configd. en1 is IFNET_FAMILY_CELLULAR/IFT_CELLULAR,
+ * no link-layer address, no CommCenter and no configd. The interface is IFNET_FAMILY_CELLULAR/IFT_CELLULAR,
  * a point-to-point link whose peer is the WDS gateway, BPF sees DLT_RAW, and inbound packets are
  * handed to PF_INET with proto_input() after the QMAP layer has removed its 4-byte header
  * (sys/vayu_cell_qmap.h). en0 and en2 are not touched.
@@ -28,14 +30,17 @@
  * Boot args:
  *   vayu_cell_net=0          nothing (the default)
  *   vayu_cell_net=1          attach en1 and start the configuration thread
+ *   vayu_wds=1               attach pdp_ip0 instead (IPv4 only, IFEF_IPV6_DISABLED)
  *   vayu_cell_net_default=1  also add a global default route via the session's gateway
  *
  * Threading: vayu_cell_net_session() only copies its arguments under a mutex and wakes the thread;
- * vayu_cell_net_input() and the output callback never sleep, never open a socket and never log.
+ * vayu_cell_net_input() and the output callback never sleep and never open a socket. The input
+ * path logs at most one line per recognised ICMP echo reply (vayu_cell_ping=1).
  * All socket/ioctl/route work happens in the one thread this file starts. Teardown only removes
  * the route and the address it added and clears the flags; the ifnet stays attached, so a later
  * session can reuse it, and every teardown step is tolerant of being already done.
  */
+#include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
@@ -51,10 +56,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/errno.h>
+#include <sys/hakios.net.h>
 #include <sys/kpi_mbuf.h>
 #include <sys/kpi_socket.h>
 #include <sys/param.h>
 #include <sys/sockio.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/vayu_cell_net.h>
 
@@ -65,10 +72,12 @@ extern bool vayu_ipa_data_transmit(uint8_t mux, const void *packet, size_t lengt
 extern int rtrequest(int req, struct sockaddr *dst, struct sockaddr *gateway,
     struct sockaddr *netmask, int flags, struct rtentry **ret_nrt);
 
-#define CELL_NET_NAME           "en1"
-#define CELL_NET_PREFIX         "en"
-#define CELL_NET_UNIT           1
-#define CELL_NET_UNIQUEID       "vayu-cell-net"
+#define CELL_NET_PREFIX_EN      "en"
+#define CELL_NET_PREFIX_PDP     "pdp_ip"
+#define CELL_NET_UNIT_EN        1
+#define CELL_NET_UNIT_PDP       0
+#define CELL_NET_UNIQUEID_EN    "vayu-cell-net"
+#define CELL_NET_UNIQUEID_PDP   "vayu-wds-pdp"
 #define CELL_NET_IPV4_MIN       20      /* the smallest IPv4 header */
 
 static int say(const char *format, ...) __printflike(1, 2);
@@ -90,27 +99,47 @@ say(const char *format, ...)
 	return length;
 }
 
-/* Same index line shape as vayu_cell_data.c: vayu-data: S9 EN1 IFNET: OK|ERROR ... */
-static void
-cell_net_stage(const char *result, const char *format, ...)
-{
-	char detail[180], line[260];
-	va_list list;
-
-	va_start(list, format);
-	vsnprintf(detail, sizeof(detail), format, list);
-	va_end(list);
-	snprintf(line, sizeof(line), "vayu-data: S9 EN1 IFNET: %s %s\n", result, detail);
-	for (const char *c = line; *c != 0; c++) loader_log_putc(*c);
-	printf("%s", line);
-}
-
 /* The WDS numbers are host order; the log shows them the way ip4_string does in vayu_cell_data.c. */
 static void
 ip4_string(char *to, size_t size, uint32_t address)
 {
 	snprintf(to, size, "%u.%u.%u.%u", (address >> 24) & 0xff, (address >> 16) & 0xff,
 	    (address >> 8) & 0xff, address & 0xff);
+}
+
+/* Logs only: keep the last octet, mask the rest (the task's rule for the session address). */
+static void
+ip4_masked(char *to, size_t size, uint32_t address)
+{
+	snprintf(to, size, "x.x.x.%u", address & 0xff);
+}
+
+static uint64_t
+cell_net_now_ms(void)
+{
+	uint64_t uptime, nanoseconds;
+
+	clock_get_uptime(&uptime);
+	absolutetime_to_nanoseconds(uptime, &nanoseconds);
+	return nanoseconds / NSEC_PER_MSEC;
+}
+
+/* RFC 1071, over bytes in network order. */
+static uint16_t
+cell_net_checksum(const uint8_t *data, size_t length)
+{
+	uint32_t sum = 0;
+
+	for (size_t i = 0; i + 1 < length; i += 2) {
+		sum += ((uint32_t)data[i] << 8) | data[i + 1];
+	}
+	if ((length & 1) != 0) {
+		sum += (uint32_t)data[length - 1] << 8;
+	}
+	while ((sum >> 16) != 0) {
+		sum = (sum & 0xffff) + (sum >> 16);
+	}
+	return (uint16_t)~sum;
 }
 
 /* ---- state --------------------------------------------------------------------------------------- */
@@ -143,7 +172,9 @@ static struct {
 	ifnet_t ifp;
 	bool    started;
 	bool    thread_started;
+	bool    pdp;                    /* vayu_wds=1: the interface is pdp_ip0, IPv6 disabled */
 	bool    default_route;
+	char    name[IFNAMSIZ];         /* "en1" or "pdp_ip0", decided once by the boot arg */
 	struct cell_net_request request;
 	bool     pending;
 	uint32_t request_generation;    /* the last request copied into `request` */
@@ -156,6 +187,48 @@ static struct {
 
 static LCK_GRP_DECLARE(cell_net_lock_group, "vayu-cell-net");
 static LCK_MTX_DECLARE(cell_net_lock, &cell_net_lock_group);
+
+/* Same index line shape as vayu_cell_data.c: vayu-data: S9 EN1|PDP_IP0 IFNET: OK|ERROR ... */
+static void
+cell_net_stage(const char *result, const char *format, ...)
+{
+	char detail[180], line[260];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(detail, sizeof(detail), format, list);
+	va_end(list);
+	snprintf(line, sizeof(line), "vayu-data: S9 %s IFNET: %s %s\n",
+	    cell_net.pdp ? "PDP_IP0" : "EN1", result, detail);
+	for (const char *c = line; *c != 0; c++) loader_log_putc(*c);
+	printf("%s", line);
+}
+
+
+/* Which interface this boot made: "en1" or "pdp_ip0". The userland publisher reads it so that a
+ * WDS run and a bring-up run do not need different binaries. */
+SYSCTL_DECL(_kern_vayu);
+SYSCTL_STRING(_kern_vayu, OID_AUTO, cellular_interface, CTLFLAG_RD | CTLFLAG_LOCKED, cell_net.name, 0,
+    "the cellular data interface: en1 (vayu_cell_net=1) or pdp_ip0 (vayu_wds=1)");
+
+/* A kernel-side ICMP echo test, the first real packet this port can claim. It is not a socket:
+ * the request is built here and handed to the same QMAP/IPA TX path en1 uses, and the matching
+ * echo reply is recognised on the RX path before the packet is given to PF_INET. 8.8.8.8 is the
+ * task's target; its address is not a secret. */
+#define CELL_PING_TARGET        0x08080808u
+#define CELL_PING_COUNT         4
+#define CELL_PING_INTERVAL_MS   1000
+#define CELL_PING_WAIT_MS       5000
+#define CELL_PING_SIZE          36      /* 20 IPv4 + 8 ICMP + 8 payload */
+
+static struct {
+	bool     enabled;
+	bool     done;
+	uint32_t id;
+	uint32_t sent;
+	uint32_t replies;
+	uint64_t sent_at[CELL_PING_COUNT];
+} cell_ping;
 
 /* ---- helpers ------------------------------------------------------------------------------------- */
 
@@ -228,7 +301,7 @@ cell_net_set_up(socket_t so)
 	int error;
 
 	bzero(&ifr, sizeof(ifr));
-	strlcpy(ifr.ifr_name, CELL_NET_NAME, sizeof(ifr.ifr_name));
+	strlcpy(ifr.ifr_name, cell_net.name, sizeof(ifr.ifr_name));
 	error = sock_ioctl(so, SIOCGIFFLAGS, &ifr);
 	if (error == 0) {
 		ifr.ifr_flags |= IFF_UP;
@@ -259,7 +332,7 @@ cell_net_address_set(socket_t so, const struct cell_net_request *request)
 	int error;
 
 	bzero(&ifra, sizeof(ifra));
-	strlcpy(ifra.ifra_name, CELL_NET_NAME, sizeof(ifra.ifra_name));
+	strlcpy(ifra.ifra_name, cell_net.name, sizeof(ifra.ifra_name));
 	sin = &ifra.ifra_addr;
 	sin->sin_len = sizeof(*sin);
 	sin->sin_family = AF_INET;
@@ -299,7 +372,7 @@ cell_net_route_add(uint32_t gateway)
 	char gateway_text[16];
 	int error;
 
-	ip4_string(gateway_text, sizeof(gateway_text), gateway);
+	ip4_masked(gateway_text, sizeof(gateway_text), gateway);
 	peer.sin_addr.s_addr = htonl(gateway);
 	error = rtrequest(RTM_ADD, (struct sockaddr *)&dst, (struct sockaddr *)&peer,
 	    (struct sockaddr *)&mask, RTF_UP | RTF_GATEWAY | RTF_STATIC, NULL);
@@ -320,7 +393,7 @@ cell_net_route_delete(uint32_t gateway)
 	char gateway_text[16];
 	int error;
 
-	ip4_string(gateway_text, sizeof(gateway_text), gateway);
+	ip4_masked(gateway_text, sizeof(gateway_text), gateway);
 	peer.sin_addr.s_addr = htonl(gateway);
 	error = rtrequest(RTM_DELETE, (struct sockaddr *)&dst, (struct sockaddr *)&peer,
 	    (struct sockaddr *)&mask, RTF_UP | RTF_GATEWAY | RTF_STATIC, NULL);
@@ -353,13 +426,13 @@ cell_net_teardown(struct cell_net_applied *applied, socket_t *so)
 			int error;
 
 			bzero(&ifr, sizeof(ifr));
-			strlcpy(ifr.ifr_name, CELL_NET_NAME, sizeof(ifr.ifr_name));
+			strlcpy(ifr.ifr_name, cell_net.name, sizeof(ifr.ifr_name));
 			sin = (struct sockaddr_in *)&ifr.ifr_addr;
 			sin->sin_len = sizeof(*sin);
 			sin->sin_family = AF_INET;
 			sin->sin_addr.s_addr = htonl(applied->address);
 			error = sock_ioctl(*so, SIOCDIFADDR, &ifr);
-			ip4_string(address, sizeof(address), applied->address);
+			ip4_masked(address, sizeof(address), applied->address);
 			if (error != 0 && error != EADDRNOTAVAIL) {
 				say("vayu-cell-net: address %s remove: %d\n", address, error);
 			} else {
@@ -386,15 +459,15 @@ cell_net_apply(const struct cell_net_request *request, struct cell_net_applied *
 
 	if (!request->up) {
 		cell_net_teardown(applied, so);
-		say("vayu-cell-net: session down, en1 stays attached\n");
+		say("vayu-cell-net: session down, %s stays attached\n", cell_net.name);
 		return;
 	}
 
-	ip4_string(address, sizeof(address), request->address);
+	ip4_masked(address, sizeof(address), request->address);
 	ip4_string(mask, sizeof(mask), request->mask);
-	ip4_string(gateway_text, sizeof(gateway_text), request->gateway);
-	ip4_string(dns1_text, sizeof(dns1_text), request->dns1);
-	ip4_string(dns2_text, sizeof(dns2_text), request->dns2);
+	ip4_masked(gateway_text, sizeof(gateway_text), request->gateway);
+	ip4_masked(dns1_text, sizeof(dns1_text), request->dns1);
+	ip4_masked(dns2_text, sizeof(dns2_text), request->dns2);
 
 	mtu = request->mtu != 0 ? request->mtu : VAYU_CELL_NET_MTU_DEFAULT;
 	if (request->address == 0 || !cell_net_mask_valid(request->mask) ||
@@ -422,7 +495,7 @@ cell_net_apply(const struct cell_net_request *request, struct cell_net_applied *
 		struct ifreq ifr;
 
 		bzero(&ifr, sizeof(ifr));
-		strlcpy(ifr.ifr_name, CELL_NET_NAME, sizeof(ifr.ifr_name));
+		strlcpy(ifr.ifr_name, cell_net.name, sizeof(ifr.ifr_name));
 		error = sock_ioctl(*so, SIOCPROTOATTACH, &ifr);
 		if (error != 0 && error != EEXIST) {
 			say("vayu-cell-net: SIOCPROTOATTACH: %d\n", error);
@@ -460,16 +533,162 @@ cell_net_apply(const struct cell_net_request *request, struct cell_net_applied *
 		say("vayu-cell-net: flags: %d\n", error);
 	}
 
-	say("vayu-cell-net: en1 address %s mask %s peer %s mtu %u, DNS %s %s (recorded only), "
-	    "link %s\n", address, mask, gateway_text, mtu, dns1_text, dns2_text,
+	say("vayu-cell-net: %s address %s mask %s peer %s mtu %u, DNS %s %s (recorded only), "
+	    "link %s\n", cell_net.name, address, mask, gateway_text, mtu, dns1_text, dns2_text,
 	    applied->fully_configured ? "configured" : "address only (gateway 0)");
+	if (hakios_ipv4_only != 0) {
+		say("vayu-cell-net: vayu_ipv4_only=1: %s carries IPv4 only; no inet6 is attached to %s or "
+		    "pdp_ip0\n", cell_net.name, cell_net.name);
+	}
 	cell_net_stage(applied->fully_configured ? "OK" : "ERROR",
-	    "en1 %s/%s peer %s mtu %u, flags %s%s", address, mask, gateway_text, mtu,
+	    "%s %s/%s peer %s mtu %u, flags %s%s", cell_net.name, address, mask, gateway_text, mtu,
 	    applied->fully_configured ? "UP|RUNNING" : "address only",
 	    applied->route_set ? ", default route added" : "");
 	if (!applied->fully_configured) {
 		say("vayu-cell-net: gateway 0: address kept, no default route, not fully configured\n");
 	}
+}
+
+/* ---- the kernel ICMP echo test ------------------------------------------------------------------- */
+
+static bool
+cell_net_ping_send(void)
+{
+	struct cell_net_applied applied;
+	uint8_t packet[CELL_PING_SIZE];
+	uint32_t sequence, address;
+	uint16_t checksum;
+
+	lck_mtx_lock(&cell_net_lock);
+	applied = cell_net.applied;
+	lck_mtx_unlock(&cell_net_lock);
+	if (!applied.fully_configured || applied.address == 0) {
+		return false;
+	}
+	sequence = cell_ping.sent + 1;
+	bzero(packet, sizeof(packet));
+	packet[0] = 0x45;                               /* IPv4, 5 words */
+	packet[2] = (uint8_t)(CELL_PING_SIZE >> 8);
+	packet[3] = (uint8_t)CELL_PING_SIZE;
+	packet[4] = (uint8_t)(cell_ping.id >> 8);        /* IP id, arbitrary */
+	packet[5] = (uint8_t)cell_ping.id;
+	packet[8] = 64;                                 /* TTL */
+	packet[9] = 1;                                  /* ICMP */
+	address = applied.address;
+	packet[12] = (uint8_t)(address >> 24);
+	packet[13] = (uint8_t)(address >> 16);
+	packet[14] = (uint8_t)(address >> 8);
+	packet[15] = (uint8_t)address;
+	packet[16] = (uint8_t)(CELL_PING_TARGET >> 24);
+	packet[17] = (uint8_t)(CELL_PING_TARGET >> 16);
+	packet[18] = (uint8_t)(CELL_PING_TARGET >> 8);
+	packet[19] = (uint8_t)CELL_PING_TARGET;
+	checksum = cell_net_checksum(packet, 20);
+	packet[10] = (uint8_t)(checksum >> 8);
+	packet[11] = (uint8_t)checksum;
+	packet[20] = 8;                                 /* echo request */
+	packet[21] = 0;
+	packet[24] = (uint8_t)(cell_ping.id >> 8);
+	packet[25] = (uint8_t)cell_ping.id;
+	packet[26] = (uint8_t)(sequence >> 8);
+	packet[27] = (uint8_t)sequence;
+	memcpy(packet + 28, "vayu-lte", 8);
+	checksum = cell_net_checksum(packet + 20, CELL_PING_SIZE - 20);
+	packet[22] = (uint8_t)(checksum >> 8);
+	packet[23] = (uint8_t)checksum;
+	if (!vayu_ipa_data_transmit(VAYU_CELL_NET_MUX, packet, sizeof(packet))) {
+		say("vayu-cell-ping: echo request seq %u was refused by the IPA/QMAP TX path "
+		    "(no GSI channel or no QMAP slot)\n", sequence);
+		return false;
+	}
+	cell_ping.sent_at[sequence - 1] = cell_net_now_ms();
+	cell_ping.sent = sequence;
+	say("vayu-cell-ping: echo request 8.8.8.8 seq %u sent via IPA mux %u (%u bytes)\n",
+	    sequence, VAYU_CELL_NET_MUX, (unsigned)sizeof(packet));
+	return true;
+}
+
+/* Called on the raw IPv4 packet before PF_INET sees it. Only an echo reply with our id counts. */
+static void
+cell_net_ping_input(const uint8_t *packet, size_t length)
+{
+	size_t header_length;
+	const uint8_t *icmp;
+	uint32_t source;
+	uint16_t id, sequence;
+	uint64_t now, rtt = 0;
+	char source_text[20];
+
+	if (!cell_ping.enabled || cell_ping.done || packet == NULL || length < 28 ||
+	    (packet[0] >> 4) != 4 || packet[9] != 1) {
+		return;
+	}
+	header_length = (size_t)(packet[0] & 0x0f) * 4;
+	if (header_length < 20 || length < header_length + 8) {
+		return;
+	}
+	icmp = packet + header_length;
+	if (icmp[0] != 0 || icmp[1] != 0) {              /* echo reply only */
+		return;
+	}
+	id = (uint16_t)((icmp[4] << 8) | icmp[5]);
+	sequence = (uint16_t)((icmp[6] << 8) | icmp[7]);
+	if (id != (uint16_t)cell_ping.id || sequence == 0 || sequence > cell_ping.sent) {
+		return;
+	}
+	now = cell_net_now_ms();
+	if (cell_ping.sent_at[sequence - 1] != 0 && now >= cell_ping.sent_at[sequence - 1]) {
+		rtt = now - cell_ping.sent_at[sequence - 1];
+	}
+	cell_ping.replies++;
+	source = ((uint32_t)packet[12] << 24) | ((uint32_t)packet[13] << 16) |
+	    ((uint32_t)packet[14] << 8) | packet[15];
+	ip4_masked(source_text, sizeof(source_text), source);
+	say("vayu-cell-ping: echo reply from %s seq %u (%u bytes), %llu ms\n", source_text,
+	    sequence, (unsigned)length, (unsigned long long)rtt);
+}
+
+static void
+cell_net_ping_thread(void *argument __unused, wait_result_t wait __unused)
+{
+	uint64_t last_send = 0;
+
+	while (!cell_ping.done) {
+		bool configured;
+
+		if (!cell_ping.enabled) {
+			break;
+		}
+		lck_mtx_lock(&cell_net_lock);
+		configured = cell_net.applied.fully_configured && cell_net.ifp != NULL &&
+		    (ifnet_flags(cell_net.ifp) & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING);
+		lck_mtx_unlock(&cell_net_lock);
+		if (!configured) {
+			delay_for_interval(500, NSEC_PER_MSEC);
+			continue;
+		}
+		if (cell_ping.sent < CELL_PING_COUNT) {
+			if (last_send != 0 && cell_net_now_ms() - last_send < CELL_PING_INTERVAL_MS) {
+				delay_for_interval(100, NSEC_PER_MSEC);
+				continue;
+			}
+			if (!cell_net_ping_send()) {
+				cell_ping.done = true;
+				break;
+			}
+			last_send = cell_net_now_ms();
+			continue;
+		}
+		if (cell_net_now_ms() - last_send < CELL_PING_WAIT_MS) {
+			delay_for_interval(200, NSEC_PER_MSEC);
+			continue;
+		}
+		say("vayu-cell-ping: RESULT: %u/%u replies from 8.8.8.8 in %u ms; IPA TX packets %llu, "
+		    "RX packets %llu\n", cell_ping.replies, cell_ping.sent, CELL_PING_WAIT_MS,
+		    (unsigned long long)cell_net.tx_packets, (unsigned long long)cell_net.rx_packets);
+		cell_ping.done = true;
+	}
+	thread_terminate(current_thread());
 }
 
 /* ---- the configuration thread -------------------------------------------------------------------- */
@@ -652,16 +871,17 @@ static bool
 cell_net_attach(void)
 {
 	struct ifnet_init_eparams init;
+	const char *uniqueid = cell_net.pdp ? CELL_NET_UNIQUEID_PDP : CELL_NET_UNIQUEID_EN;
 	errno_t error;
 
 	bzero(&init, sizeof(init));
 	init.ver = IFNET_INIT_CURRENT_VERSION;
 	init.len = sizeof(init);
 	init.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO;
-	init.uniqueid = CELL_NET_UNIQUEID;
-	init.uniqueid_len = (u_int32_t)strlen(CELL_NET_UNIQUEID);
-	init.name = CELL_NET_PREFIX;
-	init.unit = CELL_NET_UNIT;
+	init.uniqueid = uniqueid;
+	init.uniqueid_len = (u_int32_t)strlen(uniqueid);
+	init.name = cell_net.pdp ? CELL_NET_PREFIX_PDP : CELL_NET_PREFIX_EN;
+	init.unit = cell_net.pdp ? CELL_NET_UNIT_PDP : CELL_NET_UNIT_EN;
 	init.family = IFNET_FAMILY_CELLULAR;
 	init.type = IFT_CELLULAR;
 	init.output = cell_net_output;
@@ -672,7 +892,7 @@ cell_net_attach(void)
 
 	error = ifnet_allocate_extended(&init, &cell_net.ifp);
 	if (error != 0) {
-		say("vayu-cell-net: en1 cannot be made: %d (already taken?)\n", error);
+		say("vayu-cell-net: %s cannot be made: %d (already taken?)\n", cell_net.name, error);
 		cell_net.ifp = NULL;
 		return false;
 	}
@@ -681,16 +901,33 @@ cell_net_attach(void)
 	ifnet_set_mtu(cell_net.ifp, VAYU_CELL_NET_MTU_DEFAULT);
 	ifnet_set_hdrlen(cell_net.ifp, 0);
 	ifnet_set_flags(cell_net.ifp, IFF_POINTOPOINT, IFF_POINTOPOINT);
+	if (cell_net.pdp) {
+		/*
+		 * The owner's gate: no IPv6 at all. IFEF_IPV6_DISABLED makes nd6/ip6_output refuse
+		 * the interface; IFEF_NOAUTOIPV6LL keeps in6_ifattach from making a fe80:: address
+		 * when the link goes up. add_proto() already refuses PF_INET6, so this is the second,
+		 * explicit layer. IFEF_IPV6_DISABLED is checked by nd6.c and ip6_input.c.
+		 */
+		error = ifnet_set_eflags(cell_net.ifp, IFEF_IPV6_DISABLED | IFEF_NOAUTOIPV6LL,
+		    IFEF_IPV6_DISABLED | IFEF_NOAUTOIPV6LL);
+		if (error != 0) {
+			say("vayu-wds: %s: cannot disable IPv6: %d; PF_INET6 is still not plumbed\n",
+			    cell_net.name, error);
+		} else {
+			say("vayu-wds: %s: IPv6 disabled by construction (no inet6, no RA/ND, no DHCPv6)\n",
+			    cell_net.name);
+		}
+	}
 
 	error = ifnet_attach(cell_net.ifp, NULL);
 	if (error != 0) {
-		say("vayu-cell-net: en1 cannot be attached: %d\n", error);
+		say("vayu-cell-net: %s cannot be attached: %d\n", cell_net.name, error);
 		ifnet_release(cell_net.ifp);
 		cell_net.ifp = NULL;
 		return false;
 	}
 	bpfattach(cell_net.ifp, DLT_RAW, 0);
-	say("vayu-cell-net: en1 attached, IFT_CELLULAR, raw IPv4, link down\n");
+	say("vayu-cell-net: %s attached, IFT_CELLULAR, raw IPv4, link down\n", cell_net.name);
 	return true;
 }
 
@@ -699,17 +936,30 @@ cell_net_attach(void)
 void
 vayu_cell_net_init(void)
 {
-	uint32_t enabled = 0;
+	uint32_t enabled = 0, wds = 0;
 	uint32_t default_route = 0;
+	bool want_wds;
 	thread_t thread;
 	errno_t error;
 
-	if (!PE_parse_boot_argn("vayu_cell_net", &enabled, sizeof(enabled)) || enabled == 0) {
+	/* vayu_wds=1 is the WDS/ifnet switch: pdp_ip0, IPv4 only. vayu_cell_net=1 stays the
+	 * bring-up switch with en1. Both are default off and one boot makes one interface. */
+	want_wds = PE_parse_boot_argn("vayu_wds", &wds, sizeof(wds)) && wds == 1;
+	if (wds != 0 && !want_wds) {
+		say("vayu-wds: vayu_wds=%u is refused: only 1 creates pdp_ip0\n", wds);
 		return;
 	}
-	if (enabled != 1) {
-		say("vayu-cell-net: vayu_cell_net=%u is refused: only 1 creates en1\n", enabled);
-		return;
+	if (!want_wds) {
+		if (!PE_parse_boot_argn("vayu_cell_net", &enabled, sizeof(enabled)) || enabled == 0) {
+			return;
+		}
+		if (enabled != 1) {
+			say("vayu-cell-net: vayu_cell_net=%u is refused: only 1 creates en1 (use vayu_wds=1 for pdp_ip0)\n",
+			    enabled);
+			return;
+		}
+	} else if (PE_parse_boot_argn("vayu_cell_net", &enabled, sizeof(enabled)) && enabled != 0) {
+		say("vayu-wds: vayu_cell_net=%u is ignored: this boot makes pdp_ip0, not en1\n", enabled);
 	}
 
 	lck_mtx_lock(&cell_net_lock);
@@ -718,10 +968,31 @@ vayu_cell_net_init(void)
 		return;
 	}
 	cell_net.started = true;
+	cell_net.pdp = want_wds;
+	strlcpy(cell_net.name, want_wds ? VAYU_CELL_NET_NAME_WDS : VAYU_CELL_NET_NAME_LEGACY,
+	    sizeof(cell_net.name));
 	lck_mtx_unlock(&cell_net_lock);
 
-	PE_parse_boot_argn("vayu_cell_net_default", &default_route, sizeof(default_route));
-	cell_net.default_route = default_route == 1;
+	if (want_wds) {
+		/* configd owns the default route and DNS through the service net_test publishes (the
+		 * same shape as for en0). The kernel adds no route by default; vayu_wds_default=1 is
+		 * the explicit fallback for a run without configd. */
+		uint32_t wds_default = 0;
+
+		PE_parse_boot_argn("vayu_wds_default", &wds_default, sizeof(wds_default));
+		cell_net.default_route = wds_default == 1;
+	} else {
+		PE_parse_boot_argn("vayu_cell_net_default", &default_route, sizeof(default_route));
+		cell_net.default_route = default_route == 1;
+	}
+
+	{
+		uint32_t ping = 0;
+
+		PE_parse_boot_argn("vayu_cell_ping", &ping, sizeof(ping));
+		cell_ping.enabled = ping == 1;
+		cell_ping.id = 0x5601;
+	}
 
 	error = proto_register_plumber(PF_INET, IFNET_FAMILY_CELLULAR, cell_net_attach_proto, NULL);
 	if (error != 0 && error != EEXIST) {
@@ -733,7 +1004,7 @@ vayu_cell_net_init(void)
 		return;
 	}
 	if (kernel_thread_start(cell_net_thread, NULL, &thread) != KERN_SUCCESS) {
-		say("vayu-cell-net: no configuration thread; en1 stays down\n");
+		say("vayu-cell-net: no configuration thread; %s stays down\n", cell_net.name);
 		return;
 	}
 	thread_deallocate(thread);
@@ -741,8 +1012,27 @@ vayu_cell_net_init(void)
 	lck_mtx_lock(&cell_net_lock);
 	cell_net.thread_started = true;
 	lck_mtx_unlock(&cell_net_lock);
-	say("vayu-cell-net: ready, vayu_cell_net=1 vayu_cell_net_default=%u; no CommCenter, no configd, "
-	    "no DNS publication\n", cell_net.default_route ? 1 : 0);
+	if (cell_ping.enabled) {
+		thread_t ping_thread;
+
+		if (kernel_thread_start(cell_net_ping_thread, NULL, &ping_thread) == KERN_SUCCESS) {
+			thread_deallocate(ping_thread);
+			say("vayu-cell-ping: vayu_cell_ping=1: 8.8.8.8 after %s has an address, up to "
+			    "%u requests\n", cell_net.name, CELL_PING_COUNT);
+		} else {
+			cell_ping.enabled = false;
+			say("vayu-cell-ping: no thread; the ping test is off\n");
+		}
+	}
+	say("vayu-cell-net: ready: %s, %s=1 default_route=%u; no CommCenter, no configd, no DNS publication\n",
+	    cell_net.name, want_wds ? "vayu_wds" : "vayu_cell_net", cell_net.default_route ? 1 : 0);
+}
+
+const char *
+vayu_cell_net_name(void)
+{
+	/* Written once, before the thread starts; an empty name can only mean "not initialized". */
+	return cell_net.name[0] != 0 ? cell_net.name : VAYU_CELL_NET_NAME_LEGACY;
 }
 
 bool
@@ -789,6 +1079,7 @@ vayu_cell_net_input(uint8_t mux, const uint8_t *packet, size_t length)
 		cell_net.rx_dropped++;
 		return;
 	}
+	cell_net_ping_input(packet, total);
 	ifp = cell_net.ifp;
 	if (ifp == NULL || total > ifnet_mtu(ifp) ||
 	    (ifnet_flags(ifp) & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING)) {

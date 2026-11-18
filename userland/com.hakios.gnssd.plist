@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- from another HakiOS port (MIT): xreactx/hakios-xnu-kernel, branch oneplus-6t-upstream, commit 12d310ec3b2e -->
+	<key>Label</key>
+	<string>com.hakios.gnssd</string>
+	<!-- the modem's GPS fixes (kernel vayu_gnss=1, /dev/vayu-gnss) handed to locationd as simulated
+	     locations (src/gnssd.m, LOCATIOND=1); without vayu_gnss=1 among the boot-args it ends at once -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/gnssd</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>UserName</key>
+	<string>root</string>
+	<key>LimitLoadToSessionType</key>
+	<string>System</string>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

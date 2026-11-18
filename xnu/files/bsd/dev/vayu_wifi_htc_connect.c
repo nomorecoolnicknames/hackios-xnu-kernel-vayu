@@ -35,8 +35,11 @@
  */
 
 #include <stddef.h>
+#include <libkern/libkern.h>
+#include <sys/systm.h>
 #include <sys/vayu_wifi_htc_connect.h>
 #include <sys/vayu_wifi_wmi.h>
+#include <sys/vayu_wifi_net.h>
 #include <sys/vayu_wifi_scan.h>
 #include <sys/vayu_wifi_sta.h>
 
@@ -209,7 +212,12 @@ htcc_ce_tx(uint32_t ce_id, const uint8_t *data, uint32_t len, uint32_t transfer_
 	htcc_barrier();
 	next = (slot + 1) & mask;
 	if (vayu_wmi_mode >= 2 && len > 64) {
-		htcc_txdump(ce_id, buf, len);
+		/* WMI carries the PTK and GTK (install-key) and may carry a PMK: never its payload, at any level */
+		if (ce_id == VAYU_HTCC_WMI_TX_CE) {
+			o->log("vayu-wifi: htc: tx ce%u WMI payload withheld (%u bytes)\n", ce_id, len - HTCC_HDR);
+		} else {
+			htcc_txdump(ce_id, buf, len);
+		}
 	}
 	/*
 	 * W21c (vayu_wifi_wmi=2): WCN3990 has shadow_reg_support, so ath10k moves the
@@ -249,7 +257,7 @@ htcc_ce_tx(uint32_t ce_id, const uint8_t *data, uint32_t len, uint32_t transfer_
 	htcc.tx_wr[k] = next;      /* the descriptor is advertised: never reuse the slot */
 	o->log("vayu-wifi: htc: tx: ce%u slot %u NOT completed: srri %u sr_wr %u\n",
 	    ce_id, slot, srri, o->rd(ce_id, HTCC_SR_WR_IDX) & mask);
-	return -1;
+	return VAYU_HTCC_TX_UNKNOWN;    /* (not -1: the engine may still read what the descriptor points at) */
 }
 
 /* flame htc_send() for ep0: no credit flow on the control endpoint. */
@@ -687,8 +695,14 @@ vayu_htcc_run(const struct vayu_htcc_ops *ops)
 	}
 	if (rc == 0 && vayu_wmi_mode != 0) {
 		rc = htcc_wmi_init();
-		if (rc == 0 && vayu_scan_mode != 0) {
-			htcc_scan();
+		if (rc == 0) {
+			/* W25r: en0, its IO80211 services and the station boundary exist before any scan
+			 * or join, so iOS's wifid has something to ask even when the boot join is off or
+			 * found nothing.  The scan (and the loop that serves iOS) comes after. */
+			vayu_net_sta_attach(vayu_wmi_mac());
+			if (vayu_scan_mode != 0) {
+				htcc_scan();
+			}
 		}
 	}
 	ops->log("vayu-wifi: htc: dumping RX for %u ms\n", HTCC_DUMP_MS);
@@ -701,4 +715,21 @@ vayu_htcc_run(const struct vayu_htcc_ops *ops)
 	    "(%u logged), %u on wmi eid, WMI_SERVICE_READY %u\n", rc, htcc.wmi_eid, htcc.htt_eid,
 	    htcc.rx_frames, htcc.rx_logged, htcc.rx_wmi, htcc.svc_ready);
 	return rc;
+}
+
+/*
+ * K29 recovery: the station loop ended because the firmware died.  Clear the
+ * HTC endpoint/credit state and the stop latch so vayu_htcc_run() can run the
+ * CONNECT/INIT/READY sequence again on the new firmware instance.  The caller
+ * guarantees the old station thread is gone (vayu_htcc_run returned).
+ */
+void
+vayu_wifi_htcc_reset(const char *why)
+{
+	memset(&htcc, 0, sizeof(htcc));
+	htcc_stopped = false;
+	htcc_ops = NULL;
+	vayu_htcc_active = false;
+	printf("vayu-wifi: htc: reset for the new firmware instance (%s); endpoint and credit "
+	    "state cleared\n", why);
 }

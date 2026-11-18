@@ -23,6 +23,16 @@
 #                                   init hands the list to the kernel (etc/inject.conf -> sysctl kern.exec_inject)
 #                      STOREFRONT=1 ... and src/inject_store.c inside appstored: the storefront answered,
 #                                   and a bag request watched for (an experiment; see that file)
+#                      LOCATIOND=1  the modem's GPS to iOS (kernel vayu_gnss=1, best with vayu_gnss_run=0
+#                                   vayu_gnss_v02=1): iOS's locationd as a job, src/gnssd.m handing it the
+#                                   fixes of /dev/vayu-gnss, src/inject_loc.c telling Settings, Maps and
+#                                   locationd there is a GPS. locationd (31 MB) goes into the system image,
+#                                   so that one is to be built with LOCATIOND=1 too (SYSTEM=1 once). See below.
+#                      BT_AUDIO=1   Apple's BTAudioHALPlugin.driver beside our audio device (the audio
+#                                   server's end of bluetoothd's A2DP: without it a headset pairs, and
+#                                   iOS's sound stays on the speaker), and bluetoothd's helpers allowed
+#                                   (com.apple.BTServer.*, bluetoothuserd, on demand). For the kernel's
+#                                   vayu_bt_baud=3000000: 115200 baud cannot carry A2DP. See below.
 #                      EXTRA="..."  more programs for /redwood/bin (files on this machine): one-off
 #                                   diagnostics, which a file given as RC_JOBS can then run
 #                      EXTRA_SHARE="..." directories on this machine to copy whole into /redwood/share,
@@ -70,6 +80,12 @@
 #                                   the kernel. adsp=1 needs none of it: the system image has the firmware in /fw.
 #                      MODEM=1      stage checked local MPSS firmware from ../fw-modem in system.apfs /fw.
 #                                   This does not start the modem; the XNU MPSS driver is still required.
+#                      METAL=1      with Metal on the Adreno (vayu-dev's direct driver): lib/HakiosMetal.bundle
+#                                   (src/HakiosMetalCA.m over ../hakios-metal with Mesa's compiler in it) and
+#                                   share/metal/*.metallib for bin/metal_test. Inert without the boot-arg metal=N:
+#                                   the kernel then names no plug-in and init binds none. See the METAL=1 block.
+#                                   src/HakiosMetalCA.m is not in the published tree (its origin states no
+#                                   licence; it waits for its author's permission), and METAL=1 stops without it.
 #   system.apfs      the system image, the root filesystem (the resident RAM disk, /dev/md0), an
 #                    APFS container: the part of iOS 16.5 chosen by ../sysimage/select-system.py at
 #                    its real paths, the dyld shared cache, and src/stage0.c as /sbin/launchd (the
@@ -91,6 +107,10 @@
 #   CHECK=1          check every image (every container) as it is made: apfsck has to find it clean and
 #                    the kernel's apfs_lib has to read every volume back as the directory it was made of
 #                    (../tools/apfs/check-image.sh; the system image takes a few minutes more)
+#
+# From other HakiOS ports (MIT): LOCATIOND=1 after xreactx/hakios-xnu-kernel, branch oneplus-6t-upstream, commits
+# 12d310ec3b2e and e86c96b9ada8; BT_AUDIO=1 after janhurn9400/hackios-xnu-kernel, branch renoir, commit
+# 7287928f164b; METAL=1 and FLASHBOOT=1's flash_stage after telegdyd/ios-vayu, branch vayu-dev, commits 061e5a82d023 and 86984b16b016.
 set -e
 cd "$(dirname "$(readlink -f "$0")")"
 source ../xnu-env.sh
@@ -143,6 +163,12 @@ IOS_JOBS=${JOBS-"
 # (Count a QEMU run log with its duplicate lines removed: run-ios.sh prints launchd's log twice.)
 # WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
+# iOS's location daemon, for the modem's GPS (LOCATIOND=1; xreactx/oneplus-6t-upstream 12d310ec3 did the same for the
+# 6T's): mkjobs.py's DENY keeps it out while no phone had a GPS. Its fixes come from src/gnssd.m (com.hakios.gnssd).
+if [ -n "$LOCATIOND" ]; then
+	IOS_JOBS="$IOS_JOBS com.apple.locationd"
+	export ALLOW="${ALLOW:+$ALLOW }locationd"
+fi
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libhakios.dylib, src/inject_sb.c is libhakios.sb.dylib, src/inject_media.c is
 # libhakios.media.dylib, src/inject_bt.c is libbt.dylib, src/inject_nfcrestore.m is
@@ -168,6 +194,9 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 [ -n "$STOREFRONT" ] && INJECT="$INJECT
 /redwood/lib/libhakios.store.dylib appstored AppStore
 /redwood/lib/libhakios.fairplay.dylib fairplayd.H2"
+# LOCATIOND=1: MobileGestalt says there is a GPS to the programs that ask (src/inject_loc.c)
+[ -n "$LOCATIOND" ] && INJECT="$INJECT
+/redwood/lib/libhakios.loc.dylib Preferences Maps locationd"
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -182,7 +211,7 @@ else
 	$CC $LD -o hello src/hello.c
 	$CC -Ilibmini -c libmini/mini.c -o obj/mini.o
 	$CC -c libmini/start.S -o obj/start.o
-	for prog in init child stage0 var_store; do
+	for prog in init child stage0 var_store flash_stage; do
 		$CC -Ilibmini $LD -o obj/$prog.new src/$prog.c obj/mini.o obj/start.o
 		# keep the old file (and its time stamp) when nothing changed: system.apfs depends on stage0
 		cmp -s obj/$prog.new obj/$prog && rm obj/$prog.new || mv obj/$prog.new obj/$prog
@@ -198,6 +227,8 @@ cp obj/child root/bin/child
 # ends: the program and its job together, away from the iOS job list below, which several working
 # copies are editing at once.
 [ -f obj/var_store ] && cp obj/var_store root/bin/
+# A new boot image from iOS: staged in darwin for the loader to write into `boot` at the next start (src/flash_stage.c)
+[ -f obj/flash_stage ] && cp obj/flash_stage root/bin/
 cp com.hakios.varstore.plist root/LaunchDaemons/
 echo "Darwin on hakios: image built $(date '+%Y-%m-%d %H:%M')" > root/etc/motd
 # 300000 bytes, byte i = (i*31 + (i>>8)) & 0xff; init verifies it through read() and mmap()
@@ -229,6 +260,18 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			echo "build.sh: no ldid: oslogfwd is unsigned"
 		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface -o obj/surf_test src/surf_test.c
 		$DYN -o obj/rwtouch src/rwtouch.c
+		# the reverse SSH tunnel to the lab host, the screenshot and the touch driver (root-night16)
+		$DYN -o obj/tunnel src/tunnel.c
+		$DYN -framework CoreFoundation -framework IOKit -o obj/touch src/touch.c
+		$DYN -framework IOSurface -framework IOKit -framework CoreFoundation -framework CoreGraphics \
+			-framework ImageIO -o obj/fbshot src/fbshot.c
+		$DYN -o obj/usbctld src/usbctld.c src/minish.c
+		$DYN -fno-objc-arc -L. -lxpc -framework Foundation -framework CoreFoundation -lobjc \
+			-o obj/ctshimd src/ctshimd.m
+		$DYN -fno-objc-arc -framework Foundation -framework CoreFoundation -lobjc \
+			-o obj/apphangd src/apphangd.m
+		$DYN -fobjc-arc -framework Foundation -lobjc -o obj/app_register src/app_register.m
+		${LDID:-ldid} -Ssrc/app_register.entitlements obj/app_register
 		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/sound_test.c
 		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/mg_test.c
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/torch_test.c
@@ -242,16 +285,30 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework IOSurface -o obj/cow_test src/cow_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework IOSurface -o obj/cg_test src/cg_test.c
 		# what iOS here believes about Metal, and what CoreImage does without it (src/metal_test.m);
-		# OpenGLES for the CIContext made over an EAGLContext, which is deprecated and the point
+		# OpenGLES for the CIContext made over an EAGLContext, which is deprecated and the point.
+		# metal_app.m, metal_layer.m: a real Metal program and a CAMetalLayer on the device of METAL=1 below
+		# (`metal_test app LIBRARY`, `metal_test layer LIBRARY`; vayu-dev's Metal tasks 9 and 10)
 		$DYN -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework CoreGraphics \
-			-framework CoreImage -framework IOKit -framework Metal -framework OpenGLES \
-			-lMobileGestalt -o obj/metal_test src/metal_test.m
+			-framework CoreImage -framework IOKit -framework IOSurface -framework Metal -framework OpenGLES \
+			-framework QuartzCore -lMobileGestalt -Wl,-adhoc_codesign -o obj/metal_test src/metal_test.m \
+			src/metal_app.m src/metal_layer.m
 		$DYN -o obj/shm_test src/shm_test.c
 		$DYN -o obj/apfs_mmap_test src/apfs_mmap_test.c
 		$DYN -o obj/vol_ls src/vol_ls.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
+		# (what iOS's Wi-Fi side is answered, asked the way wifid asks it: src/wifiprobe.c)
+		$DYN -o obj/wifiprobe src/wifiprobe.c
+		# LOCATIOND=1: the modem's GPS fixes to locationd as simulated locations (src/gnssd.m: signed with the
+		# entitlement, or locationd will not take them) and the capability that says there is a GPS (src/inject_loc.c)
+		if [ -n "$LOCATIOND" ]; then
+			$DYN -fobjc-arc -framework Foundation -framework CoreLocation -o obj/gnssd src/gnssd.m &&
+				{ ${LDID:-ldid} -Ssrc/gnssd.entitlements obj/gnssd 2>/dev/null ||
+				  echo "build.sh: no ldid: gnssd is unsigned, and locationd will not take its fixes"; }
+			$DYN -fblocks -dynamiclib -install_name /redwood/lib/libhakios.loc.dylib -framework CoreFoundation \
+				-lMobileGestalt -lobjc -o obj/libhakios.loc.dylib src/inject_loc.c
+		fi
 		# (the account database answers only a client with the entitlements its own daemons hold: src/store_test.m)
 		$DYN -fobjc-arc -framework Foundation -framework Accounts -o obj/store_test src/store_test.m &&
 			{ ${LDID:-ldid} -Ssrc/store_test.entitlements obj/store_test 2>/dev/null ||
@@ -309,6 +366,84 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/libhakios.fairplay.dylib src/inject_fairplay.c
 		# the output device of the audio server: a plug-in for CoreAudio's HAL
 		$DYN -bundle -framework CoreFoundation -o obj/HakiosAudio src/audio_plugin.c
+		# --- METAL=1: Metal on the Adreno (vayu-dev's direct driver, Metal tasks 8-11) ------------------------
+		# The plug-in Metal loads when the kernel names it (boot-arg metal=N, MiniIOMobileFramebuffer.cpp) and init
+		# binds it at /System/Library/Extensions/HakiosMetal.bundle (src/init.c, bind_metal_plugin): src/HakiosMetalCA.m
+		# over hakios-metal's core with its compiler (`make -C hakios-metal ios MESA=1`, made here when it is not) and
+		# Mesa's iOS archives of `METAL=1 tools/mk-mesa.sh` (xnu-deps/build/mesa-metal, made here when they are not:
+		# the OpenGL ES library's Mesa above is not touched). Beside it, the two libraries metal_test runs on the
+		# device (`metal_test app`, `metal_test astc`): hakios-metal/tools/kernels' hand-written AIR, assembled by
+		# llvm-as and packed by tools/metal-mklib.py, as vayu-dev's tools/metal-app-build.sh and metal-ca-build.sh do.
+		# Without METAL=1 nothing of this is built or put in the image.
+		if [ "${METAL:-}" = 1 ] && [ ! -f src/HakiosMetalCA.m ]; then
+			echo "build.sh: METAL=1: src/HakiosMetalCA.m, the Metal plug-in, is not in this tree. It was begun from" >&2
+			echo "build.sh: vcvkk/darwin-redwood, whose repository states no licence, so it is left out until its author" >&2
+			echo "build.sh: allows it (README.md, THIRD_PARTY_LICENSES.md). Build without METAL=1 (OpenGL ES stays)." >&2
+			exit 1
+		fi
+		if [ "${METAL:-}" = 1 ]; then
+			HM=../hakios-metal
+			MB=../xnu-deps/build/mesa-metal/build-softpipe-freedreno
+			[ -f $MB/src/compiler/air/libair.a ] || METAL=1 ../tools/mk-mesa.sh
+			make -C $HM -j8 MESA=1 out/ios/libhakios-metal.a
+			if ! llvm-nm -g $HM/out/ios/libhakios-metal.a 2>/dev/null | grep -q " U _air_"; then
+				echo "build.sh: METAL=1: $HM/out/ios/libhakios-metal.a was built without its compiler (no MESA=1);" >&2
+				echo "build.sh: rm -rf $HM/out/ios and build again" >&2
+				exit 1
+			fi
+			METAL_GPU="-DHAKIOS_METAL_GPU -I$HM/include $HM/out/ios/libhakios-metal.a -lc++ -framework IOKit -framework IOSurface"
+			for a in src/compiler/air/libair.a src/freedreno/ir3/libfreedreno_ir3.a src/freedreno/isa/libir3encode.a \
+			    src/freedreno/isa/libir3decode.a src/compiler/isaspec/libisaspec.a src/compiler/nir/libnir.a \
+			    src/compiler/libcompiler.a src/freedreno/fdl/libfreedreno_layout.a \
+			    src/freedreno/common/libfreedreno_common.a src/util/libmesa_util.a src/util/libmesa_util_sse41.a \
+			    src/util/blake3/libblake3.a src/c11/impl/libmesa_util_c11.a; do
+				METAL_GPU="$METAL_GPU $MB/$a"
+			done
+			$DYN -bundle -fno-objc-arc -Wno-deprecated-declarations -framework Foundation -framework Metal -lobjc \
+				-o obj/HakiosMetal src/HakiosMetalCA.m $METAL_GPU -lz -lm \
+				-Wl,-U,_native_bridge_metal_open -Wl,-U,_native_bridge_metal_first_problem -Wl,-U,_native_bridge_metal_status \
+				-Wl,-U,_native_bridge_metal_formats -Wl,-U,_native_bridge_metal_variant_hook
+			# metal_test layer looks up the window server's services through this (src/metal_layer_lookup.c)
+			$DYN -dynamiclib -Wl,-adhoc_codesign -o obj/metal_layer_lookup.dylib src/metal_layer_lookup.c
+			rm -rf obj/metal-kernels && mkdir -p obj/metal-kernels
+			# (the .ll files use opaque pointers, which llvm-as reads from LLVM 15 on: Ubuntu 22.04's own is 14)
+			if [ -z "${LLVM_AS:-}" ]; then
+				for LLVM_AS in llvm-as-20 llvm-as-19 llvm-as-18 llvm-as-17 llvm-as-16 llvm-as-15 llvm-as; do
+					command -v $LLVM_AS > /dev/null && break
+				done
+			fi
+			for f in fill_id tex_fill tri_color_vs tri_color_fs tri_tex_fs tri_flat_vs tri_fc_fs tri_texh_fs tri_texhx_fs; do
+				$LLVM_AS $HM/tools/kernels/$f.ll -o obj/metal-kernels/$f.bc
+			done
+			K=obj/metal-kernels
+			python3 ../tools/metal-mklib.py obj/task9.metallib fill_id=kernel:$K/fill_id.bc tex_fill=kernel:$K/tex_fill.bc \
+				tri_color_vs=vertex:$K/tri_color_vs.bc tri_color_fs=fragment:$K/tri_color_fs.bc \
+				tri_tex_fs=fragment:$K/tri_tex_fs.bc tri_flat_vs=vertex:$K/tri_flat_vs.bc \
+				tri_fc_fs=fragment:$K/tri_fc_fs.bc+fc_value:int:0:0+fc_opaque:bool:1:1 > /dev/null
+			python3 ../tools/metal-mklib.py obj/astc.metallib tri_color_vs=vertex:$K/tri_color_vs.bc \
+				tri_tex_fs=fragment:$K/tri_tex_fs.bc tri_texh_fs=fragment:$K/tri_texh_fs.bc \
+				tri_texhx_fs=fragment:$K/tri_texhx_fs.bc > /dev/null
+			# CoreAnimation's own shaders for the window server on Metal (metal=3): QuartzCore's default.metallib, which
+			# the RAM system images leave out (sysimage/select-system.py takes no .metallib from frameworks) and the iOS
+			# volume on the flash has. The plug-in puts /redwood/share/ca-share/QuartzCore-default.metallib beside
+			# QuartzCore's pipeline library when the framework has none (HakiosMetalCA.m, newPipelineLibraryWithFilePath).
+			# CA_METALLIB=FILE, else the extracted tree's, else 7-Zip (23 or newer) takes it out of $IOS/rootfs.dmg once.
+			QC=System/Library/Frameworks/QuartzCore.framework/default.metallib
+			if [ -n "${CA_METALLIB:-}" ]; then
+				cp "$CA_METALLIB" obj/QuartzCore-default.metallib
+			elif [ -f $IOS/rootfs/$QC ]; then
+				cp $IOS/rootfs/$QC obj/QuartzCore-default.metallib
+			elif [ ! -s obj/QuartzCore-default.metallib ] && [ -f $IOS/rootfs.dmg ]; then
+				rm -rf obj/qc && 7z e -y -oobj/qc $IOS/rootfs.dmg $QC > obj/qc.log 2>&1 &&
+					[ -s obj/qc/default.metallib ] && mv obj/qc/default.metallib obj/QuartzCore-default.metallib
+				rm -rf obj/qc
+			fi
+			[ -s obj/QuartzCore-default.metallib ] ||
+				echo "build.sh: METAL=1: no QuartzCore default.metallib (CA_METALLIB=, or $IOS/rootfs.dmg and 7z >= 23):" \
+					"under metal=3 a RAM system image gives the window server no shaders of its own" >&2
+			echo "build.sh: METAL=1: HakiosMetal ($(stat -c %s obj/HakiosMetal) bytes), task9.metallib, astc.metallib," \
+				"QuartzCore-default.metallib $(stat -c %s obj/QuartzCore-default.metallib 2>/dev/null || echo missing)"
+		fi
 		if [ -n "$GL" ]; then
 			# the OpenGL ES library, and the table of functions that hands CoreAnimation's calls to it
 			# (Mesa says beside the library what it was built from: one from other patches is built again)
@@ -355,6 +490,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		fi
 	fi
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
+	[ -f obj/tunnel ] && cp obj/tunnel obj/touch obj/fbshot root/bin/
+	[ -f obj/usbctld ] && cp obj/usbctld root/bin/
+	[ -f obj/ctshimd ] && cp obj/ctshimd root/bin/
+	[ -f obj/apphangd ] && cp obj/apphangd root/bin/
+	[ -f obj/app_register ] && cp obj/app_register root/bin/
 	[ -f obj/oslogfwd ] && cp obj/oslogfwd root/bin/
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
@@ -366,6 +506,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/font_test ] && cp obj/font_test root/bin/
 	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
+	[ -f obj/wifiprobe ] && cp obj/wifiprobe root/bin/
+	[ -n "$LOCATIOND" ] && [ -f obj/gnssd ] && cp obj/gnssd root/bin/
 	[ -f obj/store_test ] && cp obj/store_test root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
@@ -393,6 +535,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.store.dylib ] && cp obj/libhakios.store.dylib root/lib/
 	[ -f obj/libhakios.fairplay.dylib ] && cp obj/libhakios.fairplay.dylib root/lib/
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
+	[ -n "$LOCATIOND" ] && [ -f obj/libhakios.loc.dylib ] && cp obj/libhakios.loc.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
 	[ -f obj/libbt.dylib ] && cp obj/libbt.dylib root/lib/
 	[ -f obj/libnfcrestore.dylib ] && cp obj/libnfcrestore.dylib root/lib/
@@ -404,6 +547,19 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# the system images (system-ru10) name this plug-in RedwoodAudio.driver -> /redwood/lib/RedwoodAudio.driver;
 		# without that name the link dangles and the HAL loads no device (no output, no input). One bundle, two names.
 		ln -sfn HakiosAudio.driver root/lib/RedwoodAudio.driver
+	fi
+	# METAL=1 (above): the plug-in, which init binds at /System/Library/Extensions/HakiosMetal.bundle when the
+	# boot has metal=N, and metal_test's libraries in share/metal (`metal_test app /redwood/share/metal/task9.metallib`)
+	if [ "${METAL:-}" = 1 ] && [ -f obj/HakiosMetal ]; then
+		mkdir -p root/lib/HakiosMetal.bundle root/share/metal
+		cp obj/HakiosMetal root/lib/HakiosMetal.bundle/
+		cp src/HakiosMetal.plist root/lib/HakiosMetal.bundle/Info.plist
+		cp obj/task9.metallib obj/astc.metallib root/share/metal/
+		cp obj/metal_layer_lookup.dylib root/bin/
+		if [ -s obj/QuartzCore-default.metallib ]; then
+			mkdir -p root/share/ca-share
+			cp obj/QuartzCore-default.metallib root/share/ca-share/
+		fi
 	fi
 	if [ -n "$GL" ]; then
 		# a PREBUILT build has none of these (../prebuilt/userland carries no Mesa, no gl_test):
@@ -466,6 +622,12 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# it asks through libiosexec, which reads a database the bootstrap does not ship (see
 		# init.c, where it is now built at every boot); the key is made here all the same,
 		# since nothing should depend on the order of those two
+		# ... and the key of the reverse tunnel to the lab host: 0600 root, its own name (root-night16)
+		if [ -f ../ssh/vayu_tunnel_ed25519 ]; then
+			cp ../ssh/vayu_tunnel_ed25519 root/var/root/.ssh/vayu_tunnel_ed25519
+			printf 'f\t600\t0\t0\t/private/var/root/.ssh/vayu_tunnel_ed25519\t/var/root/.ssh/vayu_tunnel_ed25519\n' \
+				>> root/etc/var.skel
+		fi
 		for k in authorized_keys ssh_host_ed25519_key ssh_host_ed25519_key.pub; do
 			[ -f ../ssh/$k ] || continue
 			cp ../ssh/$k root/var/root/.ssh/$k
@@ -491,6 +653,28 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# and not by what select-system.py extracted here (--root-volume; seven jobs turn on the difference,
 	# fairplayd among them).
 	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
+	if [ -f obj/tunnel ]; then
+		cp com.hakios.tunnel.plist root/LaunchDaemons/
+		cp etc/hakios-tunnel.conf root/etc/
+		# the lab host the tunnel goes to is yours, so it is not in the repository: ../ssh/hakios-tunnel.conf
+		# (host=, user=, beside the tunnel's key) takes the place of the commented one when it is there
+		if [ -z "$SHARE" ] && [ -f ../ssh/hakios-tunnel.conf ]; then cp ../ssh/hakios-tunnel.conf root/etc/; fi
+	fi
+	# the kernel's own Wi-Fi join (vayu_wifi_join=1 vayu_wifi_pmk_file=1, bsd/dev/vayu_wifi_rsn.c) reads the
+	# network's PMK from /redwood/etc/vayu-wifi/wifi.pmk: 64 hex digits on one line (wpa_passphrase SSID prints it
+	# as psk=). Yours, so not in the repository: ../fw-wifi/wifi.pmk, 0600. SHARE=1 leaves it out.
+	rm -rf root/etc/vayu-wifi
+	if [ -z "$SHARE" ] && [ -f ../fw-wifi/wifi.pmk ]; then
+		mkdir -p root/etc/vayu-wifi
+		install -m 0600 ../fw-wifi/wifi.pmk root/etc/vayu-wifi/wifi.pmk
+	fi
+	[ -f obj/usbctld ] && cp com.hakios.usbctld.plist root/LaunchDaemons/
+	if [ -n "$LOCATIOND" ] && [ -f obj/gnssd ]; then
+		cp com.hakios.gnssd.plist root/LaunchDaemons/
+		# (mkjobs.py looks for locationd in sysimage/rootfs, which has not got it, and says so; the system
+		# image built with LOCATIOND=1 has it, see the system image below)
+		echo "  LOCATIOND=1: gnssd and locationd's job; locationd itself only in a system image built with LOCATIOND=1"
+	fi
 	[ "${OSLOGFWD-1}" != 0 ] && cp com.hakios.oslogfwd.plist root/LaunchDaemons/
 	# the unattended self-test's own job (src/selftest.m, devices/<name>/userland), which reads
 	# kern.bootargs and exits at once unless selftest=1 is there. Only when the device build made
@@ -502,6 +686,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	fi
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
+	# (BT_AUDIO=1: bluetoothd looks up its helpers when a headset connects -- com.apple.BTServer.avrcp, .le, .map,
+	# .pbap and bluetoothuserd -- which mkjobs.py's DENY keeps out; with REST=1 they come in, started on demand)
+	[ -n "$BT_AUDIO" ] && export ALLOW="${ALLOW:+$ALLOW }bluetooth BTServer"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
 # a phone whose firmware devices/<name>/pull-firmware.sh left in ../fw-<name>/: the files go to fw/ as they are
@@ -576,6 +763,7 @@ echo "build.sh: fw/: $(ls -1 root/fw 2>/dev/null | wc -l) files from ../fw-*:${f
 # private key for ssh. Both are one small file inside 2.5 GB, and nobody would notice either leave.
 secrets=
 [ -f root/fw/network ] && secrets="$secrets fw/network (the name and passphrase of your Wi-Fi)"
+[ -f root/etc/vayu-wifi/wifi.pmk ] && secrets="$secrets etc/vayu-wifi/wifi.pmk (your Wi-Fi's key)"
 [ -f root/var/root/.ssh/ssh_host_ed25519_key ] &&
 	secrets="$secrets /var/root/.ssh/ssh_host_ed25519_key (a private key)"
 if [ -n "$secrets" ]; then
@@ -592,6 +780,27 @@ for f in extensions.plist extensions.plist.sig; do
 	[ -f $IOS/rootfs/System/Library/xpc/$f ] && cp $IOS/rootfs/System/Library/xpc/$f root/xpc/
 done
 [ -d root/lib/HakiosAudio.driver ] && ln -s /redwood/lib/HakiosAudio.driver root/hal/HakiosAudio.driver
+# BT_AUDIO=1: and Apple's Bluetooth audio plug-in beside it, the other end of bluetoothd's audio. Without it a
+# headset connects and iOS's sound stays on the speaker; bluetoothd says "[Server.Audio] Error, unable to sendMsg
+# due to no available xpc client connections" (janhurn9400/renoir 7287928f1; the 6T, xreactx/oneplus-6t-upstream,
+# has it in its system image). select-system.py leaves System/Library/Audio out, and init binds this directory over
+# the system's plug-in directory either way (src/init.c, bind_audio_plugins and flash_root), so the plug-in rides in
+# this image (550 KB), taken once out of the iOS volume (rootfs.dmg, 7-Zip) into sysimage/extra.
+if [ -n "$BT_AUDIO" ]; then
+	BTHAL=System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver
+	if [ ! -s $IOS/extra/$BTHAL/BTAudioHALPlugin ] && [ -f $IOS/rootfs.dmg ]; then
+		mkdir -p $IOS/extra
+		(cd $IOS/extra && 7z x -y ../rootfs.dmg "$BTHAL/*" -r >/dev/null)
+	fi
+	if [ -s $IOS/extra/$BTHAL/BTAudioHALPlugin ]; then
+		rm -rf root/lib/BTAudioHALPlugin.driver
+		cp -R $IOS/extra/$BTHAL root/lib/BTAudioHALPlugin.driver
+		ln -s /redwood/lib/BTAudioHALPlugin.driver root/hal/BTAudioHALPlugin.driver
+		echo "  Apple's Bluetooth audio plug-in beside ours (BT_AUDIO=1)"
+	else
+		echo "build.sh: BT_AUDIO=1, but no $BTHAL (sysimage/rootfs.dmg is needed once): no Bluetooth audio" >&2
+	fi
+fi
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (bsd/dev/hakios.image.c)
 #
@@ -764,6 +973,21 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 			ln -sf /var/jb/usr/bin/$c sysroot/bin/$c
 		done
 		echo "  the package manager's prefix: $(du -sh sysroot/jb | cut -f1) as /jb (init puts it at /var/jb)"
+	fi
+	# LOCATIOND=1: iOS's locationd, which select-system.py leaves out (31 MB, past BIG_PROGRAM), taken once out of
+	# the iOS volume (rootfs.dmg, 7-Zip) into sysimage/extra. Here and not in root.apfs: that image travels with the
+	# kernel in the 64 MB the loader takes for both (xnuloader PAYLOAD_MAX_SIZE), and it is 40 MB already.
+	if [ -n "$LOCATIOND" ]; then
+		if [ ! -s $IOS/extra/usr/libexec/locationd ] && [ -f $IOS/rootfs.dmg ]; then
+			mkdir -p $IOS/extra
+			(cd $IOS/extra && 7z x -y ../rootfs.dmg usr/libexec/locationd >/dev/null)
+		fi
+		if [ -s $IOS/extra/usr/libexec/locationd ]; then
+			install -m 0755 $IOS/extra/usr/libexec/locationd sysroot/usr/libexec/locationd
+			echo "  locationd in the system image (LOCATIOND=1)"
+		else
+			echo "build.sh: LOCATIOND=1, but no usr/libexec/locationd (sysimage/rootfs.dmg is needed once)" >&2
+		fi
 	fi
 	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
 	mkdir -p sysroot/System/Library/Audio/Plug-Ins/HAL

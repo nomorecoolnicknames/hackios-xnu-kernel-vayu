@@ -2504,24 +2504,28 @@ vayu_ssc_run(const struct hakios_qrtr_ops *ops, uint32_t node, uint32_t port, ui
 
 	/*
 	 * Late indications: the SLPI can take a while to read its registry (through the FastRPC
-	 * file server vayu_fastrpc.c answers) and only then announce its sensors. If no SUID
-	 * answered, keep asking for the two that matter for up to vayu_ssc_late seconds (default
-	 * 60), a round every 10 s, and print what arrived. Everything below is unchanged.
+	 * file server vayu_fastrpc.c answers) and only then announce its sensors. Until the
+	 * accelerometer has a UID, keep asking for the registry and accel for up to
+	 * vayu_ssc_late seconds (default 90), a round every 10 s, and print what arrived.
+	 *
+	 * The old loop stopped on ssc.suid_answers != 0, i.e. on *any* SUID response: an empty
+	 * registry answer (or the registry alone, before the physical sensors are instantiated)
+	 * ended the window and the accelerometer never got its 60 s. The gate is the accel UID.
 	 */
 	{
-		uint32_t answered;
-		uint32_t late = 60;
+		bool accel_found, registry_found;
+		uint32_t late = 90;
 		uint64_t began;
 
 		lck_spin_lock(&ssc_lock);
-		answered = ssc.suid_answers;
+		accel_found = ssc.suid[SSC_ACCEL].stored != 0;
 		lck_spin_unlock(&ssc_lock);
-		if (answered == 0) {
+		if (!accel_found) {
 			PE_parse_boot_argn("vayu_ssc_late", &late, sizeof(late));
 			if (late > 600) {
 				late = 600;		/* ten minutes at the most */
 			}
-			say("vayu-ssc: no SUID answer yet: %u s more, registry and accel every 10 s\n", late);
+			say("vayu-ssc: no accel SUID yet: %u s more, registry and accel every 10 s\n", late);
 			began = ssc_now_ns();
 			while (!ssc_leaving && ssc_now_ns() - began < (uint64_t)late * 1000000000ULL) {
 				uint32_t indications;
@@ -2534,12 +2538,14 @@ vayu_ssc_run(const struct hakios_qrtr_ops *ops, uint32_t node, uint32_t port, ui
 				ssc_lookup(q, node, port, SSC_ACCEL);
 				lck_spin_lock(&ssc_lock);
 				indications = ssc.indications;
-				answered = ssc.suid_answers;
+				accel_found = ssc.suid[SSC_ACCEL].stored != 0;
+				registry_found = ssc.suid[SSC_REGISTRY].stored != 0;
 				lck_spin_unlock(&ssc_lock);
-				say("vayu-ssc: late +%llu s: %u indication(s), %u SUID answer(s)\n",
+				say("vayu-ssc: late +%llu s: %u indication(s), registry %s, accel %s\n",
 				    (unsigned long long)((ssc_now_ns() - began) / 1000000000ULL),
-				    indications, answered);
-				if (answered != 0) {
+				    indications, registry_found ? "found" : "no",
+				    accel_found ? "found" : "no");
+				if (accel_found) {
 					break;
 				}
 			}

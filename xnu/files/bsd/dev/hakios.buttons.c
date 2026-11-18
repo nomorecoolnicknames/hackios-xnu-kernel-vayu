@@ -259,13 +259,16 @@ hakios_spmi_peek(uint16_t id, uint8_t reg, uint8_t *value)
 	if (arb_core == 0 || arb_observer == 0) {
 		return false;
 	}
+	/* (the battery's and the thermal monitor's threads look up and fill the cache at once: under the arbiter's lock) */
+	hakios_spmi_lock();
 	for (unsigned i = 0; i < count; i++) {
 		if (kept[i].id == id) {
 			p = &kept[i];
 		}
 	}
 	if (p == NULL) {
-		if (count == sizeof(kept) / sizeof(kept[0])) {
+		if (count >= sizeof(kept) / sizeof(kept[0])) {
+			hakios_spmi_unlock();
 			return false;
 		}
 		channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
@@ -284,6 +287,7 @@ hakios_spmi_peek(uint16_t id, uint8_t reg, uint8_t *value)
 		}
 		count++;                /* (kept even if not found: not looked for again) */
 	}
+	hakios_spmi_unlock();
 	return p->found && spmi_read(p, reg, value, 1) == NULL;
 }
 

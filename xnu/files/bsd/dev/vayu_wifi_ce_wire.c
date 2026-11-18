@@ -13,28 +13,45 @@
 #include <sys/vayu_wifi_ce_wire.h>
 
 /*
- * ath10k snoc.c host_ce_config_wlan[] (vayu reference tree, CE4 = 2048).
- * flags bit 3 is CE_ATTR_DIS_INTR (ce.h:287); only CE4 has it.
+ * K29: the stock WCN3990 host table, read out of the stock vayu kernel
+ * (boot.img -> Image; the table is the one the kernel pairs with the same
+ * target_ce_config_wlan we send).  Differences from the k28 table, all of
+ * them in this table only:
+ *
+ *   - CE5 is a *source* (host->target) pipe: 2048 entries, 512-byte maximum.
+ *     The target table we send says pipe 5 dir 2 (out) 1024 x 64, and the
+ *     service map says "0xfe00 out pipe 5": three independent stock tables
+ *     agree.  k28 instead declared CE5 as a 512-entry *destination* ring and
+ *     posted RX buffers there (W21h: 511 x 2048); the firmware's CE then saw a
+ *     destination ring on a pipe it owns as a source and asserted in
+ *     copy_engine.c:_CE_misc_handler (misc_is 0x48 ERR on ce5).
+ *   - CE2 is 128 entries (k28: 64), CE4 keeps its stock 2048 source entries
+ *     (k28 modes 3/6/8 shrank it to 256), CE7 has no host rings (stock has no
+ *     ce_diag window in this table), CE8 has no host ring (target->uMC is not
+ *     host DMA).
+ *
+ * The k28 table stays available as vayu_ce_host_cfg_legacy for an A/B run
+ * (vayu_wifi_ce_stock=0).
  */
 const struct vayu_ce_cfg vayu_ce_host_cfg[VAYU_CE_COUNT] = {
-	/* CE0: host->target HTC control streams */
+	/* CE0: host->target HTC control and raw streams */
 	{ 16,   2048, 0,   0 },
 	/* CE1: target->host HTT + HTC control */
 	{ 0,    2048, 512, 0 },
 	/* CE2: target->host WMI (also the HTC control downlink) */
-	{ 0,    2048, 64,  0 },
+	{ 0,    2048, 128, 0 },
 	/* CE3: host->target WMI */
 	{ 32,   2048, 0,   0 },
 	/* CE4: host->target HTT, no interrupt */
 	{ 2048, 256,  0,   VAYU_CE_CFG_DIS_INTR },
-	/* CE5: target->host HTT (ipa_uc->target) */
-	{ 0,    512,  512, 0 },
+	/* CE5: host->target HTT (TEST_RAW / IPA uC), no interrupt, never RX */
+	{ 2048, 512,  0,   VAYU_CE_CFG_DIS_INTR },
 	/* CE6: target autonomous hif_memcpy */
 	{ 0,    0,    0,   0 },
-	/* CE7: ce_diag, host-only diagnostic window */
-	{ 2,    2048, 2,   0 },
-	/* CE8: target to uMC */
-	{ 0,    2048, 128, 0 },
+	/* CE7: ce_diag: no host rings in the stock WLAN table */
+	{ 0,    0,    0,   0 },
+	/* CE8: target to uMC: no host ring */
+	{ 0,    0,    0,   0 },
 	/* CE9: target->host HTT */
 	{ 0,    2048, 512, 0 },
 	/* CE10: target->host HTT */
@@ -42,6 +59,30 @@ const struct vayu_ce_cfg vayu_ce_host_cfg[VAYU_CE_COUNT] = {
 	/* CE11: target autonomous qcache memcpy / PKTLOG */
 	{ 0,    2048, 512, 0 },
 };
+
+/* k28's table, only for vayu_wifi_ce_stock=0 (the W21h 511-buffer experiment). */
+const struct vayu_ce_cfg vayu_ce_host_cfg_legacy[VAYU_CE_COUNT] = {
+	{ 16,   2048, 0,   0 },
+	{ 0,    2048, 512, 0 },
+	{ 0,    2048, 64,  0 },
+	{ 32,   2048, 0,   0 },
+	{ 2048, 256,  0,   VAYU_CE_CFG_DIS_INTR },
+	{ 0,    512,  512, 0 },
+	{ 0,    0,    0,   0 },
+	{ 2,    2048, 2,   0 },
+	{ 0,    2048, 128, 0 },
+	{ 0,    2048, 512, 0 },
+	{ 0,    2048, 512, 0 },
+	{ 0,    2048, 512, 0 },
+};
+
+const struct vayu_ce_cfg *vayu_ce_host_cfg_active = vayu_ce_host_cfg;
+
+void
+vayu_ce_host_cfg_select(bool legacy)
+{
+	vayu_ce_host_cfg_active = legacy ? vayu_ce_host_cfg_legacy : vayu_ce_host_cfg;
+}
 
 uint32_t
 vayu_ce_roundup_pow2(uint32_t n)
@@ -94,7 +135,7 @@ vayu_ce_is_host_rx(uint32_t ce)
 		return false;
 	}
 	/* CE7 is the host-only diagnostic window: Linux has no recv callback for it. */
-	return vayu_ce_host_cfg[ce].dest_nentries != 0 && ce != VAYU_CE_DIAG_CE;
+	return vayu_ce_host_cfg_active[ce].dest_nentries != 0 && ce != VAYU_CE_DIAG_CE;
 }
 
 static void

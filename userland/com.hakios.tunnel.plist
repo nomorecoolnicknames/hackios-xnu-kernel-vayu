@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.hakios.tunnel</string>
+	<!-- A reverse SSH tunnel to the lab host: /redwood/bin/tunnel, which runs and watches
+
+	       /var/jb/usr/bin/ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
+	           -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+	           -i /var/root/.ssh/vayu_tunnel_ed25519
+	           -R 127.0.0.1:22022:127.0.0.1:22 USER@HOST
+
+	     so that the host can reach this phone's sshd as 127.0.0.1:22022.  There is no host by
+	     default: /redwood/etc/hakios-tunnel.conf (host=) or the boot argument tunnel_host= names it,
+	     and without one the program does nothing.  The key comes into /private/var/root/.ssh at every boot from
+	     /etc/var.skel (a line of type "f"), not from the image's own empty /private/var. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/tunnel</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- a tunnel that ends (the Wi-Fi went away, the host closed it) is made again; the program
+	     itself restarts ssh, this is for the case where the program is what died -->
+	<key>KeepAlive</key>
+	<true/>
+	<!-- six lines a minute if the host is not there would be noise: one try every ten seconds -->
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<!-- the key is 0600 root: without this the job is spawned in the user/501 domain (the same
+	     thing that made com.hakios.oslogfwd answer {error:1}), and ssh could not read it -->
+	<key>LimitLoadToSessionType</key>
+	<string>System</string>
+	<!-- not a background job: those get their timers rounded up by a tenth of a second, and the
+	     alive checks and the reconnect pause are seconds, not milliseconds, so either would do;
+	     launchd is also less eager to coalesce an interactive job's wakeups -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

@@ -7,7 +7,9 @@ legal opinion, and it does not assert that the project is free of all risk. See 
 ## Apple Public Source License 2.0 (the kernel)
 
 `xnu/hakios.patch` and everything under `xnu/files/` are modifications of Apple's XNU, which Apple
-publishes under the APSL 2.0. The full text is in `LICENSE.APSL`. The obligations we track:
+publishes under the APSL 2.0, and `xnu/hfs/hfs.patch` is one of Apple's HFS Plus (`hfs-627.100.6`, the
+same licence, fetched by `xnu/hfs/hfs.sh` from `github.com/apple-oss-distributions/hfs` and never kept
+here). The full text is in `LICENSE.APSL`. The obligations we track:
 
 - **Source availability (APSL 2.3).** Our modifications are published here as source. The exact
   Apple base they apply to is the tag `xnu-8796.121.2` at
@@ -16,8 +18,8 @@ publishes under the APSL 2.0. The full text is in `LICENSE.APSL`. The obligation
 - **Retention of notices (APSL 2.1).** Apple's original copyright and license notices are kept in
   the files they belong to. Our added files carry their own notices and do not remove Apple's.
 - **Marking modifications (APSL 2.2).** Changes are described in the patch and in the commit
-  history; the project's own files are named `hakios.<thing>.c` so that what is ours is
-  distinguishable from Apple's original code.
+  history; the project's own files are named `hakios.<thing>.c` (this phone's `vayu_<thing>.c`) so
+  that what is ours is distinguishable from Apple's original code.
 - **Executable distribution (APSL 2.3(c)).** Where a built kernel is distributed (`prebuilt/`),
   the corresponding source is in the same repository, and this file points at it.
 - **No re-licensing.** The XNU-derived code stays under the APSL; it is **not** relabeled MIT. The

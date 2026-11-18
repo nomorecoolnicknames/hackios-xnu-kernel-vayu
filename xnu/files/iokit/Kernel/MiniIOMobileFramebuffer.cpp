@@ -212,6 +212,14 @@ static TUNABLE(uint32_t, gRecRing, "rec_ring", 0);
 static TUNABLE(uint32_t, gRecStep, "rec_step", 3);
 static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
 /*
+ * Boot-arg fb_dup=1: is the window server really giving a new picture every refresh? A fingerprint of
+ * every frame's surface (every 32nd row, every 16th pixel: 5 400 reads, no copy slowed) is compared
+ * with the one before; the window says how many frames were the same picture again. 120 refreshes a
+ * second of 60 different pictures looks exactly like 60 Hz to the eye, and nothing in the frame count
+ * says so -- this does.
+ */
+static TUNABLE(uint32_t, gDup, "fb_dup", 0);
+/*
  * Boot-arg fb_filter=0: the picture is scaled to the panel nearest neighbour, as it once was. The
  * iPhone's 1125 x 2436 on this panel's 1080 x 2400 is 45 columns and 36 rows fewer: nearest
  * neighbour leaves out every 25th column and every 67th row, and where one of them goes through a
@@ -316,9 +324,17 @@ static uint32_t gFb120Changes;                  /* ... and how often that change
 extern "C" uint64_t hakios_touch_idle_abs(void);       /* bsd/dev/hakios.input.c */
 extern "C" void hakios_touch_synthetic(uint32_t *samples, uint32_t *down);     /* ... and what a program posted */
 extern "C" void hakios_touch_driver(uint32_t *samples, uint32_t *down);        /* ... and what the screen's own driver posted */
+extern "C" void hakios_touch_driver_total(uint64_t *samples, uint32_t *down);  /* ... counted since the machine started */
+extern "C" void hakios_nvt_stats(uint64_t *fresh, uint64_t *repeats, uint64_t *max_gap_abs);  /* bsd/dev/vayu_nvt.c */
+extern "C" void vayu_cpufreq_rows(uint32_t row[3], uint32_t mhz[3]);           /* bsd/dev/vayu_cpufreq.c: the rows now */
+extern "C" void vayu_cpufreq_display(bool on);  /* ... and iOS's display power, for cpufreq_screen_off=1 */
 static uint32_t gModeHz;                        /* the refresh the display is said to run at (fb_120: 120) */
 static bool gPictureFit;                        /* rows copied, not scaled: fb_fit, or a 120 Hz frame's cost */
 static uint32_t gVSyncsTold;                    /* refreshes told to user space since the last 5 s line (atomic) */
+static uint64_t gVSyncsToldTotal;               /* ... and since the machine started, for the finger line */
+static uint64_t gFramesShownTotal;              /* frames put on the panel since the machine started (atomic) */
+static uint64_t gPrevFrameAbs;                  /* when the frame before the last one was shown */
+static uint64_t gMaxFrameGapAbs;                /* the longest gap between two frames of the current second */
 static uint64_t gFBDrawAbs;                     /* the copy's time per frame, a running average */
 static uint32_t gFBDivisor = 1;
 /*
@@ -411,6 +427,94 @@ refreshHz(void)
 	uint32_t hz = gModeHz != 0 ? gModeHz : gRefreshHz;
 
 	return hz >= 1 && hz <= 240 ? hz : kFBRefreshHz;
+}
+
+/*
+ * scroll120: one line a second while a real finger is on the screen, printed from the touch
+ * driver's thread (bsd/dev/vayu_nvt.c) rather than from show(). The S5FPS/fbfps windows are
+ * closed by the next frame, so a scroll in which the window server stops drawing altogether has
+ * no line at all -- exactly the case worth seeing. This one counts what arrived in the last
+ * second, whatever it was:
+ *
+ *   MiniIOMobileFramebuffer: finger 1001 ms: 121 commits (120 a second), 238 screen touch samples
+ *   (237 a second), screen finger 1, 121 chip samples, 119 repeats, the longest chip gap 11 ms,
+ *   121 refreshes told (120 a second), last commit 2 ms ago, the longest gap 11 ms; cpufreq rows
+ *   0/0/0 at 1785/2419/2956 MHz
+ *
+ * `commits` is every swap that put a frame on the panel (the same number fbfps calls frames);
+ * `last commit` is how long before this line the last one came, so a stalled compositor reads as
+ * "0 commits, last commit 843 ms ago". `cpufreq rows` is the group's row and MHz at that moment.
+ */
+extern "C" void
+hakios_fb_finger_tick(void)
+{
+	static uint64_t last_abs, last_frames, last_samples, last_vsyncs, last_chip, last_repeats;
+	static uint32_t was_down;
+	uint64_t now = mach_absolute_time(), ns, samples = 0, frames, vsyncs, dframes, dsamples, dvsyncs, ms;
+	uint64_t last_commit_ms = 0, max_gap_ms = 0, gap;
+	uint64_t chip = 0, repeats = 0, chip_gap_abs = 0, dchip = 0, drepeats = 0, chip_gap_ms = 0;
+	uint32_t down = 0, rows[3], mhz[3];
+	int32_t row0, row1, row2;
+
+	hakios_touch_driver_total(&samples, &down);
+	hakios_nvt_stats(&chip, &repeats, &chip_gap_abs);
+	frames = os_atomic_load(&gFramesShownTotal, relaxed);
+	vsyncs = os_atomic_load(&gVSyncsToldTotal, relaxed);
+	if (last_abs == 0) {
+		last_abs = now;
+		last_frames = frames;
+		last_samples = samples;
+		last_vsyncs = vsyncs;
+		last_chip = chip;
+		last_repeats = repeats;
+		was_down = down;
+		return;
+	}
+	absolutetime_to_nanoseconds(now - last_abs, &ns);
+	ms = ns / NSEC_PER_MSEC;
+	if (ms < 500) {
+		return;                         /* the caller ticks faster than once a second */
+	}
+	dframes = frames - last_frames;
+	dsamples = samples - last_samples;
+	dvsyncs = vsyncs - last_vsyncs;
+	dchip = chip - last_chip;
+	drepeats = repeats - last_repeats;
+	absolutetime_to_nanoseconds(chip_gap_abs, &gap);
+	chip_gap_ms = gap / NSEC_PER_MSEC;
+	if (down != 0 || was_down != 0 || dsamples != 0 || dframes != 0) {
+		if (gPrevFrameAbs != 0 && now > gPrevFrameAbs) {
+			absolutetime_to_nanoseconds(now - gPrevFrameAbs, &gap);
+			last_commit_ms = gap / NSEC_PER_MSEC;
+		}
+		absolutetime_to_nanoseconds(gMaxFrameGapAbs, &gap);
+		max_gap_ms = gap / NSEC_PER_MSEC;
+		vayu_cpufreq_rows(rows, mhz);
+		row0 = rows[0] == UINT32_MAX ? -1 : (int32_t) rows[0];
+		row1 = rows[1] == UINT32_MAX ? -1 : (int32_t) rows[1];
+		row2 = rows[2] == UINT32_MAX ? -1 : (int32_t) rows[2];
+		IOLog("MiniIOMobileFramebuffer: finger %llu ms: %llu commits (%llu a second), %llu screen touch samples "
+		    "(%llu a second), screen finger %u, %llu chip samples (%llu a second), %llu repeats, "
+		    "the longest chip gap %llu ms, %llu refreshes told (%llu a second), last commit %llu ms ago, "
+		    "the longest gap %llu ms; cpufreq rows %d/%d/%d at %u/%u/%u MHz\n", ms,
+		    (unsigned long long) dframes, (unsigned long long) (ms != 0 ? dframes * 1000 / ms : 0),
+		    (unsigned long long) dsamples, (unsigned long long) (ms != 0 ? dsamples * 1000 / ms : 0), down,
+		    (unsigned long long) dchip, (unsigned long long) (ms != 0 ? dchip * 1000 / ms : 0),
+		    (unsigned long long) drepeats, (unsigned long long) chip_gap_ms,
+		    (unsigned long long) dvsyncs, (unsigned long long) (ms != 0 ? dvsyncs * 1000 / ms : 0),
+		    last_commit_ms, max_gap_ms, row0, row1, row2, mhz[0], mhz[1], mhz[2]);
+	}
+	last_abs = now;
+	last_frames = frames;
+	last_samples = samples;
+	last_vsyncs = vsyncs;
+	last_chip = chip;
+	last_repeats = repeats;
+	was_down = down;
+	gMaxFrameGapAbs = 0;
+	if (down == 0 && dsamples == 0) {
+		gPrevFrameAbs = 0;              /* the next frame after an idle second is not a gap */
+	}
 }
 /*
  * Is a frame being put on the panel just now? bsd/dev/vayu_adreno.c asks this (hakios_display_frames)
@@ -514,6 +618,7 @@ public:
 	uint64_t        fBeat;                  /* the beat the last frame was shown on */
 	uint64_t        fReady;                 /* when the last frame was ready to be shown */
 	uint32_t        fStatOnBeat;            /* frames that waited for a refresh, and for how long together */
+	uint32_t        fStatMidFrame;           /* frames whose copy started in the middle of a panel frame (over the scan-out) */
 	uint64_t        fStatBeatWait;
 	uint32_t        fStatSurfaces[8];       /* the first different surfaces the bottom layer was given */
 	uint32_t        fStatHeld, fStatLost;   /* swaps that waited for the one before; that gave up waiting */
@@ -546,6 +651,10 @@ public:
 	/* boot-arg fb_diff=1: which pixels of the panel each frame changed (it costs: the panel's memory is slow to read) */
 	bool            fDiff;
 	uint64_t        fDiffPixels;
+	uint64_t        fDiffFrames, fDiffSame;  /* frames looked at, and those that changed no pixel at all (the one before, shown again) */
+	uint64_t        fDupFrames, fDupSame;    /* fb_dup: frames fingerprinted, and those the same picture as the one before */
+	uint64_t        fDupHash;                /* ... the fingerprint of the last one */
+	bool            fDupValid;
 	uint32_t        fDiffLeft, fDiffTop, fDiffRight, fDiffBottom;
 	/* the screen recording, if one was asked for */
 	uint32_t *      fColumn;                /* drawLayer(): source column for every panel column */
@@ -713,6 +822,10 @@ IOMobileFramebuffer::start(IOService * provider)
 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
 	fDiff = gDiff != 0;
 	fDiffLeft = fDiffTop = ~0u;
+	fDiffFrames = fDiffSame = 0;
+	fDupFrames = fDupSame = 0;
+	fDupValid = false;
+	fStatMidFrame = 0;
 	/*
 	 * A 120 Hz display: the mode (and the refresh timer) at 120, and a frame put on the panel as
 	 * rows copied rather than scaled (a scaled frame does not fit in 8.33 ms). fb_fit=1 asks for
@@ -1410,6 +1523,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 
 	uint64_t (*panel_frame)(void) = os_atomic_load(&hakios_vsync_frame, acquire);
 	uint64_t panel_period = panel_frame != NULL ? panel_frame() : 0, panel_beat = 0;
+	uint64_t diffBefore = fDiffPixels;      /* (fb_diff: what this frame's layers change, if anything) */
 
 	if (zero) {
 		/* (no beat to wait for: the flush is taken at the panel's next frame start by itself) */
@@ -1419,11 +1533,20 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 		 * than that it starts at once (a late frame is not held back a whole refresh, which would halve
 		 * the rate when drawing takes most of a frame).
 		 */
-		if (panel_beat - began < panel_period / 2) {
+		if (gOnTheBeat >= 2 || panel_beat - began < panel_period / 2) {
+			/*
+			 * fb_beat=2: every copy starts as the panel starts a frame, which is the one phase at
+			 * which the copy can never be overtaken by the scan-out: the copy writes a row in
+			 * 0.44 us, the scan-out reads it 3.47 us later, so the whole new frame is on the glass
+			 * and nothing is torn. It costs up to one refresh of latency (8.33 ms) -- what fb_beat=1
+			 * trades away for a copy that starts in the middle of a frame and cuts it in two.
+			 */
 			clock_delay_until(panel_beat);
 			fStatOnBeat++;
 			fStatBeatWait += mach_absolute_time() - began;
 			began = mach_absolute_time();
+		} else {
+			fStatMidFrame++;
 		}
 		fBeat = panel_beat;
 	} else if (gOnTheBeat) {
@@ -1557,6 +1680,23 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 				fGraphics = true;
 				PE_initialize_console(NULL, kPEGraphicsMode);
 			}
+			if (gDup != 0 && layer == 0) {
+				const uint32_t * pixels = (const uint32_t *) s->pixels();
+				uint32_t stride = s->info.bytesPerRow / 4;
+				uint64_t hash = 0xcbf29ce484222325ULL;
+
+				for (uint32_t y = 0; y < s->info.height; y += 32) {
+					for (uint32_t x = 0; x < s->info.width; x += 16) {
+						hash = (hash ^ pixels[(size_t) y * stride + x]) * 0x100000001b3ULL;
+					}
+				}
+				fDupFrames++;
+				if (fDupValid && hash == fDupHash) {
+					fDupSame++;
+				}
+				fDupHash = hash;
+				fDupValid = true;
+			}
 			if (gGpuRead != 0) {
 				/*
 				 * The core wrote these pixels; this processor's cache may hold the frame before them.
@@ -1600,8 +1740,32 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 			}
 		}
 	}
+	if (fDiff) {
+		/*
+		 * The whole picture of this frame against the one before: not one pixel different means the
+		 * window server handed the same picture again -- a 120 Hz stream of 60 different pictures.
+		 */
+		fDiffFrames++;
+		if (fDiffPixels == diffBefore) {
+			fDiffSame++;
+		}
+	}
 	drawn = mach_absolute_time();
 	os_atomic_store(&gFBLastFrameShown, drawn, relaxed);
+	/* scroll120: the frame counters the once-a-second finger line reads */
+	{
+		uint64_t previous = gPrevFrameAbs;
+
+		if (previous != 0 && drawn > previous) {
+			uint64_t gap = drawn - previous;
+
+			if (gap > gMaxFrameGapAbs) {
+				gMaxFrameGapAbs = gap;
+			}
+		}
+		gPrevFrameAbs = drawn;
+		os_atomic_inc(&gFramesShownTotal, relaxed);
+	}
 	copyUs = (uint32_t) micros(drawn - began);
 	if (gBudget != 0) {
 		frameBudget(intervalUs, fenceUs, copyUs);
@@ -1679,18 +1843,26 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 		 */
 		if (s5 && gFbfps != 0 && (screened > 0 || screen_down != 0 || synthesized > 0 || synth_down != 0)) {
 			uint64_t fenceWait = fStatSwapWait;
+			uint32_t rowsNow[3], mhzNow[3];
+			int32_t row0, row1, row2;
 
 			absolutetime_to_nanoseconds(fenceWait, &fenceWait);
+			vayu_cpufreq_rows(rowsNow, mhzNow);
+			row0 = rowsNow[0] == UINT32_MAX ? -1 : (int32_t) rowsNow[0];
+			row1 = rowsNow[1] == UINT32_MAX ? -1 : (int32_t) rowsNow[1];
+			row2 = rowsNow[2] == UINT32_MAX ? -1 : (int32_t) rowsNow[2];
 			IOLog("MiniIOMobileFramebuffer: fbfps: scroll %llu ms: %u frames (%llu a second), %u screen touch samples "
 			    "(%u a second), screen finger %u, %u synthetic touch samples, synthetic finger %u, %u refreshes told "
 			    "(%u a second), mode %u Hz; %llu us a frame in the copy, %llu us waiting for the GPU's fence (%u swaps "
-			    "with one), %u waited for the frame before, %u came a refresh late\n", nanos / NSEC_PER_MSEC,
+			    "with one), %u waited for the frame before, %u came a refresh late, the longest gap %u ms, "
+			    "cpufreq rows %d/%d/%d at %u/%u/%u MHz\n", nanos / NSEC_PER_MSEC,
 			    fStatFrames, fStatFrames * NSEC_PER_SEC / nanos, screened,
 			    (uint32_t) ((uint64_t) screened * NSEC_PER_SEC / nanos), screen_down, synthesized, synth_down, told,
 			    (uint32_t) ((uint64_t) told * NSEC_PER_SEC / nanos), refreshHz(),
 			    fStatFrames != 0 ? drawing / fStatFrames / NSEC_PER_USEC : 0,
 			    fStatSwapFence != 0 ? fenceWait / fStatSwapFence / NSEC_PER_USEC : 0, fStatSwapFence, fStatHeld,
-			    fStatSwapsLate);
+			    fStatSwapsLate, (uint32_t) (fFrameLongest / NSEC_PER_MSEC), row0, row1, row2,
+			    mhzNow[0], mhzNow[1], mhzNow[2]);
 		}
 		/*
 		 * The fences of the frames: how many swaps came with a GPU submission to wait for at all (0: the
@@ -1746,14 +1918,32 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces, uint3
 			    different == 8 ? " -- none twice" : "", made, making, again, freed, freeing);
 		}
 		bzero(fStatSurfaces, sizeof(fStatSurfaces));
-		fStatHeld = fStatLost = fStatOnBeat = 0;
+		if (fStatMidFrame + fStatOnBeat != 0) {
+			/* (only when the panel's timing is what the copy waits for: nothing to say on a plain boot) */
+			IOLog("MiniIOMobileFramebuffer: tear: %u of %u frames started in the middle of a panel frame (the copy cut "
+			    "the scan-out in two), %u waited for the frame's start\n", fStatMidFrame, fStatMidFrame + fStatOnBeat,
+			    fStatOnBeat);
+		}
+		fStatHeld = fStatLost = fStatOnBeat = fStatMidFrame = 0;
 		fStatWaiting = fStatBeatWait = 0;
 		reportFrameTimes();
 		reportFrameBudget();
 		if (fDiff) {
 			IOLog("MiniIOMobileFramebuffer: %llu pixels of the panel changed a frame, all within %u,%u to %u,%u\n",
 			    fDiffPixels / fStatFrames, fDiffLeft, fDiffTop, fDiffRight, fDiffBottom);
+			IOLog("MiniIOMobileFramebuffer: fb_diff: %llu of %llu frames changed no pixel at all (%llu a second "
+			    "of %llu): the same picture handed over again\n", fDiffSame, fDiffFrames,
+			    fDiffFrames != 0 ? fDiffSame * NSEC_PER_SEC / nanos : 0,
+			    fDiffFrames != 0 ? fDiffFrames * NSEC_PER_SEC / nanos : 0);
+			fDiffFrames = fDiffSame = 0;
 			fDiffPixels = 0;
+		}
+		if (gDup != 0) {
+			IOLog("MiniIOMobileFramebuffer: fb_dup: %llu of %llu frames were the same picture as the one before "
+			    "(%llu a second different of %llu a second): the window server handed the picture again\n",
+			    fDupSame, fDupFrames, fDupFrames != 0 ? (fDupFrames - fDupSame) * NSEC_PER_SEC / nanos : 0,
+			    fDupFrames != 0 ? fDupFrames * NSEC_PER_SEC / nanos : 0);
+			fDupFrames = fDupSame = 0;
 			fDiffLeft = fDiffTop = ~0u;
 			fDiffRight = fDiffBottom = 0;
 		}
@@ -2038,6 +2228,7 @@ IOMobileFramebufferUserClient::vsync(void)
 	} else {
 		fVSyncCount++;
 		os_atomic_inc(&gVSyncsTold, relaxed);
+		os_atomic_inc(&gVSyncsToldTotal, relaxed);
 		setAsyncReference64(ref, fPorts[kFBNotifyVSync], fCallbacks[kFBNotifyVSync], fRefcons[kFBNotifyVSync], fTask);
 		args[0] = (uint32_t) now;
 		args[1] = now >> 32;
@@ -2137,6 +2328,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	case kFBMethodRequestPowerChange: {        /* in[0]: 0 = display off (backboardd's screen-off), else on */
 		bool on = args->scalarInputCount < 1 || in[0] != 0;
 		bool done = hakios_display_power != NULL && hakios_display_power(on);
+
+		vayu_cpufreq_display(on);               /* (only noted there; cpufreq_screen_off=1 acts on it) */
 
 		IOLog("MiniIOMobileFramebuffer: power change asked (scalars %u in [0x%llx 0x%llx]): display %s%s\n",
 		    args->scalarInputCount, args->scalarInputCount > 0 ? in[0] : 0, args->scalarInputCount > 1 ? in[1] : 0,
@@ -2256,10 +2449,21 @@ publishDisplayNode(void)
 }
 
 /*
- * The graphics accelerator. There is none, but CoreAnimation waits half a minute for a
- * service of this class to appear before it looks for a GPU at all (once per process). An
- * accelerator without the properties that name its Metal and OpenGL ES drivers is passed
- * over by both, which leaves CoreAnimation with its software renderer, as before.
+ * The graphics accelerator. CoreAnimation waits half a minute for a service of this class to
+ * appear before it looks for a GPU at all (once per process). An accelerator without the
+ * properties that name its Metal and OpenGL ES drivers is passed over by both; the window
+ * server then draws through our OpenGL ES (userland/src/eagl.c, gpu=1) or in software.
+ *
+ * Boot-arg metal=N (default 0: no properties, as before): the accelerator names Metal's plug-in
+ * (from another HakiOS port, APSL 2.0: telegdyd/ios-vayu, branch vayu-dev, commit bd98a330786f, its Metal
+ * task 8). Metal.framework's MTLRegisterDevices reads these two
+ * properties, opens /System/Library/Extensions/HakiosMetal.bundle (init binds it there from the
+ * boot image when metal is set) and sends -initWithAcceleratorPort: this service to the class.
+ * Which processes are then given a device is the plug-in's choice, by the same N
+ * (vayu-dev's HakiosMetalCA.m, hm_shown_to_this_process: 1 metal_test only, 2 all but
+ * backboardd, 3 backboardd and metal_test, 4 all; the plug-in is not in the published tree until its
+ * origin's licence is known, and without it metal=N names a bundle that is not there). Never by default: the window server tries
+ * Metal first, and until the device draws, GL is the working screen.
  */
 class IOAcceleratorES : public IOService
 {
@@ -2274,7 +2478,14 @@ publishAccelerator(IOService * provider)
 	IOAcceleratorES * accelerator = OSTypeAlloc(IOAcceleratorES);
 
 	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
+		uint32_t metal = 0;
+
 		accelerator->setName("sgx");
+		if (PE_parse_boot_argn("metal", &metal, sizeof(metal)) && metal != 0) {
+			accelerator->setProperty("MetalPluginName", "HakiosMetal");
+			accelerator->setProperty("MetalPluginClassName", "HakiosMetalDevice");
+			IOLog("MiniIOMobileFramebuffer: metal=%u: the accelerator names HakiosMetal as its Metal plug-in\n", metal);
+		}
 		accelerator->registerService();
 	}
 	OSSafeReleaseNULL(accelerator);

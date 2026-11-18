@@ -80,6 +80,22 @@
  * it (vayu_nfc_preamble, default 1) invents nothing. The answer changes of N13 are synthetic and
  * are off unless vayu_nfc_synth asks for them; vayu_nfc_propfwd sends the read-only 2F 19/06/00
  * to the PN553 instead, so its real answers can be compared with the local ones run by run.
+ *
+ * N14 (2026-11-03, ds-nfc2): the wall has moved. With the N13c table in place, d11a/d11c/d12/d12b
+ * all get past 2F 19 (4F 19 03 00 00 01 is accepted for hw 0x06) and die at the very next
+ * proprietary step, 2F 00 standby, which the bridge refused with 4F 00 01 01 unless
+ * vayu_nfc_propinit=1: nfcd prints "Set Power Mode failed!" -> "LibNfc Init/Re-init Failed" ->
+ * "Stack load failed with 0x10". phNciNfc_ProcessStandbyRsp 0x1f4581054 accepts exactly
+ * 4F 00 01 00 (payload length 1 = status 0, or 0xF1 for "already enabled"). 2F 06 never appears
+ * in those four logs, so vayu_nfc_synth=4 was unreachable; the 1-byte 4F 06 form is a parse error
+ * anyway (phNciNfc_GetFwTypeRsp 0x1f455e6e4 wants 2 payload bytes). Both are now answered locally
+ * by default (vayu_nfc_standby=0 / vayu_nfc_fwtype=0 restore the refusal).
+ *
+ * The step behind them is NFCEE: a local 42 00 02 00 00 alone sits 9.118 s (TEST15), because
+ * phLibNfc_GetNfceeIntfCfgProc 0x1f45903fc still maps the chip's A0EC=1 to ctx[325]=3 and the
+ * "no SE" init branch 0x1f45533e0 needs ctx[325..328] all 2. vayu_nfc_se=1 (default) therefore
+ * answers 20 03 05 02 a0 ec a0 ed with A0EC=0/A0ED=0 and 22 00 with 0 NFCEEs; vayu_nfc_se=0
+ * leaves both to the chip. This is the untested part: static evidence only, see REPORT.md §2.2.
  */
 
 #include <IOKit/IOLib.h>
@@ -441,6 +457,81 @@ static uint32_t gNfcPreamble = 1;       /* vayu_nfc_preamble=0: old desync on ff
 static uint32_t gNfcSynth;              /* vayu_nfc_synth: 1 = 2F 21 local ok, 2 = unused since N13c (2F 19 always per hw byte), 4 = 2F 06 2-byte */
 static uint32_t gNfcPropFwd;            /* vayu_nfc_propfwd: 1 = 2F 19, 2 = 2F 06, 4 = 2F 00 forwarded to the chip */
 static uint32_t gNfcFwIf;               /* N13c: vayu_nfc_fwif=0xNNNN forces the 2F 19 version; 0 = per platform group */
+/*
+ * N14: the three init answers that are not the chip's to give on this board.
+ *   gNfcStandby  2F 00 standby/power mode. phNciNfc_ProcessStandbyRsp 0x1f4581054 accepts only
+ *                a 1-byte payload (the status) of 0x00 or 0xF1; the old refusal 4F 00 01 01 is
+ *                what stopped every 03.11 run with "Set Power Mode failed!". On by default.
+ *   gNfcFwType   2F 06 GET_FW_TYPE. phNciNfc_GetFwTypeRsp 0x1f455e6e4 needs a 2-byte payload
+ *                ([status 0][type]); the 1-byte TEST26 form is a parse error. On by default.
+ *   gNfcSe       report the PN553's eSE/UICC away: A0EC/A0ED answer 0/0 and NFCEE_DISCOVER
+ *                answers 0. phLibNfc_GetNfceeIntfCfgProc 0x1f45903fc turns A0EC=0/A0ED=0 into
+ *                ctx[325]=ctx[326]=2, which is what the "no SE" init branch 0x1f45533e0 needs;
+ *                with the chip's own A0EC=1 an empty 42 00 just waits 9.118 s (TEST15). On by
+ *                default; vayu_nfc_se=0 restores the chip's answer.
+ *
+ * N16 (2026-11-04, ds-nfc4, run 1062): the N15 shadow must NOT be echoed for A0EC/A0ED when
+ * vayu_nfc_se says "no SE". Run 1062 showed why: nfcd itself writes a0 ec = 00 and a0 ed = 01
+ * (its platform's "no eSE, UICC present" default) in CORE_SET_CONFIG, N15 remembers the pair,
+ * and filterGetConfig() then answered 00/01. phLibNfc_GetNfceeIntfCfgProc 0x1f45903fc sets
+ * ctx[325]=2 from A0EC=0 but leaves ctx[326]=3 from A0ED=1, so the init-complete callback
+ * 0x1f45533e0 (all four of ctx[325..328] must be 2) is skipped, the stack enters the NFCEE
+ * path, nobody brings up the per-SE HCI child device, and after 1 s + 8 retries the
+ * InitComplete watchdog 0x1f4559874 gives up: "LibNfc Init/Re-init Failed" and
+ * _NFDriverLoadStackSteps returning 0x10 (0x1f13e5c78: the 0x10 override when
+ * 0x1f13f5114(ctx) says the stack is unusable). The "0 NFCEE" RSP itself is fine: NCI's own
+ * 42 00 parser accepts [status 0][count 0] and phNciNfc_CompleteNfceeDiscoverSequence
+ * 0x1f4555290 finishes the sequence at once; no 62 00 notification is needed for count 0.
+ *
+ * The write-back check of step 3 uses the multi-parameter CORE_GET_CONFIG (17 ids in
+ * good-1050, the shadow rewrite in nfcCfgRewriteGetConfig()), not this two-id probe, so
+ * answering 00/00 here does not disturb it. Mode 2 keeps the N15 behaviour for an A/B run.
+ */
+static uint32_t gNfcStandby = 1;        /* vayu_nfc_standby=0: refuse 2F 00 again (A/B) */
+static uint32_t gNfcFwType = 1;         /* vayu_nfc_fwtype=0: refuse 2F 06 again (A/B) */
+static uint32_t gNfcSe = 1;             /* 0 = chip; 1 = no SE, A0EC/A0ED 00/00 regardless of the shadow;
+                                         * 2 = no SE but echo what nfcd wrote (the N15 A/B) */
+/*
+ * N15 (2026-11-04, ds-nfc3): step 3 of _NFDriverLoadStackSteps, _NFDriverValidateEEPROM, no
+ * longer dies on the NCI init but on its own read-back of the NXP configuration. The 04.11 run
+ * (ds-pdmap/good-1050.log:11173-11539) is a full cycle of it:
+ *
+ *   20 03 1d 11 ...  -> chip answers 40 03 3e 00 10 ... (16 configuration parameters)
+ *   20 02 25 09 00 02 2c 01 a0 07 01 02 a0 08 01 01 a0 13 01 01 a0 19 01 02
+ *                     a0 d5 01 04 a0 37 01 ee a0 ec 01 00 a0 ed 01 01
+ *                    -> filterSetConfig() strips all eight 0xA0xx parameters ("strip 8") and
+ *                       forwards only 00 02 2c 01, so the PN553 applies one of the nine values
+ *   20 03 1d 11 ...  -> the chip returns its own values again: a0 07=03, a0 08=00 00,
+ *                       a0 d5=0a, a0 37=35, a0 ec=01, a0 ed=00
+ *   phLibNfc_GetEepromSettingsProc 0x1f45d6eb4: (cfg->flags & 0x1B5B0) != 0 -> retry
+ *   "phLibNfc_GetEepromSettingsProc-Retry Failed to Configs Entries"
+ *   after the third attempt: 0xFF -> "phLibNfc_VldteEepromStngsComp: Internal LibNfc status =
+ *   =0xFF" -> _NFDriverValidateEEPROM:771 "EEPROM validation failed (3/3)" ->
+ *   _NFDriverLoadStackSteps:359 "Step 3 error : 0x1" -> _openDriver:1349 "Failed to start
+ *   stack : 1".
+ *
+ * The visible loop is a plain write-then-verify: the one parameter that is forwarded (0x0002,
+ * value 2c 01) comes back changed in the next read (it was f4 01 before), while every stripped
+ * 0xA0xx keeps the value the chip had. The counter at ctx[3105] allows two retries and then
+ * returns 0xFF, exactly the three "EEPROM validation failed (n/3)" lines of the log.
+ *
+ * gNfcCfg decides what the bridge does with the extended parameters of CORE_SET_CONFIG:
+ *   0  legacy: strip every 0xA0xx, answer nothing (the 04.11 behaviour) - A/B only;
+ *   1  shadow (default): strip them but remember id/length/value, and put the remembered value
+ *      back into every CORE_GET_CONFIG_RSP that carries the parameter. The chip is not written;
+ *      nfcd reads back exactly what it wrote, which is what the validation compares;
+ *   2  forward: hand the extended parameters to the PN553 verbatim (except 0xA0BF, 0xA013 and
+ *      the 0xA1xx ids this firmware does not know) and keep no shadow - the other A/B.
+ */
+static uint32_t gNfcCfg = 1;            /* vayu_nfc_cfg: 0 = legacy strip, 1 = shadow (default), 2 = forward to the chip */
+#define kNfcCfgSlots    24              /* distinct extended parameters remembered */
+#define kNfcCfgValueMax 8               /* every 0xA0xx value on this path is 1 or 2 bytes */
+static struct {
+	uint16_t id;
+	uint8_t  len;
+	uint8_t  value[kNfcCfgValueMax];
+} gNfcCfgStore[kNfcCfgSlots];
+static unsigned gNfcCfgUsed, gNfcCfgWrites, gNfcCfgSubs, gNfcCfgRefused;
 #define NFC_SYNTH_FLUSH         0x1u
 #define NFC_SYNTH_FWIF          0x2u
 #define NFC_SYNTH_FWTYPE        0x4u
@@ -656,7 +747,63 @@ injectConnCredits(kern_ctl_ref ref, uint32_t unit, uint8_t conn)
  * CORE_SET_CONFIG_CMD: payload = [count][params], a param = [id][len][value]. NXP's extended
  * ids take two id bytes, the first 0xA0; the PN553 answers those, the firmware here does not
  * know them, so they are stripped and the count and the length are rebuilt.
+ *
+ * N15: stripping them is also why step 3 of the stack load fails, because nfcd writes a
+ * configuration and then reads it back (see gNfcCfg). In the shadow mode the value is recorded
+ * here and delivered to nfcd again in nfcCfgRewriteGetConfig(); in the forward mode the
+ * parameter is kept in the rebuilt frame unless the PN553 is known not to know it.
  */
+static void
+nfcCfgRemember(uint16_t id, const uint8_t * value, unsigned length)
+{
+	unsigned i;
+
+	if (length > kNfcCfgValueMax) {
+		gNfcCfgRefused++;
+		stockholmLog("MiniAppleStockholm: cfg: 0x%04x has %u bytes, more than the %u-byte shadow "
+		    "slot; not remembered (#%u)\n", id, length, (unsigned)kNfcCfgValueMax, gNfcCfgRefused);
+		return;
+	}
+	for (i = 0; i < gNfcCfgUsed; i++) {
+		if (gNfcCfgStore[i].id == id) break;
+	}
+	if (i == gNfcCfgUsed) {
+		if (gNfcCfgUsed == kNfcCfgSlots) {
+			gNfcCfgRefused++;
+			stockholmLog("MiniAppleStockholm: cfg: no free shadow slot for 0x%04x (#%u)\n",
+			    id, gNfcCfgRefused);
+			return;
+		}
+		gNfcCfgUsed++;
+	}
+	gNfcCfgStore[i].id = id;
+	gNfcCfgStore[i].len = (uint8_t)length;
+	if (length != 0) memcpy(gNfcCfgStore[i].value, value, length);
+	gNfcCfgWrites++;
+	{
+		char hex[3 * kNfcCfgValueMax + 8];
+
+		stockholmLog("MiniAppleStockholm: cfg: shadow 0x%04x = %s (%u byte(s), #%u; the chip is "
+		    "not written, vayu_nfc_cfg=1)\n", id,
+		    hexAll(value, length, hex, sizeof(hex)), length, gNfcCfgWrites);
+	}
+}
+
+static const uint8_t *
+nfcCfgLookup(uint16_t id, unsigned * length)
+{
+	unsigned i;
+
+	for (i = 0; i < gNfcCfgUsed; i++) {
+		if (gNfcCfgStore[i].id == id) {
+			*length = gNfcCfgStore[i].len;
+			return gNfcCfgStore[i].value;
+		}
+	}
+	*length = 0;
+	return NULL;
+}
+
 static void
 filterSetConfig(const uint8_t * packet, unsigned length)
 {
@@ -760,6 +907,16 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 			 */
 			saw_a0bf = packet[input + 1] == 0xbf;
 			keep_extended = gNfcA0bf == 1 && saw_a0bf;
+			/*
+			 * N15: vayu_nfc_cfg=2 forwards the rest of the 0xA0xx parameters to the
+			 * PN553. 0xA013 is not in its configuration at all (the chip answers
+			 * 40 03 05 09 01 a0 13 00, status 0x09, to a GET_CONFIG that names it and
+			 * nfcd then drops it from the list), and nothing with 0xA1 exists on this
+			 * firmware (0xA154 is NXP's write-counter id), so those two stay local.
+			 */
+			if (gNfcCfg == 2 && !saw_a0bf && packet[input] == 0xa0 && packet[input + 1] != 0x13) {
+				keep_extended = true;
+			}
 			input += 2;
 		} else {
 			input++;
@@ -772,6 +929,10 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 		if (input + parameter_length > end) {
 			answerRejected(packet, length, 0x40, 0x02);
 			return;
+		}
+		if (extended && !keep_extended && gNfcCfg == 1 && !saw_a0bf) {
+			nfcCfgRemember((uint16_t)((packet[start] << 8) | packet[start + 1]),
+			    packet + input, parameter_length);
 		}
 		parameter_bytes = input - start + parameter_length;
 		if (extended && !keep_extended) {
@@ -801,12 +962,17 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 			stockholmLog("MiniAppleStockholm: a0bf: local success 40 02 02 00 00 (mixed SET_CONFIG, "
 			    "%u parameter(s) stripped, nothing sent to the PN553)\n", stripped);
 		}
+		if (gNfcCfg == 1 && stripped != 0) {
+			stockholmLog("MiniAppleStockholm: cfg: %u extended parameter(s) remembered, SET_CONFIG "
+			    "answered 40 02 02 00 00 locally (vayu_nfc_cfg=1 shadow)\n", stripped);
+		}
 		filterLog(packet, length, "answer 40 02 02 00 00");
 		answerNfcd(ok, sizeof(ok));
 		return;
 	}
 	if (kept_extended != 0) {
-		snprintf(decision, sizeof(decision), "forward (keep A0BF, strip %u)", stripped);
+		snprintf(decision, sizeof(decision), "forward (keep %u 0xA0xx, strip %u)",
+		    kept_extended, stripped);
 	} else if (stripped != 0) {
 		snprintf(decision, sizeof(decision), "strip %u", stripped);
 	} else {
@@ -839,6 +1005,63 @@ filterSetConfig(const uint8_t * packet, unsigned length)
 static void
 filterGetConfig(const uint8_t * packet, unsigned length)
 {
+	/*
+	 * N14: the SE map, the other half of the NFCEE wall. nfcd asks for the two NXP
+	 * parameters in one command:
+	 *   20 03 05 02 a0 ec a0 ed      (payload length 5: count 2, two-byte ids)
+	 * The PN553 answers 40 03 0a 00 02 a0 ec 01 01 a0 ed 01 00 - A0EC=1 (eSE present),
+	 * A0ED=0 (TEST14R, receipts/2026-10-23-vayu-backup-fw-hwruns.md:679). With A0EC=1,
+	 * phLibNfc_GetNfceeIntfCfgProc 0x1f45903fc leaves ctx[325]=3, and the "no SE" branch of
+	 * the init (0x1f45533e0, taken only when ctx[325..328] are all 2) is skipped; a local
+	 * 42 00 02 00 00 then sits 9.118 s until phLibNfc_InitCompleteWdTimer 0x1f4559874 gives
+	 * up (TEST15). Reporting the SE away here makes the bridge's 0-NFCEE answer agree with
+	 * the map nfcd builds, and the init goes to "Init Comp- Static feature config"
+	 * (0x1f4553444) without HCI/eSE traffic:
+	 *   A0EC=0 -> ctx[325]=2 (0x1f459043c)   A0ED=0 -> ctx[326]=2 (0x1f4590474)
+	 *   ctx[327]=2 for hw 6..8 (ctx[2810] is only set for hw 0x1d), ctx[328]=2.
+	 * The values come from the same parse the chip's answer goes through:
+	 * phNciNfc_ProcessRfParams stores A0EC/A0ED at ctx+1174/ctx+1176 (offsets 0x98c218,
+	 * 0x98c278). vayu_nfc_se=0 restores the chip's own answer.
+	 */
+	if (gNfcSe != 0 && length == 8 && packet[2] == 5 && packet[3] == 2 &&
+	    packet[4] == 0xa0 && packet[5] == 0xec && packet[6] == 0xa0 && packet[7] == 0xed) {
+		uint8_t no_se[13] = {
+			0x40, 0x03, 0x0a, 0x00, 0x02, 0xa0, 0xec, 0x01, 0x00, 0xa0, 0xed, 0x01, 0x00
+		};
+		/*
+		 * N16: with vayu_nfc_se=1 the answer is 00/00 even when nfcd has just written
+		 * A0EC/A0ED itself (run 1062: a0ec=00, a0ed=01). Echoing the write back is what
+		 * kept ctx[326]=3 and skipped the "no SE" branch; see the gNfcSe block. Mode 2 is
+		 * the N15 behaviour (read-back must agree with the shadow), for the A/B run.
+		 */
+		if (gNfcSe >= 2) {
+			unsigned ec_length = 0, ed_length = 0;
+			const uint8_t * ec = nfcCfgLookup(0xa0ec, &ec_length);
+			const uint8_t * ed = nfcCfgLookup(0xa0ed, &ed_length);
+
+			if (ec != NULL && ec_length >= 1) no_se[8] = ec[0];
+			if (ed != NULL && ed_length >= 1) no_se[12] = ed[0];
+		}
+		filterLog(packet, length, "answer 40 03 0a .. a0 ec/a0 ed (SYNTHETIC, no SE)");
+		stockholmLog("MiniAppleStockholm: se: A0EC/A0ED answered %02x/%02x locally (vayu_nfc_se=%u, "
+		    "%s; phLibNfc_GetNfceeIntfCfgProc 0x1f45903fc turns 0/0 into ctx[325]=ctx[326]=2)\n",
+		    no_se[8], no_se[12], gNfcSe,
+		    gNfcSe >= 2 ? "the N15 shadow wins" : "the shadow is not echoed");
+		answerNfcd(no_se, sizeof(no_se));
+		return;
+	}
+	if (gNfcSe != 0 && length == 6 && packet[2] == 4 && packet[3] == 1 &&
+	    packet[4] == 0xa0 && (packet[5] == 0xec || packet[5] == 0xed)) {
+		uint8_t one[9] = { 0x40, 0x03, 0x06, 0x00, 0x01, 0xa0, packet[5], 0x01, 0x00 };
+		unsigned shadow_length = 0;
+		const uint8_t * shadow = gNfcSe >= 2 ?
+		    nfcCfgLookup((uint16_t)(0xa000u | packet[5]), &shadow_length) : NULL;
+
+		if (shadow != NULL && shadow_length >= 1) one[8] = shadow[0];
+		filterLog(packet, length, "answer 40 03 06 .. a0 ec|ed (SYNTHETIC, no SE)");
+		answerNfcd(one, sizeof(one));
+		return;
+	}
 	/* 20 03 03 01 a0 0f: one parameter, 0xA00F, no value. */
 	if (length == 6 && packet[2] == 3 && packet[3] == 1 && packet[4] == 0xa0 && packet[5] == 0x0f) {
 		static const uint8_t eepromUserData[64] = {
@@ -911,6 +1134,11 @@ filterGetConfig(const uint8_t * packet, unsigned length)
  *
  * vayu_nfc_nfcee=0 (default) or 1: forward (1 keeps the old spelling used by TEST15)
  * vayu_nfc_nfcee=2: answer 42 00 02 00 00 locally, refuse 22 01 (N6/TEST15 behaviour)
+ *
+ * N14: vayu_nfc_se=1 (the default) also answers 22 00 with 0 NFCEEs, because filterGetConfig()
+ * reports A0EC=0/A0ED=0 at the same time: the empty answer is only consistent - and only lets
+ * the init take the 0x1f45533e0 "no SE" branch - when nfcd's own map says there is no SE.
+ * Without the A0EC/A0ED part this local answer is the 9.118 s hang of TEST15.
  */
 static void
 filterNfcee(const uint8_t * packet, unsigned length)
@@ -920,8 +1148,10 @@ filterNfcee(const uint8_t * packet, unsigned length)
 	if (oid == 0x00) {                      /* NFCEE_DISCOVER */
 		static const uint8_t no_nfcee[] = { 0x42, 0x00, 0x02, 0x00, 0x00 };
 
-		if (gNfceeMode == 2) {
-			filterLog(packet, length, "answer 42 00 02 00 00 (0 NFCEEs, local)");
+		if (gNfcSe != 0 || gNfceeMode == 2) {
+			filterLog(packet, length, gNfcSe != 0 ?
+			    "answer 42 00 02 00 00 (0 NFCEEs, local; vayu_nfc_se)" :
+			    "answer 42 00 02 00 00 (0 NFCEEs, local)");
 			answerNfcd(no_nfcee, sizeof(no_nfcee));
 			return;
 		}
@@ -935,7 +1165,7 @@ filterNfcee(const uint8_t * packet, unsigned length)
 		return;
 	}
 	if (oid == 0x01) {                      /* NFCEE_MODE_SET */
-		if (gNfceeMode == 2) {
+		if (gNfcSe != 0 || gNfceeMode == 2) {
 			/* No NFCEE was reported, so there is nothing to switch on. */
 			answerRejected(packet, length, 0x42, oid);
 			return;
@@ -1194,49 +1424,50 @@ filter(const uint8_t * packet, unsigned length)
 			return;
 		}
 		/*
-		 * The rest of the 2F family stays refused; vayu_nfc_propinit=1 additionally answers the
-		 * two proprietary init steps that come after the HSU one, locally and never to the chip:
-		 * 2F 06 GET_FW_TYPE - phLibNfc_GetFwTypeProc 0x1f45e37a0 (pInfo at 0x1f45e3860) passes the
-		 * status through, and with status 0 an empty payload only makes it clamp the fw type to 3
-		 * (0x1f45e38a4);
-		 * 2F 00 standby - phLibNfc_SetStandbyModeProcess 0x1f458f76c returns 255 on any non-zero
-		 * status. Off by default so the next run still proves one variable at a time.
+		 * The rest of the 2F family stays refused; the two proprietary init steps that come
+		 * after the HSU one are answered locally and never go to the chip, because on the
+		 * SPMI/I2C path there is no HSU, no standby mode to enter and no firmware to load.
+		 *
+		 * N14: 2F 00 (standby / set power mode) is THE wall of d11a/d11c/d12/d12b: the old
+		 * answer (refused unless vayu_nfc_propinit=1) is 4F 00 01 01, and nfcd prints
+		 * "Set Power Mode failed!" -> "LibNfc Init/Re-init Failed" -> "Stack load failed
+		 * with 0x10" (ds-ui-logs/d12b-134444-merged.log:12181-12189). phNciNfc_ProcessStandbyRsp
+		 * 0x1f4581054 takes ctx[3360]/ctx[3368] (the NCI payload and its length, status byte
+		 * included) and requires length == 1 with byte 0x00 ("Set Power Mode Successful") or
+		 * 0xF1 ("already enabled"); any other value is 0xff and the "failed" line. So the
+		 * accepted answer is exactly 4F 00 01 00.
+		 */
+		if (oid == 0x00 && (gNfcPropFwd & NFC_PROPFWD_STANDBY) != 0 && length == 4 && packet[3] <= 0x01) {
+			forwardPacket(packet, length, packet, length, "forward (vayu_nfc_propfwd&4: chip answers 2F 00)");
+			return;
+		}
+		if (oid == 0x00 && length == 4 && packet[3] <= 0x01 && gNfcStandby != 0) {
+			static const uint8_t standby_ok[] = { 0x4f, 0x00, 0x01, 0x00 };
+
+			filterLog(packet, length, "answer 4f 00 01 00 (SYNTHETIC, standby; vayu_nfc_standby)");
+			stockholmLog("MiniAppleStockholm: standby: 2F 00 payload %02x answered status 0 locally "
+			    "(phNciNfc_ProcessStandbyRsp 0x1f4581054 wants payload length 1 = the status)\n",
+			    packet[3]);
+			answerNfcd(standby_ok, sizeof(standby_ok));
+			return;
+		}
+		/*
+		 * N14: 2F 06 GET_FW_TYPE never appears in the 03.11 logs (grep -c '2f 06' = 0 in
+		 * d11a/d11c/d12/d12b), so the old "vayu_nfc_synth=4" 2-byte branch was never reached.
+		 * phNciNfc_GetFwTypeRsp 0x1f455e6e4 requires a payload of exactly 2 bytes
+		 * (0x1f455e760 cmp w9,#2) with payload[0] == 0, and copies payload[1] as the type;
+		 * the 1-byte TEST26 form is a parse error by construction. 3 is what
+		 * phLibNfc_GetFwTypeProc 0x1f45e37a0 clamps an unknown type to (0x1f45e38a4).
 		 */
 		if (oid == 0x06 && (gNfcPropFwd & NFC_PROPFWD_FWTYPE) != 0 && length == 3) {
 			forwardPacket(packet, length, packet, length, "forward (vayu_nfc_propfwd&2: chip answers 2F 06)");
 			return;
 		}
-		if (oid == 0x00 && (gNfcPropFwd & NFC_PROPFWD_STANDBY) != 0 && length == 4 && packet[3] <= 0x01) {
-			forwardPacket(packet, length, packet, length, "forward (vayu_nfc_propfwd&4: chip answers 2F 00)");
-			return;
-		}
-		if (gPropInit != 0 && oid == 0x06 && (gNfcSynth & NFC_SYNTH_FWTYPE) == 0) {
-			static const uint8_t fwtype_old[] = { 0x4f, 0x06, 0x01, 0x00 };
-
-			filterLog(packet, length, "answer 4f 06 01 00 (SYNTHETIC, fw type 3; TEST26 form)");
-			answerNfcd(fwtype_old, sizeof(fwtype_old));
-			return;
-		}
-		if (gPropInit != 0 && oid == 0x06) {
-			/*
-			 * N13: the NCI response handler phNciNfc_GetFwTypeRsp 0x1f455e6e4 requires a
-			 * payload of exactly 2 bytes (0x1f455e760 cmp w9,#2); the old 1-byte answer
-			 * 4F 06 01 00 takes the "invalid payload length" branch (0x1f455e7c0) and
-			 * phLibNfc_GetFwTypeProc 0x1f45e37a0 then reports "operation failed". The
-			 * two bytes are status 0 and the FW type; 3 is what the proc clamps an
-			 * unknown type to (0x1f45e38a4), so answer 4F 06 02 00 03.
-			 */
+		if (oid == 0x06 && length == 3 && gNfcFwType != 0) {
 			static const uint8_t fwtype_ok[] = { 0x4f, 0x06, 0x02, 0x00, 0x03 };
 
 			filterLog(packet, length, "answer 4f 06 02 00 03 (SYNTHETIC, fw type 3)");
 			answerNfcd(fwtype_ok, sizeof(fwtype_ok));
-			return;
-		}
-		if (gPropInit != 0 && oid == 0x00) {
-			static const uint8_t standby_ok[] = { 0x4f, 0x00, 0x01, 0x00 };
-
-			filterLog(packet, length, "answer 4f 00 01 00 (SYNTHETIC, standby)");
-			answerNfcd(standby_ok, sizeof(standby_ok));
 			return;
 		}
 		if (oid == 0x02) {
@@ -1439,6 +1670,78 @@ ctlReassemblyMbuf(mbuf_t m, size_t total)
 	}
 }
 
+/*
+ * N15: CORE_GET_CONFIG_RSP, the other half of the EEPROM validation (see gNfcCfg). nfcd writes a
+ * configuration with CORE_SET_CONFIG, reads it back with CORE_GET_CONFIG and compares. The bridge
+ * cannot let the extended parameters through to the chip in the default mode, so the values it
+ * remembered from the SET_CONFIG are put back here, in the frame the chip answered: id, length
+ * and value are replaced, which can change the frame length (A0 08 was written as one byte and
+ * the chip reports two). Anything else in the response - the parameters the PN553 really owns -
+ * is passed through unchanged, and a response whose status is not 0 is never touched.
+ */
+static const uint8_t *
+nfcCfgRewriteGetConfig(const uint8_t * packet, unsigned length, unsigned * out_length,
+    uint8_t * out, unsigned capacity)
+{
+	unsigned count, in, written, substitutions = 0;
+
+	if (gNfcCfg != 1 || gNfcCfgUsed == 0) return packet;
+	if (length < 5 || length > capacity) return packet;
+	if (packet[0] != 0x40 || packet[1] != 0x03) return packet;
+	if ((unsigned)packet[2] + 3 != length || packet[3] != 0x00) return packet;
+	count = packet[4];
+	memcpy(out, packet, 5);
+	in = 5;
+	written = 5;
+	for (unsigned i = 0; i < count; i++) {
+		uint16_t id;
+		unsigned id_bytes, value_length, shadow_length;
+		const uint8_t * shadow;
+
+		if (in >= length) return packet;
+		if (packet[in] >= 0xa0) {
+			if (in + 1 >= length) return packet;
+			id = (uint16_t)((packet[in] << 8) | packet[in + 1]);
+			id_bytes = 2;
+		} else {
+			id = packet[in];
+			id_bytes = 1;
+		}
+		if (in + id_bytes >= length) return packet;
+		value_length = packet[in + id_bytes];
+		if (in + id_bytes + 1 + value_length > length) return packet;
+		shadow = nfcCfgLookup(id, &shadow_length);
+		if (shadow != NULL && (shadow_length != value_length ||
+		    memcmp(shadow, packet + in + id_bytes + 1, value_length) != 0)) {
+			if (written + id_bytes + 1 + shadow_length > capacity) return packet;
+			memcpy(out + written, packet + in, id_bytes);
+			out[written + id_bytes] = (uint8_t)shadow_length;
+			if (shadow_length != 0) {
+				memcpy(out + written + id_bytes + 1, shadow, shadow_length);
+			}
+			written += id_bytes + 1 + shadow_length;
+			substitutions++;
+		} else {
+			if (written + id_bytes + 1 + value_length > capacity) return packet;
+			memcpy(out + written, packet + in, id_bytes + 1 + value_length);
+			written += id_bytes + 1 + value_length;
+		}
+		in += id_bytes + 1 + value_length;
+	}
+	if (in != length) return packet;
+	out[2] = (uint8_t)(written - 3);
+	*out_length = written;
+	if (substitutions != 0) {
+		char hex[3 * 300 + 8];
+
+		gNfcCfgSubs += substitutions;
+		stockholmLog("MiniAppleStockholm: cfg: CORE_GET_CONFIG_RSP, %u parameter(s) answered from the "
+		    "shadow instead of the PN553 (total %u): %s\n", substitutions, gNfcCfgSubs,
+		    hexAll(out, written, hex, sizeof(hex)));
+	}
+	return out;
+}
+
 /* Called on the bridge thread, with packets the PN553 has already put in the I2C buffer. */
 static void
 bridgeRx(const uint8_t * packet, unsigned length)
@@ -1447,6 +1750,7 @@ bridgeRx(const uint8_t * packet, unsigned length)
 	uint32_t unit = gKctlUnit;
 	errno_t error;
 	uint8_t spoofed[260];
+	uint8_t cfgFixed[300];
 	char hex[3 * 270 + 8];
 
 	/*
@@ -1477,6 +1781,19 @@ bridgeRx(const uint8_t * packet, unsigned length)
 			    "nfcd (offset %u; phLibNfc_GetPlatformInfo maps it to the controller generation that "
 			    "_NFDriverEnableCRC compares with 5)\n", packet[hw], wanted, hw);
 			packet = spoofed;
+		}
+	}
+	/*
+	 * N15: the configuration read-back of step 3 (_NFDriverValidateEEPROM). Only a successful
+	 * CORE_GET_CONFIG_RSP is touched, and only for the parameters the bridge remembered from
+	 * nfcd's own CORE_SET_CONFIG (see gNfcCfg / nfcCfgRewriteGetConfig()).
+	 */
+	{
+		unsigned fixed_length = length;
+
+		packet = nfcCfgRewriteGetConfig(packet, length, &fixed_length, cfgFixed, sizeof(cfgFixed));
+		if (packet == cfgFixed) {
+			length = fixed_length;
 		}
 	}
 	/*
@@ -1793,6 +2110,30 @@ MiniAppleStockholmStart(void)
 	(void)PE_parse_boot_argn("vayu_nfc_synth", &gNfcSynth, sizeof(gNfcSynth));
 	(void)PE_parse_boot_argn("vayu_nfc_propfwd", &gNfcPropFwd, sizeof(gNfcPropFwd));
 	(void)PE_parse_boot_argn("vayu_nfc_fwif", &gNfcFwIf, sizeof(gNfcFwIf));
+	/*
+	 * N14: the three init answers of REPORT.md §2. All on by default: the 03.11 runs died at
+	 * 2F 00 before anything else could be measured, and an answer that needs a new boot-arg
+	 * would not be in the owner's job file. Each has an opt-out for the A/B run.
+	 */
+	(void)PE_parse_boot_argn("vayu_nfc_standby", &gNfcStandby, sizeof(gNfcStandby));
+	(void)PE_parse_boot_argn("vayu_nfc_fwtype", &gNfcFwType, sizeof(gNfcFwType));
+	(void)PE_parse_boot_argn("vayu_nfc_se", &gNfcSe, sizeof(gNfcSe));
+	if (gNfcSe > 2) gNfcSe = 1;
+	stockholmLog("MiniAppleStockholm: se: vayu_nfc_se=%u: %s\n", gNfcSe,
+	    gNfcSe == 0 ? "A0EC/A0ED and 22 00 from the chip" :
+	    gNfcSe == 2 ? "no SE, but A0EC/A0ED echo the N15 shadow (A/B)" :
+	    "no SE: A0EC/A0ED 00/00 and 22 00 answered with 0 NFCEEs (the shadow is not echoed)");
+	/*
+	 * N15: what happens to the extended (0xA0xx) parameters of CORE_SET_CONFIG. Step 3 of
+	 * _NFDriverLoadStackSteps writes a configuration and reads it back; stripping the writes
+	 * made the read-back disagree and produced "Failed to start stack : 1" (see gNfcCfg).
+	 */
+	(void)PE_parse_boot_argn("vayu_nfc_cfg", &gNfcCfg, sizeof(gNfcCfg));
+	if (gNfcCfg > 2) gNfcCfg = 1;
+	stockholmLog("MiniAppleStockholm: cfg: extended SET_CONFIG parameters %s (vayu_nfc_cfg=%u)\n",
+	    gNfcCfg == 0 ? "stripped, read-back left to the chip (legacy)" :
+	    gNfcCfg == 2 ? "forwarded to the PN553" :
+	    "stripped and answered back from the shadow (EEPROM read-back)", gNfcCfg);
 	stockholmLog("MiniAppleStockholm: n13c: 2F 19 version %s 0x%x\n",
 	    gNfcFwIf != 0 ? "forced to" : "per platform group (N13c table), fwif", gNfcFwIf);
 	stockholmLog("MiniAppleStockholm: n13b: preamble %s, synth 0x%x (2F 21 %s, 2F 19 %s, 2F 06 %s), "
@@ -1800,15 +2141,20 @@ MiniAppleStockholmStart(void)
 	    gNfcPreamble != 0 ? "strip ff ff" : "off (desync)", gNfcSynth,
 	    (gNfcSynth & NFC_SYNTH_FLUSH) != 0 ? "local ok" : "refused",
 	    "per hw byte (N13c)",
-	    (gNfcSynth & NFC_SYNTH_FWTYPE) != 0 ? "2-byte" : "1-byte",
+	    gNfcFwType != 0 ? "local 2-byte" : "refused",
 	    gNfcPropFwd,
 	    (gNfcPropFwd & NFC_PROPFWD_FWIF) != 0 ? "chip" : "local",
 	    (gNfcPropFwd & NFC_PROPFWD_FWTYPE) != 0 ? "chip" : "local",
 	    (gNfcPropFwd & NFC_PROPFWD_STANDBY) != 0 ? "chip" : "local");
+	stockholmLog("MiniAppleStockholm: init answers: 2F 00 standby %s, 2F 06 fw type %s, "
+	    "SE map %s (vayu_nfc_standby/fwtype/se)\n",
+	    gNfcStandby != 0 ? "local 4f 00 01 00" : "refused",
+	    gNfcFwType != 0 ? "local 4f 06 02 00 03" : "refused",
+	    gNfcSe != 0 ? "A0EC/A0ED 0/0, 0 NFCEE" : "from the chip");
 	(void)PE_parse_boot_argn("vayu_nfc_propinit", &gPropInit, sizeof(gPropInit));
 	if (gPropInit != 0) {
-		stockholmLog("MiniAppleStockholm: propinit: on (2F 06 GET_FW_TYPE and 2F 00 standby get a local "
-		    "status 0; the rest of the 2F family stays refused)\n");
+		stockholmLog("MiniAppleStockholm: propinit: on (kept for old jobs; 2F 06 and 2F 00 are "
+		    "answered locally by default since N14)\n");
 	}
 	/*
 	 * NFCEE (see filterNfcee()). Default is forward: the PN553's own discovery answer and its

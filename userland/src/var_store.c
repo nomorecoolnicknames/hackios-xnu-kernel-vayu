@@ -13,6 +13,9 @@
  *
  *   var_store save          pack /private/var into the store
  *   var_store load          unpack the newest good store into /private/var (init, at boot)
+ *   var_store import        the same, into the new data volume on the flash (init, var_hfs=1 var_import=1):
+ *                           exit 0 when an archive was unpacked, 3 when there is no store, 4 when nothing in it
+ *                           checks out, 1 when it failed
  *   var_store watch [SECS]  stay and save by itself: when the kernel says the run is ending, and
  *                           every SECS seconds besides (a launchd job of ours does this)
  *   var_store show          what the store holds, both slots
@@ -221,9 +224,14 @@ head_checksum(const struct head *h)
 /* ---- the store, as a stream of bytes in one slot ---- */
 
 static int fd = -1;
+static int load_outcome;                /* import: 0 unpacked, 3 no store, 4 nothing good in it */
 static uint8_t *buffer;
 static uint8_t *already;                /* what the slot holds there now, to not write it again */
 static uint64_t skipped_blocks, written_blocks;
+static uint64_t flushed_bytes;          /* of the archive, so far: what the progress lines count */
+static uint64_t save_began_ms;          /* when save() began; 0 when no save is going on */
+static uint64_t progress_at;            /* the next size at which to say how far the save has got */
+#define PROGRESS_BYTES  (32u << 20)     /* a line every 32 MB: about seven for a volume of 230 MB */
 static uint64_t buffered;               /* bytes in the buffer: to be written, or still to be read */
 static uint64_t taken;                  /* of those, already read out (load) */
 static off_t at;                        /* where in the device the buffer begins */
@@ -237,6 +245,16 @@ static off_t
 slot_at(int slot)
 {
 	return STORE_AT + (off_t)slot * SLOT_BYTES;
+}
+
+/* Milliseconds of the wall clock: what a save's own line says it took. */
+static uint64_t
+now_ms(void)
+{
+	struct timeval tv = { 0, 0 };
+
+	gettimeofday(&tv, NULL);
+	return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
 }
 
 static int
@@ -315,6 +333,27 @@ out_flush(int last)
 	}
 	at += (off_t)n;
 	buffered = 0;
+	/*
+	 * How far the save has got, as it goes: the line at the end alone cannot tell a save that was
+	 * killed in the middle (the kernel's way out does not wait forever) from one that never began.
+	 */
+	flushed_bytes += n;
+	if (save_began_ms != 0 && flushed_bytes >= progress_at) {
+		printf("var_store: %llu MB of the archive written, %llu ms\n",
+		    (unsigned long long)(flushed_bytes >> 20),
+		    (unsigned long long)(now_ms() - save_began_ms));
+		while (progress_at <= flushed_bytes) {
+			progress_at += PROGRESS_BYTES;
+		}
+	}
+	/*
+	 * A breath between two buffers of the store: one write is one request through the loader, and
+	 * while it is in flight every read of iOS waits behind it (bsd/dev/hakios.ufs.c, ufs_cwrite).
+	 * Two milliseconds let the reads that queued up go first; 58 of them cost a tenth of a second.
+	 */
+	if (save_began_ms != 0) {
+		usleep(2000);
+	}
 	return 1;
 }
 
@@ -825,8 +864,12 @@ save(void)
 	memset(&old, 0, sizeof(old));
 	best = newest(&old);
 	slot = best < 0 ? 0 : (best + 1) % SLOTS;
-	printf("var_store: saving into slot %d (slot %d holds generation %llu)\n", slot, best,
-	    best < 0 ? 0ULL : (unsigned long long)old.generation);
+	save_began_ms = now_ms();
+	flushed_bytes = 0;
+	progress_at = PROGRESS_BYTES;
+	printf("var_store: saving into slot %d (slot %d holds generation %llu, %llu MB)\n", slot, best,
+	    best < 0 ? 0ULL : (unsigned long long)old.generation,
+	    best < 0 ? 0ULL : (unsigned long long)((old.bytes + (1u << 20) - 1) >> 20));
 
 	/* the slot's header first, so that a save cut short cannot leave an old header over a new archive */
 	memset(block, 0, sizeof(block));
@@ -883,6 +926,15 @@ save(void)
 	printf("var_store: %llu blocks into the flash, %llu left alone (they held this already)%s\n",
 	    (unsigned long long)written_blocks, (unsigned long long)skipped_blocks,
 	    unsorted_dirs ? " (a directory was too big to put in order)" : "");
+	{
+		/* the one line a run's log has to carry: what was saved, and how long it took */
+		uint64_t took = now_ms() - save_began_ms;
+
+		printf("var_store: saved slot %d generation %llu, %llu MB in %llu.%01llu s\n", slot,
+		    (unsigned long long)h.generation, (unsigned long long)((h.bytes + (1u << 20) - 1) >> 20),
+		    (unsigned long long)(took / 1000), (unsigned long long)((took % 1000) / 100));
+	}
+	save_began_ms = 0;
 	return 1;
 }
 
@@ -1153,10 +1205,12 @@ load(void)
 	struct head h;
 	int best;
 
+	load_outcome = 0;
 	memset(&h, 0, sizeof(h));
 	best = newest(&h);
 	if (best < 0) {
 		printf("var_store: no store yet: /private/var stays as init made it\n");
+		load_outcome = 3;
 		return 1;
 	}
 	printf("var_store: slot %d: generation %llu of %llu seconds, %llu entries, %llu bytes\n", best,
@@ -1176,6 +1230,7 @@ load(void)
 		}
 		if (left < 0) {
 			printf("var_store: nothing good in the store: /private/var stays as init made it\n");
+			load_outcome = 4;
 			return 1;
 		}
 		h = other;
@@ -1319,6 +1374,10 @@ watch(int seconds)
 		int state = VAR_SAVE_NONE;
 
 		if (sysctl_int("kern.hakios.var_save", &state) == 0 && state == VAR_SAVE_WANTED) {
+			if (!asked) {
+				/* the kernel's own line for this is printed on the same console; this one is the saver's */
+				printf("var_store: the kernel has asked for the volume: saving now\n");
+			}
 			asked = 1;
 		}
 		gettimeofday(&tv, NULL);
@@ -1385,6 +1444,7 @@ int
 main(int argc, char **argv, char **envp)
 {
 	const char *what = argc > 1 ? argv[1] : "show";
+	char type[20];
 	int ok;
 
 	(void)envp;
@@ -1408,9 +1468,15 @@ main(int argc, char **argv, char **envp)
 			printf("var_store: not asked to keep the data volume (var_store=1): nothing to watch\n");
 			return 0;
 		}
+		if (fs_type(ROOT, type, sizeof(type)) == 0 && strcmp(type, "hfs") == 0) {
+			/* (var_hfs: a save would only copy the volume on the flash into the store at every Shut Down) */
+			printf("var_store: /private/var is the data volume on the flash itself: nothing to watch\n");
+			return 0;
+		}
 		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;
 	}
-	fd = open(DEVICE, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY : O_RDWR, 0);
+	fd = open(DEVICE, strcmp(what, "load") == 0 || strcmp(what, "import") == 0 || strcmp(what, "show") == 0 ?
+	    O_RDONLY : O_RDWR, 0);
 	if (fd < 0) {
 		printf("var_store: %s: %s (the kernel takes writes with ufs_write=1)\n", DEVICE,
 		    strerror(errno));
@@ -1421,6 +1487,10 @@ main(int argc, char **argv, char **envp)
 		release();
 	} else if (strcmp(what, "load") == 0) {
 		ok = load();
+	} else if (strcmp(what, "import") == 0) {
+		ok = load();
+		close(fd);
+		return ok ? load_outcome : 1;
 	} else if (strcmp(what, "erase") == 0) {
 		ok = claim() && erase();        /* a write like any other: the claim first */
 		release();

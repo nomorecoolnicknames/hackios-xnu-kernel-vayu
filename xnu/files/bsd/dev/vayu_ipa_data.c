@@ -35,7 +35,7 @@ extern kern_return_t thread_terminate(thread_t thread);
 #define IPA_SIZE                0x2000UL
 #define IPA_DEBUG_PHYS          0x1e42000UL
 #define IPA_DEBUG_SIZE          0x1000UL
-#define IPA_SRAM_PHYS           0x1e50000UL
+#define IPA_SRAM_PHYS           0x1e50000UL   /* legacy v4.5 offset; real window comes from vayu_ipa_sram_base() */
 #define IPA_SRAM_SIZE           0x2800UL
 #define GSI_PHYS                0x1e04000UL
 #define GSI_SIZE                0x28000UL
@@ -266,6 +266,10 @@ static uint32_t max_event_rings;
 static bool prepared, ready, filter_failed, stopping, thread_running;
 static uint32_t trace;
 static bool first_packet_seen;
+/* QMAP boundary counters: the demux is mux 1 only; command frames are not acted on because WDA
+ * asked for no checksum offload (vayu_cell_data.c), so there is no MAP command we must answer. */
+static uint32_t qmap_commands, qmap_unknown_mux;
+static bool qmap_rx_logged;
 
 /* vayu-data: S10: the first packet either way, once. The counters in vayu_cell_net_get_status()
  * carry the rest. */
@@ -727,9 +731,37 @@ receive_event(struct channel *ch, const struct event *e, void *context __unused)
 				ch->dropped++;
 				break;
 			}
-			if (header.command || header.next_header) {
+			if (header.command) {
+				qmap_commands++;
+				if (qmap_commands == 1) {
+					say("vayu-qmap: command frame mux %u, %u bytes dropped; no MAP "
+					    "command handling (checksum offload is off)\n", header.mux_id,
+					    (unsigned)packet_length);
+				}
 				ch->dropped++;
 				continue;
+			}
+			if (header.next_header) {
+				/* A next header only exists with checksum offload; WDA asked for none. */
+				if (trace) {
+					say("vayu-qmap: mux %u has a next header; dropped\n", header.mux_id);
+				}
+				ch->dropped++;
+				continue;
+			}
+			if (header.mux_id != VAYU_CELL_NET_MUX) {
+				qmap_unknown_mux++;
+				if (qmap_unknown_mux == 1 || trace) {
+					say("vayu-qmap: mux %u is not the bound mux %u; dropped\n",
+					    header.mux_id, VAYU_CELL_NET_MUX);
+				}
+				ch->dropped++;
+				continue;
+			}
+			if (!qmap_rx_logged) {
+				qmap_rx_logged = true;
+				say("vayu-qmap: first data frame mux %u, %u bytes -> %s\n", header.mux_id,
+				    (unsigned)packet_length, vayu_cell_net_name());
 			}
 			ch->packets++;
 			first_packet("received", ch->name, (uint32_t)packet_length);
@@ -831,14 +863,26 @@ registers_map_and_check(void)
 	uint32_t channels_hw = (params >> 3) & 0x1f;
 	max_event_rings = (params >> 8) & 0x1f;
 	uint32_t pipes = ipa_rd(IPA_ENABLED_PIPES);
-	say("vayu-ipa-data: GSI status %#x version %#x params %#x: %u channels %u events; IPA pipes %#x\n",
+	say("vayu-ipa-data: GSI status %#x version %#x params %#x: %u channels %u events; IPA has %u pipes\n",
 	    status, version, params, channels_hw, max_event_rings, pipes);
-	if (!(status & 1) || version == 0 || version == ~0u || channels_hw <= 6 ||
-	    max_event_rings < NCHANNELS || (pipes & ((1u << 2) | (1u << 5) | (1u << 10) | (1u << 11))) !=
-	    ((1u << 2) | (1u << 5) | (1u << 10) | (1u << 11))) {
-		say("vayu-ipa-data: GSI 2.0 preflight failed; no channel writes\n");
-		return false;
+	/* IPA_ENABLED_PIPES is a COUNT of pipes (stock ipa3_get_num_pipes() returns it as is:
+	 * ipa_utils.c:7075), not a bitmask. 115037 read 0x17 = 23 pipes. Accept the count form
+	 * (>11 means endpoints 0..11 exist) and, defensively, the old bitmask form (bits 2/5/10/11)
+	 * so a firmware that reports either is not refused. */
+	{
+		bool pipes_ok = pipes > 11 || (pipes & 0xc24u) == 0xc24u;
+
+		if (!(status & 1) || version == 0 || version == ~0u || channels_hw <= 6 ||
+		    max_event_rings < NCHANNELS || !pipes_ok) {
+			say("vayu-ipa-data: GSI 2.0 preflight failed (status %#x, %u channels, %u event rings, "
+			    "pipes %#x as %s); no channel writes\n", status, channels_hw, max_event_rings, pipes,
+			    pipes > 11 ? "count" : "mask");
+			say("vayu-data: S0 GSI: NOT READY\n");
+			return false;
+		}
 	}
+	say("vayu-data: S0 GSI: READY status %#x fw %#x, %u channels, %u event rings, %u pipes\n",
+	    status, version, channels_hw, max_event_rings, pipes);
 	return true;
 }
 

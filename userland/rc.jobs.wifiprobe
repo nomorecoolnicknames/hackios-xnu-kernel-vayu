@@ -1,0 +1,9 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# What iOS's Wi-Fi side is answered, asked the way wifid asks it (src/wifiprobe.c): the radio's power
+# and state, the network joined, the channel list wifid asks before it will scan, and then a scan --
+# every access point the kernel gives back, with its name, channel, signal, age and protection.
+# Nothing is changed: no join, no power, and the scan is answered from the one the kernel made on
+# boot.  Run with RC_JOBS=rc.jobs.wifiprobe (WIFID=1 and the Wi-Fi boot-args as usual); the lines
+# begin "wifiprobe:".  A passphrase or a key is never read or printed.
+/redwood/bin/net_test wait 30
+/redwood/bin/wifiprobe

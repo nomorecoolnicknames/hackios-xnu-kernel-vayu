@@ -27,6 +27,13 @@
 #define HAKIOS_NET_FRAME_MAX   1514
 #define HAKIOS_NET_UNITS       2       /* en0: the radio (or virtio); en1: the modem's packets (hakios.cell.c) */
 
+/*
+ * vayu_ipv4_only=1 (default 0): the owner's rule for this phone -- no IPv6 at all. hakios.net.c
+ * sets it from the boot arg; bsd/netinet6/in6_ifattach.c refuses to plumb IPv6 on en0, en1 and
+ * pdp_ip0 while it is set, so no link-local, RA/SLAAC or DHCPv6 address can appear there.
+ */
+extern int hakios_ipv4_only;
+
 struct hakios_net_link {
 	const char *    name;           /* for the log */
 	unsigned        unit;           /* which enN this is (0 unless said otherwise) */

@@ -77,6 +77,7 @@ extern void hakios_camera_quiesce(void);
 extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
 extern void hakios_var_save_on_return(void);   /* bsd/dev/hakios.ufs.c: the data volume into the flash */
+extern void hakios_var_save_ask(const char *why); /* ... and the same without waiting for it */
 extern void vayu_ir_quiesce(void);              /* bsd/dev/vayu_ir.c: an IR transfer in flight, cancelled */
 extern void vayu_usbnet_quiesce(void);          /* bsd/dev/vayu_usbnet.c: the USB controller, if it took it */
 void loader_checkpoint(uint64_t n);
@@ -232,6 +233,16 @@ struct loader_live {
 	uint64_t magic3;                /* "XNULIVE3": the kernel has what follows */
 	volatile uint64_t usb_take;     /* ours: 1 = this kernel wants the USB controller (usb_handover=1) */
 	volatile uint64_t usb_given;    /* the loader's: 1 = it no longer touches USB in this run */
+	/*
+	 * usbctl (bsd/dev/vayu_ctl.c, bsd/sys/vayu_ctl.h): the loader's way to have the kernel
+	 * touch the screen, run a command or read a file while iOS runs.  The kernel allocates
+	 * the mailbox and the window for its answers and puts their physical addresses here --
+	 * the loader reads this struct at its physical address, so a pointer would not do.
+	 */
+	uint64_t magic4;                /* "XNULIVE4": the three fields below are there */
+	volatile uint64_t vctl_pa;      /* physical address of struct vayu_ctl_mbox (0: none) */
+	volatile uint64_t vctl_window_pa;
+	volatile uint64_t vctl_window_len;
 };
 
 /*
@@ -248,7 +259,21 @@ struct loader_live loader_live = {
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
 	.magic3 = 0x334556494c554e58ULL, .usb_take = 0, .usb_given = 0,
+	.magic4 = 0x344556494c554e58ULL, .vctl_pa = 0, .vctl_window_pa = 0, .vctl_window_len = 0,
 };
+
+/*
+ * Called by bsd/dev/vayu_ctl.c once its mailbox and window exist (early boot).  The loader
+ * looks at magic4 first; a kernel without it is a loader that answers "no usbctl".
+ */
+void
+loader_live_set_vctl(uint64_t mbox_pa, uint64_t window_pa, uint64_t window_len)
+{
+	loader_live.vctl_window_pa = window_pa;
+	loader_live.vctl_window_len = window_len;
+	loader_live.vctl_pa = mbox_pa;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
 
 /*
  * The handover, for a driver that takes a controller the loader's UEFI also drives (bsd/dev/
@@ -591,6 +616,21 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 	loader_return_test((void *)(uintptr_t)(as_panic ? 2 : 1));
 }
 
+/*
+ * The volume is asked for this long before the run's own time is up (var_save_ask=SECONDS, 0: not
+ * before the end). The saver then packs and writes the 230 MB while the run is still whole; the way
+ * out at loader_return_after finds it finished (or waits the rest of var_save_ms for it). Without
+ * this the whole store had to fit in the seconds the way out is allowed to wait, and the save of
+ * d-morning14 was cut in the middle because of it.
+ */
+#define VAR_SAVE_LEAD_SECONDS   60
+
+static void
+loader_var_save_ask(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	hakios_var_save_ask("the run's time is nearly up");
+}
+
 __startup_func
 static void
 loader_return_timer_init(void)
@@ -604,6 +644,17 @@ loader_return_timer_init(void)
 	thread_call_t call = thread_call_allocate(loader_return_timer, NULL);
 	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(call, deadline);
+	{
+		uint32_t lead = VAR_SAVE_LEAD_SECONDS;
+
+		PE_parse_boot_argn("var_save_ask", &lead, sizeof(lead));
+		if (lead != 0 && seconds > lead + 20) {
+			thread_call_t ask = thread_call_allocate(loader_var_save_ask, NULL);
+
+			clock_interval_to_deadline(seconds - lead, NSEC_PER_SEC, &deadline);
+			thread_call_enter_delayed(ask, deadline);
+		}
+	}
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
 

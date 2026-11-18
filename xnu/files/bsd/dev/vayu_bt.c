@@ -17,7 +17,8 @@
  *       0x2000+ window is TrustZone-only and a read there hangs);
  *   (b) RPMh VRM votes through vayu_rpmh_send() for ldoa7, ldoc2 and ldoc11 only.
  * XNU writes no TLMM and no GCC register here: those are read only, as everywhere else in this
- * tree (the loader does the pin muxing and the SE3/AHB clock votes, vayu_bt_loader=2).
+ * tree (the loader does the pin muxing and the SE3/AHB clock votes, vayu_bt_loader=2). The one
+ * exception is opt-in: vayu_bt_baud=3000000 rewrites SE3's own RCG (see the boot-args).
  *
  * Step 9 is the hand-over to iOS: one struct tty (ttymalloc) behind two devfs nodes on one dev_t,
  * /dev/cu.bluetooth and /dev/uart.bluetooth, the kernel control "com.vayu.bt.uart" (a
@@ -220,10 +221,39 @@
  *                     calibration callback only when the reply body is longer than one byte, so
  *                     the old empty answer stalled 15 s (VSCommandStall, reason 3602). 0 restores
  *                     the old empty answer (the experiment's control).
+ *   vayu_bt_vsc_olympic_all=N default 0 (off), 1..8 (try 8): every 0xfce2 (Olympic) sub-command
+ *                     is answered with CC status 0 and N bytes, the sub-command echoed first, then
+ *                     zeros, as the OnePlus 6T's driver does for the same controller -- except
+ *                     0x0d, which keeps its own known 8-byte answer. Overrides vayu_bt_vsc_olympic;
+ *                     works with vayu_bt_vsc=0 too (then only 0xfce2 is looked at). An experiment.
+ *   vayu_bt_vsc_fill=N default 0: how many zero bytes mode 2's catch-all Command Complete carries
+ *                     for a vendor opcode neither the table nor a sub-opcode rule answers. 0 is the
+ *                     old empty body and the default: k19/k18 ran with it and every vendor command
+ *                     bluetoothd sends at start completed. It is NOT enough for two commands, so
+ *                     the table now carries their bodies itself (0xfd1b: 8 bytes,
+ *                     0xfce2/0x0d = BD_VSC_OLYMPIC_READ_PROFILING_STATS: 8 bytes). A global
+ *                     non-zero fill was k20: it made 0xfce9's reply body non-empty, bluetoothd's
+ *                     _BCM_SubOpcodeChecker read the first byte (0x00) instead of the sub-opcode it
+ *                     expects (0x01) and dropped the Command Complete -> 15 s timeout, reason 3602.
+ *                     Keep 0 unless the log of the run says a specific opcode needs a body.
  *   vayu_bt_keep=0|1  default 0: 1 leaves rails, clock and RX running at the end; 0 cancels the
  *                     S command. Step 9 always behaves as 1: the tty and the kctl need both.
  *   vayu_bt_giveback=0|1  default 0: 1 also votes "enable 0" for the rails this run turned on (same
  *                     RPMh client as UEFI: off by default).
+ *   vayu_bt_baud=N    default 115200 (off): 3000000 moves the wire to 3 Mbit/s at the start of step
+ *                     8, before the firmware, as Linux's hci_qca.c qca_set_speed() does for the
+ *                     WCN399x and as the 6T (xreactx/oneplus-6t-upstream bt6t uart_fast) and renoir
+ *                     (janhurn9400 7287928f1) ports do for A2DP, which 115200 cannot carry: RFR held
+ *                     not ready, EDL 0xfc48 with QCA_BAUDRATE_3000000 (0x0e), 10 ms, then the SE3
+ *                     RCG from 7 372 800 Hz to 96 MHz (GPLL0 even x 8/25, sys/vayu_bt_baud.h) and
+ *                     the serial divider 1, RFR back, and Read_Local_Version at the new rate. No
+ *                     Command Complete there: the RCG and the divider go back to 115200 and the
+ *                     same check runs again (the step stops only if the controller then does not
+ *                     answer either). The NVM's tag 17 rate byte is the wire's code, so the patched
+ *                     firmware stays where the wire is. This is the one GCC write of this file,
+ *                     SE3's own RCG (M, N, D, CFG, CMD) and only while DFS is off, the way the
+ *                     loader writes it. bluetoothd is still told 115200 (its termios and the DT's
+ *                     transport-speed are never applied to the UART).
  *
  * What userland must run after step 9:
  *
@@ -242,6 +272,10 @@
  * and on one the relevant registers are printed and the step chain stops; nothing spins forever
  * and nothing panics. The probe runs in a kernel thread, like vayu_haptic_init(), so a slow
  * register does not hold up boot. All sleeps are delay() based, as this file may not use IOSleep.
+ *
+ * From other HakiOS ports (APSL 2.0, as this file): vayu_bt_baud=3000000 follows xreactx/hakios-xnu-kernel,
+ * branch oneplus-6t-upstream, commit 0e5e7bd6a05c (bt6t: the UART at 3 Mbit/s), and janhurn9400/hackios-xnu-kernel,
+ * branch renoir, commit 7287928f164b (Bluetooth audio at that rate); the sequence is Linux's hci_qca.c qca_set_speed().
  */
 
 #include <kern/clock.h>
@@ -256,6 +290,7 @@
 #include <stdint.h>
 #include <sys/conf.h>
 #include <sys/errno.h>
+#include <sys/kernel.h>
 #include <sys/fcntl.h>
 #include <sys/kauth.h>
 #include <sys/kern_control.h>
@@ -269,6 +304,7 @@
 #include <sys/uio.h>
 #include <sys/vayu_bt.h>
 #include <sys/vayu_bt_leinit.h>
+#include <sys/vayu_bt_baud.h>
 #include <sys/vayu_pas.h>
 
 /*
@@ -321,6 +357,8 @@ static void bt_dt_publish(const uint8_t addr[6], const char *source);
 #define GCC_WRAP2_S3_CFG        (GCC_WRAP2_S3_CMD + 0x4)   /* cfg = cmd + 4: vayu_qup_spi.c:88 */
 #define GCC_WRAP2_S3_RCG_M      (GCC_WRAP2_S3_CMD + 0x8)   /* the RCG's one M (not a DFS level) */
 #define GCC_WRAP2_S3_RCG_N      (GCC_WRAP2_S3_CMD + 0xc)   /* the RCG's one N (not a DFS level) */
+#define GCC_WRAP2_S3_RCG_D      (GCC_WRAP2_S3_CMD + 0x10)  /* its D: the loader's "bt se3 rcg d" */
+#define GCC_CMD_UPDATE          (1u << 0)       /* CMD_UPDATE: cleared when the RCG has taken M/N/D/CFG */
 #define GCC_WRAP2_S3_DFS        (GCC_WRAP2_S3_CMD + 0x14)  /* as vayu_qup_spi.c:89 */
 
 #define GCC_WRAP2_S3_DFSR(n)    (GCC_WRAP2_S3_CMD + 0x1c + 4u * (n))  /* vendor gcc-sm8150.c:4188 */
@@ -592,9 +630,16 @@ static uint32_t g_fw_rom = 0x21;        /* step 6's fw_rom: the crbtfw/crnv name
 
 static bool g_step8_done = false;       /* "step 8 done" was printed: step 9 may run */
 static bool g_step9_ok = false;         /* the tty/kctl are up: bt_finish() leaves everything running */
+/*
+ * A connect or a tty open asks the io thread for a clean H4 start. Set from another thread and
+ * resolved in the io thread, where the framer lives (g_h4_rx is only ever read there).
+ */
+static volatile bool g_rx_fresh_request;
+static volatile bool g_inject_reset_pending;    /* the client went away: its answers are not the next one's */
 
 static bool g_rx_running = false;
 static uint32_t g_baud = 2400;
+static uint32_t g_fast_baud;            /* vayu_bt_baud=3000000: the wire's rate from step 8 on (0: 115200) */
 static uint32_t g_tx_depth, g_rx_depth, g_tx_width;
 
 static uint64_t g_dfs_rate[GCC_DFS_LEVELS];
@@ -2394,7 +2439,8 @@ bt_nvm_patch(uint8_t *data, uint64_t size)
 				break;
 			}
 			tag[0] = g_ibs ? (tag[0] | QCA_TAG_HCI_IBS) : (tag[0] & (uint8_t)~QCA_TAG_HCI_IBS);
-			tag[2] = QCA_BAUDRATE_115200;
+			/* the rate the wire is at now (vayu_bt_baud): the patched firmware stays there */
+			tag[2] = g_baud == 3000000 ? VAYU_BT_QCA_BAUD_3000000 : QCA_BAUDRATE_115200;
 			bt_dump_counted("nvm tag 17 (HCI) after", tag, len);
 			hci = true;
 			break;
@@ -2418,6 +2464,141 @@ bt_nvm_patch(uint8_t *data, uint64_t size)
 	    "(vayu_bt_ibs=%u)\n", tags, hci ? "patched" : "not found", deep ? "patched" : "not found",
 	    g_ibs ? "on" : "off", g_ibs ? "on" : "off", g_ibs ? 1 : 0);
 	return true;
+}
+
+/*
+ * vayu_bt_baud: SE3's RCG to rate_hz (96 MHz or the loader's 7 372 800 Hz, sys/vayu_bt_baud.h), only
+ * while DFS is off, as the loader writes it; then read back. True when the RCG runs at exactly that.
+ */
+static bool
+bt_rcg_set(uint64_t rate_hz)
+{
+	uint32_t m, n, mreg, nreg, dreg, cfg, cmd = 0;
+	uint64_t got;
+	bool valid;
+
+	if (gcc_va == 0 || (bt_rd(gcc_va, GCC_WRAP2_S3_DFS) & GCC_DFSR_DFS_EN) != 0) {
+		printf("vayu-bt: baud: the SE3 RCG is %s: not written\n", gcc_va == 0 ? "not mapped" : "in DFS");
+		return false;
+	}
+	if (!vayu_bt_rcg_mn(rate_hz, &m, &n) ||
+	    !vayu_bt_rcg_words(m, n, bt_rd(gcc_va, GCC_WRAP2_S3_CFG), &mreg, &nreg, &dreg, &cfg)) {
+		printf("vayu-bt: baud: no M/N for %llu Hz\n", (unsigned long long)rate_hz);
+		return false;
+	}
+	bt_wr(gcc_va, GCC_WRAP2_S3_RCG_M, mreg);
+	bt_wr(gcc_va, GCC_WRAP2_S3_RCG_N, nreg);
+	bt_wr(gcc_va, GCC_WRAP2_S3_RCG_D, dreg);
+	bt_wr(gcc_va, GCC_WRAP2_S3_CFG, cfg);
+	bt_wr(gcc_va, GCC_WRAP2_S3_CMD, bt_rd(gcc_va, GCC_WRAP2_S3_CMD) | GCC_CMD_UPDATE);
+	for (uint32_t i = 0; i < 100; i++) {
+		cmd = bt_rd(gcc_va, GCC_WRAP2_S3_CMD);
+		if ((cmd & GCC_CMD_UPDATE) == 0) {
+			break;
+		}
+		delay(10);
+	}
+	got = bt_dfs_rate(bt_rd(gcc_va, GCC_WRAP2_S3_CFG), bt_rd(gcc_va, GCC_WRAP2_S3_RCG_M),
+	    bt_rd(gcc_va, GCC_WRAP2_S3_RCG_N), &valid);
+	printf("vayu-bt: baud: se3 rcg cmd %#x cfg %#x m %#x n %#x d %#x: %llu Hz%s\n", cmd,
+	    bt_rd(gcc_va, GCC_WRAP2_S3_CFG), bt_rd(gcc_va, GCC_WRAP2_S3_RCG_M), bt_rd(gcc_va, GCC_WRAP2_S3_RCG_N),
+	    bt_rd(gcc_va, GCC_WRAP2_S3_RCG_D), (unsigned long long)got,
+	    (cmd & (GCC_CMD_UPDATE | GCC_CMD_ROOT_OFF)) != 0 ? ": UPDATE NOT TAKEN or root off" :
+	    !valid || got != rate_hz ? ": NOT the rate asked for" : "");
+	if ((cmd & (GCC_CMD_UPDATE | GCC_CMD_ROOT_OFF)) != 0 || !valid || got != rate_hz) {
+		return false;
+	}
+	g_dfs_rate[0] = got;
+	g_dfs_valid[0] = true;
+	return true;
+}
+
+/* Read_Local_Version at the rate the wire is at now: does the controller answer there? */
+static bool
+bt_baud_check(const char *when)
+{
+	static const uint8_t version[4] = { 0x01, 0x01, 0x10, 0x00 };
+	struct bt_h4 h4;
+	const uint8_t *payload;
+	uint32_t plen;
+
+	if (!bt_h4_xfer(version, sizeof(version), 0x1001, 500, &h4, true)) {
+		printf("vayu-bt: baud: %s: Read_Local_Version was not sent\n", when);
+		return false;
+	}
+	if (!bt_cmd_complete(&h4, 0x1001, &payload, &plen) || plen < 4 || payload[3] != 0) {
+		bt_dump_counted("baud: what came instead of Read_Local_Version's answer", h4.data, h4.got);
+		printf("vayu-bt: baud: %s at %u baud: NO ANSWER\n", when, g_baud);
+		return false;
+	}
+	printf("vayu-bt: baud: %s at %u baud: the controller answers (hci_ver %#x)\n", when, g_baud,
+	    plen >= 5 ? (unsigned)payload[4] : 0u);
+	return true;
+}
+
+/* The host side to the rate of clock_hz / divider, RX restarted on it. */
+static bool
+bt_baud_host(uint64_t clock_hz, uint32_t baud)
+{
+	if (g_rx_running) {
+		if (!bt_cancel_s()) {
+			return false;
+		}
+		g_rx_running = false;
+	}
+	if (!bt_rcg_set(clock_hz) || !bt_set_baud(baud)) {
+		return false;
+	}
+	return bt_start_rx();
+}
+
+/*
+ * vayu_bt_baud=3000000, at the start of step 8 (see the top). False only when the controller answers
+ * at neither rate: then nothing else can be said to it.
+ */
+static bool
+bt_uart_fast(void)
+{
+	uint8_t command[5], rx[64];
+	uint32_t got;
+
+	if (g_fast_baud == 0) {
+		return true;
+	}
+	printf("vayu-bt: baud: vayu_bt_baud=%u: the wire to %u baud before the firmware (EDL 0xfc48 code %#x, "
+	    "SE3 at 96 MHz)\n", g_fast_baud, g_fast_baud, (unsigned)vayu_bt_qca_baud_code(g_fast_baud));
+	if (gcc_va == 0 || g_baud != 115200 || !g_dfs_valid[0] || g_dfs_rate[0] != 7372800ull ||
+	    (bt_rd(gcc_va, GCC_WRAP2_S3_DFS) & GCC_DFSR_DFS_EN) != 0) {
+		printf("vayu-bt: baud: the wire is at %u from %llu Hz (the RCG not the loader's 7372800 Hz, or in DFS): "
+		    "it stays there\n", g_baud, (unsigned long long)g_dfs_rate[0]);
+		return true;
+	}
+	/* (the controller holds what it has to say while the rates change: RFR not ready, as hci_qca.c) */
+	bt_se_wr(SE_UART_MANUAL_RFR, 0x80000002u, "manual RFR, not ready during the rate change");
+	(void)vayu_bt_set_baud_command(vayu_bt_qca_baud_code(g_fast_baud), command);
+	if (!bt_tx(command, sizeof(command))) {
+		bt_se_wr(SE_UART_MANUAL_RFR, 0, "hardware RFR");
+		printf("vayu-bt: baud: 0xfc48 was not sent: the wire stays at 115200\n");
+		return bt_baud_check("115200 kept");
+	}
+	bt_sleep_ms(10);
+	if (bt_baud_host(96000000ull, g_fast_baud)) {
+		bt_se_wr(SE_UART_MANUAL_RFR, 0, "hardware RFR");
+		/* (the vendor event the WCN3990 sends for the change: Linux's QCA_DROP_VENDOR_EVENT) */
+		got = bt_rx(rx, sizeof(rx), 200000);
+		bt_dump_counted("baud: rx after the change", rx, got);
+		if (bt_baud_check("after 0xfc48")) {
+			return true;
+		}
+	} else {
+		bt_se_wr(SE_UART_MANUAL_RFR, 0, "hardware RFR");
+	}
+	printf("vayu-bt: baud: back to 115200 (the loader's 7372800 Hz, divider 2)\n");
+	if (!bt_baud_host(7372800ull, 115200)) {
+		printf("vayu-bt: baud: the host side did not go back to 115200: stopping\n");
+		return false;
+	}
+	return bt_baud_check("back");
 }
 
 static bool
@@ -2445,6 +2626,9 @@ bt_step8(void)
 	    g_fw_cts ? "honour CTS for the download" : "ignore CTS for the download");
 	printf("vayu-bt: step 8: TX_TRANS_CFG = %#x: CTS %s (vayu_bt_fw_cts=%u)\n", value,
 	    g_fw_cts ? "honoured" : "ignored", g_fw_cts ? 1 : 0);
+	if (!bt_uart_fast()) {
+		return false;
+	}
 
 	snprintf(rampatch_name, sizeof(rampatch_name), "crbtfw%02x.tlv", g_fw_rom);
 	snprintf(nvm_name, sizeof(nvm_name), "crnv%02x.bin", g_fw_rom);
@@ -2768,6 +2952,8 @@ bt_tty_open(dev_t dev, int flag, __unused int devtype, __unused proc_t p)
 	error = (*linesw[tp->t_line].l_open)(dev, tp);
 	if (error == 0) {
 		bt_tty_log("open");
+		/* the tty's reader is a new H4 parser too: start it at a packet boundary */
+		g_rx_fresh_request = true;
 		printf("vayu-bt: tty: raw 8N1 at %u, carrier on, /dev/cu.bluetooth and "
 		    "/dev/uart.bluetooth\n", (unsigned)BT_TTY_BAUD);
 	}
@@ -2928,6 +3114,7 @@ static const struct cdevsw bt_tty_cdevsw = {
 #define BT_KCTL_IO_SIZE         256             /* bytes the io thread drains in one turn */
 #define BT_KCTL_LOG_EVERY       100             /* drops/ENOBUFS: the first and every this many */
 #define BT_KCTL_UNKNOWN_OPTS    16              /* distinct unknown optnames remembered */
+#define BT_KCTL_CONNECT_WAIT_S  40              /* a connect before step 9 waits at most this long */
 
 /* setsockopt's int makes TIOCSETA* negative: compare these as uint32_t. */
 #define BT_KCTL_TIOCGETA        0x40487413u     /* TIOCGETA (ttycom.h:108) */
@@ -2973,7 +3160,7 @@ static struct bt_kctl_tx g_kctl_tx;
 
 struct bt_kctl_drop {
 	bool log;
-	uint32_t now;
+	uint64_t now;
 	uint32_t events;
 	uint64_t bytes;
 };
@@ -2994,36 +3181,21 @@ bt_kctl_termios_speed(const struct termios *t)
 	return (uint32_t)(t->c_ospeed != 0 ? t->c_ospeed : t->c_ispeed);
 }
 
-/* Under kctl_lock: append what fits; the caller logs the drop once the lock is gone. */
+/* Under kctl_lock, with room for all of it (bt_kctl_send() checked the whole chain). */
 static void
-bt_kctl_tx_put_locked(const uint8_t *bytes, uint32_t count, struct bt_kctl_drop *drop)
+bt_kctl_tx_put_locked(const uint8_t *bytes, uint32_t count)
 {
-	uint32_t space = BT_KCTL_TX_SIZE - g_kctl_tx.count;
-	uint32_t take = count < space ? count : space;
 	uint32_t first = BT_KCTL_TX_SIZE - g_kctl_tx.tail;
 
-	if (first > take) {
-		first = take;
+	if (first > count) {
+		first = count;
 	}
 	memcpy(&g_kctl_tx.buf[g_kctl_tx.tail], bytes, first);
-	if (take > first) {
-		memcpy(&g_kctl_tx.buf[0], bytes + first, take - first);
+	if (count > first) {
+		memcpy(&g_kctl_tx.buf[0], bytes + first, count - first);
 	}
-	g_kctl_tx.tail = (g_kctl_tx.tail + take) % BT_KCTL_TX_SIZE;
-	g_kctl_tx.count += take;
-
-	if (take != count) {
-		uint32_t lost = count - take;
-
-		g_kctl_tx.drops++;
-		g_kctl_tx.dropped += lost;
-		if (g_kctl_tx.drops == 1 || g_kctl_tx.drops % BT_KCTL_LOG_EVERY == 0) {
-			drop->log = true;
-			drop->now = lost;
-			drop->events = g_kctl_tx.drops;
-			drop->bytes = g_kctl_tx.dropped;
-		}
-	}
+	g_kctl_tx.tail = (g_kctl_tx.tail + count) % BT_KCTL_TX_SIZE;
+	g_kctl_tx.count += count;
 }
 
 /* The io thread's side of the ring: at most max bytes, in order, under the same lock. */
@@ -3058,6 +3230,31 @@ bt_kctl_connect(kern_ctl_ref kctlref, struct sockaddr_ctl *sac, void **unitinfo)
 
 	*unitinfo = NULL;
 
+	/*
+	 * bluetoothd opens this transport as soon as it starts, which on this port is about 20 s
+	 * before step 9 has the firmware in (vayu_bt_wait + the rampatch transfer, d12b:13098:
+	 * step 9 at +24 s, connect at +2 s). Its first HCI_Reset then waits in the ring longer
+	 * than the stack's 10 s HCI timeout: "HCI expected event 14 with opcode OI_DHCI_RESET_OPCODE
+	 * (0x00000C03) timedout" and "HCI initialization failed" (d12b:7814, 11178, reason=108).
+	 * The connect is the only place that can hold it back: ctl_connect() drops the socket lock
+	 * around this callback (bsd/kern/kern_control.c, "socket_unlock(so, 0); error =
+	 * (*kcb->kctl->connect)(...)"), so sleeping here waits only bluetoothd's own thread.
+	 * The wait is bounded: if step 9 never comes, the client gets the transport as before.
+	 */
+	if (!g_step9_ok) {
+		uint32_t waited = 0;
+
+		proc_selfname(name, sizeof(name));
+		printf("vayu-bt: kctl: connect unit %u by pid %d (%s) waits for step 9\n",
+		    (unsigned)sac->sc_unit, proc_selfpid(), name);
+		while (!g_step9_ok && waited < BT_KCTL_CONNECT_WAIT_S) {
+			tsleep(&g_step9_ok, PRIBIO, "vayu-bt9", hz);
+			waited++;
+		}
+		printf("vayu-bt: kctl: step 9 %s after %u s of waiting\n",
+		    g_step9_ok ? "reached" : "still not reached", (unsigned)waited);
+	}
+
 	lck_mtx_lock(&kctl_lock);
 	if (g_kctl_connected) {
 		if (g_kctl_ref == kctlref && g_kctl_unit == sac->sc_unit) {
@@ -3077,6 +3274,9 @@ bt_kctl_connect(kern_ctl_ref kctlref, struct sockaddr_ctl *sac, void **unitinfo)
 	g_kctl_unit = sac->sc_unit;
 	g_kctl_connected = true;
 	lck_mtx_unlock(&kctl_lock);
+
+	/* Its parser starts at the first byte it is given: give it a packet boundary (see above). */
+	g_rx_fresh_request = true;
 
 	name[0] = 0;
 	proc_selfname(name, sizeof(name));
@@ -3106,6 +3306,7 @@ bt_kctl_disconnect(kern_ctl_ref kctlref, u_int32_t unit, __unused void *unitinfo
 	if (ours) {
 		g_leinit_reset_pending = true; /* the io thread resets at its next clean boundary */
 		g_randaddr_reset_pending = true;
+		g_inject_reset_pending = true;  /* answers queued for this client are not the next one's */
 		printf("vayu-bt: kctl: disconnect unit %u\n", (unsigned)unit);
 		if (queued != 0) {
 			printf("vayu-bt: kctl: %u bytes queued by unit %u were dropped at disconnect\n",
@@ -3121,9 +3322,16 @@ bt_kctl_send(__unused kern_ctl_ref kctlref, u_int32_t unit, __unused void *uniti
     mbuf_t m, __unused int flags)
 {
 	struct bt_kctl_drop drop = { .log = false };
+	uint64_t count = 0;
+	errno_t error = 0;
 
 	if (m == NULL) {
 		return 0;
+	}
+	for (mbuf_t n = m; n != NULL; n = mbuf_next(n)) {
+		if (mbuf_data(n) != NULL) {
+			count += mbuf_len(n);
+		}
 	}
 	lck_mtx_lock(&kctl_lock);
 	/* A send still in flight when the client disconnects must not seed a later client's ring. */
@@ -3132,23 +3340,36 @@ bt_kctl_send(__unused kern_ctl_ref kctlref, u_int32_t unit, __unused void *uniti
 		mbuf_freem(m);
 		return 0;
 	}
-	for (mbuf_t n = m; n != NULL; n = mbuf_next(n)) {
-		const uint8_t *data = (const uint8_t *)mbuf_data(n);
-		uint32_t len = (uint32_t)mbuf_len(n);
+	if (count > BT_KCTL_TX_SIZE - g_kctl_tx.count) {
+		/* the whole write or none of it: a suffix dropped in the middle of an HCI packet corrupts the H4 stream */
+		error = ENOBUFS;
+		g_kctl_tx.drops++;
+		g_kctl_tx.dropped += count;
+		if (g_kctl_tx.drops == 1 || g_kctl_tx.drops % BT_KCTL_LOG_EVERY == 0) {
+			drop.log = true;
+			drop.now = count;
+			drop.events = g_kctl_tx.drops;
+			drop.bytes = g_kctl_tx.dropped;
+		}
+	} else {
+		for (mbuf_t n = m; n != NULL; n = mbuf_next(n)) {
+			const uint8_t *data = (const uint8_t *)mbuf_data(n);
+			uint32_t len = (uint32_t)mbuf_len(n);
 
-		if (data != NULL && len != 0) {
-			bt_kctl_tx_put_locked(data, len, &drop);
+			if (data != NULL && len != 0) {
+				bt_kctl_tx_put_locked(data, len);
+			}
 		}
 	}
 	lck_mtx_unlock(&kctl_lock);
 	mbuf_freem(m);
 
 	if (drop.log) {
-		printf("vayu-bt: kctl: TX ring full: %u byte(s) dropped, %u drops and %llu bytes "
-		    "in all\n", (unsigned)drop.now, (unsigned)drop.events,
+		printf("vayu-bt: kctl: TX ring full: %llu byte(s) refused whole (ENOBUFS), %u drops and %llu bytes "
+		    "in all\n", (unsigned long long)drop.now, (unsigned)drop.events,
 		    (unsigned long long)drop.bytes);
 	}
-	return 0;
+	return error;
 }
 
 static void
@@ -3430,6 +3651,12 @@ struct bt_h4_way {
 };
 
 static struct bt_h4_way g_h4_tx, g_h4_rx;
+/*
+ * A new client (bluetoothd after a restart, or the tty) starts its own H4 parser at the first byte
+ * it is given. If the framer is inside a packet at that moment, that first byte is payload: skip
+ * to the next packet boundary (the constant says why).
+ */
+static bool g_rx_fresh_start;
 static uint32_t g_h4_ibs_count[3], g_h4_ibs_logged[3];
 static const char *const g_h4_ibs_name[3] = { "WAKE_IND", "SLEEP_IND", "WAKE_ACK" };
 
@@ -3457,8 +3684,9 @@ bt_h4_trace(struct bt_h4_way *way, bool tx)
 			printf("vayu-bt: h4 > %s acl handle %#x len %u\n", source,
 			    (unsigned)handle, (unsigned)f->payload_len);
 		} else {
-			printf("vayu-bt: h4 < acl handle %#x len %u\n", (unsigned)handle,
-			    (unsigned)f->payload_len);
+			/* the first bytes too: an ACL nobody opened is otherwise unidentifiable */
+			printf("vayu-bt: h4 < acl handle %#x len %u: %s\n", (unsigned)handle,
+			    (unsigned)f->payload_len, hex);
 		}
 		break;
 	}
@@ -3770,6 +3998,21 @@ bt_h4_rx_feed(const uint8_t *bytes, uint32_t count, uint8_t *out, bool *wake_ack
 	for (uint32_t i = 0; i < count; i++) {
 		bool boundary = !g_h4_rx.framer.in_packet;
 
+		/*
+		 * A client that has just connected or opened the tty starts its own H4 parser at
+		 * this byte, but the controller's stream does not start here: the framer may be in
+		 * the middle of a packet (the field: the first reads of every new bluetoothd are
+		 * "discarding ACL packet ... Numbytes 48x" with a handle nobody opened). Parse the
+		 * rest of that packet but do not hand it over: the next packet begins at the next
+		 * boundary, and the client's parser starts where the controller's does.
+		 */
+		if (g_rx_fresh_start) {
+			(void)bt_h4_rx_byte(bytes[i], wake_ack);
+			if (!g_h4_rx.framer.in_packet) {
+				g_rx_fresh_start = false;
+			}
+			continue;
+		}
 		if (bt_h4_rx_byte(bytes[i], wake_ack)) {
 			if (g_randaddr_pending || g_randaddr_held != 0) {
 				kept = bt_randaddr_rx_byte(bytes[i], boundary, out, kept);
@@ -3824,11 +4067,14 @@ struct bt_vsc_rule {
 	const uint8_t *params;
 	uint8_t subop;                  /* first payload byte, when has_subop */
 	bool has_subop;                 /* one opcode can carry many sub-commands (0xfce2 does) */
+	bool opt_in;                    /* has_subop rule: off until vayu_bt_vsc_olympic asks for it */
 };
 
 /* vayu_bt_vsc_cal: the body of the 0xfd1b answer; 0 leaves the old empty CC in place. */
 #define BT_VSC_CAL_DEFAULT      8
 static uint8_t g_cal_zeros[BT_VSC_MAX_PARAMS];
+/* the body of the 0xfce2/0x0d (BD_VSC_OLYMPIC_READ_PROFILING_STATS) answer: four u16 */
+static uint8_t g_prof_zeros[8];
 
 static struct bt_vsc_rule bt_vsc_rules[] = {
 	/*
@@ -3869,6 +4115,35 @@ static struct bt_vsc_rule bt_vsc_rules[] = {
 	{ .opcode = 0xfd1b, .action = BT_VSC_CC, .status = 0, .nparams = BT_VSC_CAL_DEFAULT,
 	    .params = g_cal_zeros },
 	/*
+	 * 0xfce9 is the LE_META family (one opcode, the sub-opcode is the first payload byte:
+	 * 0x01 = BD_VSC_LE_META_ENA_FEATURES, 0x05 ADV_PCF_FEATURE_SEL, 0x07 ADD_ADV_MATCHING_RULE,
+	 * 0x1e ADV_PCF_SERVICE_UUID, 0x32, 0x35, ...).  It needs a Command Complete with the status
+	 * and NOTHING else.  bluetoothd 16.5 registers a sub-opcode filter for exactly this opcode
+	 * (_BCM_SubOpcodeChecker, bcm_vsc.c, 0x1001261bc): if the reply body is non-empty it reads
+	 * its first byte and compares it with the sub-opcode the command was registered under; a
+	 * mismatch throws the answer away, the command is never completed and the 15 s wait ends in
+	 * "timedout waiting for controller" + VSCommandStall + reason 3602.  An empty body skips the
+	 * check (size <= position -> accept) and the status-only parser 0x100123340 completes it.
+	 * Run G-K18-R21 (k19), 06:23:22.322: CC status 0 with 0 params -> "BD_VSC_LE_META_ENA_FEATURES
+	 * completed with status 0" 3 ms later; run 072140 (k20), 07:22:30.321: CC status 0 with 8 zero
+	 * params -> 15 s timeout at 07:22:45.322 and bluetoothd restarts, 13 times.  So this rule
+	 * always answers with the status alone and vayu_bt_vsc_fill does not apply to it.
+	 */
+	{ .opcode = 0xfce9, .action = BT_VSC_CC, .status = 0, .nparams = 0, .params = NULL },
+	/*
+	 * 0xfce2/0x0d is BD_VSC_OLYMPIC_READ_PROFILING_STATS (kCBMsgIdLocalDeviceReadPowerProfile-
+	 * StatisticsMsg -> _BCM_OlympicReadProfilingStats, bcm_vsc.c 0x100128004: payload 0d 00 00 00
+	 * <flag>, ocf 0xe2).  Its reply parser, _BCM_ProfilingStatsEventParser at 0x1001238e0, reads
+	 * FOUR u16 -- transmitting, receiving, sleep, others -- and asserts
+	 * ByteStream_NumReadBytesAvail(*pBs) >= 2 before each of the four reads (bcm_vsc.c:138-141).
+	 * The empty catch-all body of k19 aborted bluetoothd there; eight zero bytes satisfy all four
+	 * checks and the call back reports 0/0/0/0.  Run 062247: "Sending: BD_VSC_OLYMPIC_READ_
+	 * PROFILING_STATS" then "AssertFail bcm_vsc.c:138" 3 ms later (SIGABRT every ~32.5 s).
+	 * Unlike the 0x15 test below this rule is always on: it is a known length, not an experiment.
+	 */
+	{ .opcode = 0xfce2, .action = BT_VSC_CC, .status = 0, .nparams = sizeof(g_prof_zeros),
+	    .params = g_prof_zeros, .subop = 0x0d, .has_subop = 1 },
+	/*
 	 * 0xfce2 is one opcode for every Olympic sub-command; the sub-opcode is the first payload
 	 * byte.  bt8 run 205056 shows bluetoothd sending three of them: 0x0b and 0x1c (handled, the
 	 * caller does not wait) and 0x15 = BD_VSC_OLYMPIC_ANTENNA_PREF_B, which it waits 15 s for
@@ -3884,7 +4159,7 @@ static struct bt_vsc_rule bt_vsc_rules[] = {
 	 * here so that the experiment is one boot-arg away instead of another kernel build.
 	 */
 	{ .opcode = 0xfce2, .action = BT_VSC_CC, .status = 0, .nparams = 0, .params = NULL,
-	    .subop = 0x15, .has_subop = 1 },
+	    .subop = 0x15, .has_subop = 1, .opt_in = 1 },
 };
 
 #define BT_VSC_RULE_COUNT       (sizeof(bt_vsc_rules) / sizeof(bt_vsc_rules[0]))
@@ -3894,6 +4169,22 @@ static uint32_t g_vsc_seen, g_vsc_passed, g_vsc_answered;
 static uint32_t g_vsc_logged;           /* per-command vsc lines printed so far */
 static uint8_t g_olympic_bytes;         /* vayu_bt_vsc_olympic: zero bytes in the 0x15 answer, 0 = rule off */
 static uint8_t g_olympic_zeros[8];      /* the answer's body while g_olympic_bytes is set */
+static uint8_t g_olympic_all_bytes;     /* vayu_bt_vsc_olympic_all: echoed sub-command + zeros, 0 = off */
+/*
+ * vayu_bt_vsc_fill=N: the body of mode 2's catch-all answer, N zero bytes (0 = the old empty body).
+ * Run 062247: bluetoothd asks for kCBMsgIdLocalDeviceReadPowerProfileStatisticsMsg, sends
+ * BD_VSC_OLYMPIC_READ_PROFILING_STATS and aborts in bcm_vsc.c:138 on
+ * ByteStream_NumReadBytesAvail(*pBs) >= 2: the catch-all's Command Complete carried a status and
+ * no data at all. That command is 0xfce2/0x0d and now has its own always-on rule (8 bytes), so the
+ * catch-all does not have to carry a body for it. k20 answered EVERY unlisted vendor command with
+ * 8 zeros and broke 0xfce9 (LE_META): its reply body must stay empty, otherwise bluetoothd's
+ * sub-opcode filter rejects the answer (see the 0xfce9 rule above) and the command stalls 15 s.
+ * The default is therefore 0, the k19/k18 behaviour that completed every command but the two the
+ * table now handles. N (1..8) is still the experiment's knob for an unlisted opcode.
+ */
+#define BT_VSC_FILL_DEFAULT     0
+static uint8_t g_vsc_fill = BT_VSC_FILL_DEFAULT;  /* vayu_bt_vsc_fill: zero bytes in the catch-all answer */
+static uint8_t g_vsc_zeros[8];
 static uint8_t g_cal_bytes = BT_VSC_CAL_DEFAULT;  /* vayu_bt_vsc_cal: body length of the 0xfd1b answer */
 static bool g_bt_trace;                 /* vayu_bt_trace=1: every per-command vsc line, no cap */
 #define BT_VSC_LOG_FIRST        64      /* without vayu_bt_trace: the first 64 decisions, then summaries only */
@@ -3987,13 +4278,90 @@ bt_vsc_find(uint16_t opcode, const uint8_t *payload, uint32_t payload_len)
 		if (!rule->has_subop) {
 			return rule;
 		}
-		/* a sub-opcode rule is off (and must not shadow a plain one) while its knob is 0 */
-		if (payload_len < 1 || payload[0] != rule->subop || g_olympic_bytes == 0) {
+		/* a sub-opcode rule matches only its own sub-opcode, so it never shadows a plain one */
+		if (payload_len < 1 || payload[0] != rule->subop) {
+			continue;
+		}
+		/* an opt-in rule (the 0x15 experiment) is off until its knob is set */
+		if (rule->opt_in && g_olympic_bytes == 0) {
 			continue;
 		}
 		return rule;
 	}
 	return NULL;
+}
+
+#define BT_INJECT_SIZE          512             /* the answers waiting for a packet boundary */
+#define BT_INJECT_STALL_US      100000          /* 100 ms: a packet that stopped mid-way holds nothing */
+
+static uint8_t g_inject[BT_INJECT_SIZE];
+static uint32_t g_inject_len;
+static uint64_t g_inject_since_us;
+static uint32_t g_inject_waiting;       /* calls that found the framer inside a packet */
+static uint32_t g_inject_forced;        /* answers let out inside a packet (the stall above) */
+
+static void bt_inject_flush(bool force);
+
+/*
+ * Synthetic answers -- vayu_bt_vsc's Command Completes and the 0xfd48 timeout answer -- are bytes
+ * the controller never sent. bluetoothd reads the kctl socket as one H4 byte stream with one
+ * parser; an answer put between two bytes of a real packet shifts that parser by the answer's
+ * length and it does not find its place again. The field shows it: "invalid dataType 1" (0x01 is
+ * num_hci_command_packets in 04 0e 04 01 ...), then "unknown packet type", then
+ * OI_HCIIfc_DeviceHasBeenReset and reason=631 (d12b:18044-18253). So an answer is kept here until
+ * the framer is between packets, where the controller's own packets also begin. bt_vsc_answer()
+ * and bt_randaddr_poll() both run in the io thread, which is also the only reader of the buffer:
+ * no lock is needed.
+ */
+static void
+bt_inject_put(const uint8_t *bytes, uint32_t count)
+{
+	if (count == 0) {
+		return;
+	}
+	if (count > sizeof(g_inject)) {
+		bt_inject_flush(true);
+		bt_deliver_to_host(bytes, count);
+		return;
+	}
+	if (g_inject_len + count > sizeof(g_inject)) {
+		bt_inject_flush(true);
+	}
+	memcpy(g_inject + g_inject_len, bytes, count);
+	if (g_inject_len == 0) {
+		g_inject_since_us = bt_now_us();
+	}
+	g_inject_len += count;
+}
+
+/* force: the packet in flight has not moved for BT_INJECT_STALL_US; let the answers out anyway. */
+static void
+bt_inject_flush(bool force)
+{
+	uint32_t count = g_inject_len;
+
+	if (count == 0) {
+		return;
+	}
+	if (g_h4_rx.framer.in_packet && !force) {
+		g_inject_waiting++;
+		if (g_inject_waiting == 1 || g_inject_waiting % 1000 == 0) {
+			printf("vayu-bt: inject: the answers wait for a packet boundary (the "
+			    "controller's packet is not complete; %u time(s) so far)\n",
+			    (unsigned)g_inject_waiting);
+		}
+		return;
+	}
+	g_inject_len = 0;
+	if (g_h4_rx.framer.in_packet) {
+		g_inject_forced++;
+		if (g_inject_forced == 1 || g_inject_forced % 10 == 0) {
+			printf("vayu-bt: inject: %u answer(s) go out inside a packet: it has not moved "
+			    "for %u ms\n", (unsigned)g_inject_forced,
+			    (unsigned)(BT_INJECT_STALL_US / 1000));
+		}
+	}
+	bt_deliver_to_host(g_inject, count);
 }
 
 /*
@@ -4049,7 +4417,7 @@ bt_vsc_answer(uint16_t opcode, uint8_t action, uint8_t status, uint8_t nparams,
 	if (verbose) {
 		bt_vsc_trace_synthetic(event, count);   /* a throw-away framer: not bounded by the 200-packet trace cap */
 	}
-	bt_deliver_to_host(event, count);
+	bt_inject_put(event, count);
 }
 
 /*
@@ -4066,6 +4434,7 @@ bt_vsc_tx_filter(const uint8_t *pkt, uint32_t len)
 	uint16_t opcode;
 	uint8_t action, status = 0, nparams = 0;
 	const uint8_t *params = NULL;
+	uint8_t olympic[8] = { 0 };
 
 	/*
 	 * vayu_bt_leanswer=1: the controller refuses 0x2007 and 0x200b with Command
@@ -4089,10 +4458,13 @@ bt_vsc_tx_filter(const uint8_t *pkt, uint32_t len)
 		}
 	}
 
-	if (g_vsc_mode == 0 || len < 4 || pkt[0] != BT_H4_CMD) {
+	if (len < 4 || pkt[0] != BT_H4_CMD) {
 		return BT_VSC_PASS;
 	}
 	opcode = bt_le16(pkt + 1);
+	if (g_vsc_mode == 0 && !(opcode == 0xfce2 && len >= 5 && g_olympic_all_bytes != 0)) {
+		return BT_VSC_PASS;
+	}
 	rule = bt_vsc_find(opcode, pkt + 4, len - 4);
 	if ((opcode >> 10) != BT_VSC_OGF) {
 		/* a standard command: acted on only when the table lists it with an answer */
@@ -4105,7 +4477,13 @@ bt_vsc_tx_filter(const uint8_t *pkt, uint32_t len)
 	}
 
 	g_vsc_seen++;
-	if (rule != NULL) {
+	if (opcode == 0xfce2 && len >= 5 && g_olympic_all_bytes != 0 && (rule == NULL || rule->opt_in)) {
+		/* vayu_bt_vsc_olympic_all=N: the sub-command echoed, then zeros (an always-on rule keeps its own answer) */
+		olympic[0] = pkt[4];
+		action = BT_VSC_CC;
+		nparams = g_olympic_all_bytes;
+		params = olympic;
+	} else if (rule != NULL) {
 		action = rule->action;
 		status = rule->status;
 		nparams = rule->nparams;
@@ -4114,13 +4492,16 @@ bt_vsc_tx_filter(const uint8_t *pkt, uint32_t len)
 			/* vayu_bt_vsc_cal: 0 restores the old empty catch-all answer */
 			nparams = g_cal_bytes;
 		}
-		if (rule->has_subop && g_olympic_bytes != 0) {
+		if (rule->has_subop && rule->opt_in && g_olympic_bytes != 0) {
 			/* vayu_bt_vsc_olympic=N: N zero bytes, the length still being the open question */
 			nparams = g_olympic_bytes;
 			params = g_olympic_zeros;
 		}
 	} else if (g_vsc_mode == 2) {
 		action = BT_VSC_CC;
+		/* vayu_bt_vsc_fill=N: the caller's byte-stream parser may need a body to step through */
+		nparams = g_vsc_fill;
+		params = g_vsc_zeros;
 	} else {
 		action = BT_VSC_PASS;
 	}
@@ -4347,7 +4728,7 @@ bt_randaddr_poll(void)
 
 		printf("vayu-bt: randaddr: no Command Complete for 0x2005 in 2 s\n");
 		n = bt_randaddr_answer_fd48(0x01, event, 0);
-		bt_deliver_to_host(event, n);
+		bt_inject_put(event, n);
 	}
 }
 
@@ -4486,6 +4867,14 @@ vayu_bt_io_thread(__unused void *parameter, __unused wait_result_t result)
 
 	while (!g_tty_io_stop) {
 		struct tty *tp = g_tty;
+		if (g_rx_fresh_request) {
+			g_rx_fresh_request = false;
+			g_rx_fresh_start = g_h4_rx.framer.in_packet;
+			if (g_rx_fresh_start) {
+				printf("vayu-bt: h4: a new client takes over inside a packet: its "
+				    "stream starts at the next boundary\n");
+			}
+		}
 		if (g_leinit_reset_pending) {
 			vayu_bt_leinit_rx_reset(&g_leinit_rx);
 			g_leinit_reset_pending = false;
@@ -4502,7 +4891,7 @@ vayu_bt_io_thread(__unused void *parameter, __unused wait_result_t result)
 			g_tty_tx_wanted = false;
 			tty_unlock(tp);
 			if (queued != 0) {
-				if (g_vsc_mode == 0 && !g_leinit_enabled && g_randaddr_mode == 0) {
+				if (g_vsc_mode == 0 && !g_leinit_enabled && g_randaddr_mode == 0 && g_olympic_all_bytes == 0) {
 					for (uint32_t i = 0; i < queued; i++) {
 						bt_h4_tx_byte(in[i], "tty");
 					}
@@ -4530,7 +4919,7 @@ vayu_bt_io_thread(__unused void *parameter, __unused wait_result_t result)
 			uint32_t queued = bt_kctl_tx_drain(in, BT_KCTL_IO_SIZE);
 
 			if (queued != 0) {
-				if (g_vsc_mode == 0 && !g_leinit_enabled && g_randaddr_mode == 0) {
+				if (g_vsc_mode == 0 && !g_leinit_enabled && g_randaddr_mode == 0 && g_olympic_all_bytes == 0) {
 					for (uint32_t i = 0; i < queued; i++) {
 						bt_h4_tx_byte(in[i], "kctl");
 					}
@@ -4560,6 +4949,21 @@ vayu_bt_io_thread(__unused void *parameter, __unused wait_result_t result)
 
 				(void)bt_tx_quiet(&ack, 1);
 			}
+			moved = true;
+		}
+		/*
+		 * The synthetic answers collected in the TX part of this turn go out here, where the
+		 * controller's packet has ended (bt_inject_put says why). If the packet in flight
+		 * never finishes, they go out anyway after the stall time: a lost answer is worse
+		 * than a shifted parser for one packet.
+		 */
+		if (g_inject_reset_pending) {
+			g_inject_reset_pending = false;
+			g_inject_len = 0;
+		}
+		bt_inject_flush(false);
+		if (g_inject_len != 0 && bt_now_us() - g_inject_since_us > BT_INJECT_STALL_US) {
+			bt_inject_flush(true);
 			moved = true;
 		}
 		if (!moved) {
@@ -4678,9 +5082,13 @@ bt_step9(void)
 		printf("vayu-bt: step 9: the SE is not mapped\n");
 		return false;
 	}
-	if (g_baud != BT_TTY_BAUD) {
+	if (g_baud != BT_TTY_BAUD && (g_fast_baud == 0 || g_baud != g_fast_baud)) {
 		printf("vayu-bt: step 9: the UART is at %u baud, not %u\n", g_baud, (unsigned)BT_TTY_BAUD);
 		return false;
+	}
+	if (g_baud != BT_TTY_BAUD) {
+		printf("vayu-bt: step 9: the wire runs at %u baud (vayu_bt_baud); bluetoothd's %u is only what it "
+		    "is told\n", g_baud, (unsigned)BT_TTY_BAUD);
 	}
 	printf("vayu-bt: step 9: the H4 tty and \"%s\" for bluetoothd\n", BT_KCTL_NAME);
 	if (!g_rx_running || (bt_se_rd(SE_GENI_STATUS) & SE_STATUS_S_ACTIVE) == 0) {
@@ -4696,6 +5104,8 @@ bt_step9(void)
 	thread_deallocate(thread);
 
 	g_step9_ok = true;
+	/* a connect that came early is asleep on this address (bt_kctl_connect) */
+	wakeup(&g_step9_ok);
 	tty_lock(g_tty);
 	printf("vayu-bt: step 9: the tty and the kctl own the SE now (tty open now: %s); t_outq and "
 	    "the kctl TX ring -> the controller, the controller -> l_rint and the kctl client\n",
@@ -5071,6 +5481,15 @@ vayu_bt_init(void)
 		g_giveback = value != 0;
 	}
 	value = 0;
+	if (PE_parse_boot_argn("vayu_bt_baud", &value, sizeof(value)) && value != 115200 && value != 0) {
+		if (vayu_bt_qca_baud_code(value) == VAYU_BT_QCA_BAUD_NONE) {
+			printf("vayu-bt: vayu_bt_baud=%u: only 3000000 (or 115200) is known here: the wire stays at "
+			    "115200\n", (unsigned)value);
+		} else {
+			g_fast_baud = value;
+		}
+	}
+	value = 0;
 	if (PE_parse_boot_argn("vayu_bt_leinit", &value, sizeof(value))) {
 		g_leinit_enabled = value != 0;
 	}
@@ -5105,6 +5524,25 @@ vayu_bt_init(void)
 		g_olympic_bytes = (uint8_t)value;
 	}
 	value = 0;
+	if (PE_parse_boot_argn("vayu_bt_vsc_olympic_all", &value, sizeof(value))) {
+		if (value > sizeof(g_olympic_zeros)) {
+			printf("vayu-bt: vayu_bt_vsc_olympic_all=%u: at most %u answer bytes exist; using %u\n",
+			    (unsigned)value, (unsigned)sizeof(g_olympic_zeros), (unsigned)sizeof(g_olympic_zeros));
+			value = (uint32_t)sizeof(g_olympic_zeros);
+		}
+		g_olympic_all_bytes = (uint8_t)value;
+	}
+	value = 0;
+	if (PE_parse_boot_argn("vayu_bt_vsc_fill", &value, sizeof(value))) {
+		if (value > sizeof(g_vsc_zeros)) {
+			printf("vayu-bt: vayu_bt_vsc_fill=%u: at most %u answer bytes exist; "
+			    "using %u\n", (unsigned)value, (unsigned)sizeof(g_vsc_zeros),
+			    (unsigned)sizeof(g_vsc_zeros));
+			value = (uint32_t)sizeof(g_vsc_zeros);
+		}
+		g_vsc_fill = (uint8_t)value;
+	}
+	value = 0;
 	if (PE_parse_boot_argn("vayu_bt_vsc_cal", &value, sizeof(value))) {
 		if (value > BT_VSC_MAX_PARAMS) {
 			printf("vayu-bt: vayu_bt_vsc_cal=%u: at most %u bytes fit the answer; using %u\n",
@@ -5131,11 +5569,23 @@ vayu_bt_init(void)
 		printf("vayu-bt: vsc: 0xfd1b (BD_VSC_FACTORY_CAL_READ_TABLE) answered with CC status 0 "
 		    "and %u zero byte(s)%s\n", (unsigned)g_cal_bytes,
 		    g_cal_bytes == 0 ? " (the old empty body: bluetoothd will stall on it)" : "");
-		if (g_olympic_bytes != 0) {
+		printf("vayu-bt: vsc: 0xfce9 (LE_META) answered with the status alone (an empty body, "
+		    "or the sub-opcode check drops it); 0xfce2/0x0d (OLYMPIC_READ_PROFILING_STATS) "
+		    "with CC status 0 and %u zero byte(s)\n", (unsigned)sizeof(g_prof_zeros));
+		if (g_olympic_bytes != 0 && g_olympic_all_bytes == 0) {
 			printf("vayu-bt: vsc: 0xfce2/0x15 (Olympic antenna) answered with CC status 0 "
 			    "and %u zero byte(s): an experiment, see bt_vsc_rules\n",
 			    (unsigned)g_olympic_bytes);
 		}
+		if (g_vsc_fill != 0) {
+			printf("vayu-bt: vsc: an unlisted vendor command is answered with CC status 0 "
+			    "and %u zero byte(s) (vayu_bt_vsc_fill)\n", (unsigned)g_vsc_fill);
+		}
+	}
+	if (g_olympic_all_bytes != 0) {
+		printf("vayu-bt: vsc: every 0xfce2 (Olympic) sub-command but 0x0d answered with CC status 0 and %u "
+		    "byte(s), the sub-command echoed then zeros (vayu_bt_vsc_olympic_all, an experiment)\n",
+		    (unsigned)g_olympic_all_bytes);
 	}
 	if (g_leinit_enabled) {
 		printf("vayu-bt: leinit: enabled (one-shot real LE init before first random-address 0x200b)\n");

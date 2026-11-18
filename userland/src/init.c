@@ -12,6 +12,11 @@
  * Started with a file name by anything else, it is a command runner: that is
  * how a launchd job (LaunchDaemons/com.hakios.demo.plist) runs a list of
  * commands.
+ *
+ * Parts of it from other HakiOS ports (MIT, as this file): /private/var on HFS Plus (var_hfs=,
+ * var_import=, src/var_hfs.h) after telegdyd/ios-vayu, branch vayu-dev, commit 274f9827f52f; the Metal plug-in's bind
+ * (bind_metal_plugin) after telegdyd/ios-vayu, branch vayu-dev, commit 061e5a82d023; wire_limit= after
+ * adelholzener69/hakios-xnu-kernel-raphael, branch raphael, commit 3233e8371422.
  */
 #include "mini.h"
 
@@ -246,6 +251,40 @@ mount_cryptex(const char *name, const char *container, const char *flashdev)
 	check(1, what);
 }
 
+/*
+ * Metal's plug-in, with boot-arg metal=N (N != 0; the kernel's accelerator then names HakiosMetal,
+ * iokit/Kernel/MiniIOMobileFramebuffer.cpp publishAccelerator). Metal opens EXTENSIONS/HakiosMetal.bundle,
+ * and the root has none: the RAM system images (system-test22 ...) were made before it, and the iOS volume
+ * on the flash is Apple's. So this image's bundle (lib/HakiosMetal.bundle, userland/build.sh METAL=1) gets
+ * a synthetic entry there and is mounted on it, as the applications are (bind_applications); Apple's
+ * bundles beside it stay. Without metal= nothing here is done and the root is as it always was.
+ */
+static void
+bind_metal_plugin(const char *extensions)
+{
+	const char *metal = boot_arg("metal");
+	char to[256];
+	struct stat st;
+
+	if (metal == NULL || metal[0] == 0 || strcmp(metal, "0") == 0) {
+		return;
+	}
+	if (stat(in_image("/lib/HakiosMetal.bundle/HakiosMetal"), &st) != 0) {
+		printf("  metal=%s, but this image has no Metal plug-in (lib/HakiosMetal.bundle: userland/build.sh METAL=1)\n",
+		    metal);
+		check(0, "the Metal plug-in in this image (metal=N)");
+		return;
+	}
+	strcpy(to, join(extensions, "/HakiosMetal.bundle", ""));
+	if (lstat(to, &st) == 0) {
+		/* a system image made with it (vayu-dev's build.sh links it to /redwood/lib/HakiosMetal.bundle) */
+		printf("  %s: the system image has it already\n", to);
+		return;
+	}
+	check(synthetic_dir(to) && bind_dir(in_image("/lib/HakiosMetal.bundle"), to),
+	    "the Metal plug-in in /System/Library/Extensions (metal=N)");
+}
+
 static void
 flash_root(const char *dev)
 {
@@ -273,6 +312,7 @@ flash_root(const char *dev)
 	    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not iOS's");
 	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
 	    "our audio device, not Apple's plug-ins");
+	bind_metal_plugin("/flash/System/Library/Extensions");
 	bind_applications("/flash/Applications");
 	if (stat("/fw", &fw_st) == 0) {
 		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */
@@ -716,6 +756,145 @@ own_tree(const char *path, int uid)
 }
 
 /*
+ * A system group container, /private/var/containers/Shared/SystemGroup/<UUID>, is a container that
+ * several applications of the system share. containermanagerd makes it, and on iOS the sandbox --
+ * not the Unix mode -- decides who may use it. This system has no sandbox, so a daemon that runs
+ * as mobile gets the plain DAC answer, and the mode containermanagerd left is the one that counts.
+ *
+ * bluetoothd is one such daemon, and its own word for the result is in the log:
+ *     Could not create directory at path ".../A6DFCA60-.../Library/Database" with error ...
+ *     Failed to create 'paired devices' cache at ".../com.apple.MobileBluetooth.ledevices.paired.db"
+ *         with error 10 (disk I/O error, 3338)          (SQLite: SQLITE_IOERR_ACCESS on EACCES)
+ *     Failed to load device caches - device information will not be persisted
+ * and from then on, for every advertising report the controller sends,
+ *     Ignoring non-paired device address "Public ..." as the protected cache has not been loaded
+ * so no device is ever made and Settings -> Bluetooth lists nothing. The chip is not at fault:
+ * in the morning9 run the kernel logged 19 LE Advertising Reports and Server.LE.Scan counted the
+ * same 19, and 0 of them reached an application.
+ *
+ * Give every system group container, its Library and its Library/Database back to mobile as 0755,
+ * and print what was there: the next boot's log then says the modes either way.
+ */
+static void
+repair_one(const char *path, int take_owner, int *seen, int *repaired)
+{
+	struct stat st;
+	int mode_fixed = 0, owner_fixed = 0;
+
+	if (lstat(path, &st) != 0) {
+		return;                 /* a container that has not been made in this boot (or at all) */
+	}
+	printf("  %s: mode %04o uid %u gid %u\n", path, st.st_mode & 07777, (unsigned)st.st_uid,
+	    (unsigned)st.st_gid);
+	(*seen)++;
+	if ((st.st_mode & S_IFMT) != S_IFDIR) {
+		return;
+	}
+	if ((st.st_mode & 07777) != 0755) {
+		if (chmod(path, 0755) == 0) {
+			mode_fixed = 1;
+		} else {
+			printf("  %s: chmod: %s\n", path, strerror(errno));
+		}
+	}
+	/*
+	 * The container itself keeps the owner containermanagerd gave it (its own bookkeeping is
+	 * about that); what bluetoothd has to write, Library and Library/Database, becomes mobile's.
+	 */
+	if (take_owner && (st.st_uid != 501 || st.st_gid != 501)) {
+		if (chown(path, 501, 501) == 0) {
+			owner_fixed = 1;
+		} else {
+			printf("  %s: chown: %s\n", path, strerror(errno));
+		}
+	}
+	if (mode_fixed || owner_fixed) {
+		(*repaired)++;
+		printf("  -> %s%s%s\n", mode_fixed ? "0755" : "",
+		    mode_fixed && owner_fixed ? " " : "", owner_fixed ? "501:501" : "");
+	}
+}
+
+/*
+ * The three directories above the containers keep their owner (root, as init makes them) but have
+ * to be searchable by mobile; print them so a log says where a denied path stops.
+ */
+static void
+repair_parent(const char *path)
+{
+	struct stat st;
+
+	if (lstat(path, &st) != 0) {
+		printf("  %s: %s\n", path, strerror(errno));
+		return;
+	}
+	printf("  %s: mode %04o uid %u gid %u\n", path, st.st_mode & 07777, (unsigned)st.st_uid,
+	    (unsigned)st.st_gid);
+	if ((st.st_mode & S_IFMT) == S_IFDIR && (st.st_mode & 07777) != 0755) {
+		printf("  %s: chmod 0755: %s\n", path,
+		    chmod(path, 0755) == 0 ? "done" : strerror(errno));
+	}
+}
+
+static void
+repair_system_groups(void)
+{
+	static char buf[4096];
+	static const char *const group = "/private/var/containers/Shared/SystemGroup";
+	static const char *const above[] = {
+		"/private/var/containers",
+		"/private/var/containers/Shared",
+		"/private/var/containers/Shared/SystemGroup",
+	};
+	char child[512], library[640];
+	struct dirent *de;
+	struct stat st;
+	off_t position = 0;
+	ssize_t n;
+	int fd, seen = 0, repaired = 0;
+
+	for (unsigned i = 0; i < sizeof(above) / sizeof(above[0]); i++) {
+		repair_parent(above[i]);
+	}
+	fd = open(group, O_RDONLY | O_DIRECTORY, 0);
+	if (fd < 0) {
+		printf("  %s: %s: no system group yet\n", group, strerror(errno));
+		return;
+	}
+	while ((n = getdirentries(fd, buf, sizeof(buf), &position)) > 0) {
+		for (ssize_t at = 0; at < n; at += ((struct dirent *)(buf + at))->d_reclen) {
+			de = (struct dirent *)(buf + at);
+			if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+				continue;
+			}
+			if (strlen(group) + strlen(de->d_name) + 2 > sizeof(child)) {
+				continue;
+			}
+			strcpy(child, group);
+			strcpy(child + strlen(child), "/");
+			strcpy(child + strlen(child), de->d_name);
+			repair_one(child, 0, &seen, &repaired);
+			/* the database bluetoothd makes sits below Library, and Library must be writable too */
+			if (lstat(child, &st) != 0 || (st.st_mode & S_IFMT) != S_IFDIR) {
+				continue;
+			}
+			strcpy(library, child);
+			strcpy(library + strlen(library), "/Library");
+			if (lstat(library, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR) {
+				repair_one(library, 1, &seen, &repaired);
+				strcpy(library + strlen(library), "/Database");
+				if (lstat(library, &st) == 0) {
+					repair_one(library, 1, &seen, &repaired);
+				}
+			}
+		}
+	}
+	close(fd);
+	printf("  %d system group path(s) seen, %d made 0755 (Library and Database also mobile's)\n",
+	    seen, repaired);
+}
+
+/*
  * The rootless prefix of a package manager, /var/jb: the Procursus bootstrap with Sileo in it
  * (tools/mk-jb.sh) rides in the system image as /jb (or in the boot volume, /private/preboot/jb,
  * with the root on the flash), an APFS image that cannot be written to, while dpkg and apt must be
@@ -896,6 +1075,9 @@ read_whole(const char *path, char *buf, size_t size)
 	return (ssize_t)got;
 }
 
+/* var_hfs=1: /private/var as HFS Plus on the flash, the volume filled once and kept (src/var_hfs.h) */
+#include "var_hfs.h"
+
 static void
 mount_writable(void)
 {
@@ -907,11 +1089,12 @@ mount_writable(void)
 	struct stat st;
 
 	printf("\n-- writable filesystem --\n");
-	ok = mount("ramfs", "/private/var", 0, NULL) == 0;
+	ok = var_hfs_mount() != VAR_IN_MEMORY || mount("ramfs", "/private/var", 0, NULL) == 0;
 	if (!ok) {
 		printf("  mount: %s\n", strerror(errno));
 	}
-	check(ok, "mount a memory filesystem on /private/var");
+	check(ok, var_volume != VAR_IN_MEMORY ? "mount the data volume on /private/var (HFS Plus, on the flash)" :
+	    "mount a memory filesystem on /private/var");
 
 	/* the directories of the data volume, as listed in the template that ships with iOS (sysimage/mkvarskel.py) */
 	read_whole(in_image("/etc/var.skel"), skeleton, sizeof(skeleton));
@@ -926,15 +1109,17 @@ mount_writable(void)
 		if (count == 5 && f[0][0] == 'd') {
 			int mode = (int)parse_number(f[1], 8);
 
-			ok = mkdir(f[4], mode) == 0 && chmod(f[4], mode) == 0 &&
-			    chown(f[4], (int)parse_number(f[2], 10), (int)parse_number(f[3], 10)) == 0;
+			/* (one the volume on the flash has from an earlier boot stays as that boot left it) */
+			ok = mkdir(f[4], mode) == 0 ? chmod(f[4], mode) == 0 &&
+			    chown(f[4], (int)parse_number(f[2], 10), (int)parse_number(f[3], 10)) == 0 :
+			    var_volume == VAR_ON_FLASH && errno == EEXIST;
 			if (!ok) {
 				printf("  %s: %s\n", f[4], strerror(errno));
 			}
 			made++;
 		} else if (count == 3 && f[0][0] == 'l') {
 			symlink(f[1], f[2]);
-		} else if (count == 6 && f[0][0] == 'f') {
+		} else if (count == 6 && f[0][0] == 'f' && !(var_volume == VAR_ON_FLASH && lstat(f[4], &st) == 0)) {
 			/* a file of ours to start with (build.sh: the var/ directory): mode, owner, group, path, source in the image */
 			if (!copy_file(in_image(f[5]), f[4], (int)parse_number(f[1], 8), (int)parse_number(f[2], 10),
 			    (int)parse_number(f[3], 10))) {
@@ -1059,6 +1244,10 @@ restore_var(void)
 	int status = 0;
 	pid_t pid;
 
+	if (var_volume != VAR_IN_MEMORY) {
+		var_hfs_fill();         /* the volume on the flash has the last boot's already; a new one is filled once */
+		return;
+	}
 	if (wanted == NULL || strcmp(wanted, "1") != 0) {
 		return;
 	}
@@ -1484,6 +1673,54 @@ configure_vnodes(void)
 }
 
 /*
+ * How much memory processes may lock (vm.global_user_wire_limit, and per process vm.user_wire_limit).
+ * XNU sets it at boot to a share of the RAM, as if the kernel's own wired memory were small; here the
+ * RAM disks, /private/var's memory filesystem and the GPU's surfaces stay wired too. Past the limit
+ * every mlock fails, and the audio server needs one each time a sound starts (its I/O buffer:
+ * HALB_IOBufferManager "failed to lock the buffer", then "Unable to start IO"), so sound and haptics
+ * stopped for good after a while on raphael (adelholzener69/raphael 3233e8371: all of the RAM but the
+ * last 96 MB, 0 failures in 58 starts). The limits are said at every boot; boot-arg wire_limit=1 raises
+ * them to all but 96 MB, wire_limit=N to all but N MB, before any daemon starts.
+ */
+static void
+configure_wire_limit(void)
+{
+	unsigned long long memsize = 0, global = 0, task = 0, limit, reserve = 96;
+	const char *asked = boot_arg("wire_limit");
+	size_t len = sizeof(memsize);
+
+	if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) != 0 ||
+	    (len = sizeof(global), sysctlbyname("vm.global_user_wire_limit", &global, &len, NULL, 0)) != 0 ||
+	    (len = sizeof(task), sysctlbyname("vm.user_wire_limit", &task, &len, NULL, 0)) != 0) {
+		printf("init: the wired-memory limits cannot be read: error %d\n", errno);
+		return;
+	}
+	printf("init: processes may lock %llu MB in all, %llu MB each, of %llu MB\n", global >> 20, task >> 20, memsize >> 20);
+	if (asked == NULL || strcmp(asked, "0") == 0) {
+		return;
+	}
+	if (parse_number(asked, 10) > 1) {
+		reserve = (unsigned long long)parse_number(asked, 10);
+	}
+	if (memsize <= (reserve + 256) << 20) {
+		printf("init: wire_limit=%s: %llu MB of RAM leaves too little: the limits stay\n", asked, memsize >> 20);
+		return;
+	}
+	limit = memsize - (reserve << 20);
+	if (global >= limit && task >= limit) {
+		return;
+	}
+	if (sysctlbyname("vm.global_user_wire_limit", NULL, NULL, &limit, sizeof(limit)) != 0 ||
+	    sysctlbyname("vm.user_wire_limit", NULL, NULL, &limit, sizeof(limit)) != 0) {
+		printf("init: wire_limit=%s: the limits cannot be set: error %d\n", asked, errno);
+	}
+	len = sizeof(global), (void)sysctlbyname("vm.global_user_wire_limit", &global, &len, NULL, 0);
+	len = sizeof(task), (void)sysctlbyname("vm.user_wire_limit", &task, &len, NULL, 0);
+	printf("init: wire_limit=%s: now %llu MB in all, %llu MB each (all but %llu MB)\n", asked, global >> 20, task >> 20,
+	    reserve);
+}
+
+/*
  * The audio server's plug-in directory of the system image as it is on the root: the prebuilt images
  * (system-ru4 to ru10) were made before the rename to hakios and hold one link,
  *   RedwoodAudio.driver -> /redwood/lib/RedwoodAudio.driver,
@@ -1551,13 +1788,22 @@ main(int argc, char **argv, char **envp)
 			/* the root is the system image; its plug-in directory is as old as the image (see
 			 * bind_audio_plugins) and so are its applications (see bind_applications) */
 			bind_audio_plugins();
+			bind_metal_plugin("/System/Library/Extensions");
 			bind_applications("/Applications");
 		}
 	}
 
 	show_system();
 	mount_writable();
+	configure_wire_limit();
 	restore_var();
+	var_hfs_keep();
+	/*
+	 * The store brings back the modes of the last boot, and a container containermanagerd made
+	 * for root stays root's: give the shared ones back to mobile before any daemon runs.
+	 */
+	printf("\n-- the shared system group containers --\n");
+	repair_system_groups();
 	test_files();
 	test_writable();
 	test_memory();

@@ -17,6 +17,9 @@ ap.add_argument('--physbase', default='', help='hex: force XNU physical base (te
 ap.add_argument('--usb', action='store_true', help='make the loader stay resident and take commands over USB')
 ap.add_argument('--platform', default='', help='device the image is for (vayu, redwood, ...); the loader selects it before the framebuffer guess')
 ap.add_argument('--rdres', default='', help='hex size of a root image already placed at the resident address (QEMU)')
+# (a resident image the loader places itself, loader 2.5: give it as an item, resident=FILE)
+ap.add_argument('--standalone', action='store_true',
+                help='the image boots the phone by itself from its boot partition (loader 2.5): no time limit without a host')
 ap.add_argument('--checkpoint', default='', help='kernel checkpoint to stop at; 999 = loader self test')
 ap.add_argument('items', nargs='*')
 args = ap.parse_args()
@@ -37,6 +40,10 @@ if args.rdres:
     add('rdres', args.rdres.lower().replace('0x', '').encode() + b'\0')
 if args.usb:
     add('usb', b'1\0')
+if args.standalone:
+    if args.usb:
+        raise SystemExit('mkpayload.py: --standalone and --usb: a standalone image has no host to take commands from')
+    add('standalone', b'1\0')
 if args.platform:
     add('platform', args.platform.encode())
 if args.checkpoint:

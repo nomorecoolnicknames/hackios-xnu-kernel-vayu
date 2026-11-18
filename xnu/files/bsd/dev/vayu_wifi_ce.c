@@ -258,7 +258,7 @@ ce_pool_alloc(void)
 	uint32_t want[VAYU_CE_COUNT];
 
 	vayu_wmi_rx_post_want(want, VAYU_CE_COUNT, VAYU_CE_RX_POST_WANT);
-	if (!vayu_ce_pool_layout_want(vayu_wmi_host_cfg(vayu_ce_host_cfg), want, &ce.layout) ||
+	if (!vayu_ce_pool_layout_want(vayu_wmi_host_cfg(vayu_ce_host_cfg_active), want, &ce.layout) ||
 	    ce.layout.size == 0) {
 		say("vayu-wifi: ce: bad pool layout for host_ce_config_wlan\n");
 		return false;
@@ -359,7 +359,7 @@ ce_program(void)
 			ce_wr(ce_id, CE_SR_SIZE, src_n);
 			value = ce_rd(ce_id, CE_CTRL1);
 			ce_wr(ce_id, CE_CTRL1, (value & ~(CE_CTRL1_DMAX | CE_CTRL1_SRC_SWAP)) |
-			    (uint32_t)vayu_ce_host_cfg[ce_id].src_sz_max);
+			    (uint32_t)vayu_ce_host_cfg_active[ce_id].src_sz_max);
 			ce_wr(ce_id, CE_SRC_WM, src_n);         /* low 0, high src_n */
 		}
 		if (dst_n != 0) {
@@ -373,8 +373,8 @@ ce_program(void)
 			ce_wr(ce_id, CE_DST_WM, dst_n);
 		}
 		say("vayu-wifi: ce: ce%u src %u/%u dst %u/%u sr_wr %u dr_wr %u srri %u drri %u ctrl1 %#x\n",
-		    ce_id, src_n, (unsigned int)vayu_ce_host_cfg[ce_id].src_sz_max,
-		    dst_n, (unsigned int)vayu_ce_host_cfg[ce_id].src_sz_max,
+		    ce_id, src_n, (unsigned int)vayu_ce_host_cfg_active[ce_id].src_sz_max,
+		    dst_n, (unsigned int)vayu_ce_host_cfg_active[ce_id].src_sz_max,
 		    ce.regs[ce_id].sr_wr0, ce.regs[ce_id].dr_wr0,
 		    ce.regs[ce_id].cur_srri0, ce.regs[ce_id].cur_drri0,
 		    ce_rd(ce_id, CE_CTRL1));
@@ -399,7 +399,7 @@ ce_program(void)
 			    ffs_hi != (uint32_t)((src_pa >> 32) & VAYU_CE_ADDR_HI_MASK) ||
 			    ce_rd(ce_id, CE_SR_SIZE) != src_n ||
 			    (ce_rd(ce_id, CE_CTRL1) & CE_CTRL1_DMAX) !=
-			    (uint32_t)vayu_ce_host_cfg[ce_id].src_sz_max) {
+			    (uint32_t)vayu_ce_host_cfg_active[ce_id].src_sz_max) {
 				say("vayu-wifi: ce: ce%u src readback failed: base %#x_%08x size %u ctrl1 %#x\n",
 				    ce_id, ffs_hi, ffs_lo, ce_rd(ce_id, CE_SR_SIZE),
 				    ce_rd(ce_id, CE_CTRL1));
@@ -993,6 +993,46 @@ vayu_wifi_ce_mark_block_down(void)
 	}
 }
 
+/*
+ * K29 recovery: the firmware instance that owned the rings died (PFR or an
+ * SMP2P early-crash-ind).  There is no safe register access to make: the WLAN
+ * block may still be collapsed, so the rings are left alone and the pool stays
+ * allocated and SMMU-mapped.  The next vayu_wifi_ce_stage() reuses that pool,
+ * reprograms every CE base/size on the new firmware instance and posts a fresh
+ * RX window.  The caller must have waited for the new WLFW service.
+ */
+void
+vayu_wifi_ce_reset(const char *why)
+{
+	if (ce.result == VAYU_CE_OFF && !ce.programmed) {
+		/* Nothing was ever posted, but a blocked attempt still has to be cleared
+		 * so the next vayu_wifi_ce_stage() is allowed to run. */
+		ce.result = VAYU_CE_OFF;
+		ce.abort = NULL;
+		ce.block_down = false;
+		ce.torn_down = false;
+		return;
+	}
+	say("vayu-wifi: ce: reset for the new firmware instance (%s): no register access; "
+	    "pool %#llx+%#x kept, rings will be reprogrammed\n", why,
+	    (unsigned long long)ce.pool_pa, (unsigned int)ce.pool_size);
+	ce.block_down = true;           /* a dead block: teardown must not touch it */
+	ce.torn_down = true;
+	ce.programmed = false;
+	ce.result = VAYU_CE_OFF;
+	ce.abort = NULL;
+	ce.frames = 0;
+	ce.rejects = 0;
+	ce.log_frames = 0;
+	ce.log_rejects = 0;
+	for (uint32_t i = 0; i < VAYU_CE_COUNT; i++) {
+		ce.ce_frames[i] = 0;
+		ce.ce_rejects[i] = 0;
+	}
+	memset(&ce.ready, 0, sizeof(ce.ready));
+	memset(ce.rx, 0, sizeof(ce.rx));
+}
+
 void
 vayu_wifi_ce_teardown(void)
 {
@@ -1037,6 +1077,24 @@ vayu_wifi_ce_stage(bool qmi_ok, vayu_ce_abort_fn abort)
 		return ce.result;
 	}
 	ce.abort = abort;
+	ce.torn_down = false;
+	ce.block_down = false;
+	{
+		uint32_t stock = 1;
+
+		PE_parse_boot_argn("vayu_wifi_ce_stock", &stock, sizeof(stock));
+		vayu_ce_host_cfg_select(stock == 0);
+		if (stock == 0) {
+			say("vayu-wifi: ce: vayu_wifi_ce_stock=0: the k28 host table (ce5 RX %u x %u, "
+			    "W21h 511-buffer experiment)\n", vayu_ce_host_cfg_active[5].dest_nentries,
+			    vayu_ce_host_cfg_active[5].src_sz_max);
+		} else {
+			say("vayu-wifi: ce: stock vayu host_ce_config_wlan: ce5 is host->target "
+			    "(src %u x %u, no RX posting), ce7/ce8 have no host rings\n",
+			    vayu_ce_host_cfg_active[5].src_nentries,
+			    vayu_ce_host_cfg_active[5].src_sz_max);
+		}
+	}
 	{
 		uint32_t connect = 0;
 
@@ -1093,24 +1151,37 @@ vayu_wifi_ce_stage(bool qmi_ok, vayu_ce_abort_fn abort)
 		}
 		return ce.result;
 	}
-	if (!ce_pool_alloc()) {
-		ce.result = VAYU_CE_BLOCKED;
-		return ce.result;
+	/*
+	 * K29 recovery: after a PFR the old pool and its SMMU leaves are kept
+	 * (the firmware may still have DMA in flight) and the next attempt reuses
+	 * them.  The new firmware instance starts with its CE block reset, and
+	 * ce_program() rewrites every base/size before anything is posted.
+	 */
+	if (!ce.pool_mapped) {
+		if (!ce_pool_alloc()) {
+			ce.result = VAYU_CE_BLOCKED;
+			return ce.result;
+		}
+		if (!vayu_wifi_smmu_map_dma(ce.pool_pa, ce.pool_size, "ce pool")) {
+			say("vayu-wifi: ce: the SMMU refused the pool map; no CE register is touched\n");
+			ce_pool_free();
+			ce.result = VAYU_CE_BLOCKED;
+			return ce.result;
+		}
+		ce.pool_mapped = true;
+	} else {
+		say("vayu-wifi: ce: reusing the %u-byte pool at PA %#llx (kept across the restart; "
+		    "no new allocation)\n", (unsigned int)ce.pool_size,
+		    (unsigned long long)ce.pool_pa);
 	}
-	if (!vayu_wifi_smmu_map_dma(ce.pool_pa, ce.pool_size, "ce pool")) {
-		say("vayu-wifi: ce: the SMMU refused the pool map; no CE register is touched\n");
-		ce_pool_free();
-		ce.result = VAYU_CE_BLOCKED;
-		return ce.result;
+	if (ce.ce_va == 0) {
+		ce.ce_va = ml_io_map_unmappable((vm_offset_t)VAYU_CE_BASE, VAYU_CE_MAP_SIZE,
+		    VM_WIMG_IO);
 	}
-	ce.pool_mapped = true;
-	if (vayu_wmi_mode == 8 && !vayu_wifi_smmu_check_range(ce.pool_pa, ce.pool_size, "w21h ce pool")) {
-		ce.result = VAYU_CE_BLOCKED;
-		return ce.result;
+	if (ce.shadow_va == 0) {
+		ce.shadow_va = ml_io_map_unmappable((vm_offset_t)VAYU_CE_SHADOW_BASE,
+		    VAYU_CE_SHADOW_SIZE, VM_WIMG_IO);
 	}
-	ce.ce_va = ml_io_map_unmappable((vm_offset_t)VAYU_CE_BASE, VAYU_CE_MAP_SIZE, VM_WIMG_IO);
-	ce.shadow_va = ml_io_map_unmappable((vm_offset_t)VAYU_CE_SHADOW_BASE, VAYU_CE_SHADOW_SIZE,
-	    VM_WIMG_IO);
 	if (ce.ce_va == 0 || ce.shadow_va == 0) {
 		say("vayu-wifi: ce: cannot map the CE/shadow registers; no CE register is touched\n");
 		ce.result = VAYU_CE_BLOCKED;

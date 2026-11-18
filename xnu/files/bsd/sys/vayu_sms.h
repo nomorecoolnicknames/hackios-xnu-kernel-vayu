@@ -20,6 +20,17 @@
  *                       0 UIM (default), 1 NV
  *   vayu_sms_refresh=S  seconds between automatic List Messages sweeps (default 60,
  *                       0 disables, at least 15 otherwise)
+ *   vayu_sms_smsc=0|1   0: Raw Send carries the TPDU and the modem reads EF_SMSC;
+ *                       1: the full PDU with a leading 0x00 "default SMSC" byte
+ *   vayu_sms_list=0|1|2 0 (default): List with message tag 1 (MT not read), then with
+ *                       tag 0 (MT read) when the first is refused; 1: tag 1 only;
+ *                       2: tag 0 only.  Read-only; nothing is sent or deleted.
+ *   vayu_sms_ims_tlv=N  Raw Send's SMS-on-IMS TLV type: 2 (default, the
+ *                       qmi-service-wms.json value), 19 (0x13, the k25 form), 0 (omit)
+ *   vayu_sms_format=N   Raw Send's message format byte (default 6, GSM point-to-point)
+ *   vayu_sms_send_timeout=S  seconds Raw Send waits for the network's answer
+ *                       (default 30, 5..120)
+ *   vayu_sms=2          as 1, and every List/Raw Read sweep is dumped
  *
  * Privacy: the kernel log masks a sender number to its last four digits, never
  * prints message text or a PDU byte, and never prints an identifier.  The inbox

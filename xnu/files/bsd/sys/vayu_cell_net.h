@@ -16,6 +16,8 @@
  * Boot args (bsd/dev/vayu_cell_net.c):
  *   vayu_cell_net=1         create en1 and start its configuration thread (default 0: nothing)
  *   vayu_cell_net_default=1 also add a global default route via the session's gateway (default 0)
+ *   vayu_cell_ping=1        after the address is applied, send up to four ICMP echo requests to
+ *                           8.8.8.8 through the same QMAP/IPA TX path and log the replies (default 0)
  *
  * Addresses are host order, the way vayu_cell_data.c holds the WDS words (it prints them with
  * shifts and applies htonl only when building a sockaddr). vayu_cell_net_session() copies the
@@ -35,6 +37,13 @@
 #define VAYU_CELL_NET_MTU_DEFAULT       1500
 #define VAYU_CELL_NET_MTU_MIN           576
 #define VAYU_CELL_NET_MTU_MAX           1500
+
+/*
+ * Two names, one implementation. vayu_cell_net=1 keeps the bring-up name en1; vayu_wds=1 makes
+ * the same interface under the name configd and the CommCenter-less path look for: pdp_ip0.
+ */
+#define VAYU_CELL_NET_NAME_LEGACY       "en1"
+#define VAYU_CELL_NET_NAME_WDS          "pdp_ip0"
 
 /* vayu_cell_net_get_status(): what exists and what was last applied. */
 #define VAYU_CELL_NET_FLAG_ATTACHED     0x00000001u     /* en1 was made and attached */
@@ -64,10 +73,15 @@ struct vayu_cell_net_status {
 
 #ifdef KERNEL
 
-/* Opt-in vayu_cell_net=1: attach en1 and start the thread. Idempotent; nothing without the arg. */
+/*
+ * Opt-in vayu_cell_net=1 (en1) or vayu_wds=1 (pdp_ip0): attach the interface and start the
+ * thread. Idempotent; nothing without one of the two args.
+ */
 void vayu_cell_net_init(void);
-/* True only when en1 and its configuration thread exist; says nothing about configuration. */
+/* True only when the interface and its configuration thread exist; says nothing about configuration. */
 bool vayu_cell_net_ready(void);
+/* "en1" or "pdp_ip0", the name this boot chose; never NULL. Safe from any thread. */
+const char *vayu_cell_net_name(void);
 
 /*
  * Ask for a session or its end. `up` false means teardown (route and address removed, flags

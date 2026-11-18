@@ -56,8 +56,16 @@ struct vayu_ce_cfg {
 
 #define VAYU_CE_CFG_DIS_INTR     0x0008
 
-/* The 12 host pipes, in CE order.  See the file comment for the source. */
+/*
+ * The 12 host pipes, in CE order.  vayu_ce_host_cfg is the stock WCN3990 table
+ * (K29; CE5 is host->target, not an RX pipe).  vayu_ce_host_cfg_legacy is the
+ * k28 table kept for vayu_wifi_ce_stock=0.  All kernel-side users go through
+ * vayu_ce_host_cfg_active, which starts on the stock table.
+ */
 extern const struct vayu_ce_cfg vayu_ce_host_cfg[VAYU_CE_COUNT];
+extern const struct vayu_ce_cfg vayu_ce_host_cfg_legacy[VAYU_CE_COUNT];
+extern const struct vayu_ce_cfg *vayu_ce_host_cfg_active;
+void vayu_ce_host_cfg_select(bool legacy);
 
 /* Decoded 16-byte descriptor as the CE and the host see it in memory. */
 struct vayu_ce_desc {

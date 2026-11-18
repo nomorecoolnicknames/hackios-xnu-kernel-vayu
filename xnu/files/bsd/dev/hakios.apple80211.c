@@ -30,14 +30,21 @@
  * when the station has joined or failed, event 9 says so, and ASSOCIATE_RESULT (21) gives the
  * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
  * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
+ *
+ * From other HakiOS ports (APSL 2.0, as this file): vayu_wifi_bounds=1's RSSI_BOUNDS order, telegdyd/hakios-xnu-kernel,
+ * branch negroni-dev, commit b4c39cc65b12, and kiwiiiii-eth/hakios-xnu-kernel, branch fajita, commit d82116fb9050;
+ * vayu_wifi_snr=1's noise floor and SNR, kiwiiiii-eth/hakios-xnu-kernel, branch fajita, commit 68594340fc87
+ * (sys/hakios.apple80211.h).
  */
 #include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
+#include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/kern_event.h>
 #include <sys/kernel.h>
 #include <sys/proc.h>
+#include <sys/hakios.apple80211.h>
 #include <sys/hakios.input.h>
 #include <sys/hakios.net.h>
 #include <sys/hakios.sta.h>
@@ -72,8 +79,21 @@ type_name(int32_t type)
 		{ 44, "HARDWARE_VERSION" }, { 46, "RSN_IE" }, { 47, "BACKGROUND_SCAN" }, { 48, "AP_IE_LIST" }, { 49, "STATS" },
 		{ 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 54, "RADIO_INFO" }, { 57, "MCS" }, { 66, "MCS_INDEX_SET" },
 		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
-		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
-		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
+		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" },
+		/*
+		 * From 96 on: the names iOS 16.5's own IO80211.framework gives them, read out of its
+		 * type-to-name table (0x1dab4fec0 in IO80211 of 20F66, entries of {type, pad, name}).
+		 * The framework's table agrees with the old header for 1..95 (94/95 are the virtual
+		 * interface's create/delete there too); above that the old header is wrong: 96 is
+		 * VIRTUAL_IF_ROLE, 97 VIRTUAL_IF_PARENT, 383 SET_PROPERTY, 419 LTE_RESTRICTED_CHANNELS.
+		 */
+		{ 96, "VIRTUAL_IF_ROLE" }, { 97, "VIRTUAL_IF_PARENT" }, { 103, "CURRENT_NETWORK" },
+		{ 106, "RSSI_BOUNDS" }, { 115, "POWER_DEBUG_INFO" }, { 207, "CHANNELS_INFO" },
+		{ 254, "HW_SUPPORTED_CHANNELS" }, { 383, "SET_PROPERTY" }, { 384, "LQM_METRICS_CRASHTRACER_DATA" },
+		{ 386, "LQM_SUMMARY" }, { 387, "COLOCATED_NETWORK_SCOPE_ID" }, { 402, "LINKDOWN_DEBOUNCE_STATUS" },
+		{ 403, "SOFTAP_EXTENDED_CAPABILITIES_IE" }, { 408, "SENSING_ENABLE" }, { 409, "SENSING_DISABLE" },
+		{ 419, "LTE_RESTRICTED_CHANNELS" }, { 420, "NANPH_SOFTAP_CSA" }, { 422, "6G_MODE" },
+		{ 423, "COUNTRY_BAND_SUPPORT" },
 	};
 
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -201,6 +221,21 @@ static LCK_GRP_DECLARE(apple80211_lock_group, "hakios-apple80211");
 static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
 static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
 static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+static char country[3] = "RU";                  /* the two letters the radio is tuned for; wifid reads them back */
+static bool country_asked;                      /* (the boot argument is looked at once) */
+static int bounds_forks = -1, snr_given = -1;   /* vayu_wifi_bounds=1, vayu_wifi_snr=1 (sys/hakios.apple80211.h); -1: not looked at */
+
+/* A switch of this file's, looked at once. */
+static bool
+a80211_switch(const char *name, int *value)
+{
+	if (*value < 0) {
+		uint32_t asked = 0;
+
+		*value = PE_parse_boot_argn(name, &asked, sizeof(asked)) && asked != 0;
+	}
+	return *value != 0;
+}
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
 
@@ -259,6 +294,11 @@ give_network(const struct apple80211req *request, const struct hakios_sta_bss *b
 	result->version = 1;
 	channel_fill(&result->channel, bss->frequency, 0);
 	result->rssi = bss->rssi;
+	if (a80211_switch("vayu_wifi_snr", &snr_given)) {
+		result->noise_known = 1;
+		result->noise = HAKIOS_A80211_NOISE_FLOOR;
+		result->snr = hakios_a80211_snr(bss->rssi);
+	}
 	result->beacon_interval = bss->beacon_interval;
 	result->capability = bss->capability;
 	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
@@ -285,6 +325,27 @@ give_network(const struct apple80211req *request, const struct hakios_sta_bss *b
 
 /* ---- get ---------------------------------------------------------------------------------------------- */
 
+/*
+ * The two letters of the country the radio is in. iOS reads them before it decides whether it has to
+ * program a country of its own (wifid's locale timer: it compares what it read with what it worked
+ * out, and sets COUNTRY_CODE only when they differ). Left unanswered, wifid has no country for the
+ * radio at all and never sets one. "RU" or whatever `vayu_wifi_country=` says.
+ */
+static void
+country_get(char *letters)
+{
+	if (!country_asked) {
+		char asked[4] = "";
+
+		country_asked = true;
+		if (PE_parse_boot_argn("vayu_wifi_country", asked, sizeof(asked)) && asked[0] != 0) {
+			country[0] = asked[0];
+			country[1] = asked[1] != 0 ? asked[1] : 'U';
+		}
+	}
+	memcpy(letters, country, sizeof(country));
+}
+
 static int
 get(struct apple80211req *request)
 {
@@ -297,6 +358,46 @@ get(struct apple80211req *request)
 		static const char name[256] = "hakios: ath11k for the WCN6750";
 
 		return give(request, name, sizeof(name));
+	}
+	case 51: {                              /* the country: two letters and a terminator, 3 bytes (see country_get) */
+		char letters[4];
+
+		country_get(letters);
+		letters[2] = 0;
+		letters[3] = 0;
+		return give(request, letters, 3);
+	}
+	case 14: {                              /* what the radio can be: 11a, 11b, 11g, 11n, 11ac (a bit each) */
+		enum { PHY_11A = 1, PHY_11B = 2, PHY_11G = 4, PHY_11N = 8, PHY_11AC = 16 };
+		uint32_t modes = PHY_11A | PHY_11B | PHY_11G | PHY_11N | PHY_11AC;
+
+		return give(request, &modes, sizeof(modes));
+	}
+	case 17: {                              /* how quiet the channel is, in dBm: (the radio does not say) */
+		int32_t noise = -95;
+
+		return give(request, &noise, sizeof(noise));
+	}
+	case 106: {                             /* when to roam: the strongest and the weakest it should be heard, and the */
+		/* threshold between them (sys/hakios.apple80211.h: which order, and vayu_wifi_bounds=1) */
+		struct hakios_a80211_rssi_bounds answer = hakios_a80211_bounds(a80211_switch("vayu_wifi_bounds", &bounds_forks));
+
+		return give(request, &answer, sizeof(answer));
+	}
+	case 96: {                              /* the role of a virtual interface: this one is the station itself */
+		uint32_t role = 0;
+
+		return give(request, &role, sizeof(role));
+	}
+	case 97: {                              /* its parent's name: it has none */
+		char parent[16] = "";
+
+		return give(request, parent, sizeof(parent));
+	}
+	case 115: {                             /* the radio's power counters, for a debug dump: none to tell */
+		uint8_t answer[64] = { 0 };
+
+		return give(request, answer, sizeof(answer));
 	}
 	case 12: {
 		/*
@@ -436,6 +537,16 @@ get(struct apple80211req *request)
 	case 103:                               /* all of it, as a scan's result */
 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give_network(request, &state->bss);
 		break;
+	case 5:                                 /* what is left of the link, asked field by field when 103 has no answer */
+	case 6:
+	case 8:
+	case 18:
+	case 57: {
+		uint32_t value = 0;
+
+		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &value, sizeof(value));
+		break;
+	}
 	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
 		struct {
 			uint32_t version, lower, upper, extended;
@@ -575,6 +686,19 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 		return set_join(request, said, said_size);
 	case 22:                                /* leave the network */
 		return hakios_sta_ask_leave();
+	case 51: {                              /* the country iOS worked out; it is what is read back from then on */
+		char asked[4] = "";
+
+		country_asked = true;
+		if (request->req_len != 0 && request->req_data != USER_ADDR_NULL &&
+		    copyin(request->req_data, asked, request->req_len < sizeof(asked) ? request->req_len : sizeof(asked)) == 0 &&
+		    asked[0] != 0) {
+			country[0] = asked[0];
+			country[1] = asked[1] != 0 ? asked[1] : 'U';
+			snprintf(said, said_size, " (the country is now %c%c)", country[0], country[1]);
+		}
+		return 0;
+	}
 	case 19: {                              /* the radio's power */
 		struct {
 			uint32_t version, radios, state[4];
@@ -589,6 +713,20 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	/*
+	 * Configuration iOS gives a driver it takes for capable: the host AP's mode, IBSS and
+	 * background scan lists, roaming thresholds, the LTE coexistence restriction, LQM and
+	 * SoftAP low-power tuning, queue sizes and the 6 GHz switch. None of it is acted on --
+	 * the station does its own thing -- but all of it is answered 0. A refusal here
+	 * (EOPNOTSUPP, "not built" in the log) is how wifid learns a device cannot do a thing,
+	 * and it then stops asking for the rest as well.
+	 */
+	case 5: case 6: case 18: case 24: case 25: case 47: case 57:
+	case 241: case 245: case 248: case 258: case 261: case 267:
+	case 336: case 337: case 347: case 350: case 352:
+	case 380: case 381: case 382: case 383: case 392:
+	case 403: case 419: case 420: case 422:
+		return 0;
 	default:
 		return EOPNOTSUPP;
 	}
@@ -648,6 +786,10 @@ hakios_apple80211_event(enum hakios_sta_event event, int status)
 		if (state != NULL) {
 			hakios_sta_state(state);
 			link.rssi = status == 1 ? state->bss.rssi : 0;
+			if (a80211_switch("vayu_wifi_snr", &snr_given)) {
+				link.noise = (uint16_t)HAKIOS_A80211_NOISE_FLOOR;
+				link.snr = status == 1 ? (uint16_t)hakios_a80211_snr(state->bss.rssi) : 0;
+			}
 			kfree_data(state, sizeof(*state));
 		}
 		post(EVENT_SSID_CHANGED, NULL, 0);

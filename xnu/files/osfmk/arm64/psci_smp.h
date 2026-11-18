@@ -22,6 +22,8 @@ extern void             psci_smp_cpu_running(void);
 extern void             psci_smp_cpu_off(void) __dead2;
 
 extern void             psci_smp_stop_others(void);
+/* True on the boot CPU after every other started CPU abandoned kernel work. */
+extern boolean_t        psci_smp_is_quiesced(void);
 extern void             psci_smp_stop_here(void);
 
 /*

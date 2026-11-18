@@ -4,6 +4,7 @@
 # usage: xnu/apply.sh [DIR]              (default: $XNU_SRC, else xnu-src/xnu-8796.121.2 next to this directory)
 # env:   XNU_URL   where to fetch from (default: Apple's repository on GitHub; an existing clone
 #                  that has the tag will do: XNU_URL=file:///path/to/xnu)
+#        HFS_URL   the same for Apple's HFS Plus, hfs-627.100.6 (xnu/hfs/hfs.sh)
 # The result is a git tree on the branch "hakios" with the work uncommitted, which is how
 # xnu/export.sh expects to find it. A directory that already exists is left alone.
 set -e
@@ -27,6 +28,6 @@ git checkout -q -b hakios "$TAG"
 echo 'BUILD/' >> .git/info/exclude
 git apply --whitespace=nowarn "$HERE/hakios.patch"
 cp -a "$HERE/files/." .
-# vayu: the night-2026-11-02 changes to Apple files (build lists, a kfree type fix, no console panic)
-[ -s "$HERE/vayu-night.patch" ] && patch -s -p1 < "$HERE/vayu-night.patch"
+# HFS Plus (the data volume): Apple's release, fetched like XNU, and this port's changes over it
+"$HERE/hfs/hfs.sh" put "$DIR"
 echo "apply.sh: $DIR: $TAG + $(grep -c '^diff --git' "$HERE/hakios.patch") changed and $(find "$HERE/files" -type f | wc -l) new files"

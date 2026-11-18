@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- from another HakiOS port (MIT): telegdyd/ios-vayu, branch vayu-dev, commit 061e5a82d023 -->
+	<key>CFBundleIdentifier</key>
+	<string>com.hakios.metal</string>
+	<key>CFBundleName</key>
+	<string>HakiosMetal</string>
+	<key>CFBundleExecutable</key>
+	<string>HakiosMetal</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<!-- the class Metal takes (the kernel also names it in MetalPluginClassName); made when the bundle is loaded,
+	     hakios-metal/plugin/HakiosMetal.m, in the processes the plug-in shows the device to -->
+	<key>NSPrincipalClass</key>
+	<string>HakiosMetalDevice</string>
+</dict>
+</plist>

@@ -44,6 +44,9 @@
 #define VAYU_HTCC_HTT_TX_CE         4U      /* W22: HTT_DATA out pipe 4 */
 #define VAYU_HTCC_HTT_TX_OFF        1024U   /* W22: CE4 messages in the upper half of the ce0 buffer */
 
+/* A published descriptor timed out: what it points at must wait for its completion (or a CE reset). */
+#define VAYU_HTCC_TX_UNKNOWN        (-3)
+
 /* What the CE layer provides (bsd/dev/vayu_wifi_ce.c): registers, rings, a TX buffer, RX polling. */
 struct vayu_htcc_ops {
 	uint32_t (*rd)(uint32_t ce_id, uint32_t offset);
@@ -70,6 +73,8 @@ void vayu_htcc_rx(uint32_t ce_id, const uint8_t *frame, uint32_t len);
 
 /* CONNECT x2, SETUP_COMPLETE_EX, 3 s RX dump.  0 = everything sent and both services connected. */
 int vayu_htcc_run(const struct vayu_htcc_ops *ops);
+/* K29 recovery: clear endpoint/credit/stop state before a new firmware instance. */
+void vayu_wifi_htcc_reset(const char *why);
 /* W25n: the WMI endpoint's HTC credits, as last seen (HTT has none). */
 uint32_t vayu_htcc_credits(void);
 

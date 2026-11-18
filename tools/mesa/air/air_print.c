@@ -1,6 +1,9 @@
 /*
  * Copyright © 2026 Darwin on redwood contributors
  * SPDX-License-Identifier: MIT
+ *
+ * This file as oosexgang/hakios-xnu-kernel, branch main, commit 63fc2b4633ba has it (the AIR frontend upstream HakiOS
+ * took from vcvkk's), by way of telegdyd/ios-vayu, branch vayu-dev, commit 061e5a82d023 (its Metal task 9).
  */
 
 /*
@@ -636,6 +639,20 @@ print_inst(struct printer *p, const struct air_inst *in)
          fputs(", ", fp);
          print_block_ref(p, in->targets[1]);
       }
+      break;
+   case AIR_OP_SWITCH:
+      fputs("switch ", fp);
+      print_typed(p, in->operands[0]);
+      fputs(", ", fp);
+      print_block_ref(p, in->targets[0]);
+      fputs(" [", fp);
+      for (unsigned k = 1; k < in->num_targets; k++) {
+         fputs("\n    ", fp);
+         print_typed(p, in->operands[k]);
+         fputs(", ", fp);
+         print_block_ref(p, in->targets[k]);
+      }
+      fputs("\n  ]", fp);
       break;
    case AIR_OP_UNREACHABLE:
       fputs("unreachable", fp);

@@ -3291,7 +3291,14 @@ vayu_gpu_kept(void)
 static bool
 gpu_vote_speed(uint32_t speed, const char *what, bool quiet)
 {
-	uint32_t message[4] = { 1, 0, 0, 0 };
+	/*
+	 * Word 0 is hfi_send()'s header, so ack_type is word 1, as step 18's vote[] has it. It was { 1, 0, 0, 0 }:
+	 * the header overwrote the 1 and every vote of vayu_gpu_idle=1 went out with ack_type 0, not waited for
+	 * (review A1 II.3) -- a submission's vote back up could then return before the GMU had raised the clock,
+	 * and its frame be drawn at the idle speed. (The 10-27 run that had black frames in swipes had
+	 * vayu_gpu_idle=1; that this was why is not shown.) Only vayu_gpu_idle=1 votes after the bring-up.
+	 */
+	uint32_t message[4] = { 0, 1, 0, 0 };
 	uint32_t saved = step;
 	bool ok, taken = false;
 

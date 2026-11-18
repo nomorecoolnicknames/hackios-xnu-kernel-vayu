@@ -9,6 +9,7 @@
  */
 #include <machine/machine_routines.h>
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -74,11 +75,51 @@ static int battery_charging, battery_soc_estimated, battery_charger_action = -1;
 static uint64_t battery_updates, battery_failures;
 static uint32_t battery_ios = 1;
 
-/* for others in the kernel (the flashlight's thermal guard): -273 while it is not known */
+/*
+ * For the flashlight's thermal guard: a temperature counts only while a live source keeps giving it
+ * (the gauge, the DSP, or a loader snapshot whose sequence moves); none for 30 s and it is -273, unknown,
+ * which the torch takes as too hot. A snapshot that stops changing must not renew the guard.
+ */
+#define BATTERY_TEMPERATURE_MAX_AGE_NS  (30ULL * NSEC_PER_SEC)
+static LCK_GRP_DECLARE(battery_lock_group, "hakios-battery");
+static LCK_SPIN_DECLARE(battery_temperature_lock, &battery_lock_group);
+static uint64_t battery_temperature_at;
+static int battery_guard_temperature = -273;
+
+static void
+battery_temperature_update(int temperature)
+{
+	lck_spin_lock(&battery_temperature_lock);
+	battery_temperature_c = battery_guard_temperature = temperature;
+	battery_temperature_at = mach_absolute_time();
+	lck_spin_unlock(&battery_temperature_lock);
+}
+
+static void
+battery_loader_temperature_update(uint32_t sequence, int temperature)
+{
+	static uint32_t last_sequence;
+	static bool seen;
+
+	/* (the first snapshot has no age: only a later publication by the firmware shows it is live) */
+	if (seen && sequence != last_sequence) {
+		battery_temperature_update(temperature);
+	}
+	last_sequence = sequence;
+	seen = true;
+}
+
 int
 hakios_battery_temperature(void)
 {
-	return battery_temperature_c;
+	uint64_t age;
+	int temperature;
+
+	lck_spin_lock(&battery_temperature_lock);
+	temperature = battery_guard_temperature;
+	absolutetime_to_nanoseconds(mach_absolute_time() - battery_temperature_at, &age);
+	lck_spin_unlock(&battery_temperature_lock);
+	return temperature <= -273 || age > BATTERY_TEMPERATURE_MAX_AGE_NS ? -273 : temperature;
 }
 
 SYSCTL_NODE(_kern, OID_AUTO, hakios, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "redwood phone bits");
@@ -264,6 +305,54 @@ charger_limits(void)
 	}
 }
 
+/*
+ * battery_charger_dump=S (o6; default 0: off): at the first poll and then every S seconds (30 or more),
+ * the registers of the PM8150B's charger peripherals that charger_limits() reads -- CHGR 0x1000, DCDC
+ * 0x1100, USBIN 0x1300, TYPEC 0x1500 -- and of the gauge's ADC_RR 0x4200, all 256 of each, as they are:
+ * hex lines "battery: dump 0x213 70: ...", "--" where a read fails, a peripheral with nothing readable left
+ * out. Read only, through hakios_spmi_peek(), and nothing decoded: the same port under Android, dumped
+ * the same way, says what Android sets that UEFI did not (the USB input limit, its mode bits, AICL)
+ * before anything is ever written to the charger here.
+ */
+static uint32_t charger_dump_secs;
+
+static void
+charger_dump(void)
+{
+	static const uint16_t ids[] = { 0x210, 0x211, 0x213, 0x215, 0x242 };
+	static uint64_t next;
+	uint64_t now = mach_absolute_time(), every;
+
+	if (charger_dump_secs == 0 || (next != 0 && now < next)) {
+		return;
+	}
+	nanoseconds_to_absolutetime((uint64_t)charger_dump_secs * NSEC_PER_SEC, &every);
+	next = now + every;
+	printf("battery: charger dump (read only, battery_charger_dump=%u): PM8150B 0x10 CHGR, 0x11 DCDC, 0x13 USBIN, "
+	    "0x15 TYPEC, 0x42 the gauge's ADC_RR\n", charger_dump_secs);
+	for (unsigned i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+		for (unsigned row = 0; row < 256; row += 16) {
+			char line[96];
+			int at = snprintf(line, sizeof(line), "battery: dump %#x %02x:", ids[i], row);
+			bool any = false;
+
+			for (unsigned col = 0; col < 16 && at > 0 && at < (int)sizeof(line); col++) {
+				uint8_t value;
+
+				if (hakios_spmi_peek(ids[i], (uint8_t)(row + col), &value)) {
+					at += snprintf(line + at, sizeof(line) - at, " %02x", value);
+					any = true;
+				} else {
+					at += snprintf(line + at, sizeof(line) - at, " --");
+				}
+			}
+			if (any) {
+				printf("%s\n", line);
+			}
+		}
+	}
+}
+
 static bool
 charger_read(bool *plugged, int *status)
 {
@@ -292,6 +381,7 @@ battery_poll(void)
 	battery_voltage_mv = (sample.flags & LOADER_BATTERY_VOLTAGE_VALID) ? sample.voltage_mv : -1;
 	battery_current_ma = sample.current_ma;
 	battery_temperature_c = sample.temperature_c;
+	battery_loader_temperature_update(sample.sequence, sample.temperature_c);
 	battery_present = (sample.flags & LOADER_BATTERY_PRESENT) != 0;
 	battery_charger_present = (sample.flags & LOADER_BATTERY_CHARGER_PRESENT) != 0;
 	battery_charging = (sample.flags & LOADER_BATTERY_CHARGING) != 0;
@@ -341,11 +431,12 @@ battery_poll(void)
 		}
 		if (f.temperature_ok) {
 			sample.temperature_c = f.temperature_c;
-			battery_temperature_c = f.temperature_c;
+			battery_temperature_update(f.temperature_c);
 		}
 		if (said_fg % 120 == 0) {
 			charger_limits();               /* (said when it changes; looked at once a minute) */
 		}
+		charger_dump();                         /* (battery_charger_dump=S: every S s) */
 		if (said_fg++ % 120 == 0) {                      /* (once a minute) */
 			printf("battery: live: %s%d%%, %s%d mV, gauge current %s%d mA (raw sign), %s%d C (%s, rradc %#x raw, subtype %d); charger %s\n",
 			    f.soc_ok ? "" : "?", f.percent, f.voltage_ok ? "" : "?", f.voltage_mv, f.current_ok ? "" : "?", f.current_ma,
@@ -415,7 +506,8 @@ hakios_battery_report(const struct hakios_battery_state *b)
 	battery_soc_percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
 	battery_voltage_mv = b->voltage_uv / 1000;
 	battery_current_ma = b->current_ua / 1000;
-	battery_temperature_c = (b->temperature_hundredths + 50) / 100;
+	/* (rounded in 64 bits: the DSP's value near INT32_MAX plus 50 would overflow, and a hot battery read as cold) */
+	battery_temperature_update((int)(((int64_t)b->temperature_hundredths + 50) / 100));
 	battery_present = b->present != 0;
 	battery_charger_present = b->external != 0;
 	battery_charging = b->status == 1;      /* POWER_SUPPLY_STATUS_CHARGING */
@@ -461,6 +553,10 @@ hakios_battery_init(void)
 
 	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) return;
 	PE_parse_boot_argn("battery_ios", &battery_ios, sizeof(battery_ios));
+	if (PE_parse_boot_argn("battery_charger_dump", &charger_dump_secs, sizeof(charger_dump_secs)) &&
+	    charger_dump_secs != 0 && charger_dump_secs < 30) {
+		charger_dump_secs = 30;
+	}
 	if (!PE_parse_boot_argn("battery_shared_pa", &shared_pa, sizeof(shared_pa)) || shared_pa == 0) {
 		printf("battery: xnuloader did not provide battery_shared_pa\n");
 		return;

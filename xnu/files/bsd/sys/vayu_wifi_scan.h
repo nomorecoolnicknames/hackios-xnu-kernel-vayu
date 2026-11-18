@@ -48,7 +48,8 @@ struct vayu_scan_ops {
 	int (*wait)(bool (*done)(void), uint32_t ms);
 	/* One WMI message (cmd id + TLVs) on the WMI endpoint; waits up to wait_ms for an HTC credit. */
 	int (*wmi_send)(const uint8_t *msg, uint32_t len, uint32_t wait_ms);
-	/* One HTT message on the HTT endpoint (CE4, no credit flow). */
+	/* One HTT message on the HTT endpoint (CE4, no credit flow): 0 consumed, -1 not published,
+	 * VAYU_HTCC_TX_UNKNOWN published but not confirmed (keep its DMA until the HTT completion). */
 	int (*htt_send)(const uint8_t *msg, uint32_t len);
 	/* Zeroed contiguous DMA memory below 4 GiB, SMMU-mapped (IOVA = PA), never freed; 0 = none. */
 	uint64_t (*dma_alloc)(uint32_t size);
@@ -59,6 +60,29 @@ struct vayu_scan_ops {
 /* boot-arg vayu_wifi_scan: 0 off (W21h behaviour), 1 = HTT rx ring + passive scan after READY. */
 extern uint32_t vayu_scan_mode;
 
+/* W25r: what the last scan heard, kept so that iOS's Wi-Fi side can be given it (bsd/dev/vayu_wifi_net.c,
+ * the station boundary of sys/hakios.sta.h).  One access point, as the beacon had it. */
+#define VAYU_SCAN_IE_MOST       768U    /* the information elements kept of each: RSN lives far inside this */
+
+struct vayu_scan_bss {
+	uint8_t bssid[6];
+	uint8_t ssid[32], ssid_length;          /* as received, not printed: a name may be any bytes */
+	uint16_t frequency;                     /* MHz */
+	int16_t rssi;                           /* dBm */
+	uint16_t beacon_interval;               /* the beacon's own field: units of 1024 us */
+	uint16_t capability;
+	uint16_t elements_length;               /* how many of elements[] are valid */
+	uint32_t age_ms;                        /* how long ago that beacon was heard */
+};
+
+/* How many access points the last scan heard (0: no scan yet). */
+unsigned vayu_scan_bss_count(void);
+/* The index'th of them, with up to elements_size bytes of its information elements copied to elements
+ * (elements may be NULL).  false: there are not that many. */
+bool vayu_scan_bss_get(unsigned index, struct vayu_scan_bss *bss, uint8_t *elements, uint32_t elements_size);
+/* The channels the scan was made on (MHz), at most most of them; how many there are in all. */
+unsigned vayu_scan_channels(uint16_t *frequencies, unsigned most);
+
 /* Reads the boot-arg and clears the state; call before the first WMI event. */
 void vayu_scan_reset(int (*log)(const char *format, ...) __printflike(1, 2));
 /* One WMI event (payload after the 4-byte id).  Only called with vayu_scan_mode != 0. */
@@ -68,6 +92,9 @@ void vayu_scan_htt_rx(const uint8_t *p, uint32_t len);
 void vayu_scan_note_htt(const uint8_t *p, uint32_t len);
 /* After WMI READY: HTT rx ring, channel list, vdev, passive scan, summary.  0 = scan completed. */
 int vayu_scan_run(const struct vayu_scan_ops *ops);
+/* W25r: another passive scan on the vdev and channels the first one left, from the station's loop
+ * (the WMI/HTT path is not free while a link is up).  0 = completed. */
+int vayu_scan_again(const struct vayu_scan_ops *ops);
 /* W25: one native-wifi data frame on the HTT endpoint (clear = unencrypted, for EAPOL). 0 = sent. */
 int vayu_scan_tx_frame(const uint8_t *frame, uint32_t len, bool clear);
 /* W25p: the TX counters, one line: sent, completed, status, slots in flight/free, ring cap, queue,

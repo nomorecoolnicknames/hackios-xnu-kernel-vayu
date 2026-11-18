@@ -170,7 +170,7 @@ test_own_tables(void)
 	};
 	/* as `full` says it, but the TLVs in another order, one unknown among them, one given twice */
 	static const uint8_t shuffled[] = {
-		0x02, 0x01, 0x00, 0x02, 0x00, 0x26, 0x00,
+		0x04, 0x01, 0x00, 0x02, 0x00, 0x26, 0x00,         /* an indication: this table has no Result */
 		0x03, 0x02, 0x00, 0x09, 0x00,
 		0xe0, 0x03, 0x00, 1, 2, 3,                              /* nobody knows 0xe0 */
 		0x10, 0x04, 0x00, 1, 0, 0, 0,
@@ -281,7 +281,17 @@ test_own_tables(void)
 			{ QMI_EOTI, 0, 0, NO_ARRAY, 0, 0, NULL },
 		};
 		struct qmi_response_type_v01 r = { 0xffff, 0xffff };
+		static const uint8_t missing[] = { 0x02, 0x07, 0x00, 0x22, 0x00, 0x00, 0x00 };
+		static const uint8_t unrelated[] = { 0x02, 0x07, 0x00, 0x22, 0x00, 0x04, 0x00, 0x10, 0x01, 0x00, 0x00 };
+		static const uint8_t short_result[] = { 0x02, 0x07, 0x00, 0x22, 0x00, 0x05, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00 };
 
+		check(hakios_qmi_decode(missing, sizeof(missing), reply_ei, &r) == -EINVAL,
+		    "a response without Result is rejected");
+		check(hakios_qmi_decode(unrelated, sizeof(unrelated), reply_ei, &r) == -EINVAL,
+		    "an unrelated TLV cannot stand in for Result");
+
+		check(hakios_qmi_decode(short_result, sizeof(short_result), reply_ei, &r) == -EINVAL,
+		    "a short Result TLV is rejected");
 		check(hakios_qmi_decode(ok, sizeof(ok), reply_ei, &r) == 14 && r.result == QMI_RESULT_SUCCESS_V01 && r.error == QMI_ERR_NONE_V01,
 		    "the common reply, success");
 		check(hakios_qmi_decode(no, sizeof(no), reply_ei, &r) == 14 && r.result == QMI_RESULT_FAILURE_V01 &&
@@ -979,7 +989,7 @@ test_helpers(void)
 		check(router.last_node == SERVER_NODE && router.last_port == SERVER_PORT, "the request goes to %u:%u", router.last_node, router.last_port);
 	}
 	result = hakios_qmi_txn_wait_ms(&txn, 1000);
-	check(result == 21 && answer.resp.result == 0 && answer.twice_valid == 1 && answer.twice == 42, "the reply does not arrive (%d, %u)", result,
+	check(result == 21 && txn.result_present && answer.resp.result == 0 && answer.twice_valid == 1 && answer.twice == 42, "the reply does not arrive (%d, %u)", result,
 	    answer.twice);
 
 	/* ... and from the router's own thread, 50 ms later, while the caller waits */
@@ -999,6 +1009,16 @@ test_helpers(void)
 	check(result == 14 && answer.resp.result == 1 && answer.resp.error == QMI_ERR_INTERNAL_V01 && answer.twice_valid == 0 &&
 	    now_ms() - start >= 45 && now_ms() - start < 900, "the reply from another thread (%d after %llu ms)", result,
 	    (unsigned long long)(now_ms() - start));
+
+	/* A response with no Result must not turn a zeroed destination into success. */
+	memset(&answer, 0, sizeof(answer));
+	id = qmi_txn_init(&qmi, &txn, answer_ei, &answer);
+	check(qmi_send_request(&qmi, NULL, &txn, MESSAGE_ASK, 16, ask_ei, &ask) == 0, "the request is not sent");
+	(void)plain_reply(reply, router.last, 0, 0);
+	reply[5] = reply[6] = 0;
+	deliver(reply, QMI_HEADER_SIZE);
+	check(hakios_qmi_txn_wait_ms(&txn, 200) == -EINVAL && !txn.result_present,
+	    "a transaction without Result is rejected and reports its absence");
 
 	/* no reply: the wait ends when it says it will; the reply that comes after is nobody's */
 	id = qmi_txn_init(&qmi, &txn, answer_ei, &answer);

@@ -147,6 +147,9 @@
  * which have a second owner in the phone's live DT: hi259 (reset 27) is not probed; ov02b1b runs
  * without its standby (125) and VANA-EN (94), and with the ACK probe only (its 2-byte id register
  * 0x0203 would be a register write on an 8-bit OV02B); ov8856 runs without VANA-EN (94).
+ * The ultrawide (vayu_cam_uw=1, a third camera in iOS) needs gpio 94: vayu_cam_uw_pin=1 lets this
+ * file set it up as an output itself (a new maintainers' amendment), and a loader that already did
+ * is used as it is. Without either, the pin is left alone and the OV8856 cannot be powered.
  *
  * Boot-args:
  *   vayu_camera=1             step 1 only (reads).
@@ -177,9 +180,22 @@
  *                             power-down after the frame resets them.
  *   vayu_camera_skip_ms=N     step 4: RDI 0 stays halted for N ms after stream-on (default 500), so
  *                             the frame written is not the dark first one.
- *   vayu_camera_cam=0|1|2     step 4's camera: 0 = rear IMX582 (default), 1 = front S5K3T2, 2 = the
- *                             rear and then the front in one boot, each with its whole teardown;
- *                             anything else says so and uses 0.
+ *   vayu_camera_cam=0|1|2|3   step 4's camera: 0 = rear IMX582 (default), 1 = front S5K3T2, 2 = the
+ *                             rear and then the front in one boot, each with its whole teardown,
+ *                             3 = the ultrawide OV8856 (needs vayu_cam_uw=1); anything else says
+ *                             so and uses 0.
+ *   vayu_cam_uw=1             the ultrawide OV8856 is the third camera: sensor 3 in the ABI, two
+ *                             lanes (its module's laneAssign 0x10), the vendor's binned 1632x1224
+ *                             RAW10 as mode 0 and 3264x2448 as mode 1, through CSIPHY0, one session
+ *                             at a time like the other two. Step 4 reaches it with
+ *                             vayu_camera_cam=3; step 6 with a SENSOR write of 3 (the userland's
+ *                             third stream).
+ *   vayu_cam_uw_pin=1         allow this file to set up gpio 94 (the ultrawide's VANA-EN) as an
+ *                             output and drive it; without it the pin is used only if the loader
+ *                             already made it one. A maintainers' amendment, like exception 3.
+ *   vayu_cam_uw_lanes=2|4     the ultrawide's data lanes, one variable a run: 2 (default, the
+ *                             module's laneAssign 0x10, CSIPHY 0x85) or 4 (the falsifier: lane cfg
+ *                             0x3210 and CSIPHY 0xd5, the way the other two cameras run).
  *   vayu_camera_clk=1         camcc's PLL0 (Trion) up and step 3's RCGs at their svs rates; default
  *                             0: every camera RCG from XO at 19.2 MHz, no PLL. Steps 4 and 6 force
  *                             it to 1 and say so: their CSIPHY timer needs PLL0's even output.
@@ -461,8 +477,11 @@ cam_clock_state(uint32_t cbcr)
 /* ---- the state of the run ---------------------------------------------------------------------- */
 
 static uint32_t g_level, g_sensor_mask = 0x1, g_xnu_tlmm, g_shared = 1, g_pause_ms = 2200, g_hold_ms;
-static uint32_t g_cam;                  /* vayu_camera_cam: 0 = rear IMX582, 1 = front S5K3T2 (2: both, g_both) */
+static uint32_t g_cam;                  /* vayu_camera_cam: 0 = rear IMX582, 1 = front S5K3T2 (2: both, g_both), 3 = ultrawide OV8856 */
 static bool g_both;                     /* vayu_camera_cam=2: step 4 for the rear, then for the front */
+static uint32_t g_uw;                   /* vayu_cam_uw=1: the ultrawide OV8856 is there as the third camera (sensor 3) */
+static uint32_t g_uw_pin;               /* vayu_cam_uw_pin=1: this file may drive gpio 94 (the ultrawide's VANA-EN) */
+static uint32_t g_uw_lanes;             /* vayu_cam_uw_lanes: 2 (the module's laneAssign 0x10) or 4 (the falsifier) */
 static uint32_t g_clk;                  /* vayu_camera_clk: 0 = every camera RCG from XO, 1 = PLL0 and the svs rates */
 static uint32_t g_settle = 0x20;        /* vayu_camera_settle: step 4's CSIPHY settle count (a HYPOTHESIS) */
 static uint32_t g_frames_ms = 2000;     /* vayu_camera_frames_ms: step 4's wait for WM0's done */
@@ -564,6 +583,17 @@ cam_pin_is_output(uint32_t pin)
 	return false;
 }
 
+/*
+ * GPIO 94, the ultrawide's VANA enable. It has a second owner in the phone's live DT (msm_tspp's
+ * tsif1_signals_active) and is outside TLMM exception 3, so this file leaves it alone unless
+ * vayu_cam_uw_pin=1 says the maintainers have granted it (a new amendment). It is then set up here
+ * exactly as the loader sets up the other camera outputs: function 0, no pull, 2 mA, level low, then
+ * OE. A loader that already made it an output (a future boot image) is used as it is.
+ * (The code is below cam_pin_page(), which it needs.)
+ */
+static bool cam_uw_pin_ready(void);
+static bool cam_uw_pin_claim(void);
+
 static int
 cam_pin_index(uint32_t pin)
 {
@@ -596,6 +626,49 @@ cam_pin_page(uint32_t pin)
 		cam_pin_va[index] = page;
 	}
 	return page;
+}
+
+/* see the note above cam_pin_index() */
+static bool
+cam_uw_pin_ready(void)
+{
+	vm_offset_t page = cam_pin_page(94);
+	uint32_t cfg;
+
+	if (page == 0) {
+		return false;
+	}
+	cfg = rd(page);
+	return ((cfg >> TLMM_CFG_FUNC_SHFT) & TLMM_CFG_FUNC_MASK) == 0 && ((cfg >> TLMM_CFG_OE_SHFT) & 1) != 0;
+}
+
+static bool
+cam_uw_pin_claim(void)
+{
+	vm_offset_t page = cam_pin_page(94);
+	uint32_t io;
+
+	if (page == 0) {
+		printf("vayu-camera: gpio94 (the ultrawide's VANA-EN) cannot be mapped: the ultrawide stays off\n");
+		return false;
+	}
+	if (cam_uw_pin_ready()) {
+		printf("vayu-camera: gpio94 (the ultrawide's VANA-EN) is the loader's output (cfg %#x): used as it is\n",
+		    rd(page));
+		return true;
+	}
+	if (!g_uw_pin) {
+		printf("vayu-camera: gpio94 (the ultrawide's VANA-EN) is outside TLMM exception 3 and the loader did "
+		    "not set it up: the ultrawide cannot be powered (needs vayu_cam_uw_pin=1, a maintainers' ruling)\n");
+		return false;
+	}
+	io = rd(page + 4) & ~(TLMM_IO_OUT | TLMM_IO_IN);
+	wr(page + 4, io);                       /* level low before OE, as the loader does */
+	wr(page, TLMM_CFG_OE);                  /* function 0, no pull, 2 mA, output */
+	__asm__ volatile ("dsb sy");
+	printf("vayu-camera: gpio94 taken as an output for the ultrawide (cfg %#x, io %#x): "
+	    "vayu_cam_uw_pin=1, TLMM exception 3's amendment for the OV8856's VANA-EN\n", rd(page), rd(page + 4));
+	return cam_uw_pin_ready();
 }
 
 static unsigned
@@ -732,7 +805,12 @@ static const struct cam_sensor cam_sensors[] = {
 	{
 		.name = "ov8856", .sda = 33, .scl = 34, .addr7 = 0x36,
 		.reg_bytes = 2, .data_bytes = 2, .id_reg = 0x300b, .id = 0x885a, .mclk = 3,
-		.reset = 28, .standby = -1, .vdig_gpio = -1, .vana_gpio = -1,   /* VANA-EN 94: outside the exception */
+		/*
+		 * VANA-EN gpio 94: outside TLMM exception 3 (msm_tspp's tsif1_signals_active), so it is
+		 * driven only under vayu_cam_uw_pin=1 or when the loader has made it an output; cam_gpio_set()
+		 * skips it (without failing the sequence) otherwise.
+		 */
+		.reset = 28, .standby = -1, .vdig_gpio = -1, .vana_gpio = 94,
 		.vana_rail = "bobc1", .vdig_rail = "smpc8", .custom2_rail = NULL,
 		.up = ov8856_up, .down = ov8856_down,
 		.up_count = sizeof(ov8856_up) / sizeof(ov8856_up[0]),
@@ -767,7 +845,8 @@ struct cam_mode {
 
 /*
  * One row per camera that step 4 can stream. The rows differ in the sensor, its table, its modes,
- * and which CSIPHY and camcc PHY clocks carry it; both use four lanes and lane assignment 0x3210.
+ * and which CSIPHY and camcc PHY clocks carry it; the two older rows use four lanes and lane
+ * assignment 0x3210, the ultrawide two lanes and 0x10 (its module's laneAssign).
  * Sources: the modules' streamConfiguration and resolutionData (the modes: IMX582 res3 1920x1080
  * 60.08 fps and res1 4000x3000 30.03 fps; S5K3T2 res2 1280x720 120.41 fps and res1 2592x1940
  * 30.13 fps, both mode 1 entries dt 0x2b, laneAssign 0x3210), vendor sm8150-camera.dtsi:47-100
@@ -782,7 +861,8 @@ struct cam_stream_cfg {
 	struct cam_mode modes[2];       /* mode 0 first, mode 1 second */
 	unsigned lanes;
 	uint32_t lane_cfg;
-	unsigned csiphy;                /* 1 or 2 */
+	uint32_t lane_mask;             /* CSIPHY 0x814: data0 0x01, clock 0x80, data1 0x04, data2 0x10, data3 0x40 */
+	unsigned csiphy;                /* 0, 1 or 2 */
 	vm_offset_t csiphy_phys;
 	unsigned phy_sel;               /* CSID's RX phy select */
 	uint32_t timer_cmd;             /* csiNphytimer's RCG command */
@@ -797,9 +877,15 @@ struct cam_stream_cfg {
 	 * writes none of these three: its frame length is the vendor block's own, and its exposure and
 	 * gain are the usual mode's last ones (cam_real_start/cam_still_ae), not these.
 	 */
-	uint16_t ae_frame_lines;        /* 0x0340: 4x the mode's (IMX582 res3 0x04ee, S5K3T2 res2 0x03e0) */
+	uint16_t ae_frame_lines;        /* 0x0340: 4x the mode's (IMX582 res3 0x04ee, S5K3T2 res2 0x03e0); 0: no write */
 	uint16_t ae_lines;              /* 0x0202: frame lines - 48 (the vendor's own margin in res3: 0x04ee - 0x04be) */
 	uint16_t ae_gain;               /* 0x0204: 4x (Sony 1024 - 1024/4 = 0x300; Samsung 0x20 per 1x = 0x80: HYPOTHESIS) */
+	/*
+	 * The ultrawide OV8856 keeps the exposure and the gain its own mode block wrote (0x3501/0x3508,
+	 * not the SMIA 0x0202/0x0204 pair the other two use): no AE write of ours reaches it, and the
+	 * frame header reports the mode block's own values. False for the IMX582 and the S5K3T2.
+	 */
+	bool fixed_exposure;
 };
 
 /* (not const: vayu_camera_fps rewrites ae_frame_lines/ae_lines once, at init, before any session) */
@@ -811,7 +897,7 @@ static struct cam_stream_cfg cam_streams[] = {
 			{ .name = "usual", .block = "res3", .width = 1920, .height = 1080, .fps_milli = 60080 },
 			{ .name = "full",  .block = "res1", .width = 4000, .height = 3000, .fps_milli = 30030 },
 		},
-		.lanes = 4, .lane_cfg = 0x3210,
+		.lanes = 4, .lane_cfg = 0x3210, .lane_mask = 0xd5,
 		.csiphy = 1, .csiphy_phys = 0x0ac66000UL, .phy_sel = 1,
 		.timer_cmd = 0x6028, .timer_cbcr = 0x6040, .phy_cbcr = 0x6044,
 		.bayer = 0, .header = "IMX582",       /* RGGB: colorFilterArrangement 3 in CamX's order (tools/camsensor.py:142) */
@@ -824,11 +910,51 @@ static struct cam_stream_cfg cam_streams[] = {
 			{ .name = "usual", .block = "res2", .width = 1280, .height = 720, .fps_milli = 120410 },
 			{ .name = "full",  .block = "res1", .width = 2592, .height = 1940, .fps_milli = 30130 },
 		},
-		.lanes = 4, .lane_cfg = 0x3210,
+		.lanes = 4, .lane_cfg = 0x3210, .lane_mask = 0xd5,
 		.csiphy = 2, .csiphy_phys = 0x0ac67000UL, .phy_sel = 2,
 		.timer_cmd = 0x604c, .timer_cbcr = 0x6064, .phy_cbcr = 0x6068,
 		.bayer = 2, .header = "S5K3T2",       /* GBRG: the module's colorFilterArrangement 1 in CamX's order (0 BGGR, 1 GBRG, 2 GRBG, 3 RGGB: tools/camsensor.py:31-32, :142); a tester's magenta selfie with RGGB (a test run) */
 		.ae_frame_lines = 0x0f80, .ae_lines = 0x0f50, .ae_gain = 0x80,
+	},
+	/*
+	 * The ultrawide: OV8856 on CSIPHY0 (vendor dtsi cam-sensor@3, csiphy-sd-index 0; CCI1 M1 33/34 at
+	 * 0x36; MCLK3 19.2 MHz; reset 28; VANA-EN gpio 94).
+	 *
+	 * LANES (FACT, vendor modules, both variants): laneAssign is 0x10, i.e. TWO data lanes, lane 0
+	 * and lane 1 -- the IMX582's and the S5K3T2's modules say 0x3210 (four) and the HI259's says 0x02
+	 * (one, on lane 2), so the field is the lane map and this sensor is wired as a two-lane one. The
+	 * 1021-uw run drove it as four lanes (lane cfg 0x3210, CSIPHY 0xd5) and got the chip id MATCH
+	 * with 0 MIPI packets: a receiver told to expect four lanes gets no complete CSI-2 packet from a
+	 * two-lane stream. lane_mask is CSIPHY 0x814's: data0 0x01 | clock 0x80 | data1 0x04 = 0x85.
+	 *
+	 * MODES (FACT, the same modules' resolutionData/streamConfiguration): two, both full-resolution
+	 * and both RAW10 dt 0x2b -- res0 3264x2448 (HTS 1932, VTS 2482) and res1 3264x1836 (the 16:9
+	 * crop of the same array). The binned 1632x1224 frame (HTS 1932, VTS 1246) is what the vendor's
+	 * own init block leaves the sensor in; fw/camera-ov8856.tab carries it as "bin0", the mode
+	 * block of the usual mode, so that the preview is 2.5 MB a frame and not 10. Mode 1 is res0,
+	 * the 8 MP stills mode.
+	 *
+	 * The exposure is the block's own (fixed_exposure): OV8856 uses 0x3501/0x3502 and 0x3508/0x3509,
+	 * not the 0x0202/0x0204 pair, and this port does not write them.
+	 *
+	 * The line time: HTS 1932 at the vendor's 19.2 MHz PLL (the init block's, not the mainline
+	 * driver's 24 MHz one) gives ~13.4 us a line; bin0 at VTS 1246 is ~60 fps, res0 at 2482 is
+	 * ~30 fps. INFERENCE from the registers; only the frame timeout and the header's line time
+	 * follow it.
+	 */
+	{
+		.name = "ov8856", .sensor = 3, .tab = "camera-ov8856.tab",
+		.mode_count = 2,
+		.modes = {
+			{ .name = "usual", .block = "bin0", .width = 1632, .height = 1224, .fps_milli = 60000 },
+			{ .name = "full",  .block = "res0", .width = 3264, .height = 2448, .fps_milli = 30000 },
+		},
+		.lanes = 2, .lane_cfg = 0x10, .lane_mask = 0x85,
+		.csiphy = 0, .csiphy_phys = 0x0ac65000UL, .phy_sel = 0,
+		.timer_cmd = 0x6004, .timer_cbcr = 0x601c, .phy_cbcr = 0x6020,
+		.bayer = 3, .header = "OV8856",       /* BGGR: the module's colorFilterArrangement 0 in CamX's order (3 - cfa) */
+		.ae_frame_lines = 0, .ae_lines = 0, .ae_gain = 0,
+		.fixed_exposure = true,
 	},
 };
 
@@ -984,8 +1110,21 @@ cam_gpio_set(uint32_t pin, unsigned high, char *detail, size_t size)
 	int index;
 
 	if (!cam_pin_is_output(pin)) {
-		snprintf(detail, size, "gpio%u is not an output this file may drive: refused", pin);
-		return false;
+		if (pin == 94) {
+			/*
+			 * The ultrawide's VANA-EN: driven only once cam_uw_pin_ready() says so (the loader
+			 * set it up, or vayu_cam_uw_pin=1 claimed it). Otherwise the step is skipped, not
+			 * failed, so a probe of the other sensors behaves exactly as it did before.
+			 */
+			if (!cam_uw_pin_ready()) {
+				snprintf(detail, size, "gpio94 (the ultrawide's VANA-EN) is outside TLMM exception 3: "
+				    "not driven");
+				return true;
+			}
+		} else {
+			snprintf(detail, size, "gpio%u is not an output this file may drive: refused", pin);
+			return false;
+		}
 	}
 	page = cam_pin_page(pin);
 	if (page == 0) {
@@ -1647,6 +1786,11 @@ cam_sensor_pins_ok(const struct cam_sensor *s)
 	vm_offset_t page;
 	uint32_t cfg;
 
+	/* the ultrawide's VANA-EN: claimed here if the maintainers granted it (vayu_cam_uw_pin=1) */
+	if (s->vana_gpio == 94 && !cam_uw_pin_claim()) {
+		printf("vayu-camera: %s: gpio94 is not set up: the sensor cannot be powered\n", s->name);
+		return false;
+	}
 	for (unsigned i = 0; i < sizeof(outputs) / sizeof(outputs[0]); i++) {
 		if (outputs[i] < 0) {
 			continue;
@@ -3356,11 +3500,12 @@ cam_tab_reg16(const struct cam_tab_block *block, uint16_t address, uint16_t *val
 	return false;
 }
 
-/* ---- step 4: CSIPHY1 or CSIPHY2 (qcom,csiphy-v1.1) --------------------------------------------- */
+/* ---- step 4: CSIPHY0, CSIPHY1 or CSIPHY2 (qcom,csiphy-v1.1) ------------------------------------ */
 
-#define CSIPHY_SIZE             0x1000UL        /* both 0x0ac66000 and 0x0ac67000 (vendor dtsi:47-100) */
+#define CSIPHY_SIZE             0x1000UL        /* 0x0ac65000, 0x0ac66000 and 0x0ac67000 (vendor dtsi:47-100) */
 
-#define CSIPHY_LANE_ENABLE      0xd5u           /* data0 0x01, clock 0x80, data1 0x04, data2 0x10, data3 0x40 */
+/* 0x814's default for a four-lane camera: data0 0x01, clock 0x80, data1 0x04, data2 0x10, data3 0x40 */
+#define CSIPHY_LANE_ENABLE      0xd5u
 #define CSIPHY_SETTLE_OFFSET    0x08u           /* the settle count's low byte, in every lane position */
 
 struct csiphy_reg {
@@ -3408,6 +3553,8 @@ static const struct csiphy_reg csiphy_data_lane[] = {
 
 /* The five positions in the core's order: data0, clock, data1, data2, data3. */
 static const uint16_t csiphy_lane_base[] = { 0x000, 0x700, 0x200, 0x400, 0x600 };
+/* 0x814's bit for each of csiphy_lane_base[]'s positions: data0, clock, data1, data2, data3 */
+static const uint8_t csiphy_lane_bit[] = { 0x01, 0x80, 0x04, 0x10, 0x40 };
 
 /* ref/cam_csiphy_1_1_hwreg.h:46-58 (0x82c + 4*i) */
 static const struct csiphy_reg csiphy_irq_masks[] = {
@@ -3416,27 +3563,44 @@ static const struct csiphy_reg csiphy_irq_masks[] = {
 	{ 0x854, 0xff },
 };
 
-/* Each CSIPHY's page, mapped once and kept; g_csiphy_va is the selected one, g_csiphy_n its number. */
-static vm_offset_t g_csiphy_pages[3];
+/* Each CSIPHY's page, mapped once and kept; g_csiphy_va is the selected one, g_csiphy_n its number.
+ * (A page's kernel address is never 0, but index 0 is CSIPHY0, so "mapped" is kept separately.) */
+static vm_offset_t g_csiphy_pages[4];
+static bool g_csiphy_mapped[4];
 static vm_offset_t g_csiphy_va;
 static unsigned g_csiphy_n;
 
+/*
+ * One sequence's writes. With `use_mask' 0x814's value is the caller's lane mask, not the table's:
+ * the common sequence enables the camera's own lanes (four for the IMX582 and the S5K3T2, two for
+ * the OV8856) and the reset sequence, which has 0x814 = 0, is written as it is.
+ */
 static bool
-csiphy_seq_write(const struct csiphy_seq *seq, unsigned count, unsigned *writes)
+csiphy_seq_write_mask(const struct csiphy_seq *seq, unsigned count, uint32_t lane_mask, bool use_mask,
+    unsigned *writes)
 {
 	for (unsigned i = 0; i < count; i++) {
-		wr(g_csiphy_va + seq[i].offset, seq[i].value);
+		uint32_t value = (use_mask && seq[i].offset == 0x814u) ? lane_mask : seq[i].value;
+
+		wr(g_csiphy_va + seq[i].offset, value);
 		(*writes)++;
 		__asm__ volatile ("dsb sy");
-		if (seq[i].check && rd(g_csiphy_va + seq[i].offset) != seq[i].value) {
+		if (seq[i].check && rd(g_csiphy_va + seq[i].offset) != value) {
 			printf("vayu-camera: csiphy%u %#x <- %#x, but it reads %#x (going on)\n", g_csiphy_n,
-			    seq[i].offset, seq[i].value, rd(g_csiphy_va + seq[i].offset));
+			    seq[i].offset, value, rd(g_csiphy_va + seq[i].offset));
 		}
 		if (seq[i].delay_ms != 0) {
 			IOSleep(seq[i].delay_ms);
 		}
 	}
 	return true;
+}
+
+/* the plain form: every value the table's (the reset sequence, up and down) */
+static bool
+csiphy_seq_write(const struct csiphy_seq *seq, unsigned count, unsigned *writes)
+{
+	return csiphy_seq_write_mask(seq, count, 0, false, writes);
 }
 
 static bool
@@ -3467,11 +3631,14 @@ csiphy_regs_write(const struct csiphy_reg *regs, unsigned count, uint32_t base,
 static vm_offset_t
 csiphy_page(const struct cam_stream_cfg *cfg)
 {
-	if (cfg->csiphy < 1 || cfg->csiphy > 2) {
+	if (cfg->csiphy > 3) {
 		return 0;
 	}
-	if (g_csiphy_pages[cfg->csiphy] == 0) {
+	if (!g_csiphy_mapped[cfg->csiphy]) {
 		g_csiphy_pages[cfg->csiphy] = ml_io_map(cfg->csiphy_phys, CSIPHY_SIZE);
+		if (g_csiphy_pages[cfg->csiphy] != 0) {
+			g_csiphy_mapped[cfg->csiphy] = true;
+		}
 	}
 	return g_csiphy_pages[cfg->csiphy];
 }
@@ -3496,8 +3663,11 @@ csiphy_up(const struct cam_stream_cfg *cfg, uint32_t settle, const char *step)
 	}
 	g_csiphy_running = true;
 	ok = csiphy_seq_write(csiphy_reset_seq, CAM_NELEM(csiphy_reset_seq), &writes) &&
-	     csiphy_seq_write(csiphy_common_seq, CAM_NELEM(csiphy_common_seq), &writes);
+	     csiphy_seq_write_mask(csiphy_common_seq, CAM_NELEM(csiphy_common_seq), cfg->lane_mask, true, &writes);
 	for (unsigned l = 0; ok && l < CAM_NELEM(csiphy_lane_base); l++) {
+		if ((cfg->lane_mask & csiphy_lane_bit[l]) == 0) {
+			continue;               /* a lane this camera does not use is left alone */
+		}
 		if (l == 1) {
 			ok = csiphy_regs_write(csiphy_clock_lane, CAM_NELEM(csiphy_clock_lane),
 			    csiphy_lane_base[l], settle, true, &writes);
@@ -3512,8 +3682,8 @@ csiphy_up(const struct cam_stream_cfg *cfg, uint32_t settle, const char *step)
 	if (!ok) {
 		return false;
 	}
-	printf("vayu-camera: csiphy%u up: lanes %#x, settle %#x, %u writes\n",
-	    g_csiphy_n, CSIPHY_LANE_ENABLE, settle & 0xff, writes);
+	printf("vayu-camera: csiphy%u up: lanes %#x (%u data lane(s)), settle %#x, %u writes\n",
+	    g_csiphy_n, cfg->lane_mask, cfg->lanes, settle & 0xff, writes);
 	return true;
 }
 
@@ -3616,17 +3786,27 @@ cam_stream_up(const struct cam_stream_cfg *cfg, const struct cam_mode *mode, vm_
 		return false;
 	}
 	if (real) {
-		printf("vayu-camera: step 6: a %s frame %ux%u RAW10, mode %u (%s), four lanes, through CSIPHY%u, "
-		    "CSID-lite 0 RDI 0 and IFE-lite 0 WM0 (camcc PLL0, settle %#x)\n", cfg->header,
-		    width, height, (unsigned)(mode - cfg->modes), mode->name, cfg->csiphy, g_settle & 0xff);
+		printf("vayu-camera: step 6: a %s frame %ux%u RAW10, mode %u (%s), %u lane(s) (cfg %#x), through "
+		    "CSIPHY%u, CSID-lite 0 RDI 0 and IFE-lite 0 WM0 (camcc PLL0, settle %#x; lite 1 stays free: "
+		    "only one camera streams at a time)\n", cfg->header,
+		    width, height, (unsigned)(mode - cfg->modes), mode->name, cfg->lanes, cfg->lane_cfg,
+		    cfg->csiphy, g_settle & 0xff);
 	} else {
-		printf("vayu-camera: step 4: one %s frame %ux%u RAW10, four lanes, %u.%02u fps, through CSIPHY%u, "
-		    "CSID-lite 0 RDI 0 and IFE-lite 0 WM0 (camcc PLL0, settle %#x, %u ms for the frame)\n",
-		    cfg->header, width, height, mode->fps_milli / 1000, (mode->fps_milli % 1000) / 10,
+		printf("vayu-camera: step 4: one %s frame %ux%u RAW10, %u lane(s) (cfg %#x), %u.%02u fps, through "
+		    "CSIPHY%u, CSID-lite 0 RDI 0 and IFE-lite 0 WM0 (camcc PLL0, settle %#x, %u ms for the "
+		    "frame)\n", cfg->header, width, height, cfg->lanes, cfg->lane_cfg,
+		    mode->fps_milli / 1000, (mode->fps_milli % 1000) / 10,
 		    cfg->csiphy, g_settle & 0xff, g_frames_ms);
 	}
 	printf("vayu-camera: about to write (rails, camcc, TLMM, I2C, CSIPHY, SMMU, CSID, IFE) in %u ms\n",
 	    real ? 0 : g_pause_ms);
+	if (cfg->sensor == 3) {
+		printf("vayu-camera: ov8856: the plan, in this order: VANA-EN gpio 94 and BOB, VIO ldoc1, VDIG "
+		    "smpc8, MCLK3 (camcc %#x), reset 28 high, CCI1 M1 gpio 33/34 at 0x36 (id 0x300b), the tab's "
+		    "init then %s, CSIPHY0 at %#x (%u lanes, lane cfg %#x, settle %#x), CSID-lite 0 RDI 0 phy_sel "
+		    "%u, IFE-lite 0 WM0, the stream on block\n", CAMCC_MCLK_CBCR(3), mode->block,
+		    (unsigned)cfg->csiphy_phys, cfg->lanes, cfg->lane_cfg, g_settle & 0xff, cfg->phy_sel);
+	}
 	if (!real && g_pause_ms != 0) {
 		IOSleep(g_pause_ms);
 	}
@@ -3703,7 +3883,16 @@ cam_stream_up(const struct cam_stream_cfg *cfg, const struct cam_mode *mode, vm_
 	 * lines (0.12 ms), and the first frame of the stills mode came out black because of it.
 	 * Volatile registers: the power-down resets them.
 	 */
-	if (real && !full) {
+	if (real && !full && cfg->fixed_exposure) {
+		/*
+		 * The ultrawide: its mode block set 0x3501/0x3502 (the exposure) and 0x3508/0x3509 (the
+		 * gain) itself, addresses the other two sensors do not use. Writing the SMIA pair here
+		 * would land on registers the OV8856 uses for something else, so nothing is written and
+		 * the log says what the frames carry.
+		 */
+		printf("vayu-camera: %s: exposure and gain are the mode block's own (0x3501/0x3508): "
+		    "no 0x0202/0x0204 write for this sensor\n", s->name);
+	} else if (real && !full) {
 		uint32_t frame_lines = cfg->ae_frame_lines, lines = cfg->ae_lines, gain = cfg->ae_gain;
 		bool ok = cam_i2c_write_reg(&st->bus, s->addr7, 0x0340, 2, (uint16_t)frame_lines, 2) &&
 		    cam_i2c_write_reg(&st->bus, s->addr7, 0x0202, 2, (uint16_t)lines, 2) &&
@@ -3714,6 +3903,14 @@ cam_stream_up(const struct cam_stream_cfg *cfg, const struct cam_mode *mode, vm_
 		if (!ok) {
 			return false;
 		}
+	} else if (real && cfg->fixed_exposure) {
+		/*
+		 * The ultrawide's stills mode: its block wrote 0x3501/0x3502 (the exposure) and
+		 * 0x3508/0x3509 (the gain) itself, and 0x0202/0x0204 are not this sensor's. Nothing of
+		 * ours goes out, so a stills session is exposed exactly like the preview it replaces.
+		 */
+		printf("vayu-camera: %s: mode 1: the mode block's own exposure and gain (0x3501/0x3508): "
+		    "nothing of ours written\n", s->name);
 	} else if (real) {
 		/*
 		 * Mode 1, the vendor's full stills block: cam_real_start() put the usual mode's exposure
@@ -3748,6 +3945,9 @@ cam_stream_up(const struct cam_stream_cfg *cfg, const struct cam_mode *mode, vm_
 			}
 			cam_still_ae.written = true;
 		}
+	} else if (cfg->fixed_exposure && (g_ae || g_exposure != 0 || g_gain != 0)) {
+		printf("vayu-camera: %s: exposure and gain are the mode block's own: vayu_camera_ae/exposure/gain "
+		    "not written for this sensor\n", s->name);
 	} else if (g_ae || g_exposure != 0 || g_gain != 0) {
 		uint32_t frame_lines = g_ae ? cfg->ae_frame_lines : 0;
 		uint32_t lines = g_exposure != 0 ? g_exposure : g_ae ? cfg->ae_lines : 0;
@@ -4242,7 +4442,8 @@ cam_step1(void)
 #define CAM_FAKE_STREAM_MS      3000
 #define CAM_REAL_POLL_MS        2               /* step 6's poll of WM0's done bit */
 
-enum { CAM_PLACE_FREE, CAM_PLACE_WRITING, CAM_PLACE_READY, CAM_PLACE_READING };
+/* DMA: the address WM0 will write at the next SOF (or keeps writing when none was free): no reader takes it */
+enum { CAM_PLACE_FREE, CAM_PLACE_WRITING, CAM_PLACE_READY, CAM_PLACE_READING, CAM_PLACE_DMA };
 
 /* what a frame hook produced, for the place it is marked READY with */
 struct cam_frame_out {
@@ -4288,6 +4489,10 @@ struct cam_abi_sensor {
 static const struct cam_abi_sensor cam_fake_sensors[] = {
 	{ 1, 0, "IMX582", 1920, 1080, 0, 64, 13190, 1262, 65535, 22, 0x100, 0x3c0, NULL },
 	{ 2, 0, "S5K3T2", 1280, 720,  2, 64, 10000,  830, 65535,  8, 0x020, 0x200, NULL },
+	/* the ultrawide, if vayu_cam_uw=1: the vendor's binned 1632x1224 (line 13.365 us, 1246 lines, ~60 fps) */
+	{ 3, 0, "OV8856", 1632, 1224, 3, 64, 13365, 1246, 65535,  8, 0x100, 0x400, NULL },
+	/* ... and its 8 MP stills mode: 3264x2448, line 13.430 us, 2482 lines, ~30 fps */
+	{ 3, 1, "OV8856", 3264, 2448, 3, 64, 13430, 2482, 65535,  8, 0x100, 0x400, NULL },
 };
 #define CAM_FAKE_SENSOR_COUNT   (sizeof(cam_fake_sensors) / sizeof(cam_fake_sensors[0]))
 
@@ -4300,6 +4505,15 @@ static struct cam_abi_sensor cam_real_sensors[] = {
 	{ 2, 0, "S5K3T2", 1280, 720,  2, 64,  8375, 0x0f80, 0x0f80, 48, 0x020, 0x200, &cam_streams[1] },     /* gain 1x..16x (module max 16x: sensorDriverData +0x150 = 16.0, INFERENCE) */
 	/* the S5K3T2's res1: 2592x1940 at 30.13 fps; line_ns and the frame length are the vendor block's (filled at start) */
 	{ 2, 1, "S5K3T2", 2592, 1940, 2, 64,     0,      0,      0, 48, 0x020, 0x200, &cam_streams[1] },
+	/*
+	 * The ultrawide OV8856 (sensor 3, vayu_cam_uw=1), two modes, both from the vendor module's own
+	 * blocks (fw/camera-ov8856.tab, tools/ov8856_tab.py): mode 0 is the binned 1632x1224 the vendor's
+	 * init leaves the sensor in (HTS 1932, VTS 1246, ~60 fps at the 19.2 MHz PLL's line time), mode 1
+	 * is res0, 3264x2448 RAW10 (VTS 2482, ~30 fps). BGGR (the module's colorFilterArrangement 0).
+	 * The exposure and the gain are the mode block's (fixed_exposure): the header repeats what it wrote.
+	 */
+	{ 3, 0, "OV8856", 1632, 1224, 3, 64, 13365, 0x04de, 0x04de,  8, 0x100, 0x400, &cam_streams[2] },
+	{ 3, 1, "OV8856", 3264, 2448, 3, 64, 13430, 0x09b2, 0x09b2,  8, 0x100, 0x400, &cam_streams[2] },
 };
 #define CAM_REAL_SENSOR_COUNT   (sizeof(cam_real_sensors) / sizeof(cam_real_sensors[0]))
 
@@ -4336,6 +4550,9 @@ cam_fps_apply(void)
 
 		if (s->mode != 0 || cfg == NULL || s->line_ns == 0) {
 			continue;
+		}
+		if (cfg->ae_frame_lines == 0) {
+			continue;               /* (the ultrawide: its mode block's frame length is the block's own) */
 		}
 		longest = cfg->ae_frame_lines;
 		shortest = longest / 4;
@@ -4420,6 +4637,9 @@ static const struct cam_abi_sensor *
 cam_fake_find(uint32_t sensor, uint32_t mode)
 {
 	(void)mode;
+	if (sensor == 3 && !g_uw) {
+		return NULL;            /* (the ultrawide exists only with vayu_cam_uw=1) */
+	}
 	for (unsigned i = 0; i < CAM_FAKE_SENSOR_COUNT; i++) {
 		if (cam_fake_sensors[i].sensor == sensor) {
 			return &cam_fake_sensors[i];
@@ -4644,6 +4864,9 @@ static void cam_af_frame(void);
 static const struct cam_abi_sensor *
 cam_real_find(uint32_t sensor, uint32_t mode)
 {
+	if (sensor == 3 && !g_uw) {
+		return NULL;            /* (the ultrawide exists only with vayu_cam_uw=1) */
+	}
 	for (unsigned i = 0; i < CAM_REAL_SENSOR_COUNT; i++) {
 		if (cam_real_sensors[i].sensor == sensor && cam_real_sensors[i].mode == mode) {
 			return &cam_real_sensors[i];
@@ -4801,6 +5024,34 @@ cam_real_start(const struct cam_abi_sensor *s, uint32_t lines, uint32_t gain, ui
 	} else {
 		cam_real_lines = cfg->ae_lines;
 		cam_real_gain = 4u * s->gain_unity;
+		if (cfg->fixed_exposure) {
+			/*
+			 * The OV8856's mode block wrote 0x3501/0x3502 (the exposure in 16ths of a line) and
+			 * 0x3508/0x3509 (the gain, 0x100 = 1x). Report them in the ABI's units, clamped to the
+			 * frame: the header then says what the frames really carry.
+			 */
+			uint16_t exposure = 0, gain_code = 0, vts = 0;
+			uint32_t most = s->frame_lines_min > s->margin ? s->frame_lines_min - s->margin : s->frame_lines_min;
+
+			if (cam_tab_reg16(&cam_tab[CAM_TAB_MODE], 0x3501, &exposure) && exposure != 0) {
+				cam_real_lines = exposure / 16;
+			} else {
+				cam_real_lines = most / 2;
+			}
+			cam_real_lines = cam_real_lines < 4 ? 4 : cam_real_lines > most ? most : cam_real_lines;
+			if (cam_tab_reg16(&cam_tab[CAM_TAB_MODE], 0x3508, &gain_code) && gain_code != 0) {
+				cam_real_gain = (uint32_t)(((uint64_t)gain_code * s->gain_unity + 0x80) / 0x100);
+			} else {
+				cam_real_gain = s->gain_unity;
+			}
+			cam_real_gain = cam_real_gain < s->gain_unity ? s->gain_unity :
+			    cam_real_gain > s->gain_max ? s->gain_max : cam_real_gain;
+			if (cam_tab_reg16(&cam_tab[CAM_TAB_MODE], 0x380e, &vts) && vts != 0) {
+				printf("vayu-camera: step 6: %s: the mode block's own exposure: %u lines at %u ns "
+				    "(0x3501 %#x in 16ths of a line), gain %#x (code %#x), frame %u lines\n",
+				    s->name, cam_real_lines, s->line_ns, exposure, cam_real_gain, gain_code, vts);
+			}
+		}
 		cam_real_usual_lines = cam_real_lines;
 		cam_real_usual_gain = cam_real_gain;
 	}
@@ -4809,6 +5060,9 @@ cam_real_start(const struct cam_abi_sensor *s, uint32_t lines, uint32_t gain, ui
 	/* ife_config() gave WM0 place 0's address (FRAME_ADDRESSES): it is taken at the first SOF */
 	cam_real_writing = 0;
 	cam_real_next = 0;
+	lck_mtx_lock(&cam_fake_lock);
+	cam_fake_place[0].state = CAM_PLACE_DMA;
+	lck_mtx_unlock(&cam_fake_lock);
 	cam_real_late = 0;
 	memset(&cam_real_tm, 0, sizeof(cam_real_tm));
 	cam_real_ask.pending = false;
@@ -4854,6 +5108,18 @@ cam_real_ae(const struct cam_abi_sensor *s)
 	uint32_t lines, gain, code, most;
 	bool ok;
 
+	if (cfg->fixed_exposure) {
+		/* (the OV8856's exposure and gain are its mode block's: see cam_stream_up()) */
+		lck_mtx_lock(&cam_fake_lock);
+		cam_real_ask.pending = false;
+		lck_mtx_unlock(&cam_fake_lock);
+		if (!cam_fake_exposure_said) {
+			printf("vayu-camera: step 6: %s: exposure commands ignored: the mode block's own "
+			    "0x3501/0x3508\n", s->name);
+			cam_fake_exposure_said = true;
+		}
+		return;
+	}
 	lck_mtx_lock(&cam_fake_lock);
 	if (!cam_real_ask.pending) {
 		lck_mtx_unlock(&cam_fake_lock);
@@ -4969,6 +5235,8 @@ cam_real_frame(const struct cam_abi_sensor *s, int p, struct cam_frame_out *out)
 					next = c;
 				}
 			}
+			/* With no new address the hardware repeats the current place. */
+			cam_fake_place[next >= 0 ? next : writing].state = CAM_PLACE_DMA;
 			cam_real_next = next;
 			lck_mtx_unlock(&cam_fake_lock);
 			if (next >= 0) {
@@ -5209,17 +5477,22 @@ cam_session(const struct cam_abi_sensor *s, const struct cam_source *src)
 	bool failed = false, broken_now, fell_back = false;
 
 	lck_mtx_lock(&cam_fake_lock);
-	cam_fake_frame_bytes = RAW10_STRIDE(s->width) * s->height;
 	/*
-	 * A read of the last session may still be copying out of the ring (the memory stays). Give it
-	 * a bounded moment before the places are used again; the generation keeps an old read from
-	 * writing a state of the new session back.
+	 * A generation check cannot protect the bytes while an old read is still copying them.
+	 * Defer this session if the bounded wait expires; its buffers must not be reused.
 	 */
 	for (unsigned waited = 0; cam_fake_readers != 0 && waited < 1000; waited += 10) {
 		lck_mtx_unlock(&cam_fake_lock);
 		IOSleep(10);
 		lck_mtx_lock(&cam_fake_lock);
 	}
+	if (cam_fake_readers != 0) {
+		cam_fake_wanted = true;         /* (asked for again: cam_fake_serve() comes back once the reads are over) */
+		lck_mtx_unlock(&cam_fake_lock);
+		printf("vayu-camera: session deferred: readers still hold the previous ring\n");
+		return;
+	}
+	cam_fake_frame_bytes = RAW10_STRIDE(s->width) * s->height;
 	cam_fake_generation++;
 	cam_fake_frames_done = cam_fake_frames_given = cam_fake_reads = 0;
 	cam_fake_given_sequence = 0;
@@ -5271,7 +5544,7 @@ cam_session(const struct cam_abi_sensor *s, const struct cam_source *src)
 			cam_fake_next.from = 0;
 		}
 		for (int i = 0; i < CAM_FAKE_RING; i++) {
-			if (cam_fake_place[i].state != CAM_PLACE_READING &&
+			if ((cam_fake_place[i].state == CAM_PLACE_FREE || cam_fake_place[i].state == CAM_PLACE_READY) &&
 			    (p < 0 || cam_fake_place[i].sequence < cam_fake_place[p].sequence)) {
 				p = i;
 			}
@@ -5292,8 +5565,13 @@ cam_session(const struct cam_abi_sensor *s, const struct cam_source *src)
 		lck_mtx_lock(&cam_fake_lock);
 		if (rc == CAM_FRAME_DONE && out.place != p && out.place >= 0 && out.place < CAM_FAKE_RING) {
 			/* (step 6: the frame went to the place latched at its SOF; the one asked for stays free) */
-			cam_fake_place[p].state = CAM_PLACE_FREE;
+			if (cam_fake_place[p].state != CAM_PLACE_DMA) {
+				cam_fake_place[p].state = CAM_PLACE_FREE;
+			}
 			p = out.place;
+		}
+		if (rc == CAM_FRAME_DONE && src == &cam_fake_real && (cam_real_next < 0 || p == cam_real_next)) {
+			rc = CAM_FRAME_RETRY;    /* the repeated DMA address must stay reserved */
 		}
 		if (rc == CAM_FRAME_DONE) {
 			cam_fake_place[p].state = CAM_PLACE_READY;
@@ -5313,7 +5591,7 @@ cam_session(const struct cam_abi_sensor *s, const struct cam_source *src)
 				cam_fake_next.frame_lines = frame_lines;
 				cam_fake_next.from = cam_fake_frames_done + 2;   /* (the exposure from two frames on) */
 			}
-		} else {
+		} else if (cam_fake_place[p].state != CAM_PLACE_DMA) {
 			cam_fake_place[p].state = CAM_PLACE_FREE;
 		}
 		lck_mtx_unlock(&cam_fake_lock);
@@ -5336,7 +5614,9 @@ cam_session(const struct cam_abi_sensor *s, const struct cam_source *src)
 	lck_mtx_lock(&cam_fake_lock);
 	cam_fake_streaming = false;
 	for (int i = 0; i < CAM_FAKE_RING; i++) {
-		cam_fake_place[i].state = CAM_PLACE_FREE;
+		if (cam_fake_place[i].state != CAM_PLACE_READING) {
+			cam_fake_place[i].state = CAM_PLACE_FREE;
+		}
 	}
 	made = cam_fake_frames_done;
 	given = cam_fake_frames_given;
@@ -5565,8 +5845,8 @@ cam_fake_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		uint32_t mode;
 		bool announce = cam_fake_source->fixed_exposure;     /* (step 6 logs; step 5 keeps its old, silent restart) */
 
-		if (c.a != 1 && c.a != 2) {
-			return EINVAL;
+		if (c.a != 1 && c.a != 2 && !(c.a == 3 && g_uw)) {
+			return EINVAL;  /* (3 is the ultrawide: only with vayu_cam_uw=1) */
 		}
 		/* b: ~0 and 0 are the usual mode, 1 the full one; anything else is not a mode */
 		if (c.b == 0 || c.b == ~0u) {
@@ -5723,7 +6003,7 @@ cam_step6(void)
 {
 	cam_fake_source = &cam_fake_real;
 	printf("vayu-camera: step 6: /dev/hakios-camera, fed by the real sensors (1 = rear IMX582, "
-	    "2 = front S5K3T2; mode 0 usual, mode 1 full)\n");
+	    "2 = front S5K3T2, 3 = ultrawide OV8856 with vayu_cam_uw=1; mode 0 usual, mode 1 full)\n");
 	if (!g_xnu_tlmm) {
 		printf("vayu-camera: step 6 needs vayu_camera_xnu_tlmm=1 (TLMM writes): not done\n");
 		return;
@@ -5881,13 +6161,50 @@ vayu_camera_init(void)
 		g_fake_fps = 30;
 	}
 	PE_parse_boot_argn("vayu_camera_cam", &g_cam, sizeof(g_cam));
+	PE_parse_boot_argn("vayu_cam_uw", &g_uw, sizeof(g_uw));
+	PE_parse_boot_argn("vayu_cam_uw_pin", &g_uw_pin, sizeof(g_uw_pin));
 	if (g_cam == 2) {
 		g_both = true;
 		g_cam = 0;
-	} else if (g_cam > 1) {
-		printf("vayu-camera: vayu_camera_cam=%u is not 0 (rear IMX582), 1 (front S5K3T2) or 2 (both): using 0\n",
-		    g_cam);
+	} else if (g_cam == 3) {
+		/*
+		 * Step 4 on the ultrawide alone: the same one-frame test the other two cameras have
+		 * (chip id, the vendor table, CSIPHY0 -> CSID-lite 0 RDI 0 -> IFE-lite 0 WM0), for the
+		 * bring-up's first control line. Without vayu_cam_uw=1 the row is not there.
+		 */
+		g_cam = 2;
+		if (!g_uw) {
+			printf("vayu-camera: vayu_camera_cam=3 (the ultrawide) needs vayu_cam_uw=1: using the rear IMX582\n");
+			g_cam = 0;
+		}
+	} else if (g_cam > 3) {
+		printf("vayu-camera: vayu_camera_cam=%u is not 0 (rear IMX582), 1 (front S5K3T2), 2 (both) or 3 "
+		    "(the ultrawide OV8856): using 0\n", g_cam);
 		g_cam = 0;
+	}
+	/*
+	 * vayu_cam_uw_lanes=2|4: the ultrawide's data lanes, one variable a run. The vendor modules say
+	 * laneAssign 0x10 (two lanes, 0 and 1) and that is the default; 4 is the falsifier -- the same
+	 * sensor driven the way the IMX582 and the S5K3T2 are (lane cfg 0x3210, CSIPHY 0xd5).
+	 */
+	PE_parse_boot_argn("vayu_cam_uw_lanes", &g_uw_lanes, sizeof(g_uw_lanes));
+	if (g_uw && g_uw_lanes == 4) {
+		cam_streams[2].lanes = 4;
+		cam_streams[2].lane_cfg = 0x3210;
+		cam_streams[2].lane_mask = CSIPHY_LANE_ENABLE;
+		printf("vayu-camera: vayu_cam_uw_lanes=4: the ultrawide as four lanes (cfg 0x3210, CSIPHY %#x), "
+		    "against its module's laneAssign 0x10\n", cam_streams[2].lane_mask);
+	} else if (g_uw && g_uw_lanes != 0 && g_uw_lanes != 2) {
+		printf("vayu-camera: vayu_cam_uw_lanes=%u is not 2 or 4: using the module's two lanes\n",
+		    g_uw_lanes);
+	}
+	if (g_uw) {
+		printf("vayu-camera: vayu_cam_uw=%u: the ultrawide OV8856 is the third camera (sensor 3, CSIPHY0, "
+		    "%ux%u usual / %ux%u full, %u lane(s), lane cfg %#x); gpio 94 (its VANA-EN): %s\n", g_uw,
+		    cam_streams[2].modes[0].width, cam_streams[2].modes[0].height,
+		    cam_streams[2].modes[1].width, cam_streams[2].modes[1].height,
+		    cam_streams[2].lanes, cam_streams[2].lane_cfg,
+		    g_uw_pin ? "driven here (vayu_cam_uw_pin=1)" : "only if the loader set it up");
 	}
 	g_stream = &cam_streams[g_cam];
 

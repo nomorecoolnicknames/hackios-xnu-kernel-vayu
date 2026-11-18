@@ -57,7 +57,8 @@
  *
  * What it may write: SE3 registers inside 0x00c8c000..0x00c8cfff, never offset 0x1000 or above
  * (an SE's 0x2000+ window is TrustZone-only), and RPMh VRM votes for ldoa7, ldoc2 and ldoc11
- * through vayu_rpmh_send(). It writes no TLMM and no GCC register. The SPMI arbiter's read
+ * through vayu_rpmh_send(). It writes no TLMM and no GCC register (vayu_bt_baud=3000000 alone
+ * rewrites SE3's own RCG, see bsd/dev/vayu_bt.c). The SPMI arbiter's read
  * command is the one other store, and it is the only way to read a PMIC register. After step 9
  * the SE is written only by the tty/kctl io thread (through bt_tx_quiet/bt_rx and, for a 0xfd,
  * one 0xfc); the tty's and the kctl's own ioctls only touch memory, never the UART.

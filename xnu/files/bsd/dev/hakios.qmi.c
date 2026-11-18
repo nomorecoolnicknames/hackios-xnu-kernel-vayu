@@ -522,12 +522,17 @@ decode_structure(struct reader *r, const struct qmi_elem_info *ei, uint8_t *stru
 	return 0;
 }
 
-int
-hakios_qmi_decode(const void *buffer, size_t length, const struct qmi_elem_info *ei, void *structure)
+static int
+decode_message(const void *buffer, size_t length, const struct qmi_elem_info *ei, void *structure, bool *result_present)
 {
 	const uint8_t *start = buffer;
 	struct reader r;
 	size_t said;
+	bool have_result = false;
+
+	if (result_present != NULL) {
+		*result_present = false;
+	}
 
 	if (buffer == NULL || length < QMI_HEADER_SIZE || ei == NULL || structure == NULL) {
 		return -EINVAL;
@@ -553,6 +558,12 @@ hakios_qmi_decode(const void *buffer, size_t length, const struct qmi_elem_info 
 		if (value.end > r.end) {
 			return -EINVAL;
 		}
+		if (start[0] == QMI_RESPONSE && tlv_type == 0x02) {
+			if (value.end - value.at != 4) {
+				return -EINVAL;
+			}
+			have_result = true;
+		}
 		r.at = value.end;
 		for (e = ei; e->data_type != QMI_EOTI && e->tlv_type != tlv_type; e++) {
 		}
@@ -571,7 +582,19 @@ hakios_qmi_decode(const void *buffer, size_t length, const struct qmi_elem_info 
 			return error;
 		}
 	}
+	if (result_present != NULL) {
+		*result_present = have_result;
+	}
+	if (start[0] == QMI_RESPONSE && !have_result) {
+		return -EINVAL;
+	}
 	return (int)(QMI_HEADER_SIZE + said);
+}
+
+int
+hakios_qmi_decode(const void *buffer, size_t length, const struct qmi_elem_info *ei, void *structure)
+{
+	return decode_message(buffer, length, ei, structure, NULL);
 }
 
 const struct qmi_elem_info qmi_response_type_v01_ei[] = {
@@ -604,6 +627,7 @@ struct qmi_state {
 	uint32_t peer_node, peer_port;
 	/* said in the log once each, so that a firmware that talks a lot cannot fill it */
 	bool said_malformed, said_undecoded, said_unknown;
+	bool trace;                             /* vayu_qmi_trace=1: every datagram, see hakios_qmi_trace() */
 };
 
 static const struct hakios_qrtr_ops *qmi_transport;
@@ -618,6 +642,16 @@ static struct qmi_state *
 state_of(struct qmi_handle *qmi)
 {
 	return qmi != NULL ? (struct qmi_state *)(void *)qmi->sock : NULL;
+}
+
+void
+hakios_qmi_trace(struct qmi_handle *qmi, bool on)
+{
+	struct qmi_state *s = state_of(qmi);
+
+	if (s != NULL) {
+		s->trace = on;
+	}
 }
 
 /* With the lock held. */
@@ -646,7 +680,7 @@ to_handler(struct qmi_state *s, uint8_t type, uint16_t id, uint16_t message, uin
 	int result;
 
 	for (h = s->handlers; h != NULL && h->fn != NULL; h++) {
-		if (h->type == type && h->msg_id == message) {
+		if (h->type == type && (h->any || h->msg_id == message)) {
 			break;
 		}
 	}
@@ -655,6 +689,12 @@ to_handler(struct qmi_state *s, uint8_t type, uint16_t id, uint16_t message, uin
 			s->said_unknown = true;
 			os_log("qmi: a message nobody handles: type %u, id %#x, %zu bytes (said once)\n", type, message, length);
 		}
+		return;
+	}
+	if (h->any && h->ei == NULL) {
+		/* the datagram itself: a handler that takes what it has no table for */
+		txn.raw_length = length;
+		h->fn(s->handle, &from, &txn, data);
 		return;
 	}
 	decoded = os_alloc(h->decoded_size);
@@ -694,6 +734,12 @@ qmi_receive(void *context, uint32_t node, uint32_t port, const void *data, size_
 	type = header[0];
 	id = (uint16_t)(header[1] | header[2] << 8);
 	message = (uint16_t)(header[3] | header[4] << 8);
+	if (s->trace) {
+		os_log("qmi: trace: %zu bytes from %u:%u type %u id %u msg %#x: %02x %02x %02x %02x "
+		    "%02x %02x %02x %02x\n", length, node, port, type, id, message, header[0],
+		    header[1], header[2], header[3], header[4], header[5], header[6],
+		    length > 7 ? header[7] : 0);
+	}
 	if (type == QMI_RESPONSE) {
 		os_lock(&s->lock);
 		found = find_transaction(s, NULL, id);
@@ -705,7 +751,7 @@ qmi_receive(void *context, uint32_t node, uint32_t port, const void *data, size_
 			} else {
 				txn->raw_length = 0;
 			}
-			txn->result = hakios_qmi_decode(data, length, txn->ei, txn->dest);
+			txn->result = decode_message(data, length, txn->ei, txn->dest, &txn->result_present);
 			txn->done = true;
 			os_wake(&s->lock, txn);
 			os_unlock(&s->lock);

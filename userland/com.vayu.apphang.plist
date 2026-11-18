@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.vayu.apphang</string>
+	<!-- The "no such service" shim for Phone and Messages.  It owns the
+	     CallServicesDaemon and identityservicesd Mach names that no job in
+	     /redwood/LaunchDaemons has and whose stock programs are absent from the
+	     system image (callservicesd 4 959 792 B and identityservicesd 11 306 400 B,
+	     both above select-system.py's 4 MB framework limit).
+
+	     ctshimd (com.vayu.ctshim) still owns the two CoreTelephony names; this job is
+	     only the names that would otherwise be a failed lookup and a client retry. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/apphangd</string>
+	</array>
+	<key>MachServices</key>
+	<dict>
+		<key>com.apple.telephonyutilities.callservicesdaemon.callcapabilities</key>
+		<true/>
+		<key>com.apple.telephonyutilities.callservicesdaemon.callstatecontroller</key>
+		<true/>
+		<key>com.apple.telephonyutilities.callservicesdaemon.callprovidermanager</key>
+		<true/>
+		<key>com.apple.telephonyutilities.callservicesdaemon.conversationmanager</key>
+		<true/>
+		<key>com.apple.telephonyutilities.callservicesdaemon.callhistorymanager</key>
+		<true/>
+		<key>com.apple.telephonyutilities.callservicesdaemon.callhistorycontroller</key>
+		<true/>
+		<key>com.apple.telephonyutilities.callservicesdaemon.momentscontroller</key>
+		<true/>
+		<key>com.apple.telephonyutilities.callservicesdaemon.reportingcontroller</key>
+		<true/>
+		<key>com.apple.telephonyutilities.callservicesdaemon.usernotificationprovider</key>
+		<true/>
+		<key>com.apple.telephonyutilities.callservicesdaemon.voip</key>
+		<true/>
+		<key>com.apple.telephonyutilities.callservicesdaemon.voip.push</key>
+		<true/>
+		<key>com.apple.telephonyutilities.callservicesdaemon.neighborhood-activities</key>
+		<true/>
+		<key>com.apple.identityservicesd.embedded.auth</key>
+		<true/>
+		<key>com.apple.identityservicesd.idquery.embedded.auth</key>
+		<true/>
+		<key>com.apple.identityservicesd.nsxpc</key>
+		<true/>
+		<key>com.apple.identityservicesd.nsxpc.auth</key>
+		<true/>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+	<key>AbandonProcessGroup</key>
+	<true/>
+</dict>
+</plist>

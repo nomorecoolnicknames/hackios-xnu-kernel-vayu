@@ -43,6 +43,12 @@ void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
  * a driver that spends a millisecond reading the controller stamps the read's start instead of its
  * end (bsd/dev/vayu_nvt.c, boot-arg touch_hz). 0 means "now". */
 void hakios_touch_post_at(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time);
+/* usbctl: a sample from outside the drivers, counted like a program's (bsd/dev/vayu_ctl.c) */
+void hakios_touch_post_synthetic(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
+/* the panel's size in pixels, 1080x2400 on vayu when fb_fit is not on (the host's "oem touch") */
+void hakios_touch_panel_size(uint32_t *width, uint32_t *height);
+/* the USB control channel of a running kernel (bsd/dev/vayu_ctl.c) */
+void vayu_ctl_init(void);
 /* mach_absolute_time units since the last touch or button event; 0 while a finger is down; UINT64_MAX if never */
 uint64_t hakios_touch_idle_abs(void);
 /* the touch samples a program posted (write() to /dev/hakios-touch) since the last call, and whether such
@@ -52,6 +58,10 @@ void hakios_touch_synthetic(uint32_t *samples, uint32_t *down);
 /* the same for the screen's own driver (a real finger, not a program's write): S8, so that a
  * finger-driven scroll is measured by the display driver's S5FPS window in a normal boot */
 void hakios_touch_driver(uint32_t *samples, uint32_t *down);
+/* the screen driver's samples since the machine started and the fingers down now; unlike
+ * hakios_touch_driver() this does not clear the count, so a once-a-second line can be printed
+ * from the touch thread even when no frame arrives at the display driver (scroll120) */
+void hakios_touch_driver_total(uint64_t *samples, uint32_t *down);
 void hakios_input_init(void);
 void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
@@ -64,7 +74,7 @@ int hakios_ufs_read_partition(const char *name, uint64_t offset, uint8_t *dst, u
 bool hakios_ufs_part(const char *name, uint32_t *part, uint64_t *bytes);   /* a GPT partition by name, for a kernel user */
 int hakios_ufs_part_read(uint32_t part, uint64_t offset, void *dst, uint64_t len);  /* read-only, through the same path */
 void hakios_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
-int hakios_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
+int hakios_battery_temperature(void);  /* the battery's temperature in C, -273 if unknown or no fresh sample for 30 s */
 /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/hakios.buttons.c) */
 void hakios_spmi_lock(void);
 void hakios_spmi_unlock(void);

@@ -91,6 +91,7 @@
 #include <sys/kauth.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
+#include <sys/vayu_pas.h>
 #include <sys/vayu_scm.h>
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
@@ -114,9 +115,6 @@ extern lck_mtx_t hakios_smem_alloc_lock;
 /* TCS 0 of the apps RSC is one command slot for the whole kernel: vayu_pas.c's one lock, not a
  * second mutex of our own (hakios_rsc_lock is gone: two mutexes are no mutual exclusion, and run
  * 182129 wedged the modem's Wi-Fi rail vote on the other one). */
-extern bool vayu_rsc_tcs_lock(const char *who);
-extern void vayu_rsc_tcs_unlock(void);
-extern bool vayu_rsc_tcs_gave_up(void);
 
 static LCK_GRP_DECLARE(adsp_lock_group, "hakios-adsp");
 
@@ -892,7 +890,7 @@ rails(uint32_t level)
 	static const char *const names[2] = { "lcx.lvl", "lmx.lvl" };
 	uint32_t addresses[2] = { 0, 0 }, values[2] = { 0, 0 }, done = 0;
 	uint64_t began;
-	bool held;
+	enum vayu_rsc_tcs_result held;
 
 	for (unsigned r = 0; r < 2; r++) {
 		int position = level == 0 ? 0 : rail_position(names[r], level, &addresses[r]);
@@ -909,7 +907,7 @@ rails(uint32_t level)
 	need(&rsc);
 	hold();                          /* (the loader's pause, before the lock: a sleeper there must not sit on the slot) */
 	held = vayu_rsc_tcs_lock("adsp");
-	if (!held && vayu_rsc_tcs_gave_up()) {
+	if (held == VAYU_RSC_TCS_FAILED) {
 		printf("adsp: %u: TCS %u was not taken: the rails are not asked\n", step, RPMH_TCS);
 		return false;
 	}
@@ -917,7 +915,7 @@ rails(uint32_t level)
 	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0) {
 		printf("adsp: %u: TCS %u of the sequencer is busy (status %#x, control %#x): the rails are not asked\n", step, RPMH_TCS,
 		    rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS), rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL));
-		if (held) {
+		if (held == VAYU_RSC_TCS_HELD) {
 			vayu_rsc_tcs_unlock();
 		}
 		return false;
@@ -950,7 +948,7 @@ rails(uint32_t level)
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
-	if (held) {
+	if (held == VAYU_RSC_TCS_HELD) {
 		vayu_rsc_tcs_unlock();
 	}
 	return done != 0;

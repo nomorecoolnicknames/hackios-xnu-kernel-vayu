@@ -95,7 +95,8 @@ extern const struct qmi_elem_info qmi_response_type_v01_ei[];
  *   encode: `structure` by `ei` into `buffer` of `size` bytes, behind a header of that type,
  *           message id and transaction;
  *   decode: the message of `length` bytes at `buffer` by `ei` into `structure` (which the caller
- *           has zeroed: what the message does not have is left as it is).
+ *           has zeroed: what the message does not have is left as it is). A QMI_RESPONSE
+ *           without a four-byte Result TLV is rejected.
  */
 int hakios_qmi_encode(uint8_t type, uint16_t message, uint16_t transaction, const struct qmi_elem_info *ei, const void *structure,
     void *buffer, size_t size);
@@ -145,6 +146,14 @@ struct qmi_msg_handler {
 	const struct qmi_elem_info *ei;
 	size_t decoded_size;            /* of the C structure, which is made, filled in and freed around fn */
 	void (*fn)(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_txn *txn, const void *decoded);
+	/*
+	 * Take every message of this type whatever its message id (msg_id is then
+	 * not looked at).  With ei == NULL the handler is given the datagram
+	 * itself, header and all, and its length in txn->raw_length: a client that
+	 * has to see a message it has no table for -- an indication whose id a
+	 * firmware revision it has not met yet chooses -- can log it and learn.
+	 */
+	bool any;
 };
 
 struct qmi_handle {
@@ -161,6 +170,7 @@ struct qmi_txn {
 	void *dest;                     /* ... the structure it goes into */
 	struct qmi_txn *next;           /* the helpers' */
 	bool done, waiting;
+	bool result_present;            /* a four-byte Result TLV was decoded in the reply */
 	/*
 	 * Optional: a copy of the whole reply datagram, taken before decoding.  A
 	 * caller that wants the raw bytes (the SMS debug dump) sets raw/raw_size
@@ -182,6 +192,9 @@ int hakios_qmi_handle_init_transport(struct qmi_handle *qmi, size_t largest, con
 void qmi_handle_release(struct qmi_handle *qmi);
 /* Ask for a service: ops->new_server is called for every server of it there is and will be. */
 int qmi_add_lookup(struct qmi_handle *qmi, unsigned int service, unsigned int version, unsigned int instance);
+/* vayu_qmi_trace=1: a line for every QMI datagram received on this handle (type, id, message,
+ * source and the first eight header bytes). Diagnostic only; it changes no state. */
+void hakios_qmi_trace(struct qmi_handle *qmi, bool on);
 
 /* A transaction: its number (not negative), or a negative errno. The reply will be decoded by `ei` into `structure`. */
 int qmi_txn_init(struct qmi_handle *qmi, struct qmi_txn *txn, const struct qmi_elem_info *ei, void *structure);

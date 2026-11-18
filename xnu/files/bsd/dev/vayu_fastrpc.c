@@ -111,6 +111,8 @@
  *                     each way. Read here and in vayu_slpi.c (which adds the channel).
  *   vayu_frpc_cb=N    the context-bank number in bits 32+ (default 1; 0: plain physical
  *                     addresses).
+ *   vayu_frpc_wait=S  how long INIT_ATTACH and the listener handshake are retried, once a
+ *                     second, when the DSP does not answer yet (default 60, at most 600).
  *
  * Locking and threads: the GLINK edge's thread calls vayu_fastrpc_input(), which only copies
  * the 16-byte answer into a small ring under a spin lock and issues a wakeup; it never sleeps
@@ -123,6 +125,7 @@
 #include <machine/machine_routines.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <os/atomic_private.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -169,10 +172,11 @@ extern void vayu_smmu_release(int handle);
 #define FRPC_MAX_OUT		4
 
 #define FRPC_RING		16
-#define FRPC_MAX_FILES		16
-#define FRPC_MAX_DIRS		4
+#define FRPC_MAX_FILES		64		/* the registry maps 40 config JSONs; 16 was tight */
+#define FRPC_MAX_DIRS		8
 #define FRPC_PATH		256
-#define FRPC_PAK_MAX		256
+#define FRPC_PAK_MAX		512		/* the stock pak has 312 entries (registry x2, config, etc.);
+						 * 256 silently dropped every config JSON at its end */
 #define FRPC_REPLY_BYTES	62000		/* a 60 KB read plus its 8-byte scalar block and padding */
 #define FRPC_MAX_READ		61440		/* one fread; the whole invoke packet stays below 64 KB */
 
@@ -181,6 +185,14 @@ extern void vayu_smmu_release(int handle);
 
 #define FRPC_SID		0x5a0		/* the SMR covering 0x5a1-0x5a3 (mask 0x3) */
 #define FRPC_SID_MASK		0x3
+
+/* The barriers around the shared packet: arm64's dsb sy; the host build (tests/host) uses a
+ * compiler barrier of the same strength for its single thread. */
+#if defined(__arm64__) || defined(__aarch64__)
+#define frpc_barrier()		__asm__ volatile ("dsb sy" : : : "memory")
+#else
+#define frpc_barrier()		__sync_synchronize()
+#endif
 
 /* AEE codes: hexagonrpc/include/libhexagonrpc/error.h:36-85. */
 #define AEE_SUCCESS		0
@@ -388,7 +400,7 @@ static uint32_t frpc_cb = 1;		/* vayu_frpc_cb; 0: plain physical addresses */
 static bool frpc_claimed;
 static int frpc_smmu = -1;		/* vayu_smmu_claim()'s handle */
 static volatile bool frpc_leaving;	/* vayu_fastrpc_quiesce() */
-static volatile bool frpc_running;	/* the run thread is alive */
+static bool frpc_running;		/* the run thread is alive (atomic: set before it starts, cleared after its last access) */
 
 static lck_grp_t *frpc_lock_group;
 static lck_spin_t frpc_lock;
@@ -753,7 +765,7 @@ frpc_invoke(uint32_t handle, uint32_t sc, const struct frpc_arg *args, uint32_t 
 	msg.addr = slot->dsp;
 	msg.size = (pkt_size + FRPC_PAGE - 1) & ~(uint64_t)(FRPC_PAGE - 1);
 
-	__asm__ volatile ("dsb sy" : : : "memory");	/* the DSP must see every byte first */
+	frpc_barrier();			/* the DSP must see every byte first */
 	if (frpc_mode >= 2 && frpc_dumped_tx < 16) {
 		frpc_dumped_tx++;
 		frpc_hexdump("tx", (const uint8_t *)&msg, sizeof(msg));
@@ -776,7 +788,7 @@ frpc_invoke(uint32_t handle, uint32_t sc, const struct frpc_arg *args, uint32_t 
 		frpc_slot_put(index);
 		return -1;
 	}
-	__asm__ volatile ("dsb sy" : : : "memory");	/* and we must see every byte it wrote */
+	frpc_barrier();			/* and we must see every byte it wrote */
 
 	{
 		uint8_t *base = (uint8_t *)slot->va;
@@ -930,6 +942,8 @@ frpc_pak_parse(const uint8_t *data, uint64_t size)
 	return true;
 }
 
+static int frpc_pak_find(const char *path);	/* below; the load's summary asks it */
+
 static void
 frpc_pak_load(void)
 {
@@ -951,6 +965,22 @@ frpc_pak_load(void)
 	}
 	say("vayu-frpc: fw/sensors.pak: %llu bytes, %u entries\n", (unsigned long long)frpc_pak_size,
 	    frpc_pak_count);
+	{
+		/* The paths the DSP must find for the registry to come up; the first ENOENT of one
+		 * of these is the thing to look at after the run. */
+		static const char *const key[] = {
+			"/mnt/vendor/persist/sensors/registry/registry",
+			"/mnt/vendor/persist/sensors/registry/registry/lsm6dso_0",
+			"/vendor/etc/sensors/config",
+			"/vendor/etc/sensors/config/sm8150_lsm6dso_0.json",
+			"/vendor/etc/sensors/sns_reg_config",
+		};
+
+		for (unsigned i = 0; i < sizeof(key) / sizeof(key[0]); i++) {
+			say("vayu-frpc: pak %s: %s\n", key[i],
+			    frpc_pak_find(key[i]) >= 0 ? "present" : "MISSING");
+		}
+	}
 }
 
 static int
@@ -991,6 +1021,12 @@ frpc_pak_find(const char *path)
 	}
 	if (strncmp(path, "/persist/", 9) == 0) {
 		snprintf(alt, sizeof(alt), "/mnt/vendor%s", path);
+		return frpc_pak_exact(alt);
+	}
+	if (strncmp(path, "/system/vendor/", 15) == 0) {
+		/* hexagonrpcd serves /vendor and /system/vendor for the same tree
+		 * (rpcd_builder.c:171-183); the pak keeps the /vendor names. */
+		snprintf(alt, sizeof(alt), "/vendor/%s", path + 15);
 		return frpc_pak_exact(alt);
 	}
 	return -1;
@@ -1065,6 +1101,34 @@ frpc_trim_slash(char *path)
 	while (n > 1 && path[n - 1] == '/') {
 		path[--n] = 0;
 	}
+}
+
+/*
+ * A path lookup for fopen/stat: first the env-joined (or base-joined) form, then, for a
+ * relative path that missed, the virtual root's "/path". The DSP does not always name its
+ * registry files under ADSP_LIBRARY_PATH; hexagonrpcd's virtual root also carries them at "/".
+ * full is the path that hit (or the env-joined one when nothing did), for the log.
+ */
+static int
+frpc_pak_find_resolved(const char *env, const char *path, const char *relative_base, char *full,
+    size_t cap)
+{
+	char alt[FRPC_PATH];
+	int e;
+
+	frpc_resolve(env, path, relative_base, full, cap);
+	frpc_trim_slash(full);
+	e = frpc_pak_find(full);
+	if (e >= 0 || path[0] == '/') {
+		return e;
+	}
+	snprintf(alt, sizeof(alt), "/%s", path);
+	frpc_trim_slash(alt);
+	e = frpc_pak_find(alt);
+	if (e >= 0) {
+		frpc_copy(full, cap, alt);
+	}
+	return e;
 }
 
 /* --------------------------------------------------------------------------------------- */
@@ -1256,9 +1320,26 @@ frpc_serve_request(uint32_t handle, uint32_t sc, const uint8_t *blob, uint32_t b
 	}
 	method = FRPC_SC_METHOD(sc);
 	if (method == FRPC_STAT_MSG_ID && nin > 0 && in[0].size >= 4) {
-		/* Extended method id: the first u32 of the primary input buffer
-		 * (hexagonrpcd/listener.c:501-513). */
-		method = get32(in[0].data);
+		/*
+		 * sc's 5-bit method field is 31 for apps_std's stat. Some DSP builds put the real
+		 * method id in the first u32 of the params block (hexagonrpcd/listener.c:501-513);
+		 * others put the path length there and stat is simply method 31. Only a 4-byte
+		 * params block that names another known apps_std method is taken as an extension;
+		 * anything else stays stat, and the words are logged for the first requests.
+		 * (The old code always read the first word, so a path length >= 32 turned stat into
+		 * an unsupported method.)
+		 */
+		uint32_t ext = get32(in[0].data);
+
+		if (in[0].size == 4 &&
+		    (ext == 2 || ext == 3 || ext == 4 || ext == 9 || ext == 19 ||
+		     ext == 26 || ext == 27 || ext == 28)) {
+			method = ext;
+		}
+		if (frpc_requests <= 32) {
+			say("vayu-frpc: stat params %u byte(s): first word %u%s\n", in[0].size, ext,
+			    method == FRPC_STAT_MSG_ID ? "" : " (taken as the extended method id)");
+		}
 	}
 
 	if (handle == 0) {
@@ -1323,7 +1404,8 @@ frpc_serve_request(uint32_t handle, uint32_t sc, const uint8_t *blob, uint32_t b
 				break;
 			}
 			{
-				uint32_t n = frpc_min32(size, f->size - f->pos);
+				uint32_t avail = f->pos < f->size ? f->size - f->pos : 0;
+				uint32_t n = frpc_min32(size, avail);
 
 				if (n != 0) {
 					memcpy(frpc_read_buf, f->data + f->pos, n);
@@ -1337,7 +1419,9 @@ frpc_serve_request(uint32_t handle, uint32_t sc, const uint8_t *blob, uint32_t b
 		}
 
 		case 9: {	/* fseek: {fd, pos, whence} (apps_std.c:123-151) */
-			uint32_t fd, pos, whence, newpos;
+			uint32_t fd, whence;
+			int32_t pos;
+			int64_t newpos;
 			struct frpc_file *f;
 
 			if (nin < 1 || in[0].size < 12) {
@@ -1345,7 +1429,7 @@ frpc_serve_request(uint32_t handle, uint32_t sc, const uint8_t *blob, uint32_t b
 				break;
 			}
 			fd = get32(in[0].data);
-			pos = get32(in[0].data + 4);
+			pos = (int32_t)get32(in[0].data + 4);	/* signed: a seek may go back */
 			whence = get32(in[0].data + 8);
 			f = frpc_file_get(fd);
 			if (f == NULL || whence > 2) {
@@ -1357,16 +1441,19 @@ frpc_serve_request(uint32_t handle, uint32_t sc, const uint8_t *blob, uint32_t b
 				newpos = pos;
 				break;
 			case 1:			/* SEEK_CUR */
-				newpos = f->pos + pos;
+				newpos = (int64_t)f->pos + pos;
 				break;
 			default:		/* SEEK_END */
-				newpos = f->size + pos;
+				newpos = (int64_t)f->size + pos;
 				break;
 			}
-			if (newpos > f->size) {
-				newpos = f->size;
+			if (newpos < 0) {
+				newpos = 0;
 			}
-			f->pos = newpos;
+			if (newpos > (int64_t)f->size) {
+				newpos = (int64_t)f->size;
+			}
+			f->pos = (uint32_t)newpos;
 			break;
 		}
 
@@ -1392,8 +1479,7 @@ frpc_serve_request(uint32_t handle, uint32_t sc, const uint8_t *blob, uint32_t b
 				result = AEE_EUNSUPPORTED;	/* apps_std.c:168-173 */
 				break;
 			}
-			frpc_resolve(env, path, NULL, full, sizeof(full));
-			e = frpc_pak_find(full);
+			e = frpc_pak_find_resolved(env, path, NULL, full, sizeof(full));
 			if (e >= 0 && frpc_pak[e].mode == 0) {
 				int slot = frpc_file_slot();
 
@@ -1413,8 +1499,17 @@ frpc_serve_request(uint32_t handle, uint32_t sc, const uint8_t *blob, uint32_t b
 				say("vayu-frpc: fopen \"%s\" (env %s) -> fd %u, size %u\n", path, env,
 				    fd_out, frpc_file[slot].size);
 			} else {
+				char alt[FRPC_PATH];
 				int v = frpc_virt_find(full);
 
+				if (v < 0 && path[0] != '/') {	/* a relative name at the virtual root */
+					snprintf(alt, sizeof(alt), "/%s", path);
+					frpc_trim_slash(alt);
+					v = frpc_virt_find(alt);
+					if (v >= 0) {
+						frpc_copy(full, sizeof(full), alt);
+					}
+				}
 				if (v >= 0) {
 					int slot = frpc_file_slot();
 
@@ -1533,7 +1628,7 @@ frpc_serve_request(uint32_t handle, uint32_t sc, const uint8_t *blob, uint32_t b
 			break;
 		}
 
-		case 31: {	/* stat: {ext id, path} -> 96 (or 104) bytes (apps_std.c:289-352) */
+		case 31: {	/* stat: {ext id, path} -> 96 (or 96 + 8) bytes (apps_std.c:289-352) */
 			char full[FRPC_PATH];
 			const char *path;
 			uint32_t out_size = nout >= 2 ? 104 : 96;
@@ -1541,29 +1636,43 @@ frpc_serve_request(uint32_t handle, uint32_t sc, const uint8_t *blob, uint32_t b
 			int e, v;
 
 			frpc_stat_fill(statb, sizeof(statb), 0, 0, 0);
+			/*
+			 * The 104-byte form is two buffers: the 96-byte struct and the extra u64.
+			 * Encoding out[0] as 104 bytes and then the u64 as well would give the DSP a
+			 * 104-byte first buffer where it expects 96.
+			 */
 			out[0].data = statb;
-			out[0].size = out_size;
+			out[0].size = 96;
 			outc = 1;
-			if (nout >= 2) {		/* the 104-byte variant: 96 + 8 */
+			if (nout >= 2) {
 				out[1].data = statb + 96;
 				out[1].size = 8;
 				outc = 2;
 			}
-			if (nin < 2 || in[0].size < 8 || !frpc_string_ok(&in[1])) {
+			if (nin < 2 || in[0].size < 4 || !frpc_string_ok(&in[1])) {
 				result = AEE_EBADPARM;
 				break;
 			}
 			path = (const char *)in[1].data;
 			/* hexagonrpcd resolves a relative stat under /usr/lib/qcom/adsp/
 			 * (apps_std.c:316). */
-			frpc_resolve("", path, "/usr/lib/qcom/adsp/", full, sizeof(full));
-			e = frpc_pak_find(full);
+			e = frpc_pak_find_resolved("", path, "/usr/lib/qcom/adsp/", full, sizeof(full));
 			if (e >= 0) {
 				ino = e + 1;
 				mode = frpc_pak[e].mode == 1 ? 0040000 | 0555 : 0100000 | 0444;
 				file_size = frpc_pak[e].mode == 1 ? 0 : frpc_pak[e].size;
 			} else {
+				char alt[FRPC_PATH];
+
 				v = frpc_virt_find(full);
+				if (v < 0 && path[0] != '/') {
+					snprintf(alt, sizeof(alt), "/%s", path);
+					frpc_trim_slash(alt);
+					v = frpc_virt_find(alt);
+					if (v >= 0) {
+						frpc_copy(full, sizeof(full), alt);
+					}
+				}
 				if (v >= 0) {
 					ino = 1000 + v;
 					mode = 0100000 | 0444;
@@ -1768,13 +1877,53 @@ frpc_listener_loop(void)
 /* Thread and API                                                                          */
 /* --------------------------------------------------------------------------------------- */
 
+/*
+ * The DSP's FastRPC service may not be answering yet when the channel opens (its sensorspd is
+ * still starting; on Android the userspace daemon is attached before boot_slpi even runs). A
+ * single 5-second INIT_ATTACH at +1 s after the SLPI is up would lose the run, so the attach
+ * and the listener handshake are retried once a second for vayu_frpc_wait seconds (default 60).
+ */
+static bool
+frpc_bringup(void)
+{
+	uint32_t wait_s = 60, handle = 0;
+	bool attached = false;
+	unsigned attempt;
+	uint64_t began;
+
+	PE_parse_boot_argn("vayu_frpc_wait", &wait_s, sizeof(wait_s));
+	if (wait_s > 600) {
+		wait_s = 600;
+	}
+	began = frpc_now_ns();
+
+	for (attempt = 1; ; attempt++) {
+		if (!attached) {
+			attached = frpc_attach();
+		}
+		if (attached && frpc_remotectl_open(&handle) && frpc_register(handle) && frpc_init2()) {
+			say("vayu-frpc: listener up after %u attempt(s), %llu ms\n", attempt,
+			    (unsigned long long)((frpc_now_ns() - began) / 1000000ULL));
+			return true;
+		}
+		if (frpc_leaving) {
+			return false;
+		}
+		if (frpc_now_ns() - began >= (uint64_t)wait_s * 1000000000ULL) {
+			say("vayu-frpc: the listener is not up after %u s and %u attempt(s); giving up\n",
+			    wait_s, attempt);
+			return false;
+		}
+		say("vayu-frpc: bring-up attempt %u failed; trying again in 1 s\n", attempt);
+		IOSleep(1000);
+	}
+}
+
 static void
 frpc_thread(void *arg __unused, wait_result_t wr __unused)
 {
-	uint32_t handle = 0;
 	unsigned waited;
 
-	frpc_running = true;
 	say("vayu-frpc: thread started (vayu_slpi level %u, vayu_frpc_cb %u)\n", frpc_level, frpc_cb);
 
 	if (frpc_leaving) {			/* (the SLPI is already on its way down) */
@@ -1806,16 +1955,7 @@ frpc_thread(void *arg __unused, wait_result_t wr __unused)
 	if (!frpc_buffers_alloc()) {
 		goto out;
 	}
-	if (!frpc_attach()) {
-		goto out;
-	}
-	if (!frpc_remotectl_open(&handle)) {
-		goto out;
-	}
-	if (!frpc_register(handle)) {
-		goto out;
-	}
-	if (!frpc_init2()) {
+	if (!frpc_bringup()) {
 		goto out;
 	}
 	frpc_last_summary_ns = frpc_now_ns();
@@ -1825,9 +1965,10 @@ frpc_thread(void *arg __unused, wait_result_t wr __unused)
 out:
 	/* The packets are NOT freed here: the DSP may still be writing into an outstanding
 	 * next2 until the SLPI is stopped. vayu_fastrpc_release() frees them after that. */
-	frpc_running = false;
 	say("vayu-frpc: thread done; the SMR and the packets stay until the SLPI is stopped%s\n",
 	    frpc_claimed ? "" : " (nothing was claimed)");
+	/* Publish completion after the last access to the packets and SMMU state. */
+	os_atomic_store(&frpc_running, false, release);
 	thread_terminate(current_thread());
 }
 
@@ -1863,9 +2004,12 @@ vayu_fastrpc_start(struct vayu_glink *g, struct vayu_glink_channel *channel, uin
 	frpc_ring_head = frpc_ring_tail = 0;
 	lck_spin_unlock(&frpc_lock);
 	say("vayu-frpc: vayu_frpc=%u vayu_frpc_cb=%u\n", frpc, frpc_cb);
+	/* Reserve completion before the new thread can be delayed at its first instruction. */
+	os_atomic_store(&frpc_running, true, release);
 	if (kernel_thread_start(frpc_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	} else {
+		os_atomic_store(&frpc_running, false, release);
 		say("vayu-frpc: no thread; nothing is done\n");
 	}
 }
@@ -1877,22 +2021,28 @@ vayu_fastrpc_quiesce(void)
 	frpc_leaving = true;
 }
 
-void
-vayu_fastrpc_release(void)
+bool
+vayu_fastrpc_release(bool dsp_stopped)
 {
-	/* Only after the SLPI has been stopped: while it runs, its DSP may still hold addresses
-	 * that go through this bypass and may still write into an outstanding next2's packet. */
-	if (frpc_running) {
-		for (unsigned i = 0; i < 100 && frpc_running; i++) {
-			IOSleep(10);		/* (it exits within one poll after vayu_fastrpc_quiesce) */
-		}
+	/* A failed PAS shutdown leaves the DSP able to use these physical addresses. */
+	if (!dsp_stopped) {
+		say("vayu-frpc: SLPI stop was not confirmed; packets and SMMU entry retained\n");
+		return false;
+	}
+	for (unsigned i = 0; i < 100 && os_atomic_load(&frpc_running, acquire); i++) {
+		IOSleep(10);
+	}
+	if (os_atomic_load(&frpc_running, acquire)) {
+		say("vayu-frpc: thread exit was not confirmed; packets and SMMU entry retained\n");
+		return false;
 	}
 	frpc_buffers_free();
 	if (!frpc_claimed) {
-		return;
+		return true;
 	}
 	vayu_smmu_release(frpc_smmu);
 	frpc_smmu = -1;
 	frpc_claimed = false;
 	say("vayu-frpc: SMMU SMR %#x mask %#x given back\n", FRPC_SID, FRPC_SID_MASK);
+	return true;
 }

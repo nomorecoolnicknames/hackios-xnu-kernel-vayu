@@ -66,6 +66,12 @@
  *   vayu_audio=4   ... and sound (vayu_sound=1|2|3|6; see "step 4" below): the port, then a quiet tone
  *                  through the DSP, then the bottom speaker's amplifier at a low level
  *
+ *   vayu_voice=N   (with vayu_audio>=3) the q6voice path of a call (MVM, CVS, CVP; see "voice" below):
+ *                  1 the loopback (no modem, no call), 2 a VoLTE call, 3 a CS (CSFB) call, 4 the
+ *                  sessions and the vocproc without START VOICE, 5 the AFE's own loopback only.
+ *                  Needs vayu_jack>=2 (the codec's microphones), vayu_audio_xnu_tlmm=1 for the
+ *                  amplifier, and vayu_mic=1 off.
+ *
  * TLMM tiles: NORTH 0x03900000 (GPIO 89-92), SOUTH 0x03d00000 (98, 99, 137-140), 0x1000 per pin
  * (drivers/pinctrl/qcom/pinctrl-sm8150.c; vayu_qup_spi.c of branch vayu-qup found the first
  * tile alias at 0x03100000 unsafe to write). SMEM: reserved-memory smem@86000000, 2 MB.
@@ -89,6 +95,8 @@
 #include <sys/vayu_pas.h>
 #include <sys/vayu_jack.h>
 #include <vm/vm_kern.h>
+
+#include "vayu_voice.h"                 /* the voice services' packets (MVM/CVS/CVP); host-tested */
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
@@ -597,10 +605,12 @@ static struct vayu_qrtr qrtr = { .glink = &glink, .channel = &glink.channel[CHAN
 /* ---- APR: the audio services' protocol on apr_audio_svc (hakios.adsp.c, step 11) ---------------------------- */
 
 /*
- * A packet is a header of eight words (kind, header length and version, the packet's length; from
- * and to: a service, a domain -- we are 5, the DSP 4 -- and a port each; a token the answer carries
- * back; an opcode) and what the opcode takes (Linux: drivers/soc/qcom/apr.c; Android's q6core.c).
- * The DSP's core service (3) answers whether the audio services are up and which it has.
+ * A packet is a header of five words (kind and header length, the packet's length; from and to: a
+ * service, a domain -- we are 5, the DSP 4 -- and a port each; a token the answer carries back; an
+ * opcode) and what the opcode takes (Linux: drivers/soc/qcom/apr.c; Android's q6core.c). The DSP's
+ * core service (3) answers whether the audio services are up and which it has. The header itself is
+ * struct vayu_apr_header of vayu_voice.h: the voice packets (MVM/CVS/CVP) are built there and tested
+ * on the host, and this transport sends them byte for byte.
  */
 #define APR_DOMAIN_ADSP                 4
 #define APR_DOMAIN_APPS                 5
@@ -611,27 +621,20 @@ static struct vayu_qrtr qrtr = { .glink = &glink, .channel = &glink.channel[CHAN
 #define AVCS_CMD_ADSP_EVENT_GET_STATE   0x0001290cu
 #define AVCS_CMDRSP_ADSP_EVENT_GET_STATE 0x0001290du
 
-struct apr_header {
-	uint16_t field, size;
-	uint8_t from_service, from_domain;
-	uint16_t from_port;
-	uint8_t to_service, to_domain;
-	uint16_t to_port;
-	uint32_t token, opcode;
-};
-
 static struct {
+	uint16_t from_port;             /* the answer's source port: a new session's handle */
 	uint32_t opcode, token, length;
 	uint32_t words[64];
 	volatile bool there;
 } apr_answer;
 static uint32_t apr_in, apr_out, apr_next_token = 1, apr_waited_for;
 static void sound_events(uint8_t service, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length);
+static int voice_say(const char *format, ...) __printflike(1, 2);
 
 static void
 apr_input(void *context __unused, const uint8_t *data, uint32_t length)
 {
-	struct apr_header header;
+	struct vayu_apr_header header;
 	uint32_t header_length, payload;
 
 	if (length < sizeof(header)) {
@@ -664,45 +667,30 @@ apr_input(void *context __unused, const uint8_t *data, uint32_t length)
 	}
 	bzero(apr_answer.words, sizeof(apr_answer.words));
 	memcpy(apr_answer.words, data + header_length, payload < sizeof(apr_answer.words) ? payload : sizeof(apr_answer.words));
+	apr_answer.from_port = header.from_port;
 	apr_answer.length = payload;
 	apr_answer.opcode = header.opcode;
 	apr_answer.token = header.token;
 	apr_answer.there = true;
 }
 
-/* A command to one of the DSP's services and its answer waited for (ms): true if answered (in apr_answer). One at a time. */
+/* A packet already built (header and all) and its answer waited for (ms): true if answered (in apr_answer). */
 static bool
-apr_ask(uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint32_t length, uint32_t ms)
+apr_ask_raw(const uint8_t *packet, uint32_t length, uint32_t token, uint32_t ms)
 {
-	uint8_t packet[sizeof(struct apr_header) + 256];
-	struct apr_header *header = (struct apr_header *)packet;
 	bool answered = false;
-	uint32_t token;
 	int error;
 
-	if (length > sizeof(packet) - sizeof(*header) || !glink.channel[CHANNEL_APR].open) {
+	if (!glink.channel[CHANNEL_APR].open) {
 		return false;
-	}
-	bzero(packet, sizeof(packet));
-	token = apr_next_token++;
-	header->field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, sizeof(*header));
-	header->size = (uint16_t)(sizeof(*header) + length);
-	header->from_service = service;
-	header->from_domain = APR_DOMAIN_APPS;
-	header->from_port = port;
-	header->to_service = service;
-	header->to_domain = APR_DOMAIN_ADSP;
-	header->to_port = port;
-	header->token = token;
-	header->opcode = opcode;
-	if (length != 0) {
-		memcpy(packet + sizeof(*header), payload, length);
 	}
 	apr_answer.there = false;
 	apr_waited_for = token;
-	error = vayu_glink_send(&glink, &glink.channel[CHANNEL_APR], packet, (uint32_t)sizeof(*header) + length);
+	error = vayu_glink_send(&glink, &glink.channel[CHANNEL_APR], packet, length);
 	if (error != 0) {
-		say("vayu-audio: apr: > opcode %#x to service %u: NOT SENT (%d)\n", opcode, service, error);
+		say("vayu-audio: apr: > opcode %#x to service %u: NOT SENT (%d)\n",
+		    ((const struct vayu_apr_header *)packet)->opcode, ((const struct vayu_apr_header *)packet)->to_service,
+		    error);
 	} else {
 		apr_out++;
 		for (uint32_t waited = 0; waited < ms && !answered; waited++) {
@@ -716,27 +704,49 @@ apr_ask(uint8_t service, uint16_t port, uint32_t opcode, const void *payload, ui
 	return answered;
 }
 
+/*
+ * A command to one of the DSP's services and its answer waited for (ms): true if answered (in
+ * apr_answer). One at a time. from_port is what the DSP sees as the packet's source (a session index
+ * of ours; the voice services want 0..7 there), to_port the destination (0 for a create, the
+ * session's handle afterwards).
+ */
+static bool
+apr_ask_ports(uint8_t service, uint16_t from_port, uint16_t to_port, uint32_t opcode, const void *payload,
+    uint32_t length, uint32_t ms)
+{
+	uint8_t packet[sizeof(struct vayu_apr_header) + 256];
+	struct vayu_apr_header *header = (struct vayu_apr_header *)packet;
+
+	if (length > sizeof(packet) - sizeof(*header)) {
+		return false;
+	}
+	bzero(packet, sizeof(packet));
+	vapr_header(header, service, from_port, to_port, apr_next_token++, opcode, (uint32_t)sizeof(*header) + length);
+	if (length != 0) {
+		memcpy(packet + sizeof(*header), payload, length);
+	}
+	return apr_ask_raw(packet, (uint32_t)sizeof(*header) + length, header->token, ms);
+}
+
+/* The same with one port for both ends (AFE, ASM, ADM). */
+static bool
+apr_ask(uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint32_t length, uint32_t ms)
+{
+	return apr_ask_ports(service, port, port, opcode, payload, length, ms);
+}
+
 /* A command not waited for (a write): what comes back goes to sound_events(). */
 static bool
 apr_post(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length)
 {
-	uint8_t packet[sizeof(struct apr_header) + 64];
-	struct apr_header *header = (struct apr_header *)packet;
+	uint8_t packet[sizeof(struct vayu_apr_header) + 64];
+	struct vayu_apr_header *header = (struct vayu_apr_header *)packet;
 
 	if (length > sizeof(packet) - sizeof(*header) || !glink.channel[CHANNEL_APR].open) {
 		return false;
 	}
 	bzero(packet, sizeof(packet));
-	header->field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, sizeof(*header));
-	header->size = (uint16_t)(sizeof(*header) + length);
-	header->from_service = service;
-	header->from_domain = APR_DOMAIN_APPS;
-	header->from_port = port;
-	header->to_service = service;
-	header->to_domain = APR_DOMAIN_ADSP;
-	header->to_port = port;
-	header->token = token;
-	header->opcode = opcode;
+	vapr_header(header, service, port, port, token, opcode, (uint32_t)sizeof(*header) + length);
 	memcpy(packet + sizeof(*header), payload, length);
 	if (vayu_glink_send(&glink, &glink.channel[CHANNEL_APR], packet, (uint32_t)sizeof(*header) + length) != 0) {
 		return false;
@@ -1710,6 +1720,12 @@ mic_read_done_size(const uint32_t *payload, uint32_t length, uint32_t period, bo
 static void
 sound_events(uint8_t service, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
 {
+	if (service == VAPR_SVC_MVM || service == VAPR_SVC_CVS || service == VAPR_SVC_CVP) {
+		voice_say("an event from service %u: opcode %#x, token %u, %u bytes: %#x %#x %#x %#x\n", service, opcode,
+		    token, length, length > 0 ? payload[0] : 0, length > 4 ? payload[1] : 0, length > 8 ? payload[2] : 0,
+		    length > 12 ? payload[3] : 0);
+		return;
+	}
 	if (service != APR_SVC_ASM) {
 		return;
 	}
@@ -4661,6 +4677,893 @@ step_sound(uint32_t sound, uint32_t secs)
 	return ok;
 }
 
+/* ---- voice: the q6voice services (MVM, CVS, CVP) -- a call's audio path on the DSP ------------------- */
+
+/*
+ * The application processors' part of a voice call, as Android's q6voice does it (techpack/audio
+ * dsp/q6voice.c: the MVM/CVS/CVP sessions, then the AFE's TX and RX ports), in the order the DSP
+ * takes it:
+ *
+ *   1. MVM: a passive-control session for a call the modem controls ("default volte voice" for
+ *      VoLTE, "default modem voice" for CS/CSFB), or a full-control one for the loopback.
+ *   2. the CVD version (MVM, VSS_IVERSION_CMD_GET): it picks the CVP create opcode (V2 before CVD
+ *      2.2, V3 from it) and whether the endpoint media format parameters are sent (CVD 2.3).
+ *   3. CVS: the passive stream the modem's MVS attaches to, or (loopback) a full-control stream in
+ *      direction 3 -- TX and RX loopback inside the DSP, no modem and no call.
+ *   4. (loopback only) MVM: ATTACH_STREAM, the CVS handle.
+ *   5. CVP: a full-control vocproc whose TX leg is the AFE port 0x4001 (the codec's microphones)
+ *      and whose RX leg is 0x1006 (the quaternary MI2S to the amplifiers), with pass-through
+ *      topologies unless vayu_voice_topo=1, then its channel info (API 2) or device channels (API 1),
+ *      the topology commit and ENABLE.
+ *   6. MVM: ATTACH_VOCPROC, the CVP handle.
+ *   7. MVM: START VOICE. From here the DSP runs the path; a call's frames come from and go to the
+ *      modem's voice service on the CVS stream (or, in the loopback, straight back).
+ *
+ * Boot args (one variable per run):
+ *   vayu_voice=1  the loopback: full-control MVM/CVS/CVP, no modem, no call, no dialling -- what the
+ *                 microphone hears comes back out of the speaker. The proof of the whole path.
+ *   vayu_voice=2  a VoLTE call: the passive sessions named "default volte voice", CVP, START VOICE.
+ *   vayu_voice=3  a CS (CSFB) call: the passive sessions named "default modem voice", the same.
+ *   vayu_voice=4  the passive sessions and the vocproc, no START VOICE: what does the DSP accept?
+ *   vayu_voice=5  the AFE's own loopback only (no voice services at all): the microphone straight
+ *                 back to the speaker inside the AFE -- what the ports and the amplifiers do when the
+ *                 DSP's voice path is in question
+ *   vayu_voice_secs=S      how long the path stays up (default 5, at most 60)
+ *   vayu_voice_dvc=N       the speaker's digital volume index while the voice path runs (default 40,
+ *                          -30 dB: in the loopback the microphone hears the speaker)
+ *   vayu_voice_topo=1      the stock EC/NS uplink and default downlink topologies instead of
+ *                          pass-through (needs the ACDB calibration data, see below)
+ *   vayu_voice_v3=1        force the CVP V3 create (default: V3 when the CVD version is 2.2+)
+ *   vayu_voice_afe_loop=1  also set the AFE's own loopback (TX port -> RX port): a proof that needs
+ *                          none of the voice services, useful when they refuse
+ *   vayu_voice_dev_rate=R  the device rate put in the CVP media format (default 48000; the ports
+ *                          themselves are 48 kHz I2S/SLIMbus, the CVS stream 16 kHz PCM)
+ *   vayu_voice_cvp_version=N, vayu_voice_cvd=NN   override what the DSP says (API 1/2, CVD 0/21/22/23)
+ *
+ * What a call needs beyond this, and cannot come from here:
+ *   - the modem's voice service (MVS) has to attach to the CVS stream: the modem's half of the call,
+ *     driven by QMI VOICE (the VOICE client's call state ACTIVE) and by IMS or CSFB registration;
+ *     without a call the DSP accepts the sessions and START VOICE, and nothing is heard;
+ *   - for the stock EC/NS topologies, the ACDB calibration data of the stock vendor image (the
+ *     vendor partition's etc/acdbdata: the voice calibration files, one per network and device),
+ *     registered with VSS_ISTREAM_CMD_REGISTER_CALIBRATION_DATA_V2 (0x11369) and
+ *     VSS_IVOCPROC_CMD_REGISTER_CALIBRATION_DATA_V2 (0x11373) through mapped memory; with the
+ *     pass-through topologies neither the calibration nor a call is needed for the loopback.
+ *
+ * The AFE ports' own format: RX 0x1006 is the sound step's I2S port (48 kHz, 16 bits, 2 channels);
+ * TX 0x4001 is the codec's SLIMbus TX (TX7/TX8, channels 135/136, 48 kHz, 16 bits, 2 channels).
+ * The CVP is told exactly that (channel info and, on CVD 2.3+, the endpoint media format).
+ */
+#define AVCS_GET_VERSIONS_RSP   0x00012906u
+#define VOICE_NAME_LOOPBACK     "vayu voice loopback"
+#define VOICE_NAME_VOLTE        "default volte voice"
+#define VOICE_NAME_CS           "default modem voice"
+
+static struct {
+	uint16_t mvm, cvs, cvp;
+	bool mvm_created, cvs_created, cvp_created;
+	bool stream_attached, vocproc_attached, enabled, started;
+	bool tx_started, rx_started, amp_started, afe_loopback;
+	bool dsp_gone;                  /* a voice command went unanswered: the teardown stops asking */
+	uint32_t cvd;                   /* the CVD version x 10 (0, 21, 22, 23): 0, not known */
+	uint32_t cvp_version;           /* the CVP service's API version: 0, not known */
+} voice;
+
+static int
+voice_say(const char *format, ...)
+{
+	char line[320];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	return say("vayu-audio: voice: %s", line);
+}
+
+/* "2.2" -> 22, "0.0" -> 0, anything else -> 0. */
+static uint32_t
+voice_cvd_number(const char *text)
+{
+	uint32_t major = 0, minor;
+
+	if (text[0] < '0' || text[0] > '9') {
+		return 0;
+	}
+	while (*text >= '0' && *text <= '9') {
+		major = major * 10 + (uint32_t)(*text++ - '0');
+	}
+	if (*text++ != '.' || *text < '0' || *text > '9') {
+		return 0;
+	}
+	minor = (uint32_t)(*text - '0');
+	return major * 10 + minor;
+}
+
+/*
+ * One voice command and its basic answer: true when the DSP says 0. `created', when not NULL, takes
+ * the answer's source port -- the handle the DSP gives a new session (q6voice.c's callbacks:
+ * voice_set_mvm_handle(v, data->src_port) and the same for CVS and CVP).
+ */
+static bool
+voice_command(const char *what, uint8_t service, void *packet, uint32_t length, uint16_t *created)
+{
+	struct vayu_apr_header *header = (struct vayu_apr_header *)packet;
+	bool ok;
+	uint32_t token;
+
+	if (created != NULL) {
+		*created = 0;
+	}
+	lck_mtx_lock(&apr_lock);
+	token = apr_next_token++;
+	header->token = token;
+	if (!apr_ask_raw(packet, length, token, 1000)) {
+		voice_say("%s (opcode %#x to service %u): NO ANSWER\n", what, header->opcode, service);
+		voice.dsp_gone = true;
+		lck_mtx_unlock(&apr_lock);
+		return false;
+	}
+	voice.dsp_gone = false;
+	if (apr_answer.opcode == APR_BASIC_RSP_RESULT && apr_answer.words[0] == header->opcode) {
+		ok = apr_answer.words[1] == 0;
+		voice_say("%s (opcode %#x): %s%s\n", what, header->opcode, ok ? "done" : "REFUSED: ",
+		    ok ? "" : dsp_error(apr_answer.words[1]));
+		if (ok && created != NULL) {
+			*created = apr_answer.from_port;
+		}
+		lck_mtx_unlock(&apr_lock);
+		return ok;
+	}
+	voice_say("%s: an answer not expected: opcode %#x, %u bytes: %#x %#x\n", what, apr_answer.opcode,
+	    apr_answer.length, apr_answer.words[0], apr_answer.words[1]);
+	lck_mtx_unlock(&apr_lock);
+	return false;
+}
+
+/* The same for a command whose answer is a string (the CVD version), not a basic result. */
+static bool
+voice_command_text(const char *what, uint8_t service, void *packet, uint32_t length, uint32_t wanted, char *text,
+    size_t text_size)
+{
+	struct vayu_apr_header *header = (struct vayu_apr_header *)packet;
+	uint32_t copy, token;
+
+	text[0] = '\0';
+	lck_mtx_lock(&apr_lock);
+	token = apr_next_token++;
+	header->token = token;
+	if (!apr_ask_raw(packet, length, token, 1000)) {
+		voice_say("%s: NO ANSWER\n", what);
+		lck_mtx_unlock(&apr_lock);
+		return false;
+	}
+	if (apr_answer.opcode != wanted) {
+		voice_say("%s: an answer not expected: opcode %#x (wanted %#x)\n", what, apr_answer.opcode, wanted);
+		lck_mtx_unlock(&apr_lock);
+		return false;
+	}
+	copy = apr_answer.length < text_size - 1 ? apr_answer.length : (uint32_t)text_size - 1;
+	memcpy(text, apr_answer.words, copy);
+	text[copy] = '\0';
+	lck_mtx_unlock(&apr_lock);
+	voice_say("%s: \"%s\"\n", what, text);
+	return true;
+}
+
+/*
+ * Which of the voice services the core says it has, and their API versions (AVCS_GET_VERSIONS; the
+ * answer is struct avcs_fwk_ver_info: five words of build version and the service count, then three
+ * words -- service id, API version, branch version -- each; apr_audio-v2.h:9975-10034).
+ */
+static bool
+voice_services(uint32_t *mvm, uint32_t *cvs, uint32_t *cvp)
+{
+	bool have_mvm = false, have_cvs = false, have_cvp = false, answered;
+	uint32_t count = 0;
+
+	*mvm = *cvs = *cvp = 0;
+	lck_mtx_lock(&apr_lock);
+	answered = apr_ask(APR_SVC_ADSP_CORE, 0, AVCS_GET_VERSIONS, NULL, 0, 1000) &&
+	    apr_answer.opcode == AVCS_GET_VERSIONS_RSP;
+	if (answered && apr_answer.length >= 20) {
+		count = apr_answer.words[4];
+		if (count > (apr_answer.length / 4 - 5) / 3) {
+			count = (apr_answer.length / 4 - 5) / 3;
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			uint32_t id = apr_answer.words[5 + i * 3];
+			uint32_t version = apr_answer.words[6 + i * 3];
+
+			if (id == VAPR_SVC_MVM) {
+				*mvm = version;
+				have_mvm = true;
+			} else if (id == VAPR_SVC_CVS) {
+				*cvs = version;
+				have_cvs = true;
+			} else if (id == VAPR_SVC_CVP) {
+				*cvp = version;
+				have_cvp = true;
+			}
+		}
+	}
+	lck_mtx_unlock(&apr_lock);
+	if (!answered) {
+		voice_say("the core did not answer AVCS_GET_VERSIONS: the voice services' versions are unknown\n");
+		return false;
+	}
+	voice_say("the core's list: %u services; MVM %u%s, CVS %u%s, CVP %u%s\n", count, *mvm,
+	    have_mvm ? "" : " (not listed)", *cvs, have_cvs ? "" : " (not listed)", *cvp,
+	    have_cvp ? "" : " (not listed)");
+	return have_mvm && have_cvs && have_cvp;
+}
+
+/*
+ * The two AFE legs: RX 0x1006 (the I2S port and the speaker's amplifier; the earpiece's too with
+ * vayu_audio_ear=1) and TX 0x4001 (the codec's microphones over SLIMbus). The ports are the sound
+ * step's own functions; the amplifier follows only when this port is allowed to write TLMM.
+ */
+static bool
+voice_ports_up(uint16_t rx_port, uint16_t tx_port)
+{
+	bool ok;
+
+	if (rx_port != PORT) {
+		voice_say("RX port %#x is not the one this port knows (%#x): not started\n", rx_port, PORT);
+		return false;
+	}
+	ok = afe_port_start_mi2s();
+	if (!ok) {
+		voice_say("the RX port %#x did not start\n", PORT);
+		return false;
+	}
+	voice.rx_started = true;
+	if (xnu_tlmm) {
+		if (!amp_prepare(&amp_bottom) || !amp_start(&amp_bottom)) {
+			voice_say("the speaker's amplifier did not come up: the downlink runs, nothing is heard\n");
+			amp_stop(&amp_bottom);
+		} else {
+			voice.amp_started = true;
+		}
+		if (amp_ear_enabled && (!amp_prepare(&amp_ear) || !amp_start(&amp_ear))) {
+			voice_say("the earpiece's amplifier did not come up (the bottom speaker is unaffected)\n");
+			amp_stop(&amp_ear);
+		}
+	} else {
+		voice_say("vayu_audio_xnu_tlmm=0: the amplifier is not driven, nothing is heard\n");
+	}
+	if (tx_port != mic_port_id) {
+		voice_say("TX port %#x is not the codec's microphone port (%#x)\n", tx_port, mic_port_id);
+		return false;
+	}
+	if (!vayu_jack_ready() || !vayu_jack_mic_on()) {
+		voice_say("the codec's microphone path did not come up (vayu_jack>=2 and the codec's J9?)\n");
+		return false;
+	}
+	if (!mic_afe_on()) {
+		voice_say("the microphone's AFE port %#x did not start\n", mic_port_id);
+		vayu_jack_mic_off();
+		return false;
+	}
+	voice.tx_started = true;
+	voice_say("the AFE legs: RX %#x (I2S, 48 kHz, 2 x 16 bits) and TX %#x (SLIMbus TX7/TX8, 135/136, 48 kHz)\n",
+	    PORT, mic_port_id);
+	return true;
+}
+
+static void
+voice_ports_down(uint16_t tx_port)
+{
+	uint16_t stop[2] = { tx_port, 0 };
+
+	if (voice.tx_started) {
+		if (!command("voice: the microphone's port, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop,
+		    sizeof(stop), 0)) {
+			voice_say("the microphone's port %#x did not stop\n", tx_port);
+		}
+		mic_port_on = false;
+		voice.tx_started = false;
+	}
+	vayu_jack_mic_off();
+	if (voice.amp_started) {
+		amp_stop(&amp_bottom);
+		amp_stop(&amp_ear);
+		voice.amp_started = false;
+	}
+	if (voice.rx_started) {
+		afe_port_stop(PORT);
+		voice.rx_started = false;
+	}
+}
+
+/* 7. START VOICE (also the retry of a passive session while the call comes up). */
+static bool
+voice_start(void)
+{
+	struct vapr_bare bare;
+	uint32_t length = vapr_build_bare(&bare, VAPR_SVC_MVM, 0, voice.mvm, 0, VAPR_MVM_START_VOICE);
+
+	if (!voice_command("START VOICE", VAPR_SVC_MVM, &bare, length, NULL)) {
+		return false;
+	}
+	voice.started = true;
+	return true;
+}
+
+/* 1-7 above: the sessions and the vocproc, up to START VOICE (not in mode 4). */
+static bool
+voice_create(uint32_t mode, uint16_t rx_port, uint16_t tx_port, uint32_t topo_tx, uint32_t topo_rx, uint32_t dev_rate,
+    uint32_t force_v3)
+{
+	struct vapr_session_create session;
+	struct vapr_cvs_create cvs;
+	struct vapr_cvp_create cvp;
+	struct vapr_handle handle;
+	struct vapr_bare bare;
+	const uint8_t map_rx[VAPR_CHANNELS_MAX] = { 1, 2, 0, 0, 0, 0, 0, 0 };
+	const uint8_t map_tx[VAPR_CHANNELS_MAX] = { 1, 2, 0, 0, 0, 0, 0, 0 };
+	const char *name = mode == 1 ? VOICE_NAME_LOOPBACK : (mode == 2 ? VOICE_NAME_VOLTE : VOICE_NAME_CS);
+	char text[64];
+	char what[192];
+	uint32_t length, opcode;
+
+	/* 1. MVM */
+	opcode = mode == 1 ? VAPR_MVM_CREATE_FULL : VAPR_MVM_CREATE_PASSIVE;
+	length = vapr_build_session_create(&session, VAPR_SVC_MVM, 0, 0, 0, opcode, name);
+	if (!voice_command("the MVM session", VAPR_SVC_MVM, &session, length, &voice.mvm)) {
+		return false;
+	}
+	voice.mvm_created = true;
+	voice_say("the MVM handle is %u\n", voice.mvm);
+
+	/* 2. the CVD version */
+	length = vapr_build_bare(&bare, VAPR_SVC_MVM, 0, 0, 0, VAPR_VERSION_GET);
+	if (voice_command_text("the CVD version", VAPR_SVC_MVM, &bare, length, VAPR_VERSION_RSP, text, sizeof(text))) {
+		if (voice.cvd == 0) {                   /* (vayu_voice_cvd=NN keeps its value) */
+			voice.cvd = voice_cvd_number(text);
+		}
+	} else {
+		voice_say("the CVD version is not known: the CVP V2 create is used (CVD 0.0's), no media format\n");
+	}
+
+	/* 3. CVS */
+	if (mode == 1) {
+		length = vapr_build_cvs_create(&cvs, 0, 0, VAPR_DIRECTION_LOOPBACK, VAPR_MEDIA_PCM_16K, VAPR_MEDIA_PCM_16K,
+		    VAPR_NETWORK_VOIP, name);
+		if (!voice_command("the CVS stream (direction 3: TX and RX loopback)", VAPR_SVC_CVS, &cvs, length,
+		    &voice.cvs)) {
+			return false;
+		}
+	} else {
+		length = vapr_build_session_create(&session, VAPR_SVC_CVS, 0, 0, 0, VAPR_CVS_CREATE_PASSIVE, name);
+		if (!voice_command("the CVS stream (passive)", VAPR_SVC_CVS, &session, length, &voice.cvs)) {
+			return false;
+		}
+	}
+	voice.cvs_created = true;
+	voice_say("the CVS handle is %u\n", voice.cvs);
+
+	/* 3b. a passive session is the modem's: the MVM is told so (q6voice.c:846-864, only for non-VoIP) */
+	if (mode != 1) {
+		struct vapr_flag dual;
+
+		length = vapr_build_flag(&dual, VAPR_SVC_MVM, 0, voice.mvm, 0, VAPR_MVM_SET_POLICY_DUAL_CONTROL, 1);
+		if (!voice_command("the MVM, dual control (the modem is the controller)", VAPR_SVC_MVM, &dual, length,
+		    NULL)) {
+			voice_say("dual control was refused: continuing (the modem's call may still attach)\n");
+		}
+	}
+
+	/* 4. the loopback's stream has no modem: the MVM is attached to it here */
+	if (mode == 1) {
+		length = vapr_build_handle(&handle, VAPR_SVC_MVM, 0, voice.mvm, 0, VAPR_MVM_ATTACH_STREAM, voice.cvs);
+		if (!voice_command("the MVM, attached to the CVS stream", VAPR_SVC_MVM, &handle, length, NULL)) {
+			return false;
+		}
+		voice.stream_attached = true;
+	}
+
+	/* 5. CVP */
+	opcode = (force_v3 != 0 || voice.cvd >= 22) ? VAPR_CVP_CREATE_V3 : VAPR_CVP_CREATE_V2;
+	length = vapr_build_cvp_create(&cvp, 0, 0, opcode, VAPR_DIRECTION_TX_RX, tx_port, topo_tx, rx_port, topo_rx,
+	    VAPR_PROFILE_NONE, VAPR_VOCPROC_EC_INT, VAPR_PORT_NONE, name);
+	snprintf(what, sizeof(what), "the CVP session (TX %#x topology %#x, RX %#x topology %#x, %s)", tx_port, topo_tx,
+	    rx_port, topo_rx, opcode == VAPR_CVP_CREATE_V3 ? "V3" : "V2");
+	if (!voice_command(what, VAPR_SVC_CVP, &cvp, length, &voice.cvp)) {
+		return false;
+	}
+	voice.cvp_created = true;
+	voice_say("the CVP handle is %u\n", voice.cvp);
+
+	/*
+	 * The vocproc's channel description: API 2 (channel info, 0x1328E/0x1328F) when the service says
+	 * it has it, API 1 (TOPOLOGY_SET_DEV_CHANNELS) otherwise. Both are best effort: with pass-through
+	 * topologies the CVP runs without them.
+	 */
+	if (voice.cvp_version >= 2) {
+		struct vapr_channel_info info;
+
+		length = vapr_build_channel_info(&info, 0, voice.cvp, 0, VAPR_PARAM_RX_CHANNEL_INFO, 2, 16, map_rx);
+		if (!voice_command("the vocproc's RX channel info (2 channels, 16 bits)", VAPR_SVC_CVP, &info, length, NULL)) {
+			voice_say("the RX channel info was refused: continuing (pass-through does not need it)\n");
+		}
+		length = vapr_build_channel_info(&info, 0, voice.cvp, 0, VAPR_PARAM_TX_CHANNEL_INFO, 2, 16, map_tx);
+		if (!voice_command("the vocproc's TX channel info (2 channels, 16 bits)", VAPR_SVC_CVP, &info, length, NULL)) {
+			voice_say("the TX channel info was refused: continuing (pass-through does not need it)\n");
+		}
+	} else {
+		struct vapr_dev_channels channels;
+
+		length = vapr_build_dev_channels(&channels, 0, voice.cvp, 0, 2, 2);
+		if (!voice_command("the vocproc's device channels (2 TX, 2 RX)", VAPR_SVC_CVP, &channels, length, NULL)) {
+			voice_say("the device channels were refused: continuing (pass-through does not need them)\n");
+		}
+	}
+	if (voice.cvd >= 23) {
+		struct vapr_media_format format;
+
+		length = vapr_build_media_format(&format, 0, voice.cvp, 0, VAPR_PARAM_RX_PORT_MEDIA_INFO, rx_port, 2, 16,
+		    dev_rate, map_rx);
+		if (!voice_command("the RX endpoint media format (2 channels, 16 bits, the device rate)", VAPR_SVC_CVP, &format,
+		    length, NULL)) {
+			voice_say("the RX media format was refused: continuing\n");
+		}
+		length = vapr_build_media_format(&format, 0, voice.cvp, 0, VAPR_PARAM_TX_PORT_MEDIA_INFO, tx_port, 2, 16,
+		    dev_rate, map_tx);
+		if (!voice_command("the TX endpoint media format (2 channels, 16 bits, the device rate)", VAPR_SVC_CVP, &format,
+		    length, NULL)) {
+			voice_say("the TX media format was refused: continuing\n");
+		}
+	}
+
+	length = vapr_build_bare(&bare, VAPR_SVC_CVP, 0, voice.cvp, 0, VAPR_CVP_TOPOLOGY_COMMIT);
+	if (!voice_command("the CVP topology, committed", VAPR_SVC_CVP, &bare, length, NULL)) {
+		return false;
+	}
+	length = vapr_build_bare(&bare, VAPR_SVC_CVP, 0, voice.cvp, 0, VAPR_CVP_ENABLE);
+	if (!voice_command("the vocproc, enabled", VAPR_SVC_CVP, &bare, length, NULL)) {
+		return false;
+	}
+	voice.enabled = true;
+
+	/* 6. the vocproc in the MVM */
+	length = vapr_build_handle(&handle, VAPR_SVC_MVM, 0, voice.mvm, 0, VAPR_MVM_ATTACH_VOCPROC, voice.cvp);
+	if (!voice_command("the MVM, the vocproc attached", VAPR_SVC_MVM, &handle, length, NULL)) {
+		return false;
+	}
+	voice.vocproc_attached = true;
+
+	/* 7. START VOICE */
+	if (mode != 4) {
+		if (!voice_start()) {
+			if (mode == 1) {
+				return false;
+			}
+			voice_say("START VOICE was not taken yet: it is retried while the window is open "
+			    "(the modem's call may not be up)\n");
+		}
+	}
+	return true;
+}
+
+/* Everything voice_create took, in reverse; every step is tried, so a failure leaves nothing behind. */
+static void
+voice_destroy(void)
+{
+	struct vapr_handle handle;
+	struct vapr_bare bare;
+	uint32_t length;
+
+	if (!voice.dsp_gone && voice.started) {
+		length = vapr_build_bare(&bare, VAPR_SVC_MVM, 0, voice.mvm, 0, VAPR_MVM_STOP_VOICE);
+		voice_command("STOP VOICE", VAPR_SVC_MVM, &bare, length, NULL);
+		voice.started = false;
+	}
+	if (!voice.dsp_gone && voice.vocproc_attached) {
+		length = vapr_build_handle(&handle, VAPR_SVC_MVM, 0, voice.mvm, 0, VAPR_MVM_DETACH_VOCPROC, voice.cvp);
+		voice_command("the vocproc, detached", VAPR_SVC_MVM, &handle, length, NULL);
+		voice.vocproc_attached = false;
+	}
+	if (!voice.dsp_gone && voice.enabled) {
+		length = vapr_build_bare(&bare, VAPR_SVC_CVP, 0, voice.cvp, 0, VAPR_CVP_DISABLE);
+		voice_command("the vocproc, disabled", VAPR_SVC_CVP, &bare, length, NULL);
+		voice.enabled = false;
+	}
+	if (!voice.dsp_gone && voice.cvp_created) {
+		length = vapr_build_bare(&bare, VAPR_SVC_CVP, 0, voice.cvp, 0, VAPR_DESTROY_SESSION);
+		voice_command("the CVP session, destroyed", VAPR_SVC_CVP, &bare, length, NULL);
+		voice.cvp_created = false;
+	}
+	if (!voice.dsp_gone && voice.stream_attached) {
+		length = vapr_build_handle(&handle, VAPR_SVC_MVM, 0, voice.mvm, 0, VAPR_MVM_DETACH_STREAM, voice.cvs);
+		voice_command("the stream, detached", VAPR_SVC_MVM, &handle, length, NULL);
+		voice.stream_attached = false;
+	}
+	if (!voice.dsp_gone && voice.cvs_created) {
+		length = vapr_build_bare(&bare, VAPR_SVC_CVS, 0, voice.cvs, 0, VAPR_DESTROY_SESSION);
+		voice_command("the CVS session, destroyed", VAPR_SVC_CVS, &bare, length, NULL);
+		voice.cvs_created = false;
+	}
+	if (!voice.dsp_gone && voice.mvm_created) {
+		length = vapr_build_bare(&bare, VAPR_SVC_MVM, 0, voice.mvm, 0, VAPR_DESTROY_SESSION);
+		voice_command("the MVM session, destroyed", VAPR_SVC_MVM, &bare, length, NULL);
+		voice.mvm_created = false;
+	}
+	if (voice.dsp_gone) {
+		voice_say("the DSP has not answered: what was left of the sessions is not asked for (they die with it); "
+		    "the ports and the amplifiers are still taken down\n");
+	}
+}
+
+/*
+ * The AFE's own loopback (AFE_MODULE_LOOPBACK, AFE_PARAM_ID_LOOPBACK_CONFIG): TX port -> RX port
+ * inside the AFE, no voice service involved (q6afe.c:4371-4428, apr_audio-v2.h:1661-1705). The
+ * diagnostic of last resort: if this plays the microphone, the two ports and the amplifiers are
+ * right and only the voice services are in question.
+ */
+static bool
+voice_afe_loopback(bool on, uint16_t tx_port, uint16_t rx_port)
+{
+	struct vapr_afe_loopback loopback = { VAPR_AFE_LOOPBACK_MINOR, rx_port, VAPR_AFE_LOOPBACK_MODE_DEFAULT, on ? 1 : 0,
+		                              0 };
+
+	return afe_port_param(on ? "voice: the AFE's own loopback, TX -> RX" : "voice: the AFE's loopback, off", tx_port,
+	    VAPR_AFE_MODULE_LOOPBACK, VAPR_AFE_PARAM_LOOPBACK_CONFIG, &loopback, sizeof(loopback));
+}
+
+/*
+ * The voice path in two halves, "up" and "down".  step_voice() (boot-arg vayu_voice=N) does up,
+ * waits its seconds, does down.  With vayu_call_audio=1 the QMI VOICE client's thread
+ * (bsd/dev/vayu_voice.c) does up when a call goes into CONVERSATION and down when the call is over,
+ * and the audio thread below holds the codec and the DSP for it instead of finishing them after the
+ * sound step.  The two paths share the `voice' struct below, hence voice_busy.
+ */
+struct voice_parms {
+	uint32_t secs;                  /* vayu_voice_secs: the step's window, and START VOICE's retry limit */
+	uint32_t topo;
+	uint32_t v3;
+	uint32_t afe_loop;
+	uint32_t dev_rate;
+	uint32_t dvc;
+	uint16_t rx_port;
+	uint16_t tx_port;
+	uint64_t began;
+};
+
+static bool voice_busy;                 /* the voice struct is in use: step_voice() or the call's worker */
+static volatile bool steps_busy;        /* the audio thread's sound step is up: its AFE ports are not free */
+static bool call_audio;                 /* vayu_call_audio=1: the path follows the QMI call state */
+static uint32_t call_audio_secs = 3600; /* vayu_call_audio_secs: how long the codec and the DSP are held */
+static uint32_t call_audio_forced;      /* vayu_call_audio_mode=2|3: the path, whatever the call reports */
+static uint32_t call_audio_retry = 30;  /* vayu_call_audio_retry: START VOICE's retry window, seconds */
+static volatile uint32_t call_audio_pending;    /* what the client asked: 0 none, 1 up, 2 down */
+static volatile uint32_t call_audio_want;       /* the path mode asked for: 2 or 3 */
+static volatile bool call_audio_up;             /* the worker's path is up */
+
+static bool
+voice_begin(uint32_t mode, struct voice_parms *p)
+{
+	uint32_t topo_tx = VAPR_TOPOLOGY_NONE, topo_rx = VAPR_TOPOLOGY_NONE;
+	uint32_t forced_cvp = 0, forced_cvd = 0, mvm_version = 0, cvs_version = 0, cvp_version = 0;
+	bool ok, listed;
+
+	p->secs = 5;
+	p->topo = 0;
+	p->v3 = 0;
+	p->afe_loop = 0;
+	p->dev_rate = 48000;
+	p->dvc = 40;
+	p->rx_port = PORT;
+	p->tx_port = MIC_AFE_PORT;
+	PE_parse_boot_argn("vayu_voice_secs", &p->secs, sizeof(p->secs));
+	PE_parse_boot_argn("vayu_voice_topo", &p->topo, sizeof(p->topo));
+	PE_parse_boot_argn("vayu_voice_v3", &p->v3, sizeof(p->v3));
+	PE_parse_boot_argn("vayu_voice_afe_loop", &p->afe_loop, sizeof(p->afe_loop));
+	PE_parse_boot_argn("vayu_voice_dev_rate", &p->dev_rate, sizeof(p->dev_rate));
+	PE_parse_boot_argn("vayu_voice_cvp_version", &forced_cvp, sizeof(forced_cvp));
+	PE_parse_boot_argn("vayu_voice_cvd", &forced_cvd, sizeof(forced_cvd));
+	if (p->dev_rate != 8000 && p->dev_rate != 16000 && p->dev_rate != 48000) {
+		p->dev_rate = 48000;
+	}
+	/*
+	 * The loopback is the microphone hearing the speaker: -30 dB (DVC index 40) unless asked
+	 * otherwise, never above vayu_audio_dvc's cap. The earpiece keeps its own EAR_DVC_DEFAULT.
+	 */
+	PE_parse_boot_argn("vayu_voice_dvc", &p->dvc, sizeof(p->dvc));
+	dvc_index = p->dvc > dvc_most ? dvc_most : p->dvc;
+	if (p->secs == 0) {
+		p->secs = 1;
+	}
+	p->secs = p->secs > 60 ? 60 : p->secs;
+	if (p->topo != 0) {
+		topo_tx = VAPR_TOPOLOGY_TX_SM_ECNS_V2;
+		topo_rx = VAPR_TOPOLOGY_RX_DEFAULT;
+	}
+
+	voice.dsp_gone = false;
+	voice_say("vayu_voice=%u: %s, %u s, topologies %s\n", mode,
+	    mode == 1 ? "the loopback (MVM/CVS full control, direction 3): no modem, no call" :
+	    mode == 2 ? "a VoLTE call (MVM/CVS passive, \"default volte voice\")" :
+	    mode == 3 ? "a CS/CSFB call (MVM/CVS passive, \"default modem voice\")" :
+	    mode == 4 ? "the passive sessions only, no START VOICE" :
+	    "the AFE's own loopback only (no voice services)", p->secs, p->topo != 0 ? "EC/NS + default" : "pass-through");
+	if (mic_ios) {
+		voice_say("vayu_mic=1 owns the microphone's port %#x: vayu_voice is not done (drop vayu_mic)\n", mic_port_id);
+		return false;
+	}
+	if (!vayu_jack_ready()) {
+		voice_say("the codec is not up: vayu_voice needs vayu_jack>=2 (the microphones are its SLIMbus TX)\n");
+		return false;
+	}
+
+	listed = voice_services(&mvm_version, &cvs_version, &cvp_version);
+	if (!listed) {
+		voice_say("the core does not list all three voice services: the commands are tried anyway\n");
+	}
+	voice.cvp_version = forced_cvp != 0 ? forced_cvp : cvp_version;
+	voice.cvd = forced_cvd;
+	voice_say("the services' versions: MVM %u, CVS %u, CVP %u (using CVP API %u); CVD %u\n", mvm_version,
+	    cvs_version, cvp_version, voice.cvp_version, voice.cvd);
+
+	ok = voice_ports_up(p->rx_port, p->tx_port);
+	p->began = mach_absolute_time();
+	if (ok && mode != 5) {
+		ok = voice_create(mode, p->rx_port, p->tx_port, topo_tx, topo_rx, p->dev_rate, p->v3);
+	}
+	if (!ok) {
+		voice_say("FAILED: the voice path is not up (see the line above)\n");
+		voice_destroy();
+		voice_ports_down(p->tx_port);
+		return false;
+	}
+	if (p->afe_loop || mode == 5) {
+		if (!voice_afe_loopback(true, p->tx_port, p->rx_port)) {
+			voice_say("the AFE's own loopback was refused; the DSP's voice path is unaffected\n");
+		} else {
+			voice.afe_loopback = true;
+		}
+	}
+	return true;
+}
+
+/* True once the START VOICE retries have had their window (from the moment the ports went up). */
+static bool
+voice_start_give_up(struct voice_parms *p, uint32_t window_s)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time() - p->began, &ns);
+	return ns >= (uint64_t)window_s * NSEC_PER_SEC;
+}
+
+/* The READY line, once START VOICE has had its retries. */
+static void
+voice_ready(uint32_t mode, struct voice_parms *p)
+{
+	if (mode == 5) {
+		voice_say("READY (AFE loopback only): TX %#x -> RX %#x; %s; %s\n", p->tx_port, p->rx_port,
+		    voice.afe_loopback ? "the AFE's loopback is set" : "the AFE's loopback was REFUSED",
+		    voice.amp_started ? "the amplifiers are on" : "the amplifiers are off");
+	} else {
+		voice_say("READY: MVM %u, CVS %u, CVP %u; TX %#x -> RX %#x; %s; %s; %s\n", voice.mvm, voice.cvs,
+		    voice.cvp, p->tx_port, p->rx_port, voice.started ? "START VOICE accepted" : "START VOICE not sent",
+		    voice.stream_attached ? "the MVM is attached to the loopback stream" : "the stream is the modem's",
+		    voice.amp_started ? "the amplifiers are on" : "the amplifiers are off");
+	}
+	if (voice.started && mode == 1) {
+		voice_say("the loopback runs: what the microphone hears comes back out of the speaker for %u s\n", p->secs);
+	}
+}
+
+static void
+voice_end(struct voice_parms *p)
+{
+	if (voice.afe_loopback) {
+		voice_afe_loopback(false, p->tx_port, p->rx_port);
+		voice.afe_loopback = false;
+	}
+	voice_destroy();
+	voice_ports_down(p->tx_port);
+	voice_say("DONE: the voice path is down; APR sent %u packets, received %u\n", apr_out, apr_in);
+}
+
+static bool
+step_voice(uint32_t mode)
+{
+	struct voice_parms p;
+
+	voice_busy = true;
+	if (!voice_begin(mode, &p)) {
+		voice_busy = false;
+		return false;
+	}
+	/*
+	 * A passive session's START VOICE may be too early while the modem is still bringing the call
+	 * up: it is asked again every two seconds until the window closes (mode 2/3 only; the loopback
+	 * has no call to wait for, and mode 4 never starts the voice).
+	 */
+	if (!voice.started && (mode == 2 || mode == 3)) {
+		for (;;) {
+			uint64_t ns;
+
+			if (voice_start_give_up(&p, p.secs)) {
+				break;
+			}
+			delay_for_interval(2, NSEC_PER_SEC);
+			if (voice_start()) {
+				uint64_t at = 0;
+
+				absolutetime_to_nanoseconds(mach_absolute_time() - p.began, &ns);
+				at = ns / NSEC_PER_MSEC;
+				voice_say("START VOICE taken on the retry, %llu ms into the window\n", at);
+				break;
+			}
+		}
+	}
+	voice_ready(mode, &p);
+	for (;;) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - p.began, &ns);
+		if (ns >= (uint64_t)p.secs * NSEC_PER_SEC) {
+			break;
+		}
+		delay_for_interval(100, NSEC_PER_MSEC);
+	}
+	voice_end(&p);
+	voice_busy = false;
+	return true;
+}
+
+/* ---- the call client's side (vayu_call_audio=1) ------------------------------------------------- */
+
+void
+vayu_audio_call_audio_start(uint32_t path_mode)
+{
+	if (!call_audio) {
+		return;
+	}
+	if (call_audio_forced != 0) {
+		path_mode = call_audio_forced;
+	}
+	if (path_mode != 2 && path_mode != 3) {
+		path_mode = 2;
+	}
+	if (call_audio_up || call_audio_pending == 1) {
+		return;                         /* (the path is up, or already asked for) */
+	}
+	call_audio_want = path_mode;
+	call_audio_pending = 1;
+}
+
+void
+vayu_audio_call_audio_stop(void)
+{
+	if (!call_audio) {
+		return;
+	}
+	call_audio_pending = 2;                 /* (also when the bring-up is still running: it then goes down) */
+}
+
+bool
+vayu_audio_call_audio_up(void)
+{
+	return call_audio_up;
+}
+
+/*
+ * vayu_call_audio=1: the QMI client's requests are served here, in this module's thread: the path's
+ * bring-up takes seconds and the client's indication path must not wait for it (the END indication
+ * is the one that has to take the path down).  The thread never exits; the audio thread's hold
+ * window (call_audio_hold) bounds how long the codec and the DSP are there to be used.
+ */
+static void
+call_audio_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	struct voice_parms p;
+	uint32_t mode = 0;
+	bool gave_up_said = false, ready_said = false;
+
+	for (;;) {
+		if (!call_audio_up) {
+			if (call_audio_pending == 1) {
+				if (voice_busy || steps_busy) {
+					delay_for_interval(50, NSEC_PER_MSEC);
+					continue;       /* (vayu_voice=N's step or the sound step has the ports/struct) */
+				}
+				mode = call_audio_want;
+				call_audio_pending = 0;
+				gave_up_said = false;
+				ready_said = false;
+				voice_busy = true;
+				if (!voice_begin(mode, &p)) {
+					voice_busy = false;
+					voice_say("vayu_call_audio=1: the path for the call (vayu_voice=%u) is NOT up\n", mode);
+				} else {
+					call_audio_up = true;
+					voice_say("vayu_call_audio=1: the call's path is up (vayu_voice=%u); "
+					    "START VOICE is asked while the call is set up\n", mode);
+				}
+			} else {
+				call_audio_pending = call_audio_pending == 2 ? 0 : call_audio_pending;
+				delay_for_interval(100, NSEC_PER_MSEC);
+			}
+			continue;
+		}
+		/* the path is up: START VOICE's retries, and then the call's end */
+		if (!voice.started && (mode == 2 || mode == 3) && !gave_up_said) {
+			if (voice_start_give_up(&p, call_audio_retry)) {
+				voice_say("vayu_call_audio=1: START VOICE was not taken in %u s: the path stays up "
+				    "without it (the call's state is the modem's)\n", call_audio_retry);
+				gave_up_said = true;
+			} else {
+				delay_for_interval(2, NSEC_PER_SEC);
+				if (voice_start()) {
+					uint64_t ns;
+					absolutetime_to_nanoseconds(mach_absolute_time() - p.began, &ns);
+					voice_say("vayu_call_audio=1: START VOICE taken on the retry, %llu ms into the call's path\n",
+					    ns / NSEC_PER_MSEC);
+				}
+				continue;
+			}
+		}
+		if (!ready_said && (voice.started || gave_up_said)) {
+			voice_ready(mode, &p);  /* (the same READY line the vayu_voice=N step prints) */
+			ready_said = true;
+		}
+		if (call_audio_pending == 2) {
+			call_audio_pending = 0;
+			voice_end(&p);
+			call_audio_up = false;
+			voice_busy = false;
+			voice_say("vayu_call_audio=1: the call is over: the voice path is down\n");
+			continue;
+		}
+		delay_for_interval(100, NSEC_PER_MSEC);
+	}
+}
+
+/*
+ * vayu_call_audio=1 in the audio thread: the codec (vayu_jack>=2) and the DSP are held for the call
+ * client instead of being finished after the sound step.  The path itself is the worker's above.
+ */
+static void
+call_audio_hold(void)
+{
+	uint64_t began;
+
+	if (!call_audio || level < 3) {
+		return;
+	}
+	if (!vayu_jack_ready()) {
+		say("vayu-audio: vayu_call_audio=1 needs the codec up (vayu_jack>=2): the call client's path "
+		    "cannot be brought up\n");
+	}
+	say("vayu-audio: vayu_call_audio=1: the codec and the DSP are held %u s for the call client "
+	    "(/dev/vayu-voice: vayu_call=1|2; the path follows the call state, vayu_call_audio_mode=%u)\n",
+	    call_audio_secs, call_audio_forced);
+	began = mach_absolute_time();
+	for (;;) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+		if (ns >= (uint64_t)call_audio_secs * NSEC_PER_SEC) {
+			break;
+		}
+		delay_for_interval(200, NSEC_PER_MSEC);
+	}
+	if (call_audio_up) {
+		say("vayu-audio: vayu_call_audio=1: the hold window (%u s) is over with the path still up: it goes down\n",
+		    call_audio_secs);
+		call_audio_pending = 2;
+		for (unsigned waited = 0; waited < 10000 && call_audio_up; waited += 100) {
+			delay_for_interval(100, NSEC_PER_MSEC);
+		}
+	} else {
+		say("vayu-audio: vayu_call_audio=1: the hold window (%u s) is over\n", call_audio_secs);
+	}
+}
+
 /* ---- the steps -------------------------------------------------------------------------------------- */
 
 static bool
@@ -4820,9 +5723,11 @@ audio_thread(void *arg __unused, wait_result_t wr __unused)
 	} else if (level >= 2 && step_dsp()) {
 		if (level >= 3 && !step_link()) {
 			say("vayu-audio: 3: the steps after it are not attempted\n");
+			call_audio = false;     /* (no APR: the call client's path has nothing to talk to) */
 		} else if (level >= 4) {
 			uint32_t sound = 1, tone_secs = secs, then = 0, pre[2] = { 0, 0 };
 
+			steps_busy = true;              /* (the call client's path must not take the AFE ports now) */
 			PE_parse_boot_argn("vayu_sound", &sound, sizeof(sound));
 			/*
 			 * vayu_sound_pre=N, vayu_sound_pre2=M: short steps (1-3, 6) BEFORE the main one, e.g. the headphone tone and
@@ -4861,6 +5766,31 @@ audio_thread(void *arg __unused, wait_result_t wr __unused)
 				step_sound(then, tone_secs > 3 ? 3 : tone_secs);
 			}
 		}
+		/*
+		 * vayu_voice=N: the q6voice path (MVM/CVS/CVP) after the sound step, which has left the AFE
+		 * ports and the amplifiers down for it. The codec is still up (vayu_jack_run), and the final
+		 * vayu_jack_finish() below takes it down after the voice step, as it does for the sound.
+		 */
+		{
+			uint32_t voice_mode = 0;
+
+			if (PE_parse_boot_argn("vayu_voice", &voice_mode, sizeof(voice_mode)) && voice_mode != 0) {
+				delay_for_interval(200, NSEC_PER_MSEC);
+				if (call_audio_up || call_audio_pending != 0) {
+					voice_say("vayu_voice=%u: skipped: the call client's path is up or asked for "
+					    "(vayu_call_audio=1, /dev/vayu-voice)\n", voice_mode);
+				} else {
+					step_voice(voice_mode);
+				}
+			}
+		}
+		steps_busy = false;
+		/*
+		 * vayu_call_audio=1: instead of finishing the codec and the DSP after the steps, hold them
+		 * for the QMI VOICE client, whose thread brings the path up and down with the call
+		 * (vayu_audio_call_audio_start/stop, above).
+		 */
+		call_audio_hold();
 		if (mic_thread_started) {
 			/*
 			 * vayu_mic=1: the codec and the DSP stay up for /dev/hakios-mic, whose thread brings the
@@ -4913,7 +5843,7 @@ vayu_audio_quiesce(void)
 void
 vayu_audio_init(void)
 {
-	uint32_t cx = 0, pause = 2200, ear = 0, cold = 1, mic_port_arg = 0;
+	uint32_t cx = 0, pause = 2200, ear = 0, cold = 1, mic_port_arg = 0, call_audio_arg = 0;
 	thread_t thread;
 
 	PE_parse_boot_argn("vayu_mic", &mic_ios, sizeof(mic_ios));
@@ -4977,6 +5907,45 @@ vayu_audio_init(void)
 	if (amp_ear_enabled) {
 		say("vayu-audio: vayu_audio_ear=1: the earpiece's TAS2564 at 0x4d, DVC index %u (%d dB)\n", ear_dvc_index,
 		    2 * (int)ear_dvc_index - 110);
+	}
+	/*
+	 * vayu_call_audio=1: the QMI VOICE client (bsd/dev/vayu_voice.c, vayu_call=1|2) is the owner of the
+	 * q6voice path: this module's thread serves its requests, and the audio thread holds the codec and
+	 * the DSP for it (call_audio_hold).
+	 */
+	if (PE_parse_boot_argn("vayu_call_audio", &call_audio_arg, sizeof(call_audio_arg)) && call_audio_arg != 0) {
+		call_audio = true;
+		PE_parse_boot_argn("vayu_call_audio_secs", &call_audio_secs, sizeof(call_audio_secs));
+		if (call_audio_secs == 0) {
+			call_audio_secs = 3600;
+		}
+		call_audio_secs = call_audio_secs > 86400 ? 86400 : call_audio_secs;
+		PE_parse_boot_argn("vayu_call_audio_mode", &call_audio_forced, sizeof(call_audio_forced));
+		if (call_audio_forced != 2 && call_audio_forced != 3) {
+			if (call_audio_forced != 0) {
+				say("vayu-audio: vayu_call_audio_mode=%u is refused: 0 (from the call), 2 (VoLTE) and "
+				    "3 (CS) only\n", call_audio_forced);
+			}
+			call_audio_forced = 0;
+		}
+		PE_parse_boot_argn("vayu_call_audio_retry", &call_audio_retry, sizeof(call_audio_retry));
+		if (call_audio_retry == 0) {
+			call_audio_retry = 1;
+		}
+		call_audio_retry = call_audio_retry > 300 ? 300 : call_audio_retry;
+		if (level < 3) {
+			say("vayu-audio: vayu_call_audio=1 needs vayu_audio>=3 (the DSP up) and vayu_jack>=2 (the codec): "
+			    "the call's path will not be possible\n");
+		}
+		say("vayu-audio: vayu_call_audio=1 vayu_call_audio_secs=%u vayu_call_audio_mode=%u "
+		    "vayu_call_audio_retry=%u: the QMI VOICE client starts and stops the path when a call is in "
+		    "conversation\n", call_audio_secs, call_audio_forced, call_audio_retry);
+		if (kernel_thread_start(call_audio_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			say("vayu-audio: vayu_call_audio=1: no thread: the call client's path is not possible\n");
+			call_audio = false;
+		}
 	}
 	if (kernel_thread_start(audio_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

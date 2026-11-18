@@ -263,6 +263,29 @@ fsync(int fd)
 	return (int)SC(SYS_fsync, fd, 0, 0, 0, 0, 0);
 }
 
+int
+sync(void)
+{
+	return (int)SC(SYS_sync, 0, 0, 0, 0, 0, 0);
+}
+
+/* The type name of the filesystem PATH is on ("hfs", "ramfs", "apfs"), from statfs64: f_fstypename is at 72. */
+int
+fs_type(const char *path, char *type, size_t size)
+{
+	static char sfs[2168];
+	size_t i;
+
+	if (SC(SYS_statfs64, path, sfs, 0, 0, 0, 0) < 0 || size == 0) {
+		return -1;
+	}
+	for (i = 0; i + 1 < size && i < 16 && sfs[72 + i] != 0; i++) {
+		type[i] = sfs[72 + i];
+	}
+	type[i] = 0;
+	return 0;
+}
+
 ssize_t
 pread(int fd, void *buf, size_t count, off_t offset)
 {

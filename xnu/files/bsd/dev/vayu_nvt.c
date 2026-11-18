@@ -86,6 +86,7 @@
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <os/atomic_private.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
@@ -137,9 +138,48 @@ static bool nvt_qup;            /* boot arg nvt_qup=1 or touch_driver=nvt_qup */
  * at the old 125 Hz every frame of a 120 Hz scroll had less than one new position to show.
  */
 static uint32_t touch_hz = 240; /* boot arg touch_hz=N: sample at N Hz (0: touch_poll_us) */
+/*
+ * touch_idle_hz=N (o6; default 0: always touch_hz): with touch_hz, the panel is looked at only N times a
+ * second (10..touch_hz) once no finger has been down for touch_idle_ms (default 2000), and at touch_hz again
+ * from the first report of a finger. Every look is an SPI transfer this thread waits out busy (vayu_qup_spi.c
+ * polls the FIFO: 149-158 us a report, 240 looks a second = 3.6-3.8 % of a core with no finger at all,
+ * HEAT_REPORT.md, d1081c2), and 240 wakes a second of whatever core it runs on. The cost is the first touch
+ * after a pause: it is seen up to 1/N s later (17 ms at 60).
+ */
+static uint32_t touch_idle_hz, touch_idle_ms = 2000;
+/*
+ * scroll120: the display driver's once-a-second finger line (iokit/Kernel/MiniIOMobileFramebuffer.cpp).
+ * It is called from this thread, not from the display driver's show(), so a second in which the
+ * window server commits nothing still produces a line -- the interesting second of a scroll.
+ */
+extern void hakios_fb_finger_tick(void);
 static uint32_t nvt_host_cmd;   /* boot arg nvt_cmd=0xNN: one host command, after the download */
 static bool touch_tail;         /* boot arg touch_tail=1: show the five bytes after the records */
 static bool page_held;          /* the event-buffer page is selected and the last look saw data */
+/*
+ * scroll120b: the panel's own report rate, told apart from what this driver posted. The display
+ * driver's once-a-second finger line (iokit/Kernel/MiniIOMobileFramebuffer.cpp) reads these; the
+ * previous line counted only the samples hakios_touch_post_at() produced, so a finger held still
+ * (or a report the driver dropped) could not be told from a slow panel.
+ *
+ *   fresh    looks in which the 65-byte event buffer changed -- one new position from the chip
+ *   repeats  looks that saw the same non-blank report again -- the panel had nothing new
+ *   max_gap  the longest wait between two fresh reports while a finger was down
+ */
+static volatile uint64_t nvt_fresh_total;
+static volatile uint64_t nvt_dup_total;
+static volatile uint64_t nvt_max_gap_abs;
+static uint64_t nvt_last_fresh_abs;
+static bool nvt_hop_off;        /* boot arg nvt_hop=0: send the vendor's frequency-hop disable */
+static uint32_t nvt_dump;       /* boot arg nvt_dump=1: the raw report once a second under a finger */
+
+void
+hakios_nvt_stats(uint64_t *fresh, uint64_t *repeats, uint64_t *max_gap_abs)
+{
+	*fresh = os_atomic_load(&nvt_fresh_total, relaxed);
+	*repeats = os_atomic_load(&nvt_dup_total, relaxed);
+	*max_gap_abs = os_atomic_xchg(&nvt_max_gap_abs, 0, relaxed);   /* the longest since the last line */
+}
 
 /* ---- pins (TLMM) ------------------------------------------------------------------------------- */
 
@@ -306,6 +346,8 @@ spi_xfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 #define NVT_ENG_RST_ADDR        0x7fff80
 
 #define NVT_EVENT_MAP_FWINFO    0x78    /* the firmware-info block inside the event-buffer page */
+#define NVT_EVENT_MAP_RESET_COMPLETE 0x60 /* ... and the reset-state byte the download clears */
+#define NVT_EVENT_MAP_HOST_CMD  0x50    /* the one-byte host command register (see nvt_host_command) */
 #define NVT_EVENT_MAP_NT36672A  0x21c00
 #define NVT_EVENT_MAP_NT36675   0x22d00
 
@@ -369,6 +411,55 @@ nvt_read_addr(uint32_t address, uint8_t *data, uint32_t length)
 	return nvt_read((uint8_t)address, data, length);
 }
 
+static uint32_t event_map;
+static uint32_t max_x = 1080, max_y = 2400;
+static uint32_t flip;
+
+/*
+ * The vendor's host command, as the stock vayu kernel implements it (nt36xxx.c):
+ * the event-buffer page's register 0x50 takes one command byte, and the firmware clears the
+ * register to 0 when it has carried the command out. The one command that can be named from
+ * the stock binary is 0x66: nvt_switch_FreqHopEnDis() (file offset 0x9c2d34 in the stock
+ * Image) writes {0x50, 0x66} with the page set to event_buffer | 0x50, sleeps 35 ms, then
+ * reads register 0x50 until it answers 0 -- at most twenty times, and its caller logs
+ * "switch frequency hopping disable failed!" (string at 0x214da40) when it does not.
+ *
+ * There is NO report-rate command in that driver: the only writes to 0x50 outside the
+ * firmware download are 0x13 (sleep, sent from the suspend path) and 0x66 (this one); the
+ * report-rate strings and DT properties a Xiaomi "game mode" would need are absent from the
+ * Image, and nvt_xiaomi_config_info is a read-only seq_file. So nvt_rate= does not pretend to
+ * change the panel; it changes how often this driver looks (see nvt_thread), and nvt_hop=0
+ * is the one chip-side knob the vendor actually has.
+ */
+#define NVT_HOST_CMD_FREQ_HOP_DISABLE 0x66
+
+static bool
+nvt_host_command(uint8_t command)
+{
+	uint8_t status = 0xff;
+	int polls = 0;
+
+	if (!nvt_set_page(event_map | NVT_EVENT_MAP_HOST_CMD)) {
+		printf("nvt: host command %02x: the page could not be set\n", command);
+		return false;
+	}
+	if (!nvt_write(NVT_EVENT_MAP_HOST_CMD, &command, 1)) {
+		printf("nvt: host command %02x: the write failed\n", command);
+		return false;
+	}
+	for (polls = 1; polls <= 20; polls++) {
+		sleep_ms(35);
+		if (nvt_read(NVT_EVENT_MAP_HOST_CMD, &status, 1) && status == 0) {
+			break;
+		}
+	}
+	nvt_set_page(event_map);                /* the report reads start at offset 0 of this page */
+	page_held = true;
+	printf("nvt: host command %02x %s after %d poll(s) (register 50 last read %02x)\n", command,
+	    polls <= 20 ? "done" : "NOT acknowledged", polls, status);
+	return polls <= 20;
+}
+
 /* ---- the chip ----------------------------------------------------------------------------------- */
 
 /* Pins idle, chip held in reset, then its I/O supply; the device tree gives the supply 4 ms. */
@@ -393,10 +484,6 @@ power_on(void)
 	}
 	sleep_ms(4);
 }
-
-static uint32_t event_map;
-static uint32_t max_x = 1080, max_y = 2400;
-static uint32_t flip;
 
 static bool
 nvt_fw_info(uint32_t map, uint8_t *info)
@@ -462,8 +549,6 @@ nvt_fw_info_dump(const uint8_t *info, unsigned length)
 #define NVT_R_DLM_CHECKSUM_ADDR 0x3f124
 #define NVT_BLD_CRC_EN_ADDR     0x3f30e
 #define NVT_BLD_ILM_DLM_CRC_ADDR 0x3f133
-#define NVT_EVENT_MAP_RESET_COMPLETE 0x60
-#define NVT_EVENT_MAP_HOST_CMD  0x50
 #define NVT_MAX_PARTS           32
 
 static struct {
@@ -973,6 +1058,7 @@ nvt_poll(uint64_t at)
 	}
 	if (blank) {                            /* no finger, or the chip reset: nothing may stay down */
 		page_held = false;
+		nvt_last_fresh_abs = 0;         /* the gap across a lift is not a report gap */
 		nvt_release_all(at);
 		return;
 	}
@@ -980,7 +1066,30 @@ nvt_poll(uint64_t at)
 	seen.reports++;
 	if (memcmp(report, last_report, sizeof(report)) != 0) {
 		seen.fresh++;
+		os_atomic_inc(&nvt_fresh_total, relaxed);
+		if (nvt_last_fresh_abs != 0 && at > nvt_last_fresh_abs) {
+			uint64_t gap = at - nvt_last_fresh_abs;
+
+			if (gap > os_atomic_load(&nvt_max_gap_abs, relaxed)) {
+				os_atomic_store(&nvt_max_gap_abs, gap, relaxed);
+			}
+		}
+		nvt_last_fresh_abs = at;
 		memcpy(last_report, report, sizeof(report));
+	} else {
+		os_atomic_inc(&nvt_dup_total, relaxed);
+	}
+	if (nvt_dump != 0 && (seen.polls % 240) == 0) {
+		char line[3 * NVT_REPORT_SIZE + 1];
+		char *p = line;
+
+		for (unsigned i = 0; i < sizeof(report); i++) {
+			*p++ = "0123456789abcdef"[report[i] >> 4];
+			*p++ = "0123456789abcdef"[report[i] & 0xf];
+			*p++ = ' ';
+		}
+		*--p = 0;
+		printf("nvt: raw %s\n", line);
 	}
 	if (touch_tail && (seen.polls % 750) == 0) {
 		printf("nvt: tail %02x %02x %02x %02x %02x (after the ten records)\n", report[60], report[61],
@@ -1025,14 +1134,41 @@ nvt_thread(__unused void *parameter, __unused wait_result_t result)
 			poll_us = 500;
 		}
 	}
+	/*
+	 * nvt_rate=N (scroll120b): how often this driver looks, not how often the panel reports.
+	 * The stock vayu driver has no report-rate command (see nvt_host_command() above), so the
+	 * boot arg cannot make the chip produce more positions; it does shorten the average age of
+	 * the position the app is given, which is the part of "the scroll stutters" a host can fix.
+	 * Named nvt_rate because that is the switch the owner asked for; touch_hz= is the same knob.
+	 */
 	{
-		uint32_t tail = 0, command = 0;
+		uint32_t rate = 0;
+
+		if (PE_parse_boot_argn("nvt_rate", &rate, sizeof(rate))) {
+			if (rate >= 30 && rate <= 2000) {
+				touch_hz = rate;
+				poll_us = 1000000 / rate;
+				printf("nvt: nvt_rate=%u: polling every %u us; the firmware has no report-rate "
+				    "command, so this shortens the sample's age, not the panel's period\n", rate, poll_us);
+			} else {
+				printf("nvt: nvt_rate=%u is outside 30..2000; ignored\n", rate);
+			}
+		}
+	}
+	{
+		uint32_t tail = 0, command = 0, hop = 1, dump = 0;
 
 		if (PE_parse_boot_argn("touch_tail", &tail, sizeof(tail))) {
 			touch_tail = tail != 0;
 		}
 		if (PE_parse_boot_argn("nvt_cmd", &command, sizeof(command))) {
 			nvt_host_cmd = command & 0xff;
+		}
+		if (PE_parse_boot_argn("nvt_hop", &hop, sizeof(hop))) {
+			nvt_hop_off = hop == 0;         /* nvt_hop=0: the vendor's frequency-hop disable */
+		}
+		if (PE_parse_boot_argn("nvt_dump", &dump, sizeof(dump))) {
+			nvt_dump = dump;
 		}
 	}
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
@@ -1130,12 +1266,39 @@ nvt_thread(__unused void *parameter, __unused wait_result_t result)
 		page_held = true;
 	}
 
+	/*
+	 * nvt_hop=0: the vendor's verification path (nt36xxx.c nvt_switch_FreqHopEnDis()) sends
+	 * command 0x66 to the event-buffer page's register 0x50 and waits for the firmware to
+	 * clear it. The panel's frequency hopping moves the scan between bands; disabling it is
+	 * the only chip-side change the stock driver can make that may affect how often a slow
+	 * finger produces a new report. Sent after the download and after nvt_cmd=, and only
+	 * when asked for: the chip keeps the setting until its next reset, and this driver does
+	 * not reset the chip again after boot.
+	 */
+	if (nvt_hop_off) {
+		nvt_host_command(NVT_HOST_CMD_FREQ_HOP_DISABLE);
+	}
+
 	uint64_t period = 0, next = mach_absolute_time(), status_at = next;
+	uint64_t finger_period = 0, finger_at = next;
+	uint64_t idle_period = 0, idle_after = 0;       /* touch_idle_hz */
 	uint32_t status_polls = 0, status_fresh = 0;
 
 	if (touch_hz != 0) {
 		nanoseconds_to_absolutetime((uint64_t)poll_us * NSEC_PER_USEC, &period);
+		PE_parse_boot_argn("touch_idle_hz", &touch_idle_hz, sizeof(touch_idle_hz));
+		PE_parse_boot_argn("touch_idle_ms", &touch_idle_ms, sizeof(touch_idle_ms));
+		if (touch_idle_hz != 0 && touch_idle_hz >= 10 && touch_idle_hz < touch_hz) {
+			nanoseconds_to_absolutetime(NSEC_PER_SEC / touch_idle_hz, &idle_period);
+			nanoseconds_to_absolutetime((uint64_t)(touch_idle_ms > 600000 ? 600000 : touch_idle_ms) * NSEC_PER_MSEC,
+			    &idle_after);
+			printf("nvt: touch_idle_hz=%u: %u looks a second after %u ms with no finger, %u again from the first report\n",
+			    touch_idle_hz, touch_idle_hz, touch_idle_ms, touch_hz);
+		} else if (touch_idle_hz != 0) {
+			printf("nvt: touch_idle_hz=%u is outside 10..%u; ignored\n", touch_idle_hz, touch_hz - 1);
+		}
 	}
+	nanoseconds_to_absolutetime(1000ULL * NSEC_PER_MSEC, &finger_period);
 	for (unsigned tick = 1;; tick++) {
 		uint64_t before = mach_absolute_time(), after;
 
@@ -1143,6 +1306,14 @@ nvt_thread(__unused void *parameter, __unused wait_result_t result)
 		after = mach_absolute_time();
 		reading += after - before;
 		reads++;
+		/* scroll120: the display driver's finger line, once a second, finger or no finger */
+		if (after >= finger_at) {
+			hakios_fb_finger_tick();
+			finger_at += finger_period;
+			if (finger_at <= after) {
+				finger_at = after + finger_period;
+			}
+		}
 		if (tick % status_every == 0) {
 			uint64_t ns, span;
 			uint32_t looks = seen.polls - status_polls, fresh = seen.fresh - status_fresh;
@@ -1166,7 +1337,13 @@ nvt_thread(__unused void *parameter, __unused wait_result_t result)
 			 * The next look is due one period after the previous one was due, not one period after
 			 * the work ended: the sleep is short, but the wake is late, and at 4 ms both matter.
 			 */
-			next += period;
+			if (idle_period != 0) {
+				uint64_t idle = hakios_touch_idle_abs();       /* (0: a finger is down; ~0: never touched) */
+
+				next += idle != 0 && idle > idle_after ? idle_period : period;
+			} else {
+				next += period;
+			}
 			if (after < next) {
 				uint64_t wait;
 

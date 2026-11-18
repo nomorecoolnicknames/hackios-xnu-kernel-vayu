@@ -14,8 +14,11 @@
  *                           position/SV-info/NMEA events, LOC_START, log the fixes for
  *                           vayu_gnss_run seconds, LOC_STOP; the record stays readable
  *   vayu_gnss_wait=S        how long to wait for the services and DMS ONLINE (default 30, 1..120)
- *   vayu_gnss_run=S         how long a session runs after LOC_START (default 120, 5..600)
+ *   vayu_gnss_run=S         how long a session runs after LOC_START (default 120, 5..600; 0: until the
+ *                           modem goes down -- what a location client in iOS needs)
  *   vayu_gnss_interval_ms=N minimum interval between fixes (default 1000, 200..60000)
+ *   vayu_gnss_v02=1         engine unlock, standalone mode, the time, and the v02 Start and position
+ *                           report (xreactx 12d310ec3; sys/vayu_gnss_qmi.h)
  *
  * Record layout: `magic` is 'GNSS' little-endian, `version` is VAYU_GNSS_VERSION and `size` is
  * sizeof(struct vayu_gnss_record) (96 bytes); a shim that does not find them should not read the

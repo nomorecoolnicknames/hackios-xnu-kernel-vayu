@@ -129,6 +129,31 @@ static CMBaseClassID (*device_class_id)(void);
 static CMBaseClassID (*stream_class_id)(void);
 static CFStringRef port_back;           /* kFigCapturePortType_BackFacingCamera */
 static CFStringRef port_front;          /* kFigCapturePortType_FrontFacingCamera */
+static CFStringRef port_uw;             /* kFigCapturePortType_BackFacingSuperWideCamera (iOS 13+; optional) */
+
+/*
+ * The ultrawide, as a third stream of this device, only when the kernel carries it (vayu_cam_uw=1:
+ * sensor 3, the OV8856 on CSIPHY0) and the run asks for the third stream (cam_uw_dev=1): one
+ * experiment, one variable -- a run without cam_uw_dev is the same kernel with the two cameras it
+ * had. The port type is iOS 13's super-wide one; if the CMCapture of this image has no such symbol
+ * the stream is not made and the device stays exactly the two-camera one it was.
+ */
+#define CAMERA_MAX      3
+
+static bool
+uw_from_boot_args(bool *kernel, bool *dev)
+{
+	char arguments[1024];
+	size_t size = sizeof(arguments);
+
+	*kernel = *dev = false;
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return false;
+	}
+	*kernel = strstr(arguments, "vayu_cam_uw=1") != NULL;
+	*dev = strstr(arguments, "cam_uw_dev=1") != NULL;
+	return *kernel && *dev;
+}
 
 /*
  * The frames' metadata: what H10ISP's stream attaches to every frame (a dictionary under
@@ -176,6 +201,11 @@ find_functions(void)
 	port_back = port != NULL ? *port : NULL;
 	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_FrontFacingCamera");
 	port_front = port != NULL ? *port : NULL;
+	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_BackFacingSuperWideCamera");
+	port_uw = port != NULL ? *port : NULL;
+	if (port_uw == NULL) {
+		say("kFigCapturePortType_BackFacingSuperWideCamera is not there: no ultrawide camera");
+	}
 	port = dlsym(RTLD_DEFAULT, "kFigCaptureSampleBufferAttachmentKey_MetadataDictionary");
 	md_attachment = port != NULL ? *port : NULL;
 	for (int i = 0; i < MD_KEYS; i++) {
@@ -444,11 +474,20 @@ static const struct camera {
 	bool            turned;         /* its sensor the other way up from the iPhone's: the pictures turned half round */
 	double          focal_length, f_number, pixel_size, fov;
 	int             formats[2][3];  /* sensor width, height, frames a second of "Photo" and of a video format */
-} cameras[2] = {
+} cameras[CAMERA_MAX] = {
 	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 4.0, 1.8, 1.22, 65.0,
 	  { { 4032, 3024, 30 }, { 4224, 2376, 60 } } },        /* "Photo", "Video-60" */
 	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true, 2.87, 2.2, 1.0, 70.0,
 	  { { 3088, 2320, 30 }, { 3840, 2160, 30 } } },        /* "Photo", "Video-30" */
+	/*
+	 * The ultrawide OV8856 (kernel sensor 3): 8 MP class, ~118 degrees. Its usual mode is the
+	 * kernel's binned 1632x1224 (the vendor module's own, ~60 fps) and its stills mode the vendor's
+	 * 3264x2448 (res0); the "Photo" size below is the stills mode's, the ISP scales the preview.
+	 * A separate AVCaptureDevice; iPhone10,3 knows no super-wide, so Camera.app shows no 0.5x for
+	 * it -- a third-party app or camera_avtest picks it by its port type.
+	 */
+	{ 3, "Back Ultra Wide Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:2", false, 2.2, 2.2, 1.12, 118.0,
+	  { { 3264, 2448, 30 }, { 3840, 2160, 30 } } },        /* "Photo", "Video-30" */
 };
 
 struct stream {
@@ -1849,7 +1888,7 @@ worker(void *context)
  * takes a moment to settle and the exposure longer), the second only when the graph starts the
  * stream itself (`graph` true, the FigCaptureStream start method).
  */
-static CMBaseObjectRef all_streams[2];  /* the device's, back and front */
+static CMBaseObjectRef all_streams[CAMERA_MAX];  /* the device's: back, front, and the ultrawide when it is there */
 static OSStatus stream_stop(CMBaseObjectRef o);
 
 static OSStatus
@@ -1867,7 +1906,7 @@ stream_begin(CMBaseObjectRef o, bool graph)
 		return 0;
 	}
 	/* one camera at a time: the kernel gives one sensor's frames (the other stream's worker stopped first) */
-	for (int i = 0; i < 2; i++) {
+	for (int i = 0; i < CAMERA_MAX; i++) {
 		if (all_streams[i] != NULL && all_streams[i] != o && stream_of(all_streams[i])->running) {
 			say("stream: the %s's frames stop for the %s's", stream_of(all_streams[i])->camera->name, s->camera->name);
 			(void)stream_stop(all_streams[i]);
@@ -2194,8 +2233,10 @@ OSStatus
 hakios_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, CMBaseObjectRef *out)
 {
 	static bool found, usable;
-	CMBaseObjectRef device = NULL, stream[2];
+	CMBaseObjectRef device = NULL, stream[CAMERA_MAX];
+	CFIndex count;
 	struct device *d;
+	bool uw, uw_kernel = false, uw_dev = false;
 
 	(void)options;
 	if (!found) {
@@ -2212,21 +2253,45 @@ hakios_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, C
 		CFRelease(stream[0]);
 		return ERR_UNSUPPORTED;
 	}
+	count = 2;
+	/*
+	 * The ultrawide: only when the kernel carries sensor 3 (vayu_cam_uw=1) and this image knows the
+	 * super-wide port type. Otherwise the device is exactly the two-camera one it was.
+	 */
+	uw = port_uw != NULL && uw_from_boot_args(&uw_kernel, &uw_dev);
+	if (uw) {
+		if ((stream[2] = stream_create(allocator, &cameras[2], port_uw)) != NULL) {
+			count = 3;
+		} else {
+			uw = false;
+			say("the ultrawide's stream cannot be made: the device stays two cameras");
+		}
+	} else {
+		say("the ultrawide is not offered (kernel vayu_cam_uw=1: %s, cam_uw_dev=1: %s, the port type: %s)",
+		    uw_kernel ? "yes" : "no", uw_dev ? "yes" : "no", port_uw != NULL ? "yes" : "no");
+	}
 	if (derived_create(allocator, &device_vtable, device_class_id(), &device) != 0 || device == NULL) {
-		CFRelease(stream[0]);
-		CFRelease(stream[1]);
+		for (CFIndex i = 0; i < count; i++) {
+			CFRelease(stream[i]);
+		}
 		say("the device cannot be made");
 		return ERR_UNSUPPORTED;
 	}
 	d = derived_storage(device);
 	memset(d, 0, sizeof(*d));
-	d->streams = CFArrayCreate(NULL, (const void **)stream, 2, &kCFTypeArrayCallBacks);
-	all_streams[0] = stream[0];             /* (kept by the device's array) */
-	all_streams[1] = stream[1];
+	d->streams = CFArrayCreate(NULL, (const void **)stream, count, &kCFTypeArrayCallBacks);
+	for (CFIndex i = 0; i < count; i++) {
+		all_streams[i] = stream[i];     /* (kept by the device's array) */
+	}
 	d->supported = supported(device_props, sizeof(device_props) / sizeof(device_props[0]));
-	CFRelease(stream[0]);
-	CFRelease(stream[1]);
+	for (CFIndex i = 0; i < count; i++) {
+		CFRelease(stream[i]);
+	}
 	*out = device;
-	say("the device made: two streams, the back camera and the front one");
+	if (count == 3) {
+		say("the device made: 3 streams, the back camera, the front one and the ultrawide");
+	} else {
+		say("the device made: two streams, the back camera and the front one");
+	}
 	return 0;
 }

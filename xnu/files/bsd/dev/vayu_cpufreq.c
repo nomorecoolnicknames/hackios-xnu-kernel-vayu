@@ -1,6 +1,9 @@
 /*
  * The clock speed of the processor cores the kernel runs on, on the POCO X3 Pro (vayu, SM8150-AC).
- * Only with boot-args cpufreq=1 cpufreq_vayu=1: the addresses are this phone's.
+ * Only with boot-args cpufreq=1 cpufreq_vayu=1: the addresses are this phone's. Without them,
+ * vayu_thermal_monitor=1 (default 0) runs the temperature throttle alone: nothing is raised, no
+ * governor, no SDP hold, L3 and DDR left alone; it only reads while cold, and when hot it steps the
+ * groups down from the rows the firmware left (never above them).
  *
  * hakios.cpufreq.c does the same job on the POCO X5 Pro (SM7325). Its hardware ("EPSS") has three
  * groups of 0x1000 bytes at 0x18591000, a table of 4-byte rows at 0x100 and the row that is wanted at
@@ -23,10 +26,24 @@
  * enabled. With cpufreq_dry=1 it writes nothing at all and only says what it sees; with
  * cpufreq_turbo=1 single-core rows are allowed too.
  *
- * With cpufreq_gov=1 (default 0: nothing changes) the row of each group follows the load: the idle
- * time of every core is read every cpufreq_gov_ms and a quiet group goes to the slowest row, a busy
- * one to the top (see the "governor" section below). Without it the top row stays written from boot
- * until the temperature throttle (vayu_thermal, 85 C) takes a step down.
+ * With cpufreq_gov=1 (the default now; cpufreq_gov=0: nothing changes) the row of each group follows
+ * the load: the idle time of every core is read every cpufreq_gov_ms and a quiet group goes to the
+ * slowest row, a busy one to the top (see the "governor" section below). With cpufreq_gov=0 the top
+ * row stays written from boot until the temperature throttle (vayu_thermal, 75 C) takes a step down.
+ *
+ * Power (o6, all off by default; each one changes nothing unless it is given):
+ *   cpufreq_gov_prop=1     the governor picks any ordinary row of the table in proportion to the load of
+ *                          the busiest core of the group, instead of the three rows top / ~3/4 / slowest
+ *                          (see "the proportional governor" below); cpufreq_gov_head=N (125), _up=N (1),
+ *                          _down=N (3), _dwell_ms=N (300) tune it. The thermal and SDP levels still cap it.
+ *   cpufreq_touch_boost_pct=N  (20..100, default 100 = the top row, as before) what the touch boost asks
+ *                          for with cpufreq_gov_prop=1: the row at no more than N % of the top.
+ *   cpufreq_touch_boost_fix=1  the boost's hold (cpufreq_touch_boost_ms, 300) in real milliseconds. Without
+ *                          it the touch's idle time (19.2 MHz ticks) is compared with nanoseconds, and every
+ *                          touch keeps all groups on their top rows for 15.6 s.
+ *   cpufreq_screen_off=1   while iOS has the display off (RequestPowerChange 0, MiniIOMobileFramebuffer),
+ *                          after cpufreq_screen_off_ms (5000), every group at its slowest row, as the SDP
+ *                          hold does; the display back on lets go at once.
  *
  * The system cache's clock (L3) is a fourth OSM group at 0x18321000 with the same table and row
  * register (vendor clk-cpu-osm.c:985-992,44-53,935-972,1170,245); cpufreq_l3=0 leaves it alone. With
@@ -39,8 +56,10 @@
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 #include <sys/systm.h>
 #include <sys/vayu_cpufreq.h>
+#include <sys/vayu_pas.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -48,9 +67,6 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_line(const char *line);
 extern bool hakios_spmi_peek(uint16_t id, uint8_t reg, uint8_t *value);
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);        /* osfmk/arm64/machine_routines.c */
-extern bool vayu_rsc_tcs_lock(const char *who);  /* vayu_pas.c: THE lock of TCS 0 of the apps RSC */
-extern void vayu_rsc_tcs_unlock(void);
-extern bool vayu_rsc_tcs_gave_up(void);
 
 #define OSM_DOMAINS             3
 #define OSM_DOMAIN_SIZE         0x1400
@@ -180,8 +196,13 @@ struct raised_domain {
 	uint32_t was;
 	uint32_t row[3];        /* by thermal level (vayu_thermal below): the top row, a ~3/4 row, the slowest row */
 	uint32_t khz[3];
+	uint32_t written;       /* the row thermal_apply() last wrote (UINT32_MAX: none) */
 	bool per_core;
-	bool wrote;
+	bool wrote;             /* a row of ours is in the hardware: vayu_cpufreq_quiesce() puts `was' back */
+	bool managed;           /* the throttle steps this group: raised, or left at its top by the firmware */
+	uint32_t steps;                         /* cpufreq_gov_prop: the ladder below, fastest first */
+	uint32_t ladder_row[OSM_ROWS];
+	uint32_t ladder_khz[OSM_ROWS];
 };
 
 static struct raised_domain raised[OSM_DOMAINS];
@@ -224,8 +245,43 @@ thermal_rows(vm_offset_t base, uint32_t rows, bool turbo, const struct osm_row *
 	khz[2] = low.khz;
 }
 
+/*
+ * cpufreq_gov_prop: every ordinary row of the table, one per frequency, fastest first, and none faster
+ * than the top row found above (heat3's ladder, k32-heat; run d-1081c7 idled at its slowest steps).
+ * The table's order is not assumed. A table with no usable row leaves steps at 0: the proportional
+ * governor then leaves the group to the three rows above.
+ */
 static void
-raise_domain(uint32_t domain, uint32_t cores, bool dry, bool force, bool turbo)
+build_ladder(vm_offset_t base, uint32_t rows, bool turbo, const struct osm_row *top, struct raised_domain *d)
+{
+	uint32_t n = 0;
+
+	for (uint32_t i = 0; i < rows && i < OSM_ROWS; i++) {
+		struct osm_row r;
+		uint32_t at;
+
+		read_row(base, i, &r);
+		if ((r.cores == OSM_SINGLE_CORE && !turbo) || r.khz > top->khz) {
+			continue;
+		}
+		for (at = 0; at < n && d->ladder_khz[at] > r.khz; at++) {
+		}
+		if (at < n && d->ladder_khz[at] == r.khz) {
+			continue;               /* (the table repeats frequencies: one step is enough) */
+		}
+		for (uint32_t j = n; j > at; j--) {
+			d->ladder_khz[j] = d->ladder_khz[j - 1];
+			d->ladder_row[j] = d->ladder_row[j - 1];
+		}
+		d->ladder_khz[at] = r.khz;
+		d->ladder_row[at] = r.index;
+		n++;
+	}
+	d->steps = n != 0 && d->ladder_khz[0] == top->khz ? n : 0;
+}
+
+static void
+raise_domain(uint32_t domain, uint32_t cores, bool dry, bool force, bool turbo, bool monitor)
 {
 	vm_offset_t base = ml_io_map(osm_phys[domain], OSM_DOMAIN_SIZE);
 	struct osm_row top, now;
@@ -257,9 +313,25 @@ raise_domain(uint32_t domain, uint32_t cores, bool dry, bool force, bool turbo)
 		    state);
 		return;
 	}
-	if (have_now && top.khz <= now.khz) {
-		tell("cpufreq: vayu: group %u: row %u (%u MHz) is not faster than row %u (%u MHz), not touching it\n", domain,
-		    top.index, top.khz / 1000, state, now.khz / 1000);
+	if (monitor && !have_now) {
+		return;
+	}
+	if (have_now && (monitor || top.khz <= now.khz)) {
+		/*
+		 * Not raised -- the firmware's row is as fast as ours, or only the monitor runs -- but still the
+		 * throttle's: a group the loader left at its top row was never slowed down when hot (review R1.2).
+		 * Its level 0 is the firmware's row; nothing is written until a level asks for another.
+		 */
+		if (!dry) {
+			raised[domain].base = base;
+			raised[domain].was = state;
+			raised[domain].per_core = (dcvs & 1) != 0;
+			thermal_rows(base, rows, turbo, &now, raised[domain].row, raised[domain].khz);
+			raised[domain].written = state;
+			raised[domain].managed = true;
+		}
+		tell("cpufreq: vayu: group %u: keeping the firmware's row %u (%u MHz)%s\n", domain, state, now.khz / 1000,
+		    dry ? "; read-only" : "; the thermal throttle steps down from it");
 		return;
 	}
 	if (dry) {
@@ -271,7 +343,10 @@ raise_domain(uint32_t domain, uint32_t cores, bool dry, bool force, bool turbo)
 	raised[domain].was = state;
 	raised[domain].per_core = (dcvs & 1) != 0;
 	thermal_rows(base, rows, turbo, &top, raised[domain].row, raised[domain].khz);
+	build_ladder(base, rows, turbo, &top, &raised[domain]);
+	raised[domain].written = top.index;
 	raised[domain].wrote = true;
+	raised[domain].managed = true;
 	*(volatile uint32_t *)(base + OSM_PERF_STATE) = top.index;
 	if (raised[domain].per_core) {
 		for (uint32_t core = 1; core < osm_cores[domain]; core++) {
@@ -294,7 +369,9 @@ raise_domain(uint32_t domain, uint32_t cores, bool dry, bool force, bool turbo)
 static struct {
 	vm_offset_t base;
 	uint32_t was, top;
-	bool wrote;
+	uint32_t rest;                          /* level 2's row: the firmware's, or the slowest if that was the top */
+	uint32_t written;                       /* the row thermal_apply() last wrote */
+	bool wrote, managed;
 } l3_raised;
 
 static void
@@ -322,8 +399,18 @@ raise_l3(bool dry)
 		return;
 	}
 	if (have_now && top.khz <= now.khz) {
-		tell("cpufreq: vayu: L3: row %u (%u MHz) is not faster than row %u (%u MHz), not touching it\n", top.index,
-		    top.khz / 1000, state, now.khz / 1000);
+		/* (left at its top by the firmware: the throttle's all the same, its level 2 the slowest row) */
+		if (!dry) {
+			uint32_t row[3], khz[3];
+
+			thermal_rows(base, rows, true, &now, row, khz);
+			l3_raised.base = base;
+			l3_raised.was = l3_raised.top = l3_raised.written = state;
+			l3_raised.rest = row[2];
+			l3_raised.managed = true;
+		}
+		tell("cpufreq: vayu: L3: keeping the firmware's row %u (%u MHz)%s\n", state, now.khz / 1000,
+		    dry ? "; read-only" : "; the thermal throttle steps down from it");
 		return;
 	}
 	if (!have_now) {
@@ -335,9 +422,11 @@ raise_l3(bool dry)
 		return;
 	}
 	l3_raised.base = base;
-	l3_raised.was = state;
+	l3_raised.was = l3_raised.rest = state;
 	l3_raised.top = top.index;
+	l3_raised.written = top.index;
 	l3_raised.wrote = true;
+	l3_raised.managed = true;
 	*(volatile uint32_t *)(base + OSM_PERF_STATE) = top.index;
 	delay_for_interval(20, NSEC_PER_MSEC);
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -512,7 +601,8 @@ vote_bandwidth(bool dry)
 	uint32_t mc0, sh0, acv, vote = 0x3fff;
 	uint32_t address[3], data[3], status[3] = { 0 };
 	vm_offset_t tcs;
-	bool done, held;
+	bool done;
+	enum vayu_rsc_tcs_result held;
 
 	if (PE_parse_boot_argn("vayu_cmd_db", &db_phys, sizeof(db_phys)) && db_phys == 0) {
 		db_phys = VAYU_CMD_DB_PHYS;
@@ -552,12 +642,12 @@ vote_bandwidth(bool dry)
 		return;
 	}
 	held = vayu_rsc_tcs_lock("cpufreq");    /* (vayu_pas.c: THE one lock of TCS 0) */
-	if (!held && vayu_rsc_tcs_gave_up()) {
+	if (held == VAYU_RSC_TCS_FAILED) {
 		tell("cpufreq: vayu: ddr: TCS 0 was not taken: not voting\n");
 		return;
 	}
 	done = rpmh_vote(tcs, address, data, 3, status);
-	if (held) {
+	if (held == VAYU_RSC_TCS_HELD) {
 		vayu_rsc_tcs_unlock();
 	}
 	tell("cpufreq: vayu: ddr: bandwidth vote %u on MC0/SH0 + ACV 0x8: %s\n", vote, done ? "done" : "NO ANSWER");
@@ -580,19 +670,25 @@ vote_bandwidth(bool dry)
  *          (buttons=1): TYPE 0x04 = 0x09, SUBTYPE 0x05 (0x08 gen1, 0x09 gen2), STATUS 0x08 -- gen1
  *          the stage in [1:0], gen2 a state in [6:4] mapped {0,1,1,2,2,3,3,3} (mainline
  *          qcom-spmi-temp-alarm.c:23-43,153). Stage 1 is 90..105 C on the PMIC's die.
- * The throttle: level 0 = the top rows raised above; at vayu_thermal_hot (default 85 C, the
+ * The throttle: level 0 = the top rows raised above; at vayu_thermal_hot (default 75 C, the
  * hottest valid TSENS sensor) level 1 = a ~3/4 row per raised group; at hot + 10 C, or any PMIC
  * stage >= 1, level 2 = the slowest row and L3 back to the firmware's row. One level down only
- * below the level's own threshold minus 10 C. No valid sensor at all: level 1 (not the top rows
- * blind). Only groups this driver raised are ever written (none with cpufreq_dry=1). Changes go to
- * the loader log at once, a summary every 60 s.
+ * below the level's own threshold minus 10 C, and (level 1 -> 0) only after the level has held for
+ * vayu_thermal_hold_ms (default 3000): the junction swings ~20 C a second under a burst, so without
+ * the hold the throttle alone makes a 68..91 C sawtooth (see the note above thermal_apply()).
+ * No valid sensor at all: level 2 at least, and a level already in force is never relaxed (a hot
+ * core whose sensors stopped answering is not sped up); a PMIC alarm that cannot be read keeps the
+ * level from going down. Only groups this driver raised, or found at their top row, are ever
+ * written (none with cpufreq_dry=1), and only rows that changed. Changes go to the loader log at
+ * once, a summary every 60 s.
  */
 #define TSENS_CONTROLLERS       2
 #define TSENS_SENSORS           16
 #define TSENS_TM_STATUS(n)      (0x0a0 + 4 * (n))
 #define TSENS_SROT_CTRL         0x004
 #define TSENS_VALID             (1u << 21)
-#define THERMAL_POLL_MS         2000
+#define THERMAL_POLL_MS         2000    /* the PMIC alarm and the SDP check: register reads over SPMI */
+#define THERMAL_TICK_MS         100     /* the TSENS sensors: 32 words of memory, read every tick */
 
 static const uint32_t tsens_tm_phys[TSENS_CONTROLLERS] = { 0x0c263000, 0x0c265000 };
 static const uint32_t tsens_srot_phys[TSENS_CONTROLLERS] = { 0x0c222000, 0x0c223000 };
@@ -610,6 +706,10 @@ static struct {
 	uint32_t enabled[TSENS_CONTROLLERS];    /* sensor mask from SROT */
 	int hot;                                /* deci-C */
 	uint32_t level;                         /* what the temperature asks for */
+	int temp;                               /* the last hottest sensor, deci-C (thermal.have: valid) */
+	bool have;
+	uint64_t level_since;                   /* when thermal.level last went up (the hold below) */
+	uint32_t hold_ms;                       /* vayu_thermal_hold_ms: no step back 1 -> 0 before this */
 	uint32_t applied;                       /* signature of what is written (see applied_signature()) */
 	bool sensors;                           /* vayu_thermal: the TSENS/PMIC side is on */
 	bool sdp_hold;                          /* charging from a PC port (SDP, 500 mA) with the battery low: level 2 */
@@ -618,28 +718,98 @@ static struct {
 } thermal;
 
 /*
- * cpufreq_gov=1 (default 0: nothing changes): a load governor on the rows the throttle already
- * steps through. Every cpufreq_gov_ms (default 100, 20..1000) the idle time of every core of ours
- * (ml_cpu_idle_time(), as hakios.cpufreq.c's cpuload does) is read, and each OSM group takes
+ * cpufreq_gov=1 (the default; cpufreq_gov=0: nothing changes): a load governor on the rows the
+ * throttle already steps through. Every cpufreq_gov_ms (default 100, 20..1000) the idle time of
+ * every core of ours (ml_cpu_idle_time(), as hakios.cpufreq.c's cpuload does) is read, and each OSM
+ * group takes
  *   level 0  the top row, while the group's cores were 50 % busy or more;
  *   level 1  the ~3/4 row, between 15 and 50 %;
  *   level 2  the slowest row, under 15 % -- after three samples in a row (300 ms), so that the
  *            bursts of the framebuffer's copy and of a gesture do not throw it down and up again.
+ * The two thresholds have 5 points of hysteresis on the way back down (45 and 10 %): a group whose
+ * load sits on a threshold -- cpu7 alone, 11..17 % in the 03.11 log -- otherwise flips its row
+ * every 300 ms, and every flip used to write all three groups and L3 and print five lines.
  * A busier group goes back up at once. The governor only ever asks for a slower row than the
  * temperature/SDP level does: thermal_apply() takes the higher of the two. It writes only groups
  * the driver raised, and nothing after vayu_cpufreq_quiesce().
+ *
+ * The log: quiet by default. One summary line every cpufreq_gov_sum_ms (default 10000); a line per
+ * row change only with cpufreq_gov_log=1, and then no more than once per group per
+ * cpufreq_gov_log_ms (default 5000).
  */
 #define GOVERNOR_BUSY_TOP       50      /* per cent of the cores' time, per group */
 #define GOVERNOR_BUSY_MID       15
+#define GOVERNOR_BACK            5      /* points below a threshold before a group leaves its level */
 #define GOVERNOR_QUIET_SAMPLES  3
+
+/*
+ * The proportional governor (cpufreq_gov_prop=1; o6). The three rows above put a group on its top row
+ * from 50 % busy: run 1078 (03.11, k30, screen off from 223 s on) kept the big cores at 1804-2419 MHz
+ * and the prime core at 2956 MHz at 25-45 % and 11-100 % busy, 68-80 C, the battery giving 350-575 mA
+ * on top of the USB port's 500. Here a group takes the slowest step of build_ladder()'s whose frequency
+ * covers
+ *
+ *   the frequency now x the busy share of the group's busiest core x cpufreq_gov_head (125 %)
+ *
+ * -- the busiest core and not the mean, because the group's cores share one clock: one thread that
+ * keeps one big core busy needs the clock that core needs, however idle its two neighbours are (the
+ * mean of the three asked for a third of it). The frequency now and not the top: at a slower row the
+ * same work is a larger share, and asking from the top would never settle (90 % or more: twice the
+ * frequency now, see governor_prop_sample()). The share rises at once and
+ * falls smoothed (7/10 of the old); a step up is taken after cpufreq_gov_up samples (1), at once when it
+ * is two steps or more; a step down after cpufreq_gov_down (3) and no sooner than cpufreq_gov_dwell_ms
+ * (300) after the group's last change. The thermal and SDP levels stay caps: the slower of the two rows
+ * is written (wanted_row()). A row change is written without the 20 ms wait and the line, which are for
+ * cpufreq_gov_log=1: Linux's qcom-cpufreq-hw writes the same register and does not wait either.
+ */
+#define GOVERNOR_SMOOTH_OLD     7       /* tenths of the old share kept on the way down */
+#define GOVERNOR_SATURATED      90      /* per cent: the busiest core had no idle time to speak of */
+
+/*
+ * cpufreq_touch_boost=1 (default 1; 0: off): while a finger is on the screen, and for
+ * cpufreq_touch_boost_ms (default 300, 0..5000) after the last sample, every group asks for its top
+ * row regardless of the load. The load governor's thresholds are averages over cpufreq_gov_ms and a
+ * quiet group needs GOVERNOR_QUIET_SAMPLES samples before it drops: at the moment a finger lands
+ * after an idle screen the groups are already at the slowest row (03.11, d12b: 300/710/825 MHz), and
+ * the first frames of that scroll were 34-75 ms apart while the window server asked for 120 a second
+ * (670.9 s: 20 frames in 1267 ms, 167 touch samples). The temperature still wins: thermal_apply()
+ * takes the higher of this and the thermal level, so the boost can never go above the throttle's cap.
+ *
+ * bsd/dev/hakios.input.c: 0 while a finger is down, otherwise the time since the last sample in
+ * mach_absolute_time units (not nanoseconds: see cpufreq_touch_boost_fix), or ~0 when there has never
+ * been one.
+ */
+extern uint64_t hakios_touch_idle_abs(void);
 
 static struct {
 	bool on;
+	bool log;                               /* cpufreq_gov_log=1: a line per row change (rate limited) */
 	uint32_t every_ms;
+	uint32_t log_ms;                        /* cpufreq_gov_log_ms: the least gap between two such lines */
+	uint32_t sum_ms;                        /* cpufreq_gov_sum_ms: the summary line's period (0: none) */
+	uint32_t touch_boost;                   /* cpufreq_touch_boost: the top rows while a finger is down */
+	uint32_t touch_boost_ms;                /* cpufreq_touch_boost_ms: how long after the last sample */
+	bool boost;                             /* a finger is down (or was within touch_boost_ms): the top rows */
+	bool boosted;                           /* the last sample was boosted (for the one line per change) */
 	uint32_t level[OSM_DOMAINS];            /* 0 top, 1 the ~3/4 row, 2 the slowest row */
+	uint32_t percent[OSM_DOMAINS];          /* the last sample, for the summary */
 	uint32_t quiet[OSM_DOMAINS];            /* samples in a row that ask for a slower level */
+	uint64_t told[OSM_DOMAINS];             /* when this group's row change was last printed, ns */
 	uint64_t idle_before[MAX_CPUS];
 	uint64_t then;
+	bool prop;                              /* cpufreq_gov_prop=1: the proportional governor */
+	uint32_t head, up, down, dwell_ms;      /* cpufreq_gov_head/_up/_down/_dwell_ms */
+	uint32_t boost_pct;                     /* cpufreq_touch_boost_pct */
+	bool boost_fix;                         /* cpufreq_touch_boost_fix=1: the hold in real milliseconds */
+	uint32_t step[OSM_DOMAINS];             /* the ladder step the load asks for: 0 the top row */
+	uint32_t share[OSM_DOMAINS];            /* the busiest core's share, x10, smoothed */
+	uint32_t pending[OSM_DOMAINS], pending_n[OSM_DOMAINS];  /* the step wanted next, and for how many samples */
+	uint64_t changed[OSM_DOMAINS];          /* when the group's step last changed, ns */
+	uint32_t screen_off;                    /* cpufreq_screen_off=1 */
+	uint32_t screen_off_ms;                 /* cpufreq_screen_off_ms */
+	volatile bool display_off;              /* iOS has the display off (vayu_cpufreq_display()) */
+	volatile uint64_t display_off_at;       /* ... since then, ns */
+	bool screen_hold;                       /* the slowest rows because of it (the thermal thread's view) */
 } governor;
 
 /* The row the group should be at: the slower (higher) of the temperature's and the load's. */
@@ -648,22 +818,188 @@ effective_level(uint32_t domain)
 {
 	uint32_t level = thermal.level;
 
-	if (thermal.sdp_hold) {
+	if (thermal.sdp_hold || governor.screen_hold) {
 		level = 2;
 	}
 	return governor.level[domain] > level ? governor.level[domain] : level;
 }
 
-/* What thermal_apply() would write now: 0 is never a valid signature. */
+/* The row to write for a group: its level's, or with cpufreq_gov_prop=1 the governor's step when that
+ * one is slower (the levels stay caps; governor.level[] is never raised in that mode). */
+static uint32_t
+wanted_row(uint32_t domain, uint32_t *khz)
+{
+	const struct raised_domain *d = &raised[domain];
+	uint32_t level = effective_level(domain), row = d->row[level], k = d->khz[level];
+
+	if (governor.on && governor.prop && d->steps != 0) {
+		uint32_t step = governor.step[domain] < d->steps ? governor.step[domain] : d->steps - 1;
+
+		if (d->ladder_khz[step] < k) {
+			row = d->ladder_row[step];
+			k = d->ladder_khz[step];
+		}
+	}
+	if (khz != NULL) {
+		*khz = k;
+	}
+	return row;
+}
+
+/* The row each group is at now (the higher of the load governor's and the temperature's) and its
+ * frequency in MHz: for the display driver's once-a-second scroll line (scroll120), which says
+ * whether a finger's frames were slow because the cores were still on the slowest row. */
+void
+vayu_cpufreq_rows(uint32_t row[OSM_DOMAINS], uint32_t mhz[OSM_DOMAINS])
+{
+	for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
+		uint32_t level = effective_level(domain), khz;
+
+		if (!raised[domain].managed || level > 2) {
+			row[domain] = UINT32_MAX;
+			mhz[domain] = 0;
+			continue;
+		}
+		row[domain] = wanted_row(domain, &khz);
+		mhz[domain] = khz / 1000;
+	}
+}
+
+/* What thermal_apply() would write now: 0 is never a valid signature. The governor's own level is
+ * not in it: what matters is the row the two of them agree on, so a governor step that does not
+ * change that row must not make thermal_apply() write (and wait 20 ms) again. */
 static uint32_t
 applied_signature(void)
 {
-	uint32_t signature = (thermal.level + 1) * 2 + (thermal.sdp_hold ? 1 : 0);
+	uint32_t signature = (thermal.sdp_hold ? 1 : 0) + 1;
 
 	for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
-		signature = signature * 4 + governor.level[domain];
+		signature = signature * 4 + effective_level(domain);
+	}
+	if (governor.on && governor.prop) {
+		/* (the rows themselves: a step of the proportional governor is not a level) */
+		for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
+			signature = signature * OSM_ROWS + wanted_row(domain, NULL);
+		}
 	}
 	return signature;
+}
+
+/* Nanoseconds on the monotonic clock (the same base as the governor's interval arithmetic). */
+static uint64_t
+now_ns(void)
+{
+	uint64_t nanos = 0;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &nanos);
+	return nanos;
+}
+
+/*
+ * cpufreq_screen_off=1: iOS's display power (MiniIOMobileFramebuffer, RequestPowerChange: in[0] 0 the
+ * display off). Only noted here; the thermal thread holds the slowest rows once the display has been off
+ * for cpufreq_screen_off_ms and lets go at its next tick after the display is back.
+ */
+void
+vayu_cpufreq_display(bool on)
+{
+	if (!on && !governor.display_off) {
+		governor.display_off_at = now_ns();
+	}
+	governor.display_off = !on;
+}
+
+/* cpufreq_gov_prop: the slowest ladder step whose frequency is at least `khz` (0, the top, if none is). */
+static uint32_t
+ladder_step_for(const struct raised_domain *d, uint64_t khz)
+{
+	uint32_t step = 0;
+
+	for (uint32_t i = 1; i < d->steps && d->ladder_khz[i] >= khz; i++) {
+		step = i;
+	}
+	return step;
+}
+
+/*
+ * One sample of the proportional governor for one group: `most` is the busiest core's share of the
+ * interval in per cent. Only governor.step[] changes here; thermal_apply() writes the row.
+ */
+static void
+governor_prop_sample(uint32_t domain, uint32_t most)
+{
+	const struct raised_domain *d = &raised[domain];
+	uint32_t now, want, share;
+	uint64_t nanoseconds;
+
+	if (most * 10 > governor.share[domain]) {
+		governor.share[domain] = most * 10;
+	} else {
+		governor.share[domain] = (governor.share[domain] * GOVERNOR_SMOOTH_OLD + most * 10 * (10 - GOVERNOR_SMOOTH_OLD)) / 10;
+	}
+	share = (governor.share[domain] + 5) / 10;
+	governor.percent[domain] = share;
+	if (!d->wrote || d->steps < 2) {
+		return;
+	}
+	now = governor.step[domain] < d->steps ? governor.step[domain] : d->steps - 1;
+	/*
+	 * A core busy the whole interval says only that it needs more, not how much: twice the frequency
+	 * then (the slowest row to the top in three samples), not 125 % of it a step at a time.
+	 */
+	want = ladder_step_for(d, share >= GOVERNOR_SATURATED ? 2ULL * d->ladder_khz[now] :
+	    (uint64_t)d->ladder_khz[now] * share / 100 * governor.head / 100);
+	if (governor.boost) {
+		uint64_t most_khz = (uint64_t)d->ladder_khz[0] * governor.boost_pct / 100;
+		uint32_t floor = d->steps - 1;
+
+		/* a finger: at least the fastest step at no more than boost_pct of the top */
+		for (uint32_t i = 0; i < d->steps; i++) {
+			if (d->ladder_khz[i] <= most_khz) {
+				floor = i;
+				break;
+			}
+		}
+		if (floor < want) {
+			want = floor;
+		}
+	}
+	if (want == now) {
+		governor.pending_n[domain] = 0;
+		return;
+	}
+	/*
+	 * A run of samples that all ask the same way; the step taken at its end is the least change any of
+	 * them asked for (the smoothed share still wobbles by a step from one sample to the next).
+	 */
+	if (governor.pending_n[domain] == 0 || (governor.pending[domain] < now) != (want < now)) {
+		governor.pending[domain] = want;
+		governor.pending_n[domain] = 0;
+	} else if (want < now ? want > governor.pending[domain] : want < governor.pending[domain]) {
+		governor.pending[domain] = want;
+	}
+	governor.pending_n[domain]++;
+	nanoseconds = now_ns();
+	if (want < now) {
+		/* faster: after cpufreq_gov_up samples, or at once for two steps or more (a burst begins) */
+		if (now - want >= 2) {
+			governor.pending[domain] = want;
+		} else if (governor.pending_n[domain] < governor.up) {
+			return;
+		}
+	} else if (governor.pending_n[domain] < governor.down ||
+	    nanoseconds - governor.changed[domain] < (uint64_t)governor.dwell_ms * NSEC_PER_MSEC) {
+		return;
+	}
+	want = governor.pending[domain];
+	governor.step[domain] = want;
+	governor.changed[domain] = nanoseconds;
+	governor.pending_n[domain] = 0;
+	if (governor.log && nanoseconds - governor.told[domain] >= (uint64_t)governor.log_ms * NSEC_PER_MSEC) {
+		governor.told[domain] = nanoseconds;
+		tell("cpufreq: vayu: governor: group %u %u%% busy (busiest core): step %u of %u, row %u, %u MHz\n", domain, share,
+		    want, d->steps, d->ladder_row[want], d->ladder_khz[want] / 1000);
+	}
 }
 
 static void
@@ -671,7 +1007,7 @@ governor_sample(void)
 {
 	const ml_topology_info_t *topology = ml_get_topology_info();
 	uint64_t now = mach_absolute_time();
-	uint32_t busy[OSM_DOMAINS] = { 0 }, cores[OSM_DOMAINS] = { 0 };
+	uint32_t busy[OSM_DOMAINS] = { 0 }, cores[OSM_DOMAINS] = { 0 }, most[OSM_DOMAINS] = { 0 };
 
 	if (governor.then == 0) {
 		/* the first sample only takes the counters: there is no interval to divide by yet */
@@ -703,15 +1039,68 @@ governor_sample(void)
 		}
 		cores[domain]++;
 		if (delta > idle - idle_then) {
-			busy[domain] += (uint32_t)(100 * (delta - (idle - idle_then)) / delta);
+			uint32_t one = (uint32_t)(100 * (delta - (idle - idle_then)) / delta);
+
+			busy[domain] += one;
+			if (one > most[domain]) {
+				most[domain] = one;
+			}
 		}
 	}
 	governor.then = now;
+	/*
+	 * A finger on the screen asks for the top rows at once (cpufreq_touch_boost): the load numbers
+	 * above are an average of the last cpufreq_gov_ms, so they are the *end* of the quiet interval a
+	 * scroll begins in, not the work the scroll is about to do. thermal_apply() still takes the higher
+	 * of this and the thermal level, so a hot junction is not overruled.
+	 */
+	{
+		bool boost = false;
+
+		if (governor.touch_boost != 0) {
+			uint64_t idle = hakios_touch_idle_abs();
+			uint64_t hold = (uint64_t)governor.touch_boost_ms * NSEC_PER_MSEC;
+
+			/*
+			 * (idle is in mach_absolute_time units, 19.2 MHz here, not nanoseconds: compared with
+			 * nanoseconds the 300 ms hold is 15.6 s -- d1081c2: 6 boosts, 163 s of 490 at the top.
+			 * cpufreq_touch_boost_fix=1 compares like with like; without it the hold is as it was.)
+			 */
+			if (governor.boost_fix) {
+				nanoseconds_to_absolutetime((uint64_t)governor.touch_boost_ms * NSEC_PER_MSEC, &hold);
+			}
+			boost = idle == 0 || idle < hold;
+		}
+		if (boost != governor.boosted) {
+			governor.boosted = boost;
+			tell("cpufreq: vayu: touch boost %s: the rows go to the top %s\n", boost ? "on" : "off",
+			    boost ? "while a finger is down" : "back to the load");
+		}
+		governor.boost = boost;
+	}
 	for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
 		uint32_t percent = cores[domain] != 0 ? busy[domain] / cores[domain] : 0;
-		uint32_t want = percent >= GOVERNOR_BUSY_TOP ? 0 : percent >= GOVERNOR_BUSY_MID ? 1 : 2;
-		uint32_t level = governor.level[domain];
+		uint32_t want, level = governor.level[domain];
 
+		if (governor.prop && raised[domain].steps >= 2) {
+			governor_prop_sample(domain, most[domain]);
+			continue;               /* (a group with no ladder keeps the three rows below) */
+		}
+		/* (the thresholds differ on the way down: a load that sits on one does not flip the row) */
+		if (governor.boost) {
+			want = 0;
+		} else if (percent >= GOVERNOR_BUSY_TOP) {
+			want = 0;
+		} else if (level == 0 && percent >= GOVERNOR_BUSY_TOP - GOVERNOR_BACK) {
+			want = 0;
+		} else if (percent >= GOVERNOR_BUSY_MID) {
+			want = 1;
+		} else if (level <= 1 && percent >= GOVERNOR_BUSY_MID - GOVERNOR_BACK) {
+			want = 1;
+		} else {
+			want = 2;
+		}
+		governor.percent[domain] = percent;
 		if (want < level) {
 			governor.level[domain] = want;          /* busier: at once */
 			governor.quiet[domain] = 0;
@@ -723,11 +1112,49 @@ governor_sample(void)
 		} else {
 			governor.quiet[domain] = 0;
 		}
-		if (governor.level[domain] != level && raised[domain].wrote) {
-			tell("cpufreq: vayu: governor: group %u %u%% busy: row %u, %u MHz\n", domain, percent,
-			    raised[domain].row[governor.level[domain]], raised[domain].khz[governor.level[domain]] / 1000);
+		if (governor.level[domain] != level && raised[domain].managed && governor.log) {
+			uint64_t nanoseconds = now_ns();
+
+			if (nanoseconds - governor.told[domain] >= (uint64_t)governor.log_ms * NSEC_PER_MSEC) {
+				governor.told[domain] = nanoseconds;
+				tell("cpufreq: vayu: governor: group %u %u%% busy: row %u, %u MHz\n", domain, percent,
+				    raised[domain].row[governor.level[domain]], raised[domain].khz[governor.level[domain]] / 1000);
+			}
 		}
 	}
+}
+
+/* One line every cpufreq_gov_sum_ms: the rows, the load and the hottest sensor. */
+static void
+governor_summary(void)
+{
+	char line[192];
+
+	if (governor.prop) {
+		uint32_t khz[OSM_DOMAINS] = { 0 };
+
+		for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
+			if (raised[domain].managed) {
+				(void)wanted_row(domain, &khz[domain]);
+			}
+		}
+		/* (the busiest core of each group, smoothed; the MHz are what is written, caps included) */
+		snprintf(line, sizeof(line), "cpufreq: vayu: governor: steps %u/%u/%u, %u/%u/%u MHz, busiest %u/%u/%u %%, %d.%d C%s",
+		    governor.step[0], governor.step[1], governor.step[2], khz[0] / 1000, khz[1] / 1000, khz[2] / 1000,
+		    governor.percent[0], governor.percent[1], governor.percent[2], thermal.temp / 10,
+		    (thermal.temp < 0 ? -thermal.temp : thermal.temp) % 10, governor.screen_hold ? ", screen off: slowest" : "");
+		tell("%s\n", line);
+		return;
+	}
+	if (thermal.have) {
+		snprintf(line, sizeof(line), "cpufreq: vayu: governor: rows %u/%u/%u, busy %u/%u/%u %%, %d.%d C",
+		    governor.level[0], governor.level[1], governor.level[2], governor.percent[0], governor.percent[1],
+		    governor.percent[2], thermal.temp / 10, (thermal.temp < 0 ? -thermal.temp : thermal.temp) % 10);
+	} else {
+		snprintf(line, sizeof(line), "cpufreq: vayu: governor: rows %u/%u/%u, busy %u/%u/%u %%", governor.level[0],
+		    governor.level[1], governor.level[2], governor.percent[0], governor.percent[1], governor.percent[2]);
+	}
+	tell("%s\n", line);
 }
 
 /* The hottest valid sensor, in tenths of a degree; false if none is valid. */
@@ -790,40 +1217,65 @@ pmic_stage(int stage[3])
 	return most;
 }
 
+/*
+ * The rows the levels ask for, and only those that changed. The old version wrote every group on
+ * every signature change: with the governor on, one step of one group (cpu7's own group flips on
+ * the 15 % line every 300 ms) rewrote all three groups and L3, waiting 20 ms after each write --
+ * 63..80 ms of the thermal thread and five log lines, 2780 times in the 03.11 log. Now a group
+ * whose row is already the wanted one is left alone: no write, no wait, no line.
+ */
 static void
 thermal_apply(void)
 {
 	for (uint32_t domain = 0; domain < OSM_DOMAINS && !thermal.stopped; domain++) {
-		uint32_t row, state, level;
+		uint32_t row, state, level, khz;
 
-		if (!raised[domain].wrote) {
+		if (!raised[domain].managed) {
 			continue;
 		}
 		level = effective_level(domain);
-		row = raised[domain].row[level];
+		row = wanted_row(domain, &khz);
+		if (row == raised[domain].written) {
+			continue;
+		}
+		raised[domain].wrote = true;
 		*(volatile uint32_t *)(raised[domain].base + OSM_PERF_STATE) = row;
 		if (raised[domain].per_core) {
 			for (uint32_t core = 1; core < osm_cores[domain]; core++) {
 				*(volatile uint32_t *)(raised[domain].base + OSM_PERF_STATE + 4 * core) = row;
 			}
 		}
+		raised[domain].written = row;
+		if (governor.on && governor.prop && !governor.log) {
+			__asm__ volatile ("dsb sy" ::: "memory");
+			continue;               /* (cpufreq_gov_prop: no wait, no line; see "the proportional governor") */
+		}
 		delay_for_interval(20, NSEC_PER_MSEC);
 		__asm__ volatile ("dsb sy" ::: "memory");
 		state = *(volatile uint32_t *)(raised[domain].base + OSM_PERF_STATE);
-		tell("thermal: vayu: group %u -> row %u, %u MHz (level %u)%s\n", domain, row, raised[domain].khz[level] / 1000,
+		tell("thermal: vayu: group %u -> row %u, %u MHz (level %u)%s\n", domain, row, khz / 1000,
 		    level, state == row ? "" : " (the hardware reports another row)");
 	}
-	if (l3_raised.wrote && !thermal.stopped) {
+	if (l3_raised.managed && !thermal.stopped) {
 		uint32_t level = 2, any = 0, row;
 
 		/* L3 is shared: it follows the busiest group (the lowest level), and only all-idle drops it */
 		for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
 			uint32_t use;
 
-			if (!raised[domain].wrote) {
+			if (!raised[domain].managed) {
 				continue;
 			}
 			use = effective_level(domain);
+			if (governor.on && governor.prop && use < 2) {
+				uint32_t khz;
+
+				/* (cpufreq_gov_prop: a group in the slower half of its range does not keep L3 fast) */
+				(void)wanted_row(domain, &khz);
+				if ((uint64_t)khz * 2 <= raised[domain].khz[0]) {
+					use = 2;
+				}
+			}
 			if (use < level) {
 				level = use;
 			}
@@ -832,9 +1284,13 @@ thermal_apply(void)
 		if (!any) {
 			level = thermal.level;
 		}
-		row = level == 2 ? l3_raised.was : l3_raised.top;
-		*(volatile uint32_t *)(l3_raised.base + OSM_PERF_STATE) = row;
-		tell("thermal: vayu: L3 -> row %u\n", row);
+		row = level == 2 ? l3_raised.rest : l3_raised.top;
+		if (row != l3_raised.written) {
+			l3_raised.wrote = true;
+			*(volatile uint32_t *)(l3_raised.base + OSM_PERF_STATE) = row;
+			l3_raised.written = row;
+			tell("thermal: vayu: L3 -> row %u\n", row);
+		}
 	}
 }
 
@@ -876,13 +1332,27 @@ static void
 thermal_thread(__unused void *arg, __unused wait_result_t wr)
 {
 	uint32_t polls = 0, which = 0, valid = 0;
-	uint32_t interval = governor.on ? governor.every_ms : THERMAL_POLL_MS;
-	uint32_t thermal_every = (THERMAL_POLL_MS + interval - 1) / interval;
-	uint32_t summary_every = (60000 + interval - 1) / interval;
-	int last_pmic = -2;
+	uint32_t tick = THERMAL_TICK_MS;
+	uint32_t gov_every = 1, pmic_every, summary_every;
+	uint64_t governor_sum_then = 0;
+	int last_pmic = -2, pmic = -1;
+	uint32_t missing = 0, last_missing = UINT32_MAX;        /* the PMIC alarms not read (bit per PMIC) */
 
-	if (thermal_every == 0) {
-		thermal_every = 1;
+	/* The governor's own period may be shorter than the sensors'; the other way round the loop
+	 * still wakes at THERMAL_TICK_MS, so a hot junction is seen 0.1 s after it crossed, not 2 s. */
+	if (governor.on && governor.every_ms < tick) {
+		tick = governor.every_ms;
+	}
+	if (governor.on) {
+		gov_every = (governor.every_ms + tick - 1) / tick;
+	}
+	pmic_every = (THERMAL_POLL_MS + tick - 1) / tick;
+	summary_every = (60000 + tick - 1) / tick;
+	if (gov_every == 0) {
+		gov_every = 1;
+	}
+	if (pmic_every == 0) {
+		pmic_every = 1;
 	}
 	if (summary_every == 0) {
 		summary_every = 1;
@@ -891,17 +1361,33 @@ thermal_thread(__unused void *arg, __unused wait_result_t wr)
 		if (thermal.stopped) {
 			return;
 		}
-		if (governor.on) {
+		if (governor.on && polls % gov_every == 0) {
 			governor_sample();
 		}
-		if (thermal.sensors && polls % thermal_every == 0) {
-			int temp = 0, stage[3], pmic, threshold;
+		if (thermal.sensors && polls % pmic_every == 0) {
+			int stage[3];
+
+			/* over SPMI: 9 register reads; the sensors are plain memory and are read every tick */
+			pmic = pmic_stage(stage);
+			missing = (stage[0] < 0 ? 1u : 0) | (stage[1] < 0 ? 2u : 0) | (stage[2] < 0 ? 4u : 0);
+			if (pmic != last_pmic || missing != last_missing) {
+				tell("thermal: vayu: PMIC alarm stages %s %d, %s %d, %s %d (-1: not read, holds the level)\n", pmic_name[0],
+				    stage[0], pmic_name[1], stage[1], pmic_name[2], stage[2]);
+				last_pmic = pmic;
+				last_missing = missing;
+			}
+			sdp_check();
+		}
+		if (thermal.sensors) {
+			int temp = 0, threshold;
 			bool have = tsens_hottest(&temp, &which, &valid);
 			uint32_t want = thermal.level;
+			uint64_t now = now_ns();
 
-			pmic = pmic_stage(stage);
+			thermal.have = have;
+			thermal.temp = have ? temp : 0;
 			if (!have) {
-				want = 1;
+				want = want < 2 ? 2 : want;     /* (blind: the slowest rows, and never a step back up) */
 			} else {
 				if (temp >= thermal.hot + 100) {
 					want = 2;
@@ -910,16 +1396,23 @@ thermal_thread(__unused void *arg, __unused wait_result_t wr)
 				}
 				threshold = want == 2 ? thermal.hot + 100 : thermal.hot;
 				if (want > 0 && want == thermal.level && temp < threshold - 100) {
-					want--;
+					/* level 1 -> 0 waits for the hold: the junction falls ~7 C a
+					 * second here, so without it the top row is back within 2 s and
+					 * the phone ran 68..91 C in the 03.11 log (see §2 of the report) */
+					if (thermal.level != 1 ||
+					    now - thermal.level_since >= (uint64_t)thermal.hold_ms * NSEC_PER_MSEC) {
+						want--;
+					}
 				}
+			}
+			if (missing != 0 && want < thermal.level) {
+				want = thermal.level;           /* (TSENS alone does not let the level down while an alarm is unread) */
 			}
 			if (pmic >= 1) {
 				want = 2;
 			}
-			if (pmic != last_pmic) {
-				tell("thermal: vayu: PMIC alarm stages %s %d, %s %d, %s %d (-1: not read)\n", pmic_name[0], stage[0],
-				    pmic_name[1], stage[1], pmic_name[2], stage[2]);
-				last_pmic = pmic;
+			if (want > thermal.level) {
+				thermal.level_since = now;
 			}
 			if (want != thermal.level) {
 				if (have) {
@@ -940,44 +1433,143 @@ thermal_thread(__unused void *arg, __unused wait_result_t wr)
 					tell("thermal: vayu: no valid TSENS sensor, PMIC stage %d, level %u\n", pmic, thermal.level);
 				}
 			}
-			sdp_check();
+		}
+		if (governor.on && governor.sum_ms != 0) {
+			uint64_t now = now_ns();
+
+			if (governor_sum_then == 0) {
+				governor_sum_then = now;
+			} else if (now - governor_sum_then >= (uint64_t)governor.sum_ms * NSEC_PER_MSEC) {
+				governor_sum_then = now;
+				governor_summary();
+			}
+		}
+		if (governor.screen_off != 0) {
+			bool hold = governor.display_off &&
+			    now_ns() - governor.display_off_at >= (uint64_t)governor.screen_off_ms * NSEC_PER_MSEC;
+
+			if (hold != governor.screen_hold) {
+				governor.screen_hold = hold;
+				tell("cpufreq: vayu: screen off hold %s\n", hold ? "ON: the slowest rows while iOS has the display off" :
+				    "off: the display is back");
+			}
 		}
 		{
 			uint32_t signature = applied_signature();
 
 			if (signature != thermal.applied) {
-				tell("thermal: vayu: rows: temperature level %u, SDP hold %s, governor %u/%u/%u\n", thermal.level,
-				    thermal.sdp_hold ? "on" : "off", governor.level[0], governor.level[1], governor.level[2]);
+				/* (cpufreq_gov_prop: its steps are in the summary; this line only when a level changed) */
+				if (!(governor.on && governor.prop) || governor.log ||
+				    signature / (OSM_ROWS * OSM_ROWS * OSM_ROWS) != thermal.applied / (OSM_ROWS * OSM_ROWS * OSM_ROWS)) {
+					tell("thermal: vayu: rows: temperature level %u, SDP hold %s, governor %u/%u/%u\n", thermal.level,
+					    thermal.sdp_hold ? "on" : "off", governor.level[0], governor.level[1], governor.level[2]);
+				}
 				thermal.applied = signature;
 				thermal_apply();
 			}
 		}
 		polls++;
-		delay_for_interval(interval, NSEC_PER_MSEC);
+		delay_for_interval(tick, NSEC_PER_MSEC);
+	}
+}
+
+/* The power switches of the governor (o6): cpufreq_gov_prop, cpufreq_touch_boost_pct, cpufreq_screen_off. */
+static void
+governor_power_init(void)
+{
+	uint32_t prop = 0, head = 125, up = 1, down = 3, dwell = 300, pct = 100, screen = 0, screen_ms = 5000, fix = 0;
+
+	PE_parse_boot_argn("cpufreq_gov_prop", &prop, sizeof(prop));
+	PE_parse_boot_argn("cpufreq_gov_head", &head, sizeof(head));
+	PE_parse_boot_argn("cpufreq_gov_up", &up, sizeof(up));
+	PE_parse_boot_argn("cpufreq_gov_down", &down, sizeof(down));
+	PE_parse_boot_argn("cpufreq_gov_dwell_ms", &dwell, sizeof(dwell));
+	PE_parse_boot_argn("cpufreq_touch_boost_pct", &pct, sizeof(pct));
+	PE_parse_boot_argn("cpufreq_screen_off", &screen, sizeof(screen));
+	PE_parse_boot_argn("cpufreq_screen_off_ms", &screen_ms, sizeof(screen_ms));
+	PE_parse_boot_argn("cpufreq_touch_boost_fix", &fix, sizeof(fix));
+	governor.boost_fix = fix != 0;
+	governor.prop = governor.on && prop != 0;
+	governor.head = head < 100 ? 100 : head > 400 ? 400 : head;
+	governor.up = up < 1 ? 1 : up > 10 ? 10 : up;
+	governor.down = down < 1 ? 1 : down > 20 ? 20 : down;
+	governor.dwell_ms = dwell > 5000 ? 5000 : dwell;
+	governor.boost_pct = pct < 20 ? 20 : pct > 100 ? 100 : pct;
+	governor.screen_off = screen;
+	governor.screen_off_ms = screen_ms > 600000 ? 600000 : screen_ms;
+	if (governor.prop) {
+		tell("cpufreq: vayu: governor: proportional (cpufreq_gov_prop=1): the busiest core's share x %u %% of the "
+		    "frequency now, a step up after %u sample(s), down after %u and %u ms; touch boost to %u %% of the top\n",
+		    governor.head, governor.up, governor.down, governor.dwell_ms, governor.boost_pct);
+		for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
+			const struct raised_domain *d = &raised[domain];
+
+			if (d->wrote) {
+				tell("cpufreq: vayu: group %u ladder: %u steps, row %u %u MHz .. row %u %u MHz%s\n", domain, d->steps,
+				    d->steps ? d->ladder_row[0] : 0, d->steps ? d->ladder_khz[0] / 1000 : 0,
+				    d->steps ? d->ladder_row[d->steps - 1] : 0, d->steps ? d->ladder_khz[d->steps - 1] / 1000 : 0,
+				    d->steps < 2 ? " (too short: the three rows stay)" : "");
+			}
+		}
+	}
+	if (governor.boost_fix) {
+		tell("cpufreq: vayu: touch boost: the hold is %u ms of real time (cpufreq_touch_boost_fix=1; without it, %u ms "
+		    "was compared with 19.2 MHz ticks and held ~52 times as long)\n", governor.touch_boost_ms, governor.touch_boost_ms);
+	}
+	if (governor.screen_off != 0) {
+		tell("cpufreq: vayu: screen off hold on (cpufreq_screen_off=1): the slowest rows %u ms after iOS turns the "
+		    "display off\n", governor.screen_off_ms);
 	}
 }
 
 static void
-vayu_thermal_init(void)
+vayu_thermal_init(bool monitor)
 {
-	uint32_t on = 1, hot = 85, gov = 0, every = 100;
+	uint32_t on = 1, hot = 75, gov = 1, every = 100, hold = 3000, log = 0, log_ms = 5000, sum_ms = 10000;
+	uint32_t boost = 1, boost_ms = 300;
 	thread_t thread;
 
 	PE_parse_boot_argn("vayu_thermal", &on, sizeof(on));
 	PE_parse_boot_argn("vayu_thermal_hot", &hot, sizeof(hot));
 	PE_parse_boot_argn("cpufreq_gov", &gov, sizeof(gov));
 	PE_parse_boot_argn("cpufreq_gov_ms", &every, sizeof(every));
-	governor.on = gov != 0;
+	PE_parse_boot_argn("cpufreq_gov_log", &log, sizeof(log));
+	PE_parse_boot_argn("cpufreq_gov_log_ms", &log_ms, sizeof(log_ms));
+	PE_parse_boot_argn("cpufreq_gov_sum_ms", &sum_ms, sizeof(sum_ms));
+	PE_parse_boot_argn("cpufreq_touch_boost", &boost, sizeof(boost));
+	PE_parse_boot_argn("cpufreq_touch_boost_ms", &boost_ms, sizeof(boost_ms));
+	governor.on = !monitor && gov != 0;
+	governor.touch_boost = boost != 0;
+	governor.touch_boost_ms = boost_ms > 5000 ? 5000 : boost_ms;
 	governor.every_ms = every < 20 ? 20 : every > 1000 ? 1000 : every;
+	governor.log = log != 0;
+	governor.log_ms = log_ms < 1000 ? 1000 : log_ms > 600000 ? 600000 : log_ms;
+	governor.sum_ms = sum_ms > 600000 ? 600000 : sum_ms;
+	governor_power_init();
 	if (governor.on) {
-		tell("cpufreq: vayu: governor on: a sample every %u ms; rows 0 (top) / 1 (~3/4) / 2 (slowest)\n",
-		    governor.every_ms);
+		char more[80] = "";
+
+		if (governor.sum_ms != 0) {
+			snprintf(more, sizeof(more), ", a summary every %u ms", governor.sum_ms);
+		}
+		if (governor.log) {
+			strlcat(more, ", a line per row change", sizeof(more));
+		}
+		tell("cpufreq: vayu: governor on: a sample every %u ms%s; rows 0 (top) / 1 (~3/4) / 2 (slowest)\n",
+		    governor.every_ms, more);
+		tell("cpufreq: vayu: touch boost %s: the top rows while a finger is down and for %u ms after it%s\n",
+		    governor.touch_boost != 0 ? "on" : "off", governor.touch_boost_ms,
+		    governor.touch_boost != 0 ? "" : " (cpufreq_touch_boost=0)");
 	}
+	thermal.hold_ms = hold > 60000 ? 60000 : hold;
 	thermal.sdp_on = 1;
 	thermal.sdp_below = 50;
 	PE_parse_boot_argn("vayu_sdp_slow", &thermal.sdp_on, sizeof(thermal.sdp_on));
 	PE_parse_boot_argn("vayu_sdp_below", &thermal.sdp_below, sizeof(thermal.sdp_below));
 	thermal.sdp_below = thermal.sdp_below > 95 ? 95 : thermal.sdp_below;
+	if (monitor) {
+		thermal.sdp_on = 0;
+	}
 	if (on == 0 && !governor.on) {
 		tell("thermal: vayu: off (vayu_thermal=0)\n");
 		return;
@@ -1009,10 +1601,11 @@ vayu_thermal_init(void)
 			}
 		}
 	}
-	tell("thermal: vayu: throttle at %d C (level 1), %d C (level 2), each 10 C lower to step back; poll %u ms\n",
-	    thermal.hot / 10, thermal.hot / 10 + 10, governor.on ? governor.every_ms : THERMAL_POLL_MS);
+	tell("thermal: vayu: throttle at %d C (level 1), %d C (level 2), each 10 C lower to step back, level 1 held %u ms; "
+	    "the sensors every %u ms, the PMIC every %u ms\n", thermal.hot / 10, thermal.hot / 10 + 10, thermal.hold_ms,
+	    THERMAL_TICK_MS, THERMAL_POLL_MS);
 	for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
-		if (raised[domain].wrote) {
+		if (raised[domain].managed) {
 			tell("thermal: vayu: group %u levels: row %u %u MHz / row %u %u MHz / row %u %u MHz\n", domain,
 			    raised[domain].row[0], raised[domain].khz[0] / 1000, raised[domain].row[1], raised[domain].khz[1] / 1000,
 			    raised[domain].row[2], raised[domain].khz[2] / 1000);
@@ -1040,16 +1633,30 @@ void
 vayu_cpufreq_init(void)
 {
 	const ml_topology_info_t *topology = ml_get_topology_info();
-	uint32_t cores[OSM_DOMAINS] = { 0 }, dry = 0, force = 0, turbo = 0, l3 = 1, ddr = 0, here, before;
+	uint32_t cores[OSM_DOMAINS] = { 0 }, dry = 0, force = 0, turbo = 0, l3 = 1, ddr = 0, here, before, monitor = 0;
 
 	if (!cpufreq_wanted()) {
-		return;
+		DTEntry entry;
+		void const *type;
+		unsigned int size;
+
+		/* (the addresses are vayu's: the monitor alone only on the board the loader names so in /arm-io) */
+		if (!PE_parse_boot_argn("vayu_thermal_monitor", &monitor, sizeof(monitor)) || monitor == 0 ||
+		    SecureDTLookupEntry(NULL, "/arm-io", &entry) != kSuccess ||
+		    SecureDTGetProperty(entry, "device_type", &type, &size) != kSuccess ||
+		    size < 4 || memcmp(type, "vayu", 4) != 0 || (size > 4 && ((const char *)type)[4] != 0)) {
+			return;
+		}
+		tell("thermal: vayu: monitor only (vayu_thermal_monitor=1): no clock raise, governor or SDP hold\n");
 	}
 	PE_parse_boot_argn("cpufreq_dry", &dry, sizeof(dry));
 	PE_parse_boot_argn("cpufreq_force", &force, sizeof(force));
 	PE_parse_boot_argn("cpufreq_turbo", &turbo, sizeof(turbo));
 	PE_parse_boot_argn("cpufreq_l3", &l3, sizeof(l3));
 	PE_parse_boot_argn("vayu_ddr", &ddr, sizeof(ddr));
+	if (monitor) {
+		force = turbo = l3 = ddr = 0;
+	}
 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
 		cores[domain_of(topology->cpus[i].phys_id)]++;
 	}
@@ -1060,7 +1667,7 @@ vayu_cpufreq_init(void)
 	    dry ? "; read-only (cpufreq_dry=1)" : "");
 	for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
 		if (cores[domain] != 0) {
-			raise_domain(domain, cores[domain], dry != 0, force != 0, turbo != 0);
+			raise_domain(domain, cores[domain], dry != 0, force != 0, turbo != 0, monitor != 0);
 		}
 	}
 	if (l3 != 0) {
@@ -1069,10 +1676,10 @@ vayu_cpufreq_init(void)
 	if (ddr != 0) {
 		vote_bandwidth(dry != 0);
 	}
-	if (!dry) {
+	if (!dry && !monitor) {
 		tell("cpufreq: vayu: on core %u a loop ran at %u, now at %u\n", here, before, loop_speed());
 	}
-	vayu_thermal_init();
+	vayu_thermal_init(monitor != 0);
 }
 
 /*
@@ -1092,6 +1699,7 @@ vayu_cpufreq_quiesce(void)
 			continue;
 		}
 		raised[domain].wrote = false;
+		raised[domain].written = raised[domain].was;
 		*(volatile uint32_t *)(raised[domain].base + OSM_PERF_STATE) = raised[domain].was;
 		if (raised[domain].per_core) {
 			for (uint32_t core = 1; core < osm_cores[domain]; core++) {
@@ -1102,6 +1710,7 @@ vayu_cpufreq_quiesce(void)
 	}
 	if (l3_raised.wrote) {
 		l3_raised.wrote = false;
+		l3_raised.written = l3_raised.was;
 		*(volatile uint32_t *)(l3_raised.base + OSM_PERF_STATE) = l3_raised.was;
 		tell("cpufreq: vayu: L3 back to row %u for the loader\n", l3_raised.was);
 	}

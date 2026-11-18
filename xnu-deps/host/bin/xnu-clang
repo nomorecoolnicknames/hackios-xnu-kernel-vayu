@@ -16,5 +16,14 @@ for a in "$@"; do
     *) args+=("$a");;
   esac
 done
+# A distribution's clang on Linux (Ubuntu 22.04's 14) does not look for libc++ in the SDK it is given, only beside
+# itself: <cstddef> is not found. Name the SDK's own.
+if [ "$drv" = clang++ ]; then
+  sdk=
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    [ "${args[i]}" = -isysroot ] && sdk=${args[i+1]}
+  done
+  [ -n "$sdk" ] && [ -d "$sdk/usr/include/c++/v1" ] && extra+=(-stdlib++-isystem "$sdk/usr/include/c++/v1")
+fi
 exec /usr/bin/$drv -include "$HB/../../hostinc/xnu_clang_compat.h" -target arm64-apple-ios${XNU_SDK_VERSION:-16.5} --ld-path="$HB/ld64" \
   -w "${extra[@]}" "${args[@]}"

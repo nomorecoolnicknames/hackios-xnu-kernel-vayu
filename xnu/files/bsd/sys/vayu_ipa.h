@@ -36,6 +36,11 @@ void vayu_ipa_modem_endpoints(uint32_t *to_modem, uint32_t *from_modem);
 uint32_t vayu_ipa_restricted_bytes(void);
 /* Base of the IPA local SW SRAM this boot uses (0x1e47000 with vayu_ipa_sram=1, else 0x1e50000). */
 uint32_t vayu_ipa_sram_base(void);
+/* Read the uC shared area, polling up to ms for INIT_COMPLETED; logs one line with the raw values.
+ * True when the uC said IPA_HW_2_CPU_RESPONSE_INIT_COMPLETED. */
+bool vayu_ipa_uc_look(const char *when, uint64_t ms);
+/* "about to <what>" with the usual pause (ipa_post_auth_ms/ipa_step_ms), for other IPA files. */
+void vayu_ipa_step(const char *what);
 #endif
 
 #endif /* _SYS_VAYU_IPA_H_ */

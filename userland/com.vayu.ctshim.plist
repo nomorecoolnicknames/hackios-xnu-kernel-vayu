@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.vayu.ctshim</string>
+	<!-- The userland CoreTelephony server.  It owns the two Mach services that carry the
+	     telephony state.  root30 runs no CommCenter at all (its
+	     LaunchDaemons/com.apple.CommCenter.plist is removed), so ctshimd is the only
+	     owner of both names.
+
+	     com.apple.commcenter.coretelephony.xpc: NSXPC, the CTXPCService interface protocols; the client is CoreTelephony.framework's CoreTelephonyClient
+	         (SettingsCellularUI, SpringBoard).
+	     com.apple.commcenter.xpc: the older CTServerConnection dictionary protocol
+	         (CTServerConnectionGetRadioModuleIsDead and friends).
+
+	     Answers come from the kernel's 152-byte /dev/vayu-cell record only. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/ctshimd</string>
+	</array>
+	<key>MachServices</key>
+	<dict>
+		<key>com.apple.commcenter.coretelephony.xpc</key>
+		<true/>
+		<key>com.apple.commcenter.xpc</key>
+		<true/>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+	<key>AbandonProcessGroup</key>
+	<true/>
+</dict>
+</plist>

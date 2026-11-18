@@ -19,6 +19,9 @@
  *                           while unregistered (UIM initialization and PS attach are asynchronous)
  *   vayu_cell_data=1        after REGISTERED, a separate DPM/WDA/WDS client starts an IPv4 session
  *                           and reads its settings (bsd/dev/vayu_cell_data.c); no packets yet
+ *   vayu_cell_lte=1         this task's switch: implies vayu_cell=2 and runs the WDS control plane
+ *                           (APN internet by default) after the IPA QMI handshake; the packet path
+ *                           is used only when vayu_ipa_data=1 and vayu_cell_net=1 are ready too
  *
  * What it never does: no DMS identifier request, no SIM PIN, no APDU, no EFS/storage write, no
  * WDS/data call and no IPA register access. The host writes no storage; rmtfs keeps any modem
@@ -255,6 +258,9 @@ cell_request(const char *what, uint32_t node, uint32_t port, uint16_t message,
 		return ret;
 	}
 	ret = hakios_qmi_txn_wait_ms(&txn, VAYU_CELL_REPLY_MS);
+	if (ret >= 0 && !txn.result_present) {
+		ret = -EINVAL;          /* (a zeroed result is not a success the modem gave) */
+	}
 	if (ret < 0) {
 		if (ret == -ETIMEDOUT) {
 			say("vayu-cell: %s: no reply in %u ms\n", what, VAYU_CELL_REPLY_MS);
@@ -841,6 +847,31 @@ cell_reg_name(uint8_t state)
 	}
 }
 
+/* QmiNasAttachState: the CS and PS domains are attached separately on LTE. */
+static const char *
+cell_attach_name(uint8_t state)
+{
+	switch (state) {
+	case 0: return "unknown";
+	case 1: return "attached";
+	case 2: return "detached";
+	default: return "?";
+	}
+}
+
+/* QmiNasNetworkServiceDomain: what the serving system offers.  A voice call needs CS here or IMS. */
+static const char *
+cell_domain_name(uint8_t domain)
+{
+	switch (domain) {
+	case 0: return "none";
+	case 1: return "CS only";
+	case 2: return "PS only";
+	case 3: return "CS and PS";
+	default: return "?";
+	}
+}
+
 /*
  * A value the specification's range does not hold is not a measurement: the modem's "not there"
  * (0x8000 for a 16-bit one) and a wrong one are left out of the record rather than shown as bars.
@@ -972,6 +1003,23 @@ cell_nas_round(struct vayu_cell_record *record)
 		    record->roam == 0 ? "no" : record->roam == 1 ? "YES" : "unknown");
 		if (cell.serving.detailed_valid && cell.serving.detailed.forbidden != 0) {
 			say("vayu-cell: network: the modem says this network is forbidden\n");
+		}
+		/*
+		 * The CS domain is what a voice call without IMS needs, and on LTE it is a separate
+		 * attach: print it next to the registration so a "the modem says no service" from the
+		 * voice client can be read against what the network actually offered.
+		 */
+		if (cell.serving.detailed_valid) {
+			say("vayu-cell: domains: CS %s (%u), PS %s (%u), service %s (%u), detailed status %u\n",
+			    cell_attach_name(serving->cs_attach_state), (unsigned int)serving->cs_attach_state,
+			    cell_attach_name(serving->ps_attach_state), (unsigned int)serving->ps_attach_state,
+			    cell_domain_name(cell.serving.detailed.capability),
+			    (unsigned int)cell.serving.detailed.capability,
+			    (unsigned int)cell.serving.detailed.status);
+		} else {
+			say("vayu-cell: domains: CS %s (%u), PS %s (%u); the detailed service status is not in the reply\n",
+			    cell_attach_name(serving->cs_attach_state), (unsigned int)serving->cs_attach_state,
+			    cell_attach_name(serving->ps_attach_state), (unsigned int)serving->ps_attach_state);
 		}
 		cell.last_registered = record->reg_state == VAYU_CELL_REG_REGISTERED;
 		vayu_cell_data_registered(cell.last_registered);
@@ -1290,7 +1338,22 @@ vayu_cell_start(struct vayu_qrtr *q)
 		say("vayu-cell: already started\n");
 		return;
 	}
-	if (!PE_parse_boot_argn("vayu_cell", &level, sizeof(level)) || level == 0) {
+	if (!PE_parse_boot_argn("vayu_cell", &level, sizeof(level))) {
+		uint32_t lte = 0, wds = 0;
+		bool want_lte = PE_parse_boot_argn("vayu_cell_lte", &lte, sizeof(lte)) && lte == 1;
+		bool want_wds = PE_parse_boot_argn("vayu_wds", &wds, sizeof(wds)) && wds == 1;
+
+		/* The data task's switches: vayu_cell_lte=1 and vayu_wds=1 also start the
+		 * UIM/NAS/DMS client at level 2, because WDS has nothing to start without a
+		 * registered modem. */
+		if (!want_lte && !want_wds) {
+			return;
+		}
+		level = 2;
+		say("vayu-cell: %s=1 implies vayu_cell=2 (no vayu_cell given)\n",
+		    want_wds ? "vayu_wds" : "vayu_cell_lte");
+	}
+	if (level == 0) {
 		return;
 	}
 	if (q == NULL || q->glink == NULL || !q->glink->up) {
@@ -1370,7 +1433,8 @@ vayu_cell_start(struct vayu_qrtr *q)
 	    "vayu_cell_provision=%u vayu_cell_register=%u\n", level, wait_s, poll_s, online_arg, provision_arg,
 	    register_arg);
 	say("vayu-cell: UIM 0x%x (card status, EF_ICCID, EF_IMSI), NAS 0x%x (serving system, signal), "
-	    "DMS 0x%x (operating mode); no PIN, no host storage write; data only under vayu_cell_data=1\n",
+	    "DMS 0x%x (operating mode); no PIN, no host storage write; data only under vayu_wds=1, "
+	    "vayu_cell_lte=1 (or the legacy vayu_cell_data=1)\n",
 	    VAYU_CELL_UIM_SERVICE, VAYU_CELL_NAS_SERVICE, VAYU_CELL_DMS_SERVICE);
 	(void)cell_make_node();
 	cell.started = true;

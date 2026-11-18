@@ -60,10 +60,30 @@
  *          report cannot be read. Sentences are parsed, never logged: one carries the exact
  *          position, and the log keeps two decimals.
  *
- * There is deliberately no Inject Time / Inject Position / Set Server here: this client opens no
- * assistance session and sends the engine no data of its own. Those messages' ids are not in the
- * reference this file was written from, and a request with a guessed id is what the project's
- * rules forbid.
+ * There is deliberately no Inject Position / Set Server here: this client opens no assistance
+ * session. Without vayu_gnss_v02=1 it sends the engine no data of its own either.
+ *
+ * vayu_gnss_v02=1 (bsd/dev/vayu_gnss.c) is the sequence a LOC v02 client of another port used to a
+ * fix, a Compass showing it and 21-23 satellites by a window on the 6T's modem
+ * (xreactx/oneplus-6t-upstream 12d310ec3, drivers/modem/hakios.mpss.c "GNSS"; ids as in Qualcomm's
+ * loc_api_v02.h and libqmi's qmi-service-loc.json, which that file names). Its message ids and TLVs
+ * are taken from there, not guessed:
+ *   Set Engine Lock 0x003a, TLV 0x01 u32 1 (no lock); Set Operation Mode 0x004a, TLV 0x01 u32 4
+ *   (standalone: no assistance server here); Inject UTC Time 0x0038, TLV 0x01 u64 milliseconds since
+ *   1970, TLV 0x02 u32 its uncertainty in milliseconds (also again when the engine asks: indication
+ *   0x0028); Register Events with mask 0x197 (position, SV info, NMEA, the time request 0x0028 bit 4,
+ *   the engine state 0x002b bit 7, the fix session state 0x002c bit 8); Start with the session
+ *   (0x01, u8), recurrence 0x10 (u32 1, periodic), accuracy 0x11 (u32 3, high), intermediate
+ *   reports 0x12 (u32 1, on) and the minimum interval 0x13 (u32 ms). Its position report: TLV 0x01
+ *   the session status (u32: 0 success, 1 in progress), 0x10 latitude and 0x11 longitude (binary64
+ *   degrees), 0x12 the circular horizontal uncertainty (binary32 metres), 0x18 the horizontal speed
+ *   (binary32 m/s), 0x1a the altitude over the ellipsoid (binary32 m). A report without an
+ *   uncertainty is the engine's remembered position (hundreds of km off on the 6T until its first
+ *   real fix), not a fix. Which of those TLVs this modem (the SM8150's) sends is still to be seen
+ *   on the phone; the TLV map of the first unreadable report is logged as before.
+ *
+ * From another HakiOS port (APSL 2.0): the LOC v02 messages of vayu_gnss_v02 are xreactx/hakios-xnu-kernel, branch
+ * oneplus-6t-upstream, commit 12d310ec3b2e.
  */
 #ifndef _SYS_VAYU_GNSS_QMI_H_
 #define _SYS_VAYU_GNSS_QMI_H_
@@ -93,6 +113,21 @@
 #define VAYU_GNSS_EVENT_POSITION     0x00000001u
 #define VAYU_GNSS_EVENT_SV_INFO      0x00000002u
 #define VAYU_GNSS_EVENT_NMEA         0x00000004u
+#define VAYU_GNSS_EVENT_TIME_REQ     0x00000010u        /* 0x0028: the engine asks for the time */
+#define VAYU_GNSS_EVENT_ENGINE_STATE 0x00000080u        /* 0x002b */
+#define VAYU_GNSS_EVENT_FIX_STATE    0x00000100u        /* 0x002c */
+
+/* vayu_gnss_v02=1 (see the top): the messages of xreactx 12d310ec3 */
+#define VAYU_GNSS_LOC_EVENT_INJECT_TIME_REQ     0x0028
+#define VAYU_GNSS_LOC_EVENT_ENGINE_STATE        0x002b
+#define VAYU_GNSS_LOC_EVENT_FIX_SESSION_STATE   0x002c
+#define VAYU_GNSS_LOC_INJECT_UTC_TIME           0x0038
+#define VAYU_GNSS_LOC_SET_ENGINE_LOCK           0x003a
+#define VAYU_GNSS_LOC_SET_OPERATION_MODE        0x004a
+#define VAYU_GNSS_LOCK_NONE          1
+#define VAYU_GNSS_MODE_STANDALONE    4
+#define VAYU_GNSS_RECURRENCE_PERIODIC 1
+#define VAYU_GNSS_ACCURACY_HIGH      3
 
 /* DMS operating modes (QmiDmsOperatingMode): 0 is ONLINE, the one this client waits for. */
 #define VAYU_GNSS_DMS_ONLINE         0
@@ -445,6 +480,95 @@ vayu_gnss_parse_position_report(const uint8_t *message, size_t length, struct va
 		}
 	}
 	return position;
+}
+
+/* The v02 position report's TLVs (vayu_gnss_v02=1; see the top) */
+#define VAYU_GNSS_V02_STATUS            0x01
+#define VAYU_GNSS_V02_LATITUDE          0x10
+#define VAYU_GNSS_V02_LONGITUDE         0x11
+#define VAYU_GNSS_V02_HOR_UNC_CIRCULAR  0x12
+#define VAYU_GNSS_V02_SPEED_HORIZONTAL  0x18
+#define VAYU_GNSS_V02_ALTITUDE_ELLIPSOID 0x1a
+
+/*
+ * Reads a v02 position report into `fix`. True only for a fix: a session status of success (0) or
+ * in progress (1), a sane latitude and longitude, and an uncertainty above zero -- a report without
+ * one is the engine's remembered position.
+ */
+static inline bool
+vayu_gnss_parse_position_v02(const uint8_t *message, size_t length, struct vayu_gnss_fix *fix)
+{
+	const uint8_t *body;
+	size_t body_length;
+	struct vayu_gnss_tlv found;
+	double latitude, longitude, uncertainty;
+	uint32_t status;
+
+	if (!vayu_gnss_body(message, length, &body, &body_length)) {
+		return false;
+	}
+	if (vayu_gnss_tlv_find(body, body_length, VAYU_GNSS_V02_STATUS, &found) == NULL || found.length != 4) {
+		return false;
+	}
+	status = vayu_gnss_le32(found.value);
+	if (status != 0 && status != 1) {
+		return false;
+	}
+	if (vayu_gnss_tlv_find(body, body_length, VAYU_GNSS_V02_HOR_UNC_CIRCULAR, &found) == NULL || found.length != 4) {
+		return false;
+	}
+	uncertainty = vayu_gnss_real(found.value, found.length);
+	if (!(uncertainty > 0.0 && uncertainty < 100000.0)) {
+		return false;
+	}
+	if (vayu_gnss_tlv_find(body, body_length, VAYU_GNSS_V02_LATITUDE, &found) == NULL || found.length != 8) {
+		return false;
+	}
+	latitude = vayu_gnss_real(found.value, found.length);
+	if (vayu_gnss_tlv_find(body, body_length, VAYU_GNSS_V02_LONGITUDE, &found) == NULL || found.length != 8) {
+		return false;
+	}
+	longitude = vayu_gnss_real(found.value, found.length);
+	if (!(latitude >= -90.0 && latitude <= 90.0 && longitude >= -180.0 && longitude <= 180.0) ||
+	    (latitude == 0.0 && longitude == 0.0) ||
+	    !vayu_gnss_fix_position(fix, vayu_gnss_e7(latitude), vayu_gnss_e7(longitude), VAYU_GNSS_SOURCE_QMI)) {
+		return false;
+	}
+	fix->has_hepe = true;
+	fix->hepe_cm = (uint32_t)(uncertainty * 100.0 + 0.5);
+	if (vayu_gnss_tlv_find(body, body_length, VAYU_GNSS_V02_SPEED_HORIZONTAL, &found) != NULL && found.length == 4) {
+		double speed = vayu_gnss_real(found.value, found.length);
+
+		if (speed >= 0.0 && speed < 1000.0) {
+			fix->has_speed = true;
+			fix->speed_mm_s = (uint32_t)(speed * 1000.0 + 0.5);
+		}
+	}
+	if (vayu_gnss_tlv_find(body, body_length, VAYU_GNSS_V02_ALTITUDE_ELLIPSOID, &found) != NULL && found.length == 4) {
+		double altitude = vayu_gnss_real(found.value, found.length);
+
+		if (altitude > -1000.0 && altitude < 30000.0) {
+			fix->has_altitude = true;
+			fix->altitude_mm = (int32_t)(int64_t)(altitude * 1000.0 + (altitude >= 0.0 ? 0.5 : -0.5));
+		}
+	}
+	return true;
+}
+
+/* The status word (TLV 0x01, u32) of a v02 indication: the answer to a request, or a state. */
+static inline bool
+vayu_gnss_ind_status(const uint8_t *message, size_t length, uint32_t *status)
+{
+	const uint8_t *body;
+	size_t body_length;
+	struct vayu_gnss_tlv found;
+
+	if (!vayu_gnss_body(message, length, &body, &body_length) ||
+	    vayu_gnss_tlv_find(body, body_length, 0x01, &found) == NULL || found.length != 4) {
+		return false;
+	}
+	*status = vayu_gnss_le32(found.value);
+	return true;
 }
 
 /* ---- NMEA 0183 ------------------------------------------------------------------------------ */
@@ -980,6 +1104,54 @@ struct vayu_gnss_stop_req {
 static const struct qmi_elem_info vayu_gnss_stop_req_ei[] = {
 	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
 	  .tlv_type = 0x01, .offset = offsetof(struct vayu_gnss_stop_req, session) },
+	{ .data_type = QMI_EOTI },
+};
+
+/* vayu_gnss_v02=1: Start as xreactx 12d310ec3 sends it (see the top). */
+struct vayu_gnss_start_v02_req {
+	uint8_t  session;               /* TLV 0x01 */
+	uint32_t recurrence;            /* TLV 0x10: 1 periodic */
+	uint32_t accuracy;              /* TLV 0x11: 3 high */
+	uint32_t intermediate;          /* TLV 0x12: 1 on */
+	uint32_t min_interval_ms;       /* TLV 0x13 */
+};
+
+static const struct qmi_elem_info vayu_gnss_start_v02_req_ei[] = {
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x01, .offset = offsetof(struct vayu_gnss_start_v02_req, session) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x10, .offset = offsetof(struct vayu_gnss_start_v02_req, recurrence) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x11, .offset = offsetof(struct vayu_gnss_start_v02_req, accuracy) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x12, .offset = offsetof(struct vayu_gnss_start_v02_req, intermediate) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x13, .offset = offsetof(struct vayu_gnss_start_v02_req, min_interval_ms) },
+	{ .data_type = QMI_EOTI },
+};
+
+/* Set Engine Lock (0x003a) and Set Operation Mode (0x004a): one u32 in TLV 0x01. */
+struct vayu_gnss_u32_req {
+	uint32_t value;
+};
+
+static const struct qmi_elem_info vayu_gnss_u32_req_ei[] = {
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x01, .offset = offsetof(struct vayu_gnss_u32_req, value) },
+	{ .data_type = QMI_EOTI },
+};
+
+/* Inject UTC Time (0x0038): TLV 0x01 the time, milliseconds since 1970; TLV 0x02 its uncertainty, ms. */
+struct vayu_gnss_utc_req {
+	uint64_t time_ms;
+	uint32_t uncertainty_ms;
+};
+
+static const struct qmi_elem_info vayu_gnss_utc_req_ei[] = {
+	{ .data_type = QMI_UNSIGNED_8_BYTE, .elem_len = 1, .elem_size = sizeof(uint64_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x01, .offset = offsetof(struct vayu_gnss_utc_req, time_ms) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x02, .offset = offsetof(struct vayu_gnss_utc_req, uncertainty_ms) },
 	{ .data_type = QMI_EOTI },
 };
 

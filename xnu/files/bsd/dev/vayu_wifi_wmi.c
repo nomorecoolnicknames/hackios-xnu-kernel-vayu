@@ -453,11 +453,11 @@ vayu_wmi_summary(void)
 }
 
 /*
- * W21d (vayu_wifi_wmi=3) candidate: CE4 (host->target HTT, DIS_INTR) source ring
- * 2048 -> 256 entries, as ath10k snoc.c host_ce_config_wlan CE4 .src_nentries = 256
- * and as our target config CE4 nentries 256 (vayu_wifi.c tgt cfg).  Other modes
- * get the table unchanged.  W21f (=6): =3 plus CE5 receive buffers 512 -> 2048
- * bytes, as flame radio.c RX_BUF_SIZE for all host RX CEs.
+ * K29: the host table is used exactly as selected (stock by default; the k28
+ * table only with vayu_wifi_ce_stock=0).  The old W21d/W21f overrides were an
+ * experiment from before the stock vayu kernel's own host_ce_config_wlan was
+ * read out: it keeps CE4 at 2048 entries and does not turn CE5 into an RX
+ * pipe, so there is nothing left to override here.
  */
 const struct vayu_ce_cfg *
 vayu_wmi_host_cfg(const struct vayu_ce_cfg *base)
@@ -465,24 +465,31 @@ vayu_wmi_host_cfg(const struct vayu_ce_cfg *base)
 	static struct vayu_ce_cfg cfg[VAYU_CE_COUNT];
 	uint32_t i;
 
-	if (vayu_wmi_mode < 3) {
+	/*
+	 * k28 W21h also gave ce5 2048-byte buffers (vayu_wmi_host_cfg mode 8 in
+	 * k28).  Keep that only for the exact A/B (legacy table + wmi=8); the
+	 * stock table has no ce5 RX ring at all.
+	 */
+	if (base != vayu_ce_host_cfg_legacy || vayu_wmi_mode != 8) {
 		return base;
 	}
 	for (i = 0; i < VAYU_CE_COUNT; i++) {
 		cfg[i] = base[i];
 	}
-	cfg[4].src_nentries = 256;
-	if (vayu_wmi_mode == 6 || vayu_wmi_mode == 8) {
-		/* flame radio.c:177,240: every host RX CE gets 2048-byte buffers (ce5 included). */
-		cfg[5].src_sz_max = 2048;
-	}
+	cfg[5].src_sz_max = 2048;
 	return cfg;
 }
 
 /*
- * W21h (vayu_wifi_wmi=8): =6 plus ce5 filled to nentries-1 like ath10k
- * ath10k_snoc_rx_post_pipe() (__ath10k_ce_rx_num_free_bufs = nentries-1); flame
- * RX_POST stays 32 on every other host RX CE.  Pool cost: 512 x 2048 bytes for ce5.
+ * K29: every host RX pipe gets the same 32-buffer window (flame's RX_POST).
+ * CE5 is a source pipe in the stock table and has rx_post == 0, so the old
+ * W21h "fill ce5 to nentries-1" special case is gone from the default path:
+ * it was posting 511 RX buffers on a host->target pipe, which is the
+ * configuration that preceded the firmware's _CE_misc_handler assert.
+ *
+ * vayu_wifi_ce_stock=0 selects the k28 table; with vayu_wifi_wmi=8 it also
+ * restores the exact W21h 511 x 2048 CE5 window, so one boot arg reproduces
+ * the pre-fix configuration for an A/B run.
  */
 void
 vayu_wmi_rx_post_want(uint32_t *want, uint32_t count, uint32_t def)
@@ -492,7 +499,8 @@ vayu_wmi_rx_post_want(uint32_t *want, uint32_t count, uint32_t def)
 	for (i = 0; i < count; i++) {
 		want[i] = def;
 	}
-	if (vayu_wmi_mode == 8 && count > 5) {
+	if (vayu_ce_host_cfg_active == vayu_ce_host_cfg_legacy && vayu_wmi_mode == 8 &&
+	    count > 5) {
 		want[5] = 0xffffffffU;  /* clamped to nentries-1 by vayu_ce_rx_post_count() */
 	}
 }

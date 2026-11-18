@@ -2,7 +2,18 @@
  * vayu cellular data-session control plane: DPM, WDA and WDS over the modem's QRTR.
  *
  * The NAS client proved registration first (0620: LTE). This file starts an IPv4 data
- * session only after NAS reports REGISTERED and only with boot-arg vayu_cell_data=1:
+ * session only after NAS reports REGISTERED. Two switches exist:
+ *
+ *   vayu_cell_data=1        the old full-path gate: WDS Start only when the IPA QMI handshake,
+ *                           the GSI/data path and en1 are all ready.
+ *   vayu_cell_lte=1         this task's switch: the APN of vayu_cell_apn, without it the SIM's default profile;
+ *                           vayu_cell_lte_control=1 (default) allows WDS Start and the address
+ *                           after the IPA QMI handshake alone, without GSI. It never claims
+ *                           packets in that mode. The packet path is used when vayu_ipa_data=1
+ *                           and vayu_cell_net=1 are ready too; vayu_cell_ping=1 then sends the
+ *                           ICMP test.
+ *
+ * The WDS conversation is:
  *
  *   DPM Open Port        embedded port, vayu AP->modem endpoint 2, modem->AP endpoint 11
  *   WDA Set Data Format  raw IP in QMAP, no checksum offload, downlink aggregation bounded
@@ -11,13 +22,15 @@
  *   WDS Start Network    default profile or the optional vayu_cell_apn boot arg
  *   WDS Get Settings     address, gateway, mask, DNS and MTU, exposed through sysctl
  *
- * There is deliberately no IPA register access, no GSI ring, no rmnet/en1 and no packet sent.
- * `kern.vayu.cellular_data=1` means the modem accepted a session and returned an IPv4 address,
- * not that iOS can exchange packets. That next stage is IPA 4.1, whose endpoints/GSI mapping
- * (2/GSI3, 11/GSI6) is different from SM7325's 2/16 (4.11) and must not be copied.
+ * This file itself never touches an IPA register or a GSI ring. In control-only mode it also does
+ * not touch en1 or send a packet: `kern.vayu.cellular_data=1` then means the modem accepted a
+ * session and returned an IPv4 address, not that iOS can exchange packets. When the data path is
+ * ready (vayu_ipa_data.c + vayu_cell_net.c) the same session configures en1 and the ICMP test may
+ * run. IPv4 logging is masked to the last octet; the full value stays in the sysctls/interface.
  *
  * No storage is written by the host; the rmtfs overlay handles modem-side NV/EFS activity.
- * No APN or identifier is logged. All retries are bounded and each stage is read from its reply.
+ * The APN is a boot arg only, not an identifier. All retries are bounded and each stage is
+ * read from its reply.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -28,6 +41,7 @@
 #include <sys/errno.h>
 #include <sys/hakios.qmi.h>
 #include <sys/hakios.qrtr.h>
+#include <sys/hakios.net.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/vayu_cell_data.h>
@@ -105,6 +119,7 @@ enum data_stage {
 };
 
 static void data_clear_sysctls(void);
+static bool data_packet_path_ready(void);
 
 static struct {
 	struct qmi_handle qmi;
@@ -124,6 +139,17 @@ static struct {
 	uint32_t wds_handle_node, wds_handle_port, wds_generation;
 	uint32_t wds_handle_generation;
 	uint32_t stop_attempts;
+	/* vayu_cell_lte=1: this task's opt-in. control_only=1 (default) starts WDS and reads the
+	 * address after the IPA QMI handshake even when the GSI/data path is not ready; it never
+	 * claims packets in that state. vayu_cell_data=1 keeps the old fail-closed behaviour.
+	 * vayu_wds=1 is the k26 switch: the same WDS client, the APN of vayu_cell_apn, and pdp_ip0 on the
+	 * net side; it also defaults to control_only=1 and never enables IPv6. */
+	bool lte;
+	bool wds;
+	bool control_only;
+	bool net_session;              /* vayu_cell_net_session(true) was called for this session */
+	uint64_t stats_ms;
+	uint32_t stats_last_tx, stats_last_rx;
 	char apn[VAYU_CELL_APN_MAX];
 } data;
 
@@ -145,6 +171,8 @@ SYSCTL_STRING(_kern_vayu, OID_AUTO, cellular_netmask, CTLFLAG_RD | CTLFLAG_LOCKE
     "data session IPv4 netmask");
 SYSCTL_STRING(_kern_vayu, OID_AUTO, cellular_dns, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_dns, 0,
     "data session DNS servers");
+SYSCTL_INT(_kern_vayu, OID_AUTO, ipv4_only, CTLFLAG_RD | CTLFLAG_LOCKED, &hakios_ipv4_only, 0,
+    "vayu_ipv4_only=1: WDS is IPv4 only and en0/en1/pdp_ip0 carry no IPv6");
 
 static int
 data_new_server(struct qmi_handle *qmi __unused, struct qmi_service *service)
@@ -269,8 +297,9 @@ data_request(const char *what, uint32_t node, uint32_t port, uint16_t message,
 static void
 data_clear_sysctls(void)
 {
-	if (cellular_data != 0) {
+	if (data.net_session) {
 		vayu_cell_net_session(false, 0, 0, 0, 0, 0, 0);
+		data.net_session = false;
 	}
 	cellular_data = 0;
 	cellular_mtu = 0;
@@ -523,33 +552,53 @@ data_start_session(void)
 	if (!data.registered || data.stop || data.cleanup || data.session_uncertain) {
 		return;
 	}
-	/* 0041 stage 4: a Start is only legal after the whole chain is up. */
-	if (!vayu_ipa_ready() || !vayu_ipa_data_ready() || !vayu_cell_net_ready()) {
-		static uint64_t last_blocked;
-		if (now_ms() - last_blocked > 5000) {
-			last_blocked = now_ms();
-			data_stage_line(7, "WDS START", "ERROR", "blocked: IPA handshake %s, GSI %s, en1 %s",
-			    vayu_ipa_ready() ? "ready" : "NOT READY", vayu_ipa_data_ready() ? "ready" : "NOT READY",
-			    vayu_cell_net_ready() ? "ready" : "NOT READY (need vayu_cell_net=1)");
+	/* 0041 stage 4: the old path requires the whole chain. vayu_cell_lte=1 with
+	 * vayu_cell_lte_control=1 (the default) requires only the IPA QMI handshake: WDS gives the
+	 * address without GSI, and the modem's own 0x24 counters say whether a packet crossed it. */
+	{
+		bool packet_path = data_packet_path_ready();
+		bool control_mode = data.lte && data.control_only;
+
+		if (!vayu_ipa_ready() || (!packet_path && !control_mode)) {
+			static uint64_t last_blocked;
+			if (now_ms() - last_blocked > 5000) {
+				last_blocked = now_ms();
+				data_stage_line(7, "WDS START", "ERROR",
+				    "blocked: IPA handshake %s, GSI %s, %s %s (%s)",
+				    vayu_ipa_ready() ? "ready" : "NOT READY",
+				    vayu_ipa_data_ready() ? "ready" : "NOT READY",
+				    vayu_cell_net_name(),
+				    vayu_cell_net_ready() ? "ready" : "NOT READY (need vayu_wds=1)",
+				    control_mode ? "control-only also needs the handshake" : "full path");
+			}
+			return;
 		}
-		return;
 	}
 	{
 		uint32_t qmi_stage = vayu_ipa_qmi_stage();
+		uint32_t needed = data.lte ? 2 : 4;
 
-		if (qmi_stage < 4) {
+		if (qmi_stage < needed) {
 			static uint64_t last_refused;
 			if (now_ms() - last_refused > 5000) {
 				last_refused = now_ms();
 				data_stage_line(7, "WDS START", "ERROR",
-				    "vayu_ipa_qmi=%u: stage 4 is not enabled; no data session", qmi_stage);
+				    "vayu_ipa_qmi=%u: stage %u is not enabled; no data session", qmi_stage,
+				    needed);
 			}
 			return;
 		}
 	}
 	data.stage_attempts++;
-	say("vayu-cell-data: WDS Start Network Interface: IPv4, %s\n",
-	    data.apn[0] != 0 ? "boot-arg APN" : "SIM default profile");
+	if (hakios_ipv4_only != 0) {
+		say("vayu-cell-data: vayu_ipv4_only=1: WDS Start asks for PDP IPv4 only, APN %s; no IPv6 "
+		    "address is requested and pdp_ip0 must show no inet6\n",
+		    data.apn[0] != 0 ? data.apn : "(SIM default profile)");
+	}
+	say("vayu-cell-data: WDS Start Network Interface: IPv4, APN %s (%s), mode %s\n",
+	    data.apn[0] != 0 ? data.apn : "(SIM default profile)",
+	    data.apn[0] != 0 ? "boot arg" : "no APN given",
+	    data_packet_path_ready() ? "full path" : "control only");
 	ret = data_request_ms("WDS Start Network Interface", node, port,
 	    VAYU_CELL_WDS_START_NETWORK_INTERFACE, vayu_cell_wds_start_req_ei, &req,
 	    vayu_cell_wds_start_resp_ei, &resp, &resp.result, DATA_START_REPLY_MS);
@@ -583,6 +632,10 @@ data_start_session(void)
 	if (ret == 0 && resp.handle_valid) {
 		data.wds_handle = resp.handle;
 		say("vayu-cell-data: WDS data session accepted, handle %#x; asking for settings\n", data.wds_handle);
+		if (data.wds) {
+			say("vayu-wds: start ok handle %#x (IPv4, APN %s)\n", data.wds_handle,
+			    data.apn[0] != 0 ? data.apn : "SIM default");
+		}
 		data_stage_line(7, "WDS START", "OK", "IPv4 %s, handle %#x",
 		    data.apn[0] != 0 ? "boot-arg APN" : "SIM default profile", data.wds_handle);
 		data_advance(DATA_SETTINGS);
@@ -625,12 +678,57 @@ ip4_string(char *to, size_t size, uint32_t address)
 	    address & 0xff);
 }
 
+/* Logs only: the assignment allows the last octet in a log, nothing more. The full address stays
+ * in cellular_ip and in the WDS/ifnet state, where the interface needs it. */
+static void
+ip4_masked(char *to, size_t size, uint32_t address)
+{
+	snprintf(to, size, "x.x.x.%u", address & 0xff);
+}
+
+/* The modem's own counters (WDS 0x24). They say whether a packet crossed the modem, which the
+ * GSI ring alone cannot prove. Logged only when a counter changed, or when force is set. */
+static void
+data_stats(const char *when, bool force)
+{
+	struct vayu_cell_wds_stats_resp resp = { 0 };
+	int ret;
+
+	if (data.wds_handle == 0 || !data.wds_there || data.cleanup) {
+		return;
+	}
+	ret = data_request_ms("WDS Get Packet Statistics", data.wds_node, data.wds_port,
+	    VAYU_CELL_WDS_GET_PACKET_STATISTICS, NULL, NULL, vayu_cell_wds_stats_resp_ei, &resp,
+	    &resp.result, 2000);
+	if (ret != 0) {
+		return;
+	}
+	if (!force && resp.tx_packets == data.stats_last_tx && resp.rx_packets == data.stats_last_rx) {
+		return;
+	}
+	data.stats_last_tx = resp.tx_packets;
+	data.stats_last_rx = resp.rx_packets;
+	say("vayu-cell-data: WDS statistics %s: tx %u pkts/%llu B, rx %u pkts/%llu B, "
+	    "errors %u/%u, dropped %u/%u\n", when, (unsigned)resp.tx_packets,
+	    (unsigned long long)resp.tx_bytes, (unsigned)resp.rx_packets,
+	    (unsigned long long)resp.rx_bytes, (unsigned)resp.tx_errors, (unsigned)resp.rx_errors,
+	    (unsigned)resp.tx_dropped, (unsigned)resp.rx_dropped);
+}
+
+static bool
+data_packet_path_ready(void)
+{
+	return vayu_ipa_data_ready() && vayu_cell_net_ready();
+}
+
 static void
 data_settings(void)
 {
 	struct vayu_cell_wds_settings_req req = { .requested_settings = VAYU_CELL_SETTINGS_MASK };
 	struct vayu_cell_wds_settings_resp resp = { 0 };
 	char ip[20], gw[20], mask[20], dns1[20], dns2[20];
+	char ip_log[20], gw_log[20], dns1_log[20], dns2_log[20];
+	bool packet_path;
 	int ret;
 
 	data.stage_attempts++;
@@ -648,8 +746,14 @@ data_settings(void)
 	ip4_string(mask, sizeof(mask), resp.mask_valid ? resp.mask : 0);
 	ip4_string(dns1, sizeof(dns1), resp.dns1_valid ? resp.dns1 : 0);
 	ip4_string(dns2, sizeof(dns2), resp.dns2_valid ? resp.dns2 : 0);
-	say("vayu-cell-data: session settings: address %s gateway %s netmask %s DNS %s %s MTU %u\n",
-	    ip, gw, mask, dns1, dns2, resp.mtu_valid ? resp.mtu : 0);
+	ip4_masked(ip_log, sizeof(ip_log), resp.address_valid ? resp.address : 0);
+	ip4_masked(gw_log, sizeof(gw_log), resp.gateway_valid ? resp.gateway : 0);
+	ip4_masked(dns1_log, sizeof(dns1_log), resp.dns1_valid ? resp.dns1 : 0);
+	ip4_masked(dns2_log, sizeof(dns2_log), resp.dns2_valid ? resp.dns2 : 0);
+	packet_path = data_packet_path_ready();
+	say("vayu-cell-data: WDS runtime settings (Get Current Settings 0x2d): address %s gateway %s "
+	    "netmask %s DNS %s %s MTU %u\n", ip_log, gw_log, mask, dns1_log, dns2_log,
+	    resp.mtu_valid ? resp.mtu : 0);
 	if (resp.ip_family_valid && resp.ip_family != VAYU_CELL_IPV4) {
 		say("vayu-cell-data: settings are not IPv4 (family %u); stopping the accepted session\n",
 		    (unsigned int)resp.ip_family);
@@ -681,14 +785,43 @@ data_settings(void)
 	}
 	cellular_data = 1;
 	data.stage = DATA_UP;
-	vayu_cell_net_session(true, resp.address, resp.mask_valid ? resp.mask : 0,
-	    resp.gateway_valid ? resp.gateway : 0, resp.dns1_valid ? resp.dns1 : 0,
-	    resp.dns2_valid ? resp.dns2 : 0, resp.mtu_valid ? resp.mtu : 0);
+	data.stats_ms = now_ms();
+	if (packet_path) {
+		vayu_cell_net_session(true, resp.address, resp.mask_valid ? resp.mask : 0,
+		    resp.gateway_valid ? resp.gateway : 0, resp.dns1_valid ? resp.dns1 : 0,
+		    resp.dns2_valid ? resp.dns2 : 0, resp.mtu_valid ? resp.mtu : 0);
+		data.net_session = true;
+	}
 	data_stage_line(8, "WDS GET SETTINGS", "OK", "address %s gateway %s mask %s DNS %s %s MTU %u",
-	    ip, gw, mask, dns1, dns2, resp.mtu_valid ? resp.mtu : 0);
-	data_stage_line(9, "EN1 SESSION", "OK", "configuration queued (vayu_cell_net=1): address %s peer %s", ip, gw);
-	say("vayu-cell-data: CONTROL PLANE UP: IPv4 session/settings accepted; en1 configuration queued. "
-	    "IPA/GSI packet counters, not this line, prove transport\n");
+	    ip_log, gw_log, mask, dns1_log, dns2_log, resp.mtu_valid ? resp.mtu : 0);
+	if (data.wds) {
+		say("vayu-wds: ipv4 addr %s gw %s mask %s dns %s %s mtu %u\n", ip_log, gw_log, mask,
+		    dns1_log, dns2_log, resp.mtu_valid ? resp.mtu : 0);
+	}
+	if (packet_path) {
+		data_stage_line(9, vayu_cell_net_name(), "OK",
+		    "configuration queued: address %s peer %s", ip_log, gw_log);
+		if (data.wds) {
+			say("vayu-wds: %s up requested: %s/%s peer %s mtu %u (IPv4 only)\n",
+			    vayu_cell_net_name(), ip_log, mask, gw_log, resp.mtu_valid ? resp.mtu : 0);
+		}
+		say("vayu-cell-data: CONTROL PLANE UP: IPv4 session/settings accepted; %s configuration "
+		    "queued. IPA/GSI packet counters, not this line, prove transport\n", vayu_cell_net_name());
+	} else {
+		data_stage_line(9, vayu_cell_net_name(), "SKIPPED",
+		    "control only: GSI %s, %s %s; address held, no packets",
+		    vayu_ipa_data_ready() ? "ready" : "NOT READY", vayu_cell_net_name(),
+		    vayu_cell_net_ready() ? "ready" : "NOT READY (need vayu_wds=1)");
+		if (data.wds) {
+			say("vayu-wds: address held; %s stays down until GSI is ready (vayu_ipa_data=1) "
+			    "and the interface module is up (vayu_wds=1); no packet claim\n",
+			    vayu_cell_net_name());
+		}
+		say("vayu-cell-data: CONTROL PLANE UP (control only): the modem accepted the IPv4 session "
+		    "and returned an address; the packet path is not up, so no ping and no packet claim. "
+		    "Enable vayu_ipa=1 vayu_ipa_data=1 vayu_wds=1 (or vayu_cell_net=1) for the data path\n");
+	}
+	data_stats("after settings", true);
 }
 
 static void
@@ -700,16 +833,32 @@ data_round(void)
 	if (data.stop || data.cleanup) {
 		return;
 	}
-	if (!data.registered || data.stage == DATA_UP || data.stage == DATA_FAILED || now_ms() < data.next_ms) {
+	if (!data.registered || now_ms() < data.next_ms) {
 		return;
 	}
-	if (!vayu_ipa_ready() || !vayu_ipa_data_ready() || !vayu_cell_net_ready()) {
+	if (data.stage == DATA_UP) {
+		/* A control-only session has no en1, but the modem's counters still tell whether
+		 * anything crossed it (and later prove the ping). */
+		if (now_ms() - data.stats_ms >= 5000) {
+			data.stats_ms = now_ms();
+			data_stats("up", false);
+		}
+		return;
+	}
+	if (data.stage == DATA_FAILED) {
+		return;
+	}
+	if (!vayu_ipa_ready() || (!data_packet_path_ready() && !(data.lte && data.control_only))) {
 		static uint64_t last_gate_log;
 		if (now_ms() - last_gate_log > 5000) {
 			last_gate_log = now_ms();
-			say("vayu-cell-data: WDS/DPM blocked: IPA handshake %s, GSI/tables %s, en1 %s; no Start is sent\n",
+			say("vayu-cell-data: WDS/DPM blocked: IPA handshake %s, GSI/tables %s, %s %s; mode %s; "
+			    "no Start is sent\n",
 			    vayu_ipa_ready() ? "ready" : "NOT READY", vayu_ipa_data_ready() ? "ready" : "NOT READY",
-			    vayu_cell_net_ready() ? "ready" : "NOT READY (need vayu_cell_net=1)");
+			    vayu_cell_net_name(),
+			    vayu_cell_net_ready() ? "ready" : "NOT READY (need vayu_wds=1)",
+			    data.lte && data.control_only ? "control-only (waits for the IPA handshake only)" :
+			    "full path (needs GSI and the interface)");
 			data_stage_line(1, "IPA QMI READY", vayu_ipa_ready() ? "OK" : "TIMEOUT",
 			    "vayu_ipa_qmi=%u; handshake %s", vayu_ipa_qmi_stage(),
 			    vayu_ipa_ready() ? "done" : "not complete");
@@ -788,8 +937,10 @@ data_thread(void *argument __unused, wait_result_t wait __unused)
 	    data.dpm_there ? "there" : "MISSING", data.wda_there ? "there" : "MISSING",
 	    data.wds_there ? "there" : "MISSING");
 	for (;;) {
+		/* Control-only needs the handshake, not GSI: the address comes from WDS. A full-path
+		 * session dies if GSI or the interface goes away under it. */
 		if ((data.stage == DATA_START || data.stage == DATA_SETTINGS) &&
-		    (!vayu_ipa_ready() || !vayu_ipa_data_ready())) {
+		    (!vayu_ipa_ready() || (!vayu_ipa_data_ready() && !(data.lte && data.control_only)))) {
 			say("vayu-cell-data: IPA readiness was lost during Start/Settings; stopping the client\n");
 			data_stage_line(7, "WDS START", "ERROR", "IPA readiness lost during Start/Settings");
 			data.stop = true;
@@ -859,11 +1010,20 @@ void
 vayu_cell_data_start(struct vayu_qrtr *q)
 {
 	thread_t thread;
-	uint32_t enabled = 0, wait_s = 60;
+	uint32_t enabled = 0, lte = 0, wds = 0, wait_s = 60;
+	bool want_data, want_lte, want_wds;
 
-	if (!PE_parse_boot_argn("vayu_cell_data", &enabled, sizeof(enabled)) || enabled != 1) {
-		if (enabled != 0) {
-			say("vayu-cell-data: vayu_cell_data=%u is refused: only 1 enables a data session\n", enabled);
+	want_data = PE_parse_boot_argn("vayu_cell_data", &enabled, sizeof(enabled)) && enabled == 1;
+	want_lte = PE_parse_boot_argn("vayu_cell_lte", &lte, sizeof(lte)) && lte == 1;
+	want_wds = PE_parse_boot_argn("vayu_wds", &wds, sizeof(wds)) && wds == 1;
+	if (wds != 0 && !want_wds) {
+		say("vayu-wds: vayu_wds=%u is refused: only 1 starts the WDS client and pdp_ip0\n", wds);
+		return;
+	}
+	if (!want_data && !want_lte && !want_wds) {
+		if (enabled != 0 || lte != 0) {
+			say("vayu-cell-data: refused: vayu_cell_data=%u vayu_cell_lte=%u; only 1 enables a data session\n",
+			    enabled, lte);
 		}
 		return;
 	}
@@ -885,10 +1045,39 @@ vayu_cell_data_start(struct vayu_qrtr *q)
 	data.stage = DATA_DPM;
 	data.next_ms = now_ms() + 1000;
 	data.running = true;
-	if (PE_parse_boot_argn("vayu_cell_apn", data.apn, sizeof(data.apn))) {
-		data.apn[sizeof(data.apn) - 1] = 0;
+	data.lte = want_lte || want_wds;
+	data.wds = want_wds;
+	if (data.lte) {
+		uint32_t control = 1;
+
+		/* Default: WDS control plane is allowed after the handshake without GSI. The packet
+		 * path stays disengaged until vayu_ipa_data=1 and the interface module are also ready. */
+		PE_parse_boot_argn(want_wds ? "vayu_wds_control" : "vayu_cell_lte_control", &control,
+		    sizeof(control));
+		data.control_only = control == 1;
 	}
-	say("vayu-cell-data: vayu_cell_data=1: DPM/WDA/WDS after NAS registration and IPA readiness; no packets yet\n");
+	/* The APN is the operator's, so it is the boot arguments' (vayu_cell_apn=); without one WDS Start
+	 * carries no APN and the modem uses the SIM's default profile. */
+	if (!PE_parse_boot_argn("vayu_cell_apn", data.apn, sizeof(data.apn))) {
+		data.apn[0] = 0;
+	}
+	data.apn[sizeof(data.apn) - 1] = 0;
+	if (want_wds) {
+		say("vayu-wds: vayu_wds=1: APN %s, control-only %u, pdp_ip0; WDS Start requires "
+		    "vayu_ipa_ready(); packets and pdp_ip0 need vayu_ipa_data=1 and GSI\n",
+		    data.apn[0] != 0 ? data.apn : "(SIM default profile)", data.control_only ? 1 : 0);
+	} else if (want_lte) {
+		say("vayu-cell-data: vayu_cell_lte=1: APN %s, control-only %u; WDS Start still requires "
+		    "vayu_ipa_ready() (firmware + INIT_MODEM_DRIVER + INIT_COMPLETE)\n",
+		    data.apn[0] != 0 ? data.apn : "(SIM default profile)", data.control_only ? 1 : 0);
+		if (hakios_ipv4_only != 0) {
+			say("vayu-cell-data: vayu_ipv4_only=1: APN %s, WDS PDP IPv4 only; en1 and pdp_ip0 must "
+			    "show no inet6\n", data.apn[0] != 0 ? data.apn : "(SIM default profile)");
+		}
+	} else {
+		say("vayu-cell-data: vayu_cell_data=1 (legacy full-path gate): DPM/WDA/WDS only after IPA "
+		    "and GSI are ready\n");
+	}
 	data.started = true;
 	if (kernel_thread_start(data_thread, NULL, &thread) != KERN_SUCCESS) {
 		say("vayu-cell-data: no thread\n");

@@ -52,6 +52,11 @@
  *                      448420-448425, where they were left unanswered). The first 16 messages in
  *                      total, 24 bytes each, are logged; no GSI protocol is spoken, nothing is sent
  *                      beyond the GLINK open/ack and the intents
+ *   vayu_modem_keep_wifi=1  after THE MODEM SAYS FATAL, leave vayu-wifi's driver, CE rings and QRTR
+ *                      transport attached instead of stopping them in step_link()'s cleanup. The WLAN
+ *                      data path is host<->WLAN; only its firmware service (WLFW, 0x45) lives on MPSS.
+ *                      Pair it with vayu_wifi_smp2p_abort=0, or vayu-wifi's own SMP2P poll still ends
+ *                      the station. Default 0: the old behaviour, everything is taken down.
  * After a FATAL, vayu_smem_census() lists the shared memory's items (its crash text was not in item 421).
  *
  * What it does NOT do: it runs no rmtfs server and no EFS of its own, it sends no QMI request
@@ -90,12 +95,24 @@
 #include <sys/vayu_pas.h>
 #include <sys/vayu_rmtfs.h>
 #include <sys/vayu_sms.h>
+#include <sys/vayu_voice.h>
 #include <sys/vayu_wifi.h>
 
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
 
 static uint32_t level, wait_s = 15, listen_s = 20, secs = 2;
+/*
+ * vayu_modem_keep_wifi=1: when the modem says FATAL, leave the WLAN driver running instead of
+ * stopping it in step_link()'s cleanup. Run 062247: the modem's IPA QMI server asserted (the
+ * 0x21 INIT_MODEM_DRIVER sent from the published host port, vayu_ipa_try bit 4) and its death
+ * took Wi-Fi with it: it is MPSS that serves WLFW (0x45), and the crash also set the SMP2P
+ * "wlan" early-crash-ind bit that vayu_wifi aborts on. The Wi-Fi data path is host<->WLAN and
+ * does not need the modem once the firmware is loaded, so with this argument the driver, its
+ * CE rings and the QRTR transport are left attached and the station can stay joined. Use it
+ * together with vayu_wifi_smp2p_abort=0, otherwise vayu-wifi's own poll still ends the station.
+ */
+static uint32_t keep_wifi;
 static bool glink_prepared;             /* its items were made: vayu_glink_down() on the way out */
 
 /* Every line to the loader's log as well: what is done to the modem should be known even if the kernel dies. */
@@ -292,6 +309,7 @@ static void
 step_link(void)
 {
 	bool seen[64] = { false };
+	bool modem_fatal = false;
 	uint32_t heard = listen_s, s, node = 0, port = 0;
 
 	say("vayu-modem: 3: GLINK with the modem, QRTR on IPCRTR (%u s)\n", listen_s);
@@ -304,6 +322,7 @@ step_link(void)
 	vayu_ipa_start(&qrtr);
 	vayu_cell_start(&qrtr);		/* vayu_cell=N: SIM/network; changes gated by vayu_cell_* args */
 	vayu_sms_start(&qrtr);		/* vayu_sms=1: WMS client, inbox, /dev/vayu-sms */
+	vayu_voice_start(&qrtr);	/* vayu_voice=N: VOICE client, /dev/vayu-voice */
 	vayu_gnss_start(&qrtr);		/* vayu_gnss=1: the modem's GNSS engine (bsd/dev/vayu_gnss.c) */
 	vayu_wifi_start(&qrtr, listen_s);
 	for (s = 1; s <= listen_s; s++) {
@@ -322,6 +341,7 @@ step_link(void)
 			vayu_pas_survey(&mpss);
 			vayu_smem_census_all("vayu-modem");     /* every partition (critique W2 #6) */
 			heard = s;
+			modem_fatal = true;
 			break;
 		}
 	}
@@ -336,10 +356,18 @@ step_link(void)
 	vayu_gnss_stop();
 	vayu_sms_stop();
 	vayu_cell_stop();
-	vayu_wifi_stop();
+	if (modem_fatal && keep_wifi != 0) {
+		/* the modem is gone, its WLFW is gone with it; the WLAN itself and its CE rings are not */
+		say("vayu-modem: the modem is lost; the WLAN and its QRTR transport are left running "
+		    "(vayu_modem_keep_wifi=1)\n");
+	} else {
+		vayu_wifi_stop();
+	}
 	vayu_ipa_stop();
 	vayu_rmtfs_stop();
-	vayu_qrtr_detach(&qrtr);
+	if (!(modem_fatal && keep_wifi != 0)) {
+		vayu_qrtr_detach(&qrtr);
+	}
 }
 
 static void
@@ -413,6 +441,7 @@ vayu_modem_init(void)
 	PE_parse_boot_argn("vayu_pause", &pause, sizeof(pause));
 	PE_parse_boot_argn("vayu_modem_chan", &chan, sizeof(chan));
 	PE_parse_boot_argn("vayu_modem_gsi", &gsi, sizeof(gsi));
+	PE_parse_boot_argn("vayu_modem_keep_wifi", &keep_wifi, sizeof(keep_wifi));
 	if (chan != 0 || gsi != 0) {
 		glink.channels = 3;                     /* glink_ssr and SSM_RTR_MODEM_APPS opened back, their data logged */
 	}
@@ -422,7 +451,7 @@ vayu_modem_init(void)
 	vayu_pas_set_pause(pause);
 	vayu_rmtfs_prepare();           /* the 3 MB rmtfs buffer from low memory, before the userland */
 	say("vayu-modem: vayu_modem=%u vayu_modem_wait=%u vayu_modem_listen=%u vayu_modem_secs=%u vayu_modem_cx=%u vayu_modem_rails=%u "
-	    "vayu_pause=%u vayu_modem_chan=%u vayu_modem_gsi=%u\n", level, wait_s, listen_s, secs, cx, rails, pause, chan, gsi);
+	    "vayu_pause=%u vayu_modem_chan=%u vayu_modem_gsi=%u vayu_modem_keep_wifi=%u\n", level, wait_s, listen_s, secs, cx, rails, pause, chan, gsi, keep_wifi);
 	if (kernel_thread_start(modem_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}

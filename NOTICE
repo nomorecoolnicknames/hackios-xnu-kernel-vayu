@@ -19,7 +19,43 @@ In the repository:
 - the Wi-Fi driver: Linux's ath11k (BSD-3-Clause-Clear) and FreeBSD's LinuxKPI headers (BSD-2-Clause) are
   fetched by tools/mk-ath11k.sh at pinned releases and built on our layer wifi/lx (MIT); only the layer is here.
 
+- ios-flame (Pixel 4 port, github.com/NWylynko/ios-flame, a fork of dipa-studio/ios-flame): parts of the
+  WCN3990 Wi-Fi bring-up of the POCO X3 Pro (xnu/files/bsd/dev/vayu_wifi_htc_connect.c, vayu_wifi_scan.c,
+  vayu_wifi_sta.c, vayu_wifi_wmi.c and their headers in xnu/files/bsd/sys/) are ported from its
+  phone/wifi/radio.c (commit 745c4341). MIT License, Copyright (c) 2026 dipa-studio; each of those files carries
+  the notice.
+- Other HakiOS ports: vayu_scm.c follows the single SCM lock of the Redmi K20 Pro port (hackios_Raphael, commit
+  13145c3066); the idea, no code. Code taken from another fork of HakiOS names the fork, branch and commit in the
+  file's head and is listed here; those forks are under HakiOS's own licences (APSL 2.0 for the kernel, MIT
+  for the rest):
+  - oosexgang/hakios-xnu-kernel (upstream), main: HFS Plus built into the kernel and virtio_blk=2 (83aceb83817c,
+    7ef54e774d32; xnu/hfs/), the hakios-metal driver, the AIR frontend in tools/mesa/air and the ir3 patches in
+    tools/mesa/metal (63fc2b4633ba).
+  - telegdyd/ios-vayu, vayu-dev: HFS Plus as the data volume (74cfdfa7d258, ec38881a572c, 274f9827f52f:
+    /dev/ufs_var, userland/src/var_hfs.h, devices/poco-x3-pro/tools/var-volume.sh), loader 2.5's standalone start,
+    layout block and staged boot image (546ac05ab957, 8054280162b9, 86984b16b016; xnuloader/loader.c,
+    userland/src/flash_stage.*, devices/poco-x3-pro/tools/standalone.sh and darwin-install.sh, 56f0a3adbd41), the
+    A640 port of hakios-metal, the Metal programs and docs/metal-*.md (061e5a82d023; bd98a330786f for the kernel's
+    plug-in names).
+  - Scion-Project/scion-kernel, main: exitlog= (a40a96524a51, bsd/kern/kern_sig.c) and systrace_log=
+    (8042def0c06d, osfmk/arm64/user_exception_trace.c).
+  - xreactx/hakios-xnu-kernel, oneplus-6t-upstream: vayu_bt_baud= (0e5e7bd6a05c), vayu_gnss_v02= (12d310ec3b2e),
+    userland/src/gnssd.m and inject_loc.c (12d310ec3b2e, e86c96b9ada8).
+  - janhurn9400/hackios-xnu-kernel, renoir: vayu_bt_baud= and BT_AUDIO=1 (7287928f164b).
+  - telegdyd/hakios-xnu-kernel, negroni-dev, and kiwiiiii-eth/hakios-xnu-kernel, fajita: vayu_wifi_bounds= and
+    vayu_wifi_snr= (b4c39cc65b12; d82116fb9050, 68594340fc87; bsd/dev/hakios.apple80211.c).
+  - adelholzener69/hakios-xnu-kernel-raphael, raphael: wire_limit= (3233e8371422, userland/src/init.c).
+- The Metal plug-in of vayu-dev and upstream (HakiosMetalCA.m) is not here: it was begun from vcvkk/darwin-redwood,
+  which states no licence, and waits for its author's permission (THIRD_PARTY_LICENSES.md).
+- Mu-Silicium's vayuPkg (Project Silicium): devices/poco-x3-pro/uefi/ fetches it at a pinned commit (BASE) and
+  lays the XNU hook of devices/poco-x5-pro/uefi/ over it; BSD-2-Clause-Patent. Its device tree for the phone,
+  devices/poco-x3-pro/prebuilt/device-tree.dtb, is compiled from GPL-2.0 Linux sources (to verify: see
+  tools/provenance.allow).
+
 Fetched at build time, never committed:
+
+- HFS Plus (Apple, hfs-627.100.6, APSL 2.0): xnu/hfs/hfs.sh fetches it from github.com/apple-oss-distributions/hfs
+  for xnu/apply.sh, as XNU itself; xnu/hfs/hfs.patch is this port's change to it.
 
 - the iOS 16.5 IPSW (Apple): the user space of the system image; sysimage/fetch.sh downloads it from
   Apple's public servers; its license is Apple's.
