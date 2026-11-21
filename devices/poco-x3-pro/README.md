@@ -65,6 +65,17 @@ behaviour behind a boot argument that is off by default. It builds and boots in 
 kernel above; this branch's last changes (the Metal plug-in's names, inert without `metal=`, and the network and operator
 values moved to boot arguments) have not, and none of the new boot arguments has been turned on there yet.
 
+## iOS 27 and macOS 13.4 on this phone
+
+Runs of 20-21 November 2026, with the kernels of `xnu/lines/` (see the main README):
+
+| System | Kernel | Seen on the phone | Not yet |
+|---|---|---|---|
+| iOS 27 | xnu-12377 on Scion's iOS 27 kernel (`xnu/lines/ios27/`) | the user space starts from a root over the USB cable (NBD), about a hundred processes; the daemons' self-SIGKILL fixed (`vayu_spawnattr=27`) | SpringBoard crash-loops on SIGABRT; no picture of the system on the panel (the boot console and the logo, then black) |
+| macOS 13.4 | xnu-8796.121.2 (`xnu/lines/macos13/`) | the volumes on NBD disks; WindowServer, the Dock and the menu bar, drawn by the Adreno 640 (HakiosMetal); the desktop on the panel, portrait, HiDPI 2x | the wallpaper's picture (its window is on screen); touch and the cursor |
+
+The panel's pictures in those runs came from the kernel's log (`vayu_fbthumb=N`, `tools/fbthumb2png.py`).
+
 ## What is here
 
 | What | Where |

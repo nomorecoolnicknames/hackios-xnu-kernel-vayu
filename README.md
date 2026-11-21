@@ -47,12 +47,38 @@ one access point only, `vayu_wifi_bssid_tail=XX:XX`) and reads the key from `/re
 (`vayu_wifi_pmk_file=1`; `userland/build.sh` takes it from `fw-wifi/wifi.pmk`, outside git); mobile data takes the APN
 from `vayu_cell_apn=`, without it the SIM's default profile.
 
+**Since 18 November.** The kernel in `xnu/` is now the line the daily images are built from: the third camera, NFC
+(PN553), 120 Hz and the boot menu were seen on the phone with it on 19 November. On top of that come the cell work (the
+IPA's GSI rings and microcontroller, the modem's QMI requests, WDS), telephony (the kernel's own QMUX services, rmtfs),
+the charger's watchdog and limits (`vayu_charge=1`) and the IPA filter answers (`vayu_ipa_flt_ack=1`), each behind its
+boot argument and off by default. This merged tree builds and boots in QEMU; as a whole it has not run on the phone.
+The boot loader has a boot menu (HakiOS, Android, other EFI applications, a diagnostics entry; or rEFInd with
+`boot_menu=refind`) and keeps count of failed starts in misc's boot control block.
+
 **Metal.** The Metal driver for the Adreno 640 (`hakios-metal/`, `METAL=1`) is here without its plug-in: that file was begun
 from a repository that states no licence, and it waits for its author's permission. `METAL=1` stops and says so; the
 system draws through OpenGL ES as before.
 
+## iOS 27 and macOS 13.4
+
+Two more kernel lines are here, each a patch and new files over the tree it starts from (`xnu/line.sh`, `xnu/lines/`):
+
+- **iOS 27** (`xnu/lines/ios27/`, xnu-12377 on Scion's iOS 27 kernel). On the phone iOS 27's user space starts from a root
+  served over the USB cable (NBD), about a hundred processes. A kernel bug that made most daemons kill themselves (iOS
+  27's `posix_spawn` attributes read in an older layout) is fixed (`vayu_spawnattr=27`). SpringBoard currently
+  crash-loops on SIGABRT, and there is no picture of the system on the panel yet.
+- **macOS 13.4** (`xnu/lines/macos13/`, xnu-8796.121.2). On the phone macOS boots with its volumes on NBD disks;
+  WindowServer, the Dock and the menu bar run, drawn by the Adreno 640 through HakiosMetal, and the desktop comes up on
+  the panel (portrait, HiDPI 2x). The wallpaper's window is on screen but its picture is not drawn yet; touch and the
+  cursor do not work yet.
+
+Pictures of the panel come from the kernel's log: `vayu_fbthumb=N` writes a thumbnail every N seconds and
+`tools/fbthumb2png.py` turns a log back into PNG files. The screenshots themselves are not in the repository (they show
+Apple's artwork). The user spaces of these two lines (how their system images are made) are not in this branch yet.
+
 ## What is here
 
+- `xnu/lines/`: the iOS 27 and macOS 13.4 kernel lines, laid over their bases by `xnu/line.sh apply LINE`.
 - `xnu/`: the kernel, as a patch to Apple's open-source XNU (`hakios.patch`) and new files (`files/`), laid over Apple's tag
   by `xnu/apply.sh`, which also fetches Apple's HFS Plus and lays `xnu/hfs/hfs.patch` over it. This phone's drivers are `xnu/files/bsd/dev/vayu_*.c`; the head of each says where its numbers come
   from and lists its boot arguments.
