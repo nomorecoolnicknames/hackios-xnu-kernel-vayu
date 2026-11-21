@@ -92,8 +92,6 @@
 #                                   (src/HakiosMetalCA.m over ../hakios-metal with Mesa's compiler in it) and
 #                                   share/metal/*.metallib for bin/metal_test. Inert without the boot-arg metal=N:
 #                                   the kernel then names no plug-in and init binds none. See the METAL=1 block.
-#                                   src/HakiosMetalCA.m is not in the published tree (its origin states no
-#                                   licence; it waits for its author's permission), and METAL=1 stops without it.
 #   system.apfs      the system image, the root filesystem (the resident RAM disk, /dev/md0), an
 #                    APFS container: the part of iOS 16.5 chosen by ../sysimage/select-system.py at
 #                    its real paths, the dyld shared cache, and src/stage0.c as /sbin/launchd (the
@@ -406,12 +404,6 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# device (`metal_test app`, `metal_test astc`): hakios-metal/tools/kernels' hand-written AIR, assembled by
 		# llvm-as and packed by tools/metal-mklib.py, as vayu-dev's tools/metal-app-build.sh and metal-ca-build.sh do.
 		# Without METAL=1 nothing of this is built or put in the image.
-		if [ "${METAL:-}" = 1 ] && [ ! -f src/HakiosMetalCA.m ]; then
-			echo "build.sh: METAL=1: src/HakiosMetalCA.m, the Metal plug-in, is not in this tree. It was begun from" >&2
-			echo "build.sh: vcvkk/darwin-redwood, whose repository states no licence, so it is left out until its author" >&2
-			echo "build.sh: allows it (README.md, THIRD_PARTY_LICENSES.md). Build without METAL=1 (OpenGL ES stays)." >&2
-			exit 1
-		fi
 		if [ "${METAL:-}" = 1 ]; then
 			HM=../hakios-metal
 			MB=../xnu-deps/build/mesa-metal/build-softpipe-freedreno

@@ -114,8 +114,8 @@ Nor is anything of the network the port was made on. What is yours is given at r
   nothing;
 - the scripts that talk to the phone over adb or fastboot want its `SERIAL=` and assume none.
 
-The Metal plug-in (`userland/src/HakiosMetalCA.m` in vayu-dev and upstream) is not here: it was begun from a repository that
-states no licence and waits for its author's permission; `METAL=1 userland/build.sh` stops and says so.
+The Metal plug-in (`userland/src/HakiosMetalCA.m`, MIT; begun from vcvkk's plug-in, whose author allowed MIT on
+2026-11-21) is built with `METAL=1 userland/build.sh`.
 
 ## Building and running
 

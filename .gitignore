@@ -70,9 +70,6 @@ __pycache__/
 !/userland/rc.*
 !/userland/com.hakios.*.plist
 !/userland/src/
-# the Metal plug-in waits for its origin's licence (THIRD_PARTY_LICENSES.md): a copy put back for one's own builds
-# stays out of the repository
-/userland/src/HakiosMetalCA.m
 !/userland/libmini/
 !/userland/var/
 

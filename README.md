@@ -55,9 +55,9 @@ boot argument and off by default. This merged tree builds and boots in QEMU; as 
 The boot loader has a boot menu (HakiOS, Android, other EFI applications, a diagnostics entry; or rEFInd with
 `boot_menu=refind`) and keeps count of failed starts in misc's boot control block.
 
-**Metal.** The Metal driver for the Adreno 640 (`hakios-metal/`, `METAL=1`) is here without its plug-in: that file was begun
-from a repository that states no licence, and it waits for its author's permission. `METAL=1` stops and says so; the
-system draws through OpenGL ES as before.
+**Metal.** The Metal driver for the Adreno 640 (`hakios-metal/`) and its plug-in (`userland/src/HakiosMetalCA.m`) are built
+with `METAL=1`; the plug-in is MIT (its base's author allowed it on 2026-11-21). Without `METAL=1`, and on the phone
+without the boot argument `metal=N`, the system draws through OpenGL ES as before.
 
 ## iOS 27 and macOS 13.4
 

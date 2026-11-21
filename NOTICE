@@ -57,8 +57,10 @@ In the repository:
 - rEFInd (Roderick W. Smith and contributors), GPL-3.0: xnuloader/refind/ holds build scripts and patches against
   its v0.14.2 sources, which xnuloader/refind/build.sh fetches; the patches are under rEFInd's GPL-3.0. The theme
   is drawn by mktheme.py with the DejaVu fonts of the build host (not committed).
-- The Metal plug-in of vayu-dev and upstream (HakiosMetalCA.m) is not here: it was begun from vcvkk/darwin-redwood,
-  which states no licence, and waits for its author's permission (THIRD_PARTY_LICENSES.md).
+- The Metal plug-in, userland/src/HakiosMetalCA.m: begun from vcvkk's HakiosMetal.m (vcvkk/darwin-redwood, branch
+  hakios-workspace, eb9fdf5), then oosexgang/hakios-metal 30f9c95 and oosexgang/hakios-xnu-kernel 63fc2b46, with this
+  port's changes. MIT: the base's author granted permission to publish under MIT on 2026-11-21 (the text:
+  hakios-metal/LICENSE, THIRD_PARTY_LICENSES.md).
 - Mu-Silicium's vayuPkg (Project Silicium): devices/poco-x3-pro/uefi/ fetches it at a pinned commit (BASE) and
   lays the XNU hook of devices/poco-x5-pro/uefi/ over it; BSD-2-Clause-Patent. Its device tree for the phone,
   devices/poco-x3-pro/prebuilt/device-tree.dtb, is compiled from GPL-2.0 Linux sources (to verify: see
