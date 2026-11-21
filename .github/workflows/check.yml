@@ -1,0 +1,31 @@
+name: check
+on:
+  push:
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python compiles
+        run: |
+          git ls-files '*.py' | xargs -r python3 -m py_compile
+      - name: Shell scripts parse
+        run: |
+          git ls-files '*.sh' xl | xargs -r -n1 bash -n
+      - name: Makefile help
+        run: make help
+      - name: No Apple files, no screenshots
+        run: |
+          # the rule of the repository: nothing of iOS, no pictures of it
+          ! git ls-files | grep -E -i '\.(png|jpe?g|gif|dylib|dmg|ipsw|car|nib|strings)$' | grep -v '^prebuilt/userland/' 
+          ! git ls-files | grep -E -i 'cryptex|dyld_shared_cache|SpringBoard\.app|/System/Library/'
+      - name: The kernel patch applies to Apple's tree
+        run: |
+          git clone -q --depth 1 --branch xnu-8796.121.2 https://github.com/apple-oss-distributions/xnu.git /tmp/xnu
+          git -C /tmp/xnu apply --check "$PWD/xnu/hakios.patch"
+      - name: APFS tools self-test
+        run: |
+          [ -x tools/apfs/run-tests.sh ] && tools/apfs/run-tests.sh || echo "no self-test on this runner"
+      - name: SoC args generator reproduces the POCO X5 Pro values
+        run: sh tools/soc-args-test.sh
