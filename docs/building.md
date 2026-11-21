@@ -8,7 +8,7 @@ machine, the firmware is pulled from your own phone.
 
 ```sh
 sudo apt install git curl tar xz-utils lz4 build-essential flex bison m4 perl python3 python3-venv \
-    autoconf automake libtool pkg-config lld nasm mono-devel qemu-system-arm qemu-efi-aarch64
+    autoconf automake libtool pkg-config uuid-dev llvm lld nasm mono-devel qemu-system-arm qemu-efi-aarch64
 ```
 
 For Mesa (`GL=1` images, `gpu=1`) also `clang ninja-build libdrm-dev`.

@@ -13,6 +13,7 @@ set -euo pipefail
 
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
+export PATH="$ROOT/xnu-deps/host/bin:$PATH"
 HOOK=$ROOT/devices/poco-x5-pro/uefi
 MU=${MU:-$ROOT/Mu-Silicium}
 VENV=${VENV:-$ROOT/venv}

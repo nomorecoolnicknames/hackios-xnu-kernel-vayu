@@ -52,6 +52,17 @@ link() {
 	[ "$(readlink "$2" 2>/dev/null)" = "$1" ] || ln -sfn "$1" "$2"
 }
 
+link_host_tool() {
+	local name=$1 candidate path
+	for candidate in "$name" "$name-18" "$name-17" "$name-16" "$name-15" "$name-14"; do
+		if path=$(command -v "$candidate" 2>/dev/null); then
+			link "$path" "host/bin/$name"
+			return 0
+		fi
+	done
+	log "no $name or versioned LLVM tool is installed"
+}
+
 # replace FILE with what is on standard input, unless it is the same already (make looks at time stamps)
 update() {
 	cat > "$1.new"
@@ -172,6 +183,8 @@ stage1() {
 		link "$CCTOOLS/ld" host/bin/ld64
 	fi
 	link xnu-clang host/bin/xnu-clang++
+	link_host_tool dsymutil
+	link_host_tool llvm-objcopy
 
 	# --- the SDK -------------------------------------------------------------------------------
 	# The makefiles ask xcrun (ours: host/bin/xcrun) for an SDK and a platform directory.
