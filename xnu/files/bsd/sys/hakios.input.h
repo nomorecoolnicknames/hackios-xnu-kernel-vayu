@@ -73,12 +73,16 @@ bool hakios_ufs_dev(dev_t dev);           /* one of the storage's devices */
 int hakios_ufs_read_partition(const char *name, uint64_t offset, uint8_t *dst, uint64_t len, uint64_t *bytes); /* for drivers */
 bool hakios_ufs_part(const char *name, uint32_t *part, uint64_t *bytes);   /* a GPT partition by name, for a kernel user */
 int hakios_ufs_part_read(uint32_t part, uint64_t offset, void *dst, uint64_t len);  /* read-only, through the same path */
-void hakios_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
+void hakios_battery_init(void);        /* battery=1: UEFI state; vayu_charge=1: opt-in PM8150B maintenance */
 int hakios_battery_temperature(void);  /* the battery's temperature in C, -273 if unknown or no fresh sample for 30 s */
 /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/hakios.buttons.c) */
 void hakios_spmi_lock(void);
 void hakios_spmi_unlock(void);
 bool hakios_spmi_peek(uint16_t id, uint8_t reg, uint8_t *value);    /* hakios.buttons.c: one PMIC register, read only */
+bool hakios_spmi_read_live(uint16_t id, uint8_t reg, uint8_t *value); /* map the arbiter for an opt-in PMIC client */
+bool hakios_spmi_owned(uint16_t id); /* whether the arbiter permits this system to write a peripheral */
+bool hakios_spmi_update(uint16_t id, uint8_t reg, uint8_t mask, uint8_t value, uint8_t *before, uint8_t *after,
+    bool *written);   /* only an owned channel; mask 0 writes the command value directly */
 /*
  * How the battery is, as the audio DSP's battery manager says (bsd/dev/hakios.adsp.c, with adsp=1):
  * handed to bsd/dev/hakios.battery.c, which keeps it for the sysctls kern.hakios.battery_* and

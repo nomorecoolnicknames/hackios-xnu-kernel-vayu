@@ -102,6 +102,7 @@ wr(vm_offset_t address, uint32_t value)
 #define ARB_CNFG_SIZE           0x1000UL
 #define ARB_OBSERVER_PHYS       0x0e600000UL    /* "obsrvr": 0x10000 per system, 0x80 per channel in it */
 #define ARB_OBSERVER_SIZE       0x10000UL       /* ours is the first */
+#define ARB_CHNLS_PHYS          0x0c600000UL    /* "chnls": 0x10000 per channel, for its owner's writes */
 #define ARB_SYSTEM              0               /* who we are to the arbiter: the device tree's "qcom,ee" */
 
 #define ARB_VERSION             0x000
@@ -117,14 +118,46 @@ wr(vm_offset_t address, uint32_t value)
 #define OBSERVER_STATUS         0x08
 #define OBSERVER_DATA0          0x18            /* the bytes read, the first in the lowest byte */
 #define OBSERVER_DATA1          0x1c
+#define CHANNEL_WDATA0          0x10
 #define STATUS_DONE             0x1
 #define STATUS_FAILURE          0x2
 #define STATUS_DENIED           0x4
 #define STATUS_DROPPED          0x8
+#define COMMAND_WRITE           (0u << 27)
 #define COMMAND_READ            (1u << 27)      /* "extended register read long"; [11:4] register, [2:0] bytes - 1 */
 #define READ_TIMEOUT_US         2000            /* a read takes some tens of microseconds */
+#define WRITE_TIMEOUT_US        2000
 
 static vm_offset_t arb_core, arb_cnfg, arb_observer;
+static vm_offset_t arb_write[ARB_MAX_CHANNELS];
+static LCK_GRP_DECLARE(spmi_map_lck_grp, "hakios-spmi-map");
+static LCK_MTX_DECLARE(spmi_map_lock, &spmi_map_lck_grp);
+
+static bool
+spmi_map(void)
+{
+	lck_mtx_lock(&spmi_map_lock);
+	if (arb_core == 0) arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+	if (arb_cnfg == 0) arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
+	if (arb_observer == 0) arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+	lck_mtx_unlock(&spmi_map_lock);
+	return arb_core != 0 && arb_cnfg != 0 && arb_observer != 0;
+}
+
+static vm_offset_t
+spmi_write_map(uint16_t channel)
+{
+	vm_offset_t write;
+
+	if (channel >= ARB_MAX_CHANNELS) return 0;
+	lck_mtx_lock(&spmi_map_lock);
+	if (arb_write[channel] == 0) {
+		arb_write[channel] = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * channel, 0x1000);
+	}
+	write = arb_write[channel];
+	lck_mtx_unlock(&spmi_map_lock);
+	return write;
+}
 
 /*
  * One transfer at a time through the arbiter for this system, whoever asks (the flashlight's
@@ -289,6 +322,91 @@ hakios_spmi_peek(uint16_t id, uint8_t reg, uint8_t *value)
 	}
 	hakios_spmi_unlock();
 	return p->found && spmi_read(p, reg, value, 1) == NULL;
+}
+
+bool
+hakios_spmi_read_live(uint16_t id, uint8_t reg, uint8_t *value)
+{
+	uint32_t version;
+
+	if (!spmi_map()) return false;
+	version = rd(arb_core + ARB_VERSION);
+	return version >= ARB_VERSION_5 && version < ARB_VERSION_7 && hakios_spmi_peek(id, reg, value);
+}
+
+bool
+hakios_spmi_owned(uint16_t id)
+{
+	uint32_t channels, version;
+
+	if (!spmi_map()) return false;
+	version = rd(arb_core + ARB_VERSION);
+	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) return false;
+	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
+	if (channels == 0 || channels > ARB_MAX_CHANNELS) channels = ARB_MAX_CHANNELS;
+	for (uint32_t n = 0; n < channels; n++) {
+		if (((rd(arb_core + ARB_CHANNEL(n)) >> 8) & 0xfff) == id) {
+			return (rd(arb_cnfg + ARB_OWNER(n)) & 7) == ARB_SYSTEM;
+		}
+	}
+	return false;
+}
+
+bool
+hakios_spmi_update(uint16_t id, uint8_t reg, uint8_t mask, uint8_t value, uint8_t *before, uint8_t *after,
+    bool *written)
+{
+	struct peripheral p = { .name = "a charger peripheral", .id = id };
+	vm_offset_t write;
+	uint8_t old, next, back;
+	uint32_t channels, status, version;
+	uint64_t start, interval;
+
+	*written = false;
+	if (!spmi_map()) return false;
+	version = rd(arb_core + ARB_VERSION);
+	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) return false;
+	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
+	if (channels == 0 || channels > ARB_MAX_CHANNELS) channels = ARB_MAX_CHANNELS;
+	for (uint32_t n = 0; n < channels; n++) {
+		if (((rd(arb_core + ARB_CHANNEL(n)) >> 8) & 0xfff) == id) {
+			if ((rd(arb_cnfg + ARB_OWNER(n)) & 7) == ARB_SYSTEM) {
+				p.channel = (uint16_t)n;
+				p.found = true;
+			}
+			break;
+		}
+	}
+	if (!p.found) return false;
+	if (mask == 0) {
+		old = 0;
+		next = value;
+	} else {
+		if (spmi_read(&p, reg, &old, 1) != NULL) return false;
+		next = (uint8_t)((old & ~mask) | (value & mask));
+	}
+	*before = old;
+	*after = mask == 0 ? value : old;
+	if (mask != 0 && next == old) return true;
+	write = spmi_write_map(p.channel);
+	if (write == 0 || ((rd(arb_core + ARB_CHANNEL(p.channel)) >> 8) & 0xfff) != id ||
+	    (rd(arb_cnfg + ARB_OWNER(p.channel)) & 7) != ARB_SYSTEM) return false;
+	nanoseconds_to_absolutetime(WRITE_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
+	hakios_spmi_lock();
+	wr(write + CHANNEL_WDATA0, next);
+	wr(write + OBSERVER_COMMAND, COMMAND_WRITE | (uint32_t)reg << 4);
+	start = mach_absolute_time();
+	do {
+		status = rd(write + OBSERVER_STATUS);
+	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
+	hakios_spmi_unlock();
+	if (!(status & STATUS_DONE) || (status & (STATUS_DENIED | STATUS_FAILURE | STATUS_DROPPED))) return false;
+	if (mask != 0) {
+		if (spmi_read(&p, reg, &back, 1) != NULL || (back & mask) != (next & mask)) return false;
+		*after = back;
+	}
+	*written = true;
+	return true;
 }
 
 /* ---- the two peripherals ------------------------------------------------------------------------- */
@@ -538,9 +656,10 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 
 	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
 	    ARB_OBSERVER_PHYS);
-	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
-	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
-	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+	if (!spmi_map()) {
+		printf("buttons: the PMIC arbiter could not be mapped\n");
+		goto out;
+	}
 	version = rd(arb_core + ARB_VERSION);
 	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
 	printf("buttons: PMIC arbiter version %#x, %u channels\n", version, channels);

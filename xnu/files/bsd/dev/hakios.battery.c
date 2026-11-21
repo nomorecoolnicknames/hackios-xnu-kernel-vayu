@@ -527,6 +527,142 @@ hakios_battery_report(const struct hakios_battery_state *b)
 	HakiosBatteryReport(b, sizeof(*b));
 }
 
+/*
+ * boot-arg vayu_charge=1: keep the PM8150B charging from the SMB5 sequence in
+ * drivers/input/hakios.buttons.c of Akhdaa/hakios-xiaomi-munch@15014aa2ffee768d9a7e34c94998804f57a107fe.
+ * Pet MISC 0x43 every ten seconds; only raise the USB ICL/FCC for CDP or DCP,
+ * and only when below 1500/1800 mA. The write helper refuses channels not owned
+ * by this system and verifies every register write.
+ */
+#define VAYU_CHARGE_USBIN_ID       0x213
+#define VAYU_CHARGE_CHGR_ID        0x210
+#define VAYU_CHARGE_MISC_ID        0x216
+#define VAYU_CHARGE_ICL_MA         1500
+#define VAYU_CHARGE_FCC_MA         1800
+#define VAYU_CHARGE_APSD_CDP       (1u << 2)
+#define VAYU_CHARGE_APSD_DCP       (1u << 3)
+
+static bool charge_broken;
+static bool charge_status_seen;
+static uint8_t charge_last_input, charge_last_apsd, charge_last_state;
+static bool charge_read_error_seen;
+static bool charge_watchdog_owner_known, charge_watchdog_owner;
+static bool charge_watchdog_owner_last;
+static bool charge_current_owner_known, charge_current_owner, charge_current_owner_last;
+
+static bool
+vayu_charge_put(uint16_t id, uint8_t reg, uint8_t mask, uint8_t value, const char *what)
+{
+	uint8_t before, after;
+	bool written;
+
+	if (!hakios_spmi_update(id, reg, mask, value, &before, &after, &written)) {
+		printf("vayu-charge: %s register %#x failed; no more writes this run\n", what, reg);
+		charge_broken = true;
+		return false;
+	}
+	if (written) {
+		printf("vayu-charge: write %s register %#x: %#x -> %#x\n", what, reg, before, after);
+	}
+	return true;
+}
+
+static void
+vayu_charge_poll(void)
+{
+	uint8_t input, apsd, state, icl, fcc;
+
+	if (charge_broken) return;
+	charge_watchdog_owner = hakios_spmi_owned(VAYU_CHARGE_MISC_ID);
+	if (!charge_watchdog_owner_known || charge_watchdog_owner != charge_watchdog_owner_last) {
+		printf("vayu-charge: watchdog channel %s\n",
+		    charge_watchdog_owner ? "is owned by this system" : "is not owned by this system; no charger writes");
+		charge_watchdog_owner_last = charge_watchdog_owner;
+		charge_watchdog_owner_known = true;
+	}
+	if (!charge_watchdog_owner) return;
+	if (!vayu_charge_put(VAYU_CHARGE_MISC_ID, 0x43, 0, 0x01, "charger watchdog")) return;
+	if (!hakios_spmi_read_live(VAYU_CHARGE_USBIN_ID, 0x10, &input) ||
+	    !hakios_spmi_read_live(VAYU_CHARGE_USBIN_ID, 0x08, &apsd) ||
+	    !hakios_spmi_read_live(VAYU_CHARGE_CHGR_ID, 0x06, &state)) {
+		if (!charge_read_error_seen) {
+			printf("vayu-charge: USBIN/APSD/CHGR read failed; no charger writes this interval\n");
+			charge_read_error_seen = true;
+		}
+		return;
+	}
+	charge_read_error_seen = false;
+	if (!charge_status_seen || input != charge_last_input || apsd != charge_last_apsd || state != charge_last_state) {
+		printf("vayu-charge: USBIN status 0x1310=%#x APSD 0x1308=%#x CHGR 0x1006=%#x\n",
+		    input, apsd, state);
+		charge_last_input = input;
+		charge_last_apsd = apsd;
+		charge_last_state = state;
+		charge_status_seen = true;
+	}
+	if (!(input & (1u << 4)) || !(apsd & (VAYU_CHARGE_APSD_DCP | VAYU_CHARGE_APSD_CDP))) return;
+	charge_current_owner = hakios_spmi_owned(VAYU_CHARGE_USBIN_ID) && hakios_spmi_owned(VAYU_CHARGE_CHGR_ID);
+	if (!charge_current_owner_known || charge_current_owner != charge_current_owner_last) {
+		printf("vayu-charge: current-limit channels %s\n",
+		    charge_current_owner ? "are owned by this system" : "are not owned by this system; watchdog only");
+		charge_current_owner_last = charge_current_owner;
+		charge_current_owner_known = true;
+	}
+	if (!charge_current_owner) return;
+	if (hakios_spmi_read_live(VAYU_CHARGE_USBIN_ID, 0x70, &icl)) {
+		if (icl < VAYU_CHARGE_ICL_MA / 50 &&
+		    (!vayu_charge_put(VAYU_CHARGE_USBIN_ID, 0x70, 0xff, VAYU_CHARGE_ICL_MA / 50,
+		    "USB input current limit") ||
+		    !vayu_charge_put(VAYU_CHARGE_USBIN_ID, 0x66, 0x01, 0x01, "USB high-current mode") ||
+		    !vayu_charge_put(VAYU_CHARGE_USBIN_ID, 0x42, 0x01, 0x00, "USB ICL override") ||
+		    !vayu_charge_put(VAYU_CHARGE_USBIN_ID, 0x65, 0x10, 0x10, "USB ICL override after APSD"))) return;
+	} else {
+		if (!charge_read_error_seen) {
+			printf("vayu-charge: USB ICL read failed; current limits left unchanged\n");
+			charge_read_error_seen = true;
+		}
+	}
+	if (!hakios_spmi_read_live(VAYU_CHARGE_CHGR_ID, 0x61, &fcc)) {
+		if (!charge_read_error_seen) {
+			printf("vayu-charge: battery FCC read failed; current limit left unchanged\n");
+			charge_read_error_seen = true;
+		}
+		return;
+	}
+	if (fcc < VAYU_CHARGE_FCC_MA / 50) {
+		(void)vayu_charge_put(VAYU_CHARGE_CHGR_ID, 0x61, 0xff, VAYU_CHARGE_FCC_MA / 50,
+		    "battery fast-charge current");
+	}
+}
+
+static void
+vayu_charge_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	for (;;) {
+		vayu_charge_poll();
+		delay_for_interval(10, NSEC_PER_SEC);
+	}
+}
+
+static void
+vayu_charge_init(void)
+{
+	uint32_t enabled = 0;
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("vayu_charge", &enabled, sizeof(enabled)) || enabled == 0) return;
+	if (enabled != 1) {
+		printf("vayu-charge: vayu_charge=%u refused; only 1 enables PM8150B charging maintenance\n", enabled);
+		return;
+	}
+	printf("vayu-charge: vayu_charge=1: PM8150B watchdog every 10 s, current limits only raised\n");
+	if (kernel_thread_start(vayu_charge_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	} else {
+		printf("vayu-charge: could not start the PM8150B charging thread\n");
+	}
+}
+
 static void
 battery_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -551,6 +687,7 @@ hakios_battery_init(void)
 	vm_offset_t page;
 	thread_t thread;
 
+	vayu_charge_init();
 	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) return;
 	PE_parse_boot_argn("battery_ios", &battery_ios, sizeof(battery_ios));
 	if (PE_parse_boot_argn("battery_charger_dump", &charger_dump_secs, sizeof(charger_dump_secs)) &&
