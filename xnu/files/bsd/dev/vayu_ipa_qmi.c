@@ -1,6 +1,9 @@
 /*
  * vayu IPA QMI service 0x31: the modem-facing IPA 4.1 handshake, in stages.
  *
+ * vayu_ipa_flt_ack=1 (INSTALL_FILTER_RULE answered): from this repository's branch snatch, commit 640c7df, which
+ * followed kiwiiiii-eth/hakios-xnu-kernel's hakios.mpss.c (commit b47c5df2); rewritten for this tree.
+ *
  * 0641 proved the ordering requirement: WDS Start crashes the modem at
  * ipa_ipfltr.init_done when this handshake has not happened. This client sends the exact
  * vayu-r-oss INIT_MODEM_DRIVER layout, waits for its answer and then sends INIT_COMPLETE.
@@ -86,6 +89,51 @@
  * NOT_SUPPORTED ("Use QMI_IPA_INSTALL_FILTER_RULE_EX_REQ_V01 instead"). They are still available
  * through vayu_ipa_try, but a sequence run leaves them off.
  *
+ * a11-qmi (after Q3, against mainline drivers/net/ipa ipa_qmi.c/ipa_smp2p.c/ipa_uc.c and vayu-r-oss
+ * ipa_v3 ipa_qmi_service.c): every switch below is default 0/absent, and absent keeps the f6 run.
+ *   vayu_ipa_ready_mainline=1  vayu_ipa_ready() also wants the modem's DRIVER_INIT_COMPLETE (0x35)
+ *                 answered with a successful send: mainline ipa_qmi_ready() needs uc_ready (the modem
+ *                 loads the IPA uC on a first boot and says so with 0x35). The old gate was
+ *                 INIT_MODEM_DRIVER + INIT_COMPLETE only (vendor: :97-145, :1587-1638, no 0x35).
+ *                 =2: the same, and INIT_COMPLETE_IND (0x22) is held until 0x35 as well (mainline
+ *                 order: 0x22 only once modem_ready && uc_ready); vendor sends 0x22 without 0x35.
+ *   vayu_ipa_skip_uc_load=V    TLV 0x18 (mainline skip_uc_load = vendor is_ssr_bootup) present with
+ *                 value V (0 or 1). Absent: the TLV is absent (vendor first boot, !ipa3_uc_loaded_check()).
+ *                 Mainline always sends it: 0 on a first boot. =0 is the mainline cold-boot message;
+ *                 =1 tells the modem the uC is already loaded (what vayu_ipa_try bit 1 sends).
+ *   vayu_ipa_qmi_order=1       the mainline ipa_qmi_setup() order: our 0x31/1 server is published
+ *                 *before* the client lookup, and INIT_MODEM_DRIVER is the first message the client
+ *                 sends once the modem's 0x31/2 appears: no NEW_LOOKUP to the modem (Linux's name
+ *                 service keeps lookups local), no INDICATION_REGISTER wait, no 0x7fff probe, no
+ *                 SMP2P survey or dance, none of the vayu_ipa_try requests before it.
+ *   vayu_ipa_qmi_dump=1        print the encoded INIT_MODEM_DRIVER (header + TLVs) once, before the
+ *                 first attempt: the bytes that go to the modem. Logging only.
+ * a11 g-series: g4 (vayu_ipa_skip_uc_load=1) got INIT_MODEM_DRIVER answered in 6 ms (ctrl ep 13,
+ * default ep 13, init pending 1); with the TLV absent or 0 the modem never answers (its first-boot
+ * path loads the IPA uC, and that stalls). With skip_uc_load=1 the modem was told the uC is loaded
+ * and sends no 0x35, so vayu_ipa_ready_mainline does not wait for one then (mainline: uc_ready
+ * survives a modem restart; skip_uc_load=1 is that state). Right after INIT the modem sent
+ * CONFIG_REQ (0x27), which was answered NOT_SUPPORTED and closed the data path:
+ *   vayu_ipa_qmi_vendor_acks=1  answer the modem's CONFIG_REQ (0x27) and FILTER_INSTALLED_NOTIF (0x24)
+ *                 with success, as vayu-r-oss does: handle_ipa_config_req() calls
+ *                 ipa_mhi_handle_ipa_config_req(), which on a GSI transport changes nothing and returns
+ *                 0 (ipa_mhi_client.c:2998-3013); ipa3_handle_filter_installed_notify_req() only
+ *                 answers (ipa_qmi_service.c). The request is printed. INSTALL_FILTER_RULE (0x23) still
+ *                 fails closed here: vendor caches those rules, which this file does not do.
+ *   vayu_ipa_flt_ack=1  (from snatch 640c7df) also answer the modem's INSTALL_FILTER_RULE (0x23) on our
+ *                 host port with SUCCESS, programming nothing, as Linux ipa3 handle_install_filter_rule_req
+ *                 does (ipa_qmi_service.c:156-213: it caches the uplink rules, answers success and echoes
+ *                 each filter_spec_ex rule_id in TLV 0x11). The encoding, from msm-4.14
+ *                 ipa_qmi_service_v01.c: TLV 0x15 filter_spec_ex_list = a 1-byte count, then per entry
+ *                 ipa_filter_spec_ex_type_v01 packed: ip_type 4, filter_rule 150 (ipa_filter_rule_type_v01:
+ *                 the fixed arrays all sent), filter_action 4, is_routing_table_index_valid 1,
+ *                 route_table_index 4, is_mux_id_valid 1, mux_id 4, rule_id 4 at +168, is_rule_hashable 1:
+ *                 173 bytes. The reply's TLV 0x11 rule_id = a 1-byte count, then the ids (u32), at most
+ *                 MAX_NUM_Q6_RULE (35) as Linux. A request of another shape: success with no ids. The
+ *                 request is printed (its first 96 bytes) as 0x27/0x24 are.
+ * vayu_ipa_smp2p_watch / vayu_ipa_smp2p_mainline are in vayu_ipa.c. Lines say what they are:
+ * "S1 SMP2P" now names item 428 as ours and 435 as the modem's.
+ *
  * It does not configure GSI rings or carry packets. Those belong to vayu_ipa_data.c.
  */
 #include <kern/clock.h>
@@ -155,6 +203,10 @@ static bool qmi_trace;
 #define VAYU_IPA_SEQ_NO_HOST    (1u << 2)
 static uint32_t qmi_try;
 static uint32_t qmi_seq;
+/* a11-qmi switches (see the top of this file). qmi_skip_uc < 0: TLV 0x18 absent. */
+static uint32_t qmi_ready_mainline, qmi_order, qmi_dump, qmi_vendor_acks, qmi_filter_ack;
+static int32_t qmi_skip_uc = -1;
+static volatile bool driver_complete_acked;    /* 0x35 answered and the answer sent without an error */
 
 /* The last 0x21 answer, so the sequence's SUMMARY can say answered/silent and with what result
  * even when the reply was an error (ipa_init_modem_driver() only keeps init_done on success). */
@@ -293,6 +345,46 @@ ipa_crash_item(const char *when)
 	say("vayu-ipa-qmi: S2 CRASH 421 %s: %u bytes: \"%s\"\n", when, size, text);
 }
 
+/*
+ * a11 (j1: after a WDS Start the modem answered no QMI request at all, then GLINK sends failed with
+ * ENOBUFS): what the modem itself says, read only. Its crash-reason item 421 and every entry of its
+ * outbound SMP2P item 435 by name ("slave-kernel" bit 0 is the error-fatal bit of Linux's
+ * qcom_q6v5, bit 1 ready, bit 2 handover).
+ */
+void
+vayu_ipa_modem_snapshot(const char *when)
+{
+	uint32_t size = 0, at = vayu_smem_item(1, 435, &size), entries;
+	char line[200];
+	size_t used = 0;
+
+	ipa_crash_item(when);
+	if (at == 0 || size < 40 || vayu_smem_word(at) != 0x504d5324U) {   /* "$SMP" */
+		say("vayu-ipa-qmi: MODEM %s: its SMP2P item 435 is not readable\n", when);
+		return;
+	}
+	entries = vayu_smem_word(at + 12) >> 16;
+	if (entries > 16) entries = 16;
+	line[0] = 0;
+	for (uint32_t i = 0; i < entries && 40 + 20 * i <= size && used < sizeof(line); i++) {
+		char name[17];
+
+		for (uint32_t w = 0; w < 4; w++) {
+			uint32_t word = vayu_smem_word(at + 20 + 20 * i + 4 * w);
+
+			memcpy(name + 4 * w, &word, 4);
+		}
+		name[16] = 0;
+		for (int c = 0; c < 16 && name[c]; c++) {
+			if (name[c] < 0x20 || name[c] > 0x7e) name[c] = '.';
+		}
+		used += (size_t)snprintf(line + used, sizeof(line) - used, "%s%s=%#x", i ? " " : "", name,
+		    vayu_smem_word(at + 36 + 20 * i));
+	}
+	say("vayu-ipa-qmi: MODEM %s: SMP2P 435 flags %#x, %u entries: %s\n", when, vayu_smem_word(at + 16),
+	    entries, line);
+}
+
 /* k19 (vayu_ipa_try bits 5..7): one request to the modem's IPA service with its own timeout,
  * decoded by the plain result/error table. The ordinary INIT keeps ipa_init_modem_driver(): this
  * is for questions whose shape is a decision (empty body, one TLV, a re-ask after a timeout). */
@@ -382,8 +474,12 @@ ipa_init_request(struct vayu_ipa_init_req *req)
 	req->ctrl_comm_dest_end_pt_valid = 1;
 	req->ctrl_comm_dest_end_pt = 11;       /* IPA_CLIENT_APPS_WAN_CONS */
 	/* is_ssr_bootup absent: first boot (stock: !ipa3_uc_loaded_check()). vayu_ipa_try bit 1 asks
-	 * for the post-SSR shape instead; that is the only difference in the message. */
-	if (qmi_try & VAYU_IPA_TRY_SSR) {
+	 * for the post-SSR shape instead; that is the only difference in the message.
+	 * vayu_ipa_skip_uc_load=V (a11) puts the TLV in with V; it wins over the try bit. */
+	if (qmi_skip_uc >= 0) {
+		req->is_ssr_bootup_valid = 1;
+		req->is_ssr_bootup = (uint8_t)qmi_skip_uc;
+	} else if (qmi_try & VAYU_IPA_TRY_SSR) {
 		req->is_ssr_bootup_valid = 1;
 		req->is_ssr_bootup = 1;
 	}
@@ -430,6 +526,28 @@ ipa_init_modem_driver(void)
 	if (ret < 0) {
 		say("vayu-ipa-qmi: S2 INIT_MODEM_DRIVER: ERROR no transaction (%d)\n", ret);
 		return false;
+	}
+	if (qmi_dump) {
+		static bool dumped;
+
+		if (!dumped) {
+			uint8_t bytes[256];
+			int length = hakios_qmi_encode(QMI_REQUEST, VAYU_IPA_INIT_MODEM_DRIVER, (uint16_t)txn.id,
+			    vayu_ipa_init_req_ei, &req, bytes, sizeof(bytes));
+
+			dumped = true;
+			say("vayu-ipa-qmi: S2 DUMP 0x21: %d bytes (header 7 + TLVs), transaction %#x, to node %u port %u\n",
+			    length, (unsigned)txn.id, ipa_node, ipa_port);
+			for (int at = 0; at < length; at += 32) {
+				char hex[3 * 32 + 1];
+				int used = 0;
+
+				for (int i = at; i < length && i < at + 32; i++) {
+					used += snprintf(hex + used, sizeof(hex) - (size_t)used, "%02x ", bytes[i]);
+				}
+				say("vayu-ipa-qmi: S2 DUMP 0x21 +%03d: %s\n", at, hex);
+			}
+		}
 	}
 	started = now_ms();
 	ret = qmi_send_request(&ipa_qmi, &to, &txn, VAYU_IPA_INIT_MODEM_DRIVER, 256, vayu_ipa_init_req_ei, &req);
@@ -584,10 +702,12 @@ ipa_hello(void)
 #define IPA_SMP2P_OURS  428
 #define IPA_SMP2P_MAGIC 0x504d5324U
 
+/* Returns how many "ipa" entries the *modem's* items carry; our own 428 is printed, never counted
+ * (k19 counted it, so vayu_ipa_seq bit 1 always saw "found"). */
 static unsigned
 ipa_smp2p_survey(const char *when)
 {
-	unsigned found = 0;
+	unsigned found = 0, ours = 0;
 
 	for (uint32_t item = 424; item <= 444; item++) {
 		uint32_t size = 0, at = vayu_smem_item(1, item, &size);
@@ -599,13 +719,15 @@ ipa_smp2p_survey(const char *when)
 		for (uint32_t i = 0; i < entries && 40 + 20 * i <= size; i++) {
 			if (vayu_smem_word(at + 20 + 20 * i) != 0x00617069) continue;   /* "ipa" */
 			say("vayu-ipa-qmi: S2 SMP2P %s: item %u entry %u \"ipa\" = %#x%s\n", when, item, i,
-			    vayu_smem_word(at + 36 + 20 * i), item == IPA_SMP2P_OURS ? " (ours)" : " (the modem's)");
-			found++;
+			    vayu_smem_word(at + 36 + 20 * i), item == IPA_SMP2P_OURS ? " (ours, AP -> modem)" :
+			    " (the modem's, modem -> AP)");
+			if (item == IPA_SMP2P_OURS) ours++;
+			else found++;
 		}
 	}
 	if (found == 0) {
-		say("vayu-ipa-qmi: S2 SMP2P %s: no item in 424..444 carries an \"ipa\" entry: the modem never "
-		    "asked for the clock\n", when);
+		say("vayu-ipa-qmi: S2 SMP2P %s: no modem item in 424..444 carries an \"ipa\" entry (%s)\n", when,
+		    ours != 0 ? "only our own 428" : "not even our 428");
 	}
 	return found;
 }
@@ -759,15 +881,27 @@ stage_init(void)
 	uint64_t waited;
 
 	if ((qmi_try & VAYU_IPA_TRY_CRASH) || qmi_seq != 0) ipa_crash_item("before the first request");
-	if (qmi_seq & VAYU_IPA_SEQ_CLOCK) {
+	if (qmi_order) {
+		/* Mainline: INIT_DRIVER is sent from the new_server callback, nothing before it. */
+		say("vayu-ipa-qmi: S2 ORDER mainline: INIT_MODEM_DRIVER first (no SMP2P dance, indication wait, "
+		    "probe or vayu_ipa_try requests before it; INDICATION_REGISTER %s so far)\n",
+		    indication_wanted ? "seen" : "not seen");
+		goto attempts;
+	}
+	if ((qmi_seq & VAYU_IPA_SEQ_CLOCK) && vayu_ipa_smp2p_is_mainline()) {
+		(void)ipa_smp2p_survey("before the sequence");
+		say("vayu-ipa-qmi: S2 SMP2P CLOCK: skipped: vayu_ipa_smp2p_mainline=1 answers the modem's query "
+		    "instead of a 0 -> 3 dance\n");
+	} else if (qmi_seq & VAYU_IPA_SEQ_CLOCK) {
 		unsigned found = ipa_smp2p_survey("before the sequence");
 
-		if (found != 0) {
-			ipa_smp2p_dance();
-		} else {
-			say("vayu-ipa-qmi: S2 SMP2P CLOCK: no modem \"ipa\" entry yet; the 0 -> 3 dance is "
-			    "skipped (the NEW_LOOKUP is the only change this attempt)\n");
+		/* The k19 survey counted our own 428 entry, so the dance always ran; f5/f6 depend on that.
+		 * Kept, but said as it is. */
+		if (found == 0) {
+			say("vayu-ipa-qmi: S2 SMP2P CLOCK: no modem \"ipa\" entry yet; the 0 -> 3 dance runs anyway "
+			    "(the k19/f6 behaviour)\n");
 		}
+		ipa_smp2p_dance();
 	} else if (qmi_try & VAYU_IPA_TRY_SMP2P) {
 		ipa_smp2p_survey("before the INIT");
 		if (qmi_try & VAYU_IPA_TRY_DANCE) ipa_smp2p_dance();
@@ -786,6 +920,7 @@ stage_init(void)
 
 		ipa_ask("S2 MIN 0x21 (only platform_type)", VAYU_IPA_INIT_MODEM_DRIVER, vayu_ipa_min_req_ei, &min, 5000);
 	}
+attempts:
 	for (uint32_t attempt = 1; attempt <= qmi_attempts && !ipa_stop; attempt++) {
 		(void)vayu_ipa_uc_look("qmi", 0);      /* the uC state at every attempt, no wait */
 		init_attempts_made = attempt;
@@ -826,6 +961,14 @@ stage_init(void)
  * registered for indications (stock :132/:1621; 0x35 is not a condition). Sent from our published
  * server port, as stock sends it from the A5 server handle: the modem's client knows that address only.
  */
+/* Mainline uc_ready: the modem's 0x35 answered, or the modem was told the uC is loaded already
+ * (skip_uc_load=1), in which case it does not send one. */
+static bool
+ipa_uc_ready(void)
+{
+	return driver_complete_acked || qmi_skip_uc == 1;
+}
+
 static void
 ipa_send_complete(void)
 {
@@ -834,6 +977,15 @@ ipa_send_complete(void)
 	int ret;
 
 	if (!indication_wanted || !init_done || complete_sent || ipa_stop || client_port == 0 || host_port == NULL) return;
+	if (qmi_ready_mainline >= 2 && !ipa_uc_ready()) {
+		static bool said;
+
+		if (!said) {
+			said = true;
+			say("vayu-ipa-qmi: S2 INIT_COMPLETE_IND: held until 0x35 (vayu_ipa_ready_mainline=2)\n");
+		}
+		return;
+	}
 	ret = vayu_qrtr_ops.send(host_port, client_node, client_port, ind, sizeof(ind));
 	if (ret == 0) {
 		complete_sent = true;
@@ -842,6 +994,66 @@ ipa_send_complete(void)
 	} else {
 		say("vayu-ipa-qmi: S2 INIT_COMPLETE_IND: ERROR send %d\n", ret);
 	}
+}
+
+/* A TLV of a QMI message (header 7 bytes: type, transaction 2, message 2, length 2); NULL if absent or malformed. */
+static const uint8_t *
+ipa_qmi_tlv(const uint8_t *m, size_t length, uint8_t type, uint16_t *size)
+{
+	size_t end;
+
+	if (length < 7) return NULL;
+	end = 7 + (size_t)m[5] + ((size_t)m[6] << 8);
+	if (end > length) return NULL;
+	for (size_t at = 7; at + 3 <= end;) {
+		uint16_t n = (uint16_t)(m[at + 1] | m[at + 2] << 8);
+
+		if (n > end - at - 3) return NULL;
+		if (m[at] == type) {
+			*size = n;
+			return m + at + 3;
+		}
+		at += 3 + n;
+	}
+	return NULL;
+}
+
+#define IPA_FLT_SPEC_EX_BYTES   173     /* ipa_filter_spec_ex_type_v01 on the wire (see the top of this file) */
+#define IPA_FLT_SPEC_EX_RULE_ID 168
+#define IPA_FLT_RULE_IDS_MAX    35      /* MAX_NUM_Q6_RULE, as Linux ipa3 echoes at most */
+
+/*
+ * vayu_ipa_flt_ack=1: TLV 0x11 of the INSTALL_FILTER_RULE answer (after the result TLV of `answer`, 14 bytes),
+ * with the rule_id of each filter_spec_ex entry; the answer's length back. *ids: how many; *shape: 1 if TLV 0x15
+ * is count + count * 173 bytes, 0 if absent, -1 if of another shape (no ids then).
+ */
+static size_t
+ipa_filter_rule_ids(const uint8_t *m, size_t length, uint8_t *answer, size_t room, unsigned *ids, int *shape)
+{
+	uint16_t size = 0;
+	const uint8_t *list = ipa_qmi_tlv(m, length, 0x15, &size);
+	unsigned count = list != NULL && size >= 1 ? list[0] : 0, echo;
+	size_t at = 14;
+
+	*ids = 0;
+	*shape = list == NULL ? 0 : size == 1 + (size_t)count * IPA_FLT_SPEC_EX_BYTES && count <= 64 ? 1 : -1;
+	if (*shape == 1) {
+		echo = count < IPA_FLT_RULE_IDS_MAX ? count : IPA_FLT_RULE_IDS_MAX;
+		if (at + 4 + 4 * (size_t)echo <= room) {
+			answer[at++] = 0x11;
+			answer[at++] = (uint8_t)(1 + 4 * echo);
+			answer[at++] = 0;
+			answer[at++] = (uint8_t)echo;
+			for (unsigned r = 0; r < echo; r++) {
+				memcpy(answer + at, list + 1 + (size_t)r * IPA_FLT_SPEC_EX_BYTES + IPA_FLT_SPEC_EX_RULE_ID, 4);
+				at += 4;
+			}
+			*ids = echo;
+		}
+	}
+	answer[5] = (uint8_t)(at - 7);
+	answer[6] = (uint8_t)((at - 7) >> 8);
+	return at;
 }
 
 static void
@@ -867,18 +1079,50 @@ ipa_receive(void *context __unused, uint32_t node, uint32_t from_port, const voi
 		/* A request on our published host port. Answer with the same transaction id.
 		 * Only the handshake requests are implemented. Claiming success for a filter or
 		 * configuration request without applying it would be a fake data-ready path. */
+		bool filter_ack = qmi_filter_ack && message == VAYU_IPA_INSTALL_FILTER_RULE;
+		bool vendor_ack = filter_ack || (qmi_vendor_acks &&
+		    (message == VAYU_IPA_CONFIG_REQ || message == VAYU_IPA_FILTER_INSTALLED_NOTIF));
 		bool supported = message == VAYU_IPA_INDICATION_REGISTER ||
-		    message == VAYU_IPA_DRIVER_INIT_COMPLETE;
+		    message == VAYU_IPA_DRIVER_INIT_COMPLETE || vendor_ack;
 		uint16_t result = supported ? 0 : 1;
 		uint16_t error = supported ? 0 : QMI_ERR_NOT_SUPPORTED_V01;
-		uint8_t answer[14] = { 2, m[1], m[2], m[3], m[4], 7, 0, 2, 4, 0,
+		uint8_t answer[14 + 4 + 4 * IPA_FLT_RULE_IDS_MAX] = { 2, m[1], m[2], m[3], m[4], 7, 0, 2, 4, 0,
 		    (uint8_t)result, (uint8_t)(result >> 8), (uint8_t)error, (uint8_t)(error >> 8) };
+		size_t answer_length = 14;
+		unsigned ids = 0;
+		int shape = 0;
+		int sent;
 
+		if (filter_ack) {
+			answer_length = ipa_filter_rule_ids(m, length, answer, sizeof(answer), &ids, &shape);
+		}
 		if (!supported) vayu_ipa_data_filter_error();
-		(void)vayu_qrtr_ops.send(host_port, node, from_port, answer, sizeof(answer));
+		sent = vayu_qrtr_ops.send(host_port, node, from_port, answer, answer_length);
+		if (sent != 0) {
+			say("vayu-ipa-qmi: answer to modem request %#x: ERROR send %d\n", message, sent);
+		} else if (message == VAYU_IPA_DRIVER_INIT_COMPLETE) {
+			driver_complete_acked = true;
+		}
 		if (!supported) {
 			say("vayu-ipa-qmi: modem request %#x (%zu bytes) answered NOT_SUPPORTED (nothing was changed)\n",
 			    message, length);
+		} else if (filter_ack) {
+			say("vayu-ipa-qmi: modem request %#x INSTALL_FILTER_RULE (%zu bytes) answered SUCCESS as Linux ipa3 "
+			    "does, nothing programmed: %u rule id(s) echoed (TLV 0x15 %s)%s\n", message, length, ids,
+			    shape == 1 ? "count + 173-byte filter_spec_ex entries" : shape == 0 ? "absent" :
+			    "of another shape: no ids", sent == 0 ? "" : ", but the answer was NOT sent");
+		} else if (vendor_ack) {
+			say("vayu-ipa-qmi: modem request %#x %s (%zu bytes) answered SUCCESS as vayu-r-oss does (%s)%s\n",
+			    message, message == VAYU_IPA_CONFIG_REQ ? "CONFIG_REQ" : "FILTER_INSTALLED_NOTIF", length,
+			    message == VAYU_IPA_CONFIG_REQ ? "GSI transport: nothing to apply" : "a notification only",
+			    sent == 0 ? "" : ", but the answer was NOT sent");
+		}
+		if (vendor_ack) {
+			for (size_t at = 0; at < length && at < 96; at += 24) {
+				ipa_say_hex(message == VAYU_IPA_CONFIG_REQ ? "S2 CONFIG_REQ 0x27" :
+				    message == VAYU_IPA_INSTALL_FILTER_RULE ? "S2 INSTALL_FILTER_RULE 0x23" : "S2 FILTER_NOTIF 0x24",
+				    m + at, length - at < 24 ? length - at : 24);
+			}
 		}
 	} else {
 		say("vayu-ipa-qmi: modem message %#x type %u on the host port: result %u error %u\n", message, m[0],
@@ -894,7 +1138,10 @@ ipa_receive(void *context __unused, uint32_t node, uint32_t from_port, const voi
 		break;
 	case VAYU_IPA_DRIVER_INIT_COMPLETE:
 		driver_complete = true;
-		say("vayu-ipa-qmi: S2 MODEM_INIT_CMPLT(0x35): OK (answered success)\n");
+		say("vayu-ipa-qmi: S2 MODEM_INIT_CMPLT(0x35): OK from node %u port %u, status TLV %s (answered success%s)\n",
+		    node, from_port, length >= 11 && m[7] == 0x01 ? (m[10] ? "1" : "0") : "absent",
+		    driver_complete_acked ? "" : ", the answer was NOT sent");
+		ipa_send_complete();            /* vayu_ipa_ready_mainline=2 held it for this */
 		break;
 	default:
 		break;
@@ -921,7 +1168,7 @@ ipa_del_server(struct qmi_handle *qmi __unused, struct qmi_service *service)
 {
 	if (ipa_node == service->node && ipa_port == service->port) {
 		ipa_modem_there = false;
-		indication_wanted = init_done = complete_sent = driver_complete = false;
+		indication_wanted = init_done = complete_sent = driver_complete = driver_complete_acked = false;
 		say("vayu-ipa-qmi: modem IPA service went away\n");
 	}
 }
@@ -954,22 +1201,25 @@ static const struct qmi_ops wds_qmi_ops = {
 	.del_server = wds_del_server,
 };
 
-/* S1: our "ipa" entry must read 3 (response done + clock on); the modem's is logged as it is. */
+/* S1: our own outbound "ipa" entry (428) must read 3, the pre-set answer (with vayu_ipa_smp2p_mainline=1
+ * it only has to exist: it is 0 until the modem asks); the modem's inbound one (435) is logged as it is
+ * and decides nothing: it is the modem's clock query, absent until its IPA driver makes it. */
 static void
 stage_smp2p(void)
 {
-	bool ours_found = false, theirs_found = false;
+	bool ours_found = false, theirs_found = false, mainline = vayu_ipa_smp2p_is_mainline();
 	uint32_t ours = 0, theirs = 0;
 	uint64_t waited = 0;
 
 	for (;;) {
 		vayu_ipa_smp2p_read(&ours_found, &ours, &theirs_found, &theirs);
-		if ((ours_found && (ours & 3) == 3) || ipa_stop || waited >= 5000) break;
+		if ((ours_found && (mainline || (ours & 3) == 3)) || ipa_stop || waited >= 5000) break;
 		delay_for_interval(100, NSEC_PER_MSEC);
 		waited += 100;
 	}
-	say("vayu-ipa-qmi: S1 SMP2P: %s ours \"ipa\" %s%#x, modem \"ipa\" %s%#x, firmware %s (%llu ms)\n",
-	    ours_found && (ours & 3) == 3 ? "OK" : "ERROR", ours_found ? "" : "absent ", ours,
+	say("vayu-ipa-qmi: S1 SMP2P: %s ours (428, AP -> modem) \"ipa\" %s%#x, the modem's (435, its clock query) "
+	    "\"ipa\" %s%#x, firmware %s (%llu ms)\n",
+	    ours_found && (mainline || (ours & 3) == 3) ? "OK" : "ERROR", ours_found ? "" : "absent ", ours,
 	    theirs_found ? "" : "absent ", theirs, vayu_ipa_firmware_ready() ? "ready" : "NOT READY", waited);
 }
 
@@ -1035,6 +1285,21 @@ ipa_thread(void *arg, wait_result_t wr __unused)
 	int ret;
 
 	stage_smp2p();
+	if (qmi_order && stage >= 2) {
+		/* Mainline ipa_qmi_setup(): qmi_add_server() before the client's qmi_add_lookup(). */
+		if (!vayu_ipa_firmware_ready()) {
+			say("vayu-ipa-qmi: S2 PUBLISH 0x31/1: ERROR IPA firmware/SMP2P not ready; no INIT_MODEM_DRIVER\n");
+			goto out;
+		}
+		host_port = vayu_qrtr_ops.open(ipa_receive, NULL, NULL);
+		ret = host_port == NULL ? -ENOMEM :
+		    vayu_qrtr_publish(host_port, VAYU_IPA_QMI_SERVICE, VAYU_IPA_QMI_INSTANCE, VAYU_IPA_QMI_INSTANCE);
+		if (ret != 0) {
+			say("vayu-ipa-qmi: S2 PUBLISH 0x31/1: ERROR %d\n", ret);
+			goto out;
+		}
+		say("vayu-ipa-qmi: S2 PUBLISH 0x31/1: OK, before the client lookup (vayu_ipa_qmi_order=1)\n");
+	}
 	ret = qmi_handle_init(&ipa_qmi, 4096, &ipa_qmi_ops, NULL);
 	if (ret < 0) {
 		say("vayu-ipa-qmi: S1 LOOKUP 0x31/2: ERROR qmi_handle_init %d\n", ret);
@@ -1054,7 +1319,7 @@ ipa_thread(void *arg, wait_result_t wr __unused)
 	}
 	say("vayu-ipa-qmi: S1 LOOKUP 0x31/2: OK node %u port %u version %u after %llu ms\n", ipa_node, ipa_port,
 	    ipa_version, waited);
-	if (qmi_seq & VAYU_IPA_SEQ_NEWLOOKUP) {
+	if ((qmi_seq & VAYU_IPA_SEQ_NEWLOOKUP) && !qmi_order) {
 		/*
 		 * A second NEW_LOOKUP, now that the service is known to be up: the first one (sent when
 		 * the lookup was registered) may have reached the modem's name service before its IPA
@@ -1065,6 +1330,7 @@ ipa_thread(void *arg, wait_result_t wr __unused)
 		say("vayu-ipa-qmi: S1 NEW_LOOKUP after the service: %s\n", ret == 0 ? "sent" : "ERROR");
 	}
 	if (stage < 2) goto idle;
+	if (qmi_order) goto published;
 
 	if (!vayu_ipa_firmware_ready()) {
 		say("vayu-ipa-qmi: S2 PUBLISH 0x31/1: ERROR IPA firmware/SMP2P not ready; no INIT_MODEM_DRIVER\n");
@@ -1078,6 +1344,7 @@ ipa_thread(void *arg, wait_result_t wr __unused)
 		goto out;
 	}
 	say("vayu-ipa-qmi: S2 PUBLISH 0x31/1: OK\n");
+published:
 	stage_init();
 	if (!init_done) {
 		say("vayu-ipa-qmi: S2 handshake stopped; WDS Start remains blocked\n");
@@ -1085,10 +1352,15 @@ ipa_thread(void *arg, wait_result_t wr __unused)
 	}
 	ipa_send_complete();
 	(void)wait_for(&driver_complete, 10000);
+	ipa_send_complete();                    /* a late INDICATION_REGISTER, or 0x22 held for 0x35 */
 	ipa_summary("after the attempts");
-	say("vayu-ipa-qmi: S2 RESULT: %s (INIT_MODEM_DRIVER %s, INDICATION_REGISTER %s, INIT_COMPLETE %s, 0x35 %s)\n",
+	say("vayu-ipa-qmi: S2 RESULT: %s (INIT_MODEM_DRIVER %s, INDICATION_REGISTER %s, INIT_COMPLETE %s, 0x35 %s%s; "
+	    "ready gate %s)\n",
 	    vayu_ipa_ready() ? "OK IPA READY" : "ERROR not ready", init_done ? "ok" : "no",
-	    indication_wanted ? "ok" : "no", complete_sent ? "sent" : "NOT SENT", driver_complete ? "ok" : "TIMEOUT");
+	    indication_wanted ? "ok" : "no", complete_sent ? "sent" : "NOT SENT", driver_complete ? "ok" : "TIMEOUT",
+	    driver_complete && !driver_complete_acked ? " (answer not sent)" : "",
+	    qmi_ready_mainline == 0 ? "vendor: INIT + INIT_COMPLETE" :
+	    qmi_skip_uc == 1 ? "mainline: uC said loaded (skip_uc_load=1), no 0x35 expected" : "mainline: + 0x35");
 	if (stage >= 3 && !ipa_stop) stage_wds();
 	if (stage >= 4) {
 		say("vayu-ipa-qmi: S4 WDS START: %s (vayu_cell_data=1 drives it)\n",
@@ -1105,6 +1377,7 @@ idle:
 		while (!ipa_stop) {
 			if (!init_done && stage >= 2 && ipa_modem_there && late < 4 && now_ms() >= next) {
 				late++;
+				init_attempts_made++;
 				next = now_ms() + 30000;
 				say("vayu-ipa-qmi: S2 LATE INIT %u/4: asking again\n", late);
 				if (ipa_init_modem_driver()) {
@@ -1141,7 +1414,16 @@ out:
 bool
 vayu_ipa_ready(void)
 {
-	return vayu_ipa_firmware_ready() && init_done && complete_sent;
+	/* vayu_ipa_ready_mainline: mainline ipa_qmi_ready() also needs uc_ready, the 0x35 the modem sends
+	 * once it has loaded the IPA uC. */
+	return vayu_ipa_firmware_ready() && init_done && complete_sent && (qmi_ready_mainline == 0 || ipa_uc_ready());
+}
+
+/* The modem's DRIVER_INIT_COMPLETE (0x35) was answered: its IPA driver init is no longer pending. */
+bool
+vayu_ipa_modem_init_complete(void)
+{
+	return driver_complete_acked;
 }
 
 bool
@@ -1181,6 +1463,33 @@ vayu_ipa_start(struct vayu_qrtr *q)
 
 		qmi_trace = PE_parse_boot_argn("vayu_qmi_trace", &trace, sizeof(trace)) && trace == 1;
 	}
+	PE_parse_boot_argn("vayu_ipa_ready_mainline", &qmi_ready_mainline, sizeof(qmi_ready_mainline));
+	PE_parse_boot_argn("vayu_ipa_qmi_order", &qmi_order, sizeof(qmi_order));
+	PE_parse_boot_argn("vayu_ipa_qmi_dump", &qmi_dump, sizeof(qmi_dump));
+	PE_parse_boot_argn("vayu_ipa_qmi_vendor_acks", &qmi_vendor_acks, sizeof(qmi_vendor_acks));
+	if (qmi_vendor_acks > 1) qmi_vendor_acks = 0;
+	PE_parse_boot_argn("vayu_ipa_flt_ack", &qmi_filter_ack, sizeof(qmi_filter_ack));
+	if (qmi_filter_ack > 1) qmi_filter_ack = 0;
+	if (qmi_filter_ack) {
+		say("vayu-ipa-qmi: vayu_ipa_flt_ack=1: the modem's INSTALL_FILTER_RULE (0x23) answered SUCCESS with its rule "
+		    "ids echoed; the rules are not programmed\n");
+	}
+	if (qmi_ready_mainline > 2) qmi_ready_mainline = 0;
+	if (qmi_order > 1) qmi_order = 0;
+	if (qmi_dump > 1) qmi_dump = 0;
+	{
+		uint32_t skip = 0;
+
+		qmi_skip_uc = PE_parse_boot_argn("vayu_ipa_skip_uc_load", &skip, sizeof(skip)) && skip <= 1 ? (int32_t)skip : -1;
+	}
+	if (qmi_ready_mainline | qmi_order | qmi_dump | qmi_vendor_acks || qmi_skip_uc >= 0) {
+		say("vayu-ipa-qmi: a11: ready_mainline %u (%s), skip_uc_load %s, qmi_order %u (%s), qmi_dump %u, "
+		    "vendor_acks %u\n",
+		    qmi_ready_mainline, qmi_ready_mainline == 2 ? "+0x35, 0x22 after 0x35" :
+		    qmi_ready_mainline == 1 ? "+0x35" : "vendor gate",
+		    qmi_skip_uc < 0 ? "TLV 0x18 absent" : qmi_skip_uc ? "TLV 0x18 = 1" : "TLV 0x18 = 0",
+		    qmi_order, qmi_order ? "server first, INIT first" : "old", qmi_dump, qmi_vendor_acks);
+	}
 	if (PE_parse_boot_argn("vayu_ipa_try", &qmi_try, sizeof(qmi_try)) && qmi_try != 0) {
 		say("vayu-ipa-qmi: vayu_ipa_try=%#x: extra probes/variants on (0x20 hello %s, 0x23 filter %s, "
 		    "INIT is_ssr_bootup %s, platform_type %s, 0x21 from host 0x31/1 %s, post-0x21 %s, "
@@ -1206,7 +1515,7 @@ vayu_ipa_start(struct vayu_qrtr *q)
 		 * accident.
 		 */
 		qmi_try &= ~VAYU_IPA_TRY_HOST_INIT;
-		if (qmi_seq & VAYU_IPA_SEQ_NEWLOOKUP) {
+		if ((qmi_seq & VAYU_IPA_SEQ_NEWLOOKUP) && !qmi_order) {
 			vayu_qrtr_lookup_announce(VAYU_IPA_QMI_SERVICE);
 		}
 		say("vayu-ipa-qmi: vayu_ipa_seq=%#x: clean 0x21 sequence (NEW_LOOKUP %s, SMP2P clock %s, "
@@ -1246,7 +1555,7 @@ vayu_ipa_stop(void)
 		vayu_qrtr_ops.close(host_port);
 		host_port = NULL;
 	}
-	init_done = complete_sent = indication_wanted = driver_complete = false;
+	init_done = complete_sent = indication_wanted = driver_complete = driver_complete_acked = false;
 	ipa_modem_there = wds_there = false;
 	ipa_started = false;
 	say("vayu-ipa: stopped\n");

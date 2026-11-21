@@ -17,6 +17,10 @@
 #include <mach/kern_return.h>
 #include "hfs.h"
 #include "hfs_iokit.h"
+/*
+ * var_hfs_trace=1 (hakios_hfs_trace, hakios_hfs_note): bsd/dev/hakios.ufs.c, beside kern.hakios's other names -- a
+ * sysctl declared here would be HFS's own, which this kernel registers by hand.
+ */
 
 #ifndef panic_on_assert
 bool panic_on_assert = false;

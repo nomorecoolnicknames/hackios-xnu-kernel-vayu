@@ -46,6 +46,7 @@
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
 #include <sys/vayu_wled.h>
+#include <sys/vayu_display_power.h>
 
 /*
  * Every line of this driver also goes into the loader's log (as the torch's and the audio's say() do):
@@ -330,6 +331,9 @@ vayu_wled_power(bool on)
 
 	if (!os_atomic_load(&writes_ok, acquire)) {
 		return false;
+	}
+	if (on) {
+		vayu_display_power_wake();      /* (display_off_intf=1: the panel's stream back before the light) */
 	}
 	lck_mtx_lock(&wled_lock);
 	known = spmi_read(&ctrl, 0x46, &was, 1) == NULL;

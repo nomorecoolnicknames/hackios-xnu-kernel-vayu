@@ -32,6 +32,10 @@
  *   vayu_cell_net=1          attach en1 and start the configuration thread
  *   vayu_wds=1               attach pdp_ip0 instead (IPv4 only, IFEF_IPV6_DISABLED)
  *   vayu_cell_net_default=1  also add a global default route via the session's gateway
+ *   vayu_wds_cc=1            with vayu_wds=1: pdp_ip0 is CommCenter's, as on an iPhone -- it sets the
+ *                            address (SIOCAIFADDR) and publishes the service to configd, which adds
+ *                            the route and DNS; IFF_RUNNING follows IFF_UP once vayu_ipa_data_ready().
+ *                            Pair it with vayu_cell_data_port=1 so the kernel starts no session.
  *
  * Threading: vayu_cell_net_session() only copies its arguments under a mutex and wakes the thread;
  * vayu_cell_net_input() and the output callback never sleep and never open a socket. The input
@@ -64,6 +68,7 @@
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/vayu_cell_net.h>
+#include <sys/vayu_ipa_data.h>
 
 extern void loader_log_putc(char c);
 /* The main agent's IPA transmit; it must copy the bytes before returning (the mbuf is freed below). */
@@ -174,6 +179,7 @@ static struct {
 	bool    thread_started;
 	bool    pdp;                    /* vayu_wds=1: the interface is pdp_ip0, IPv6 disabled */
 	bool    default_route;
+	bool    cc;                     /* vayu_wds_cc=1: CommCenter configures pdp_ip0, not this file */
 	char    name[IFNAMSIZ];         /* "en1" or "pdp_ip0", decided once by the boot arg */
 	struct cell_net_request request;
 	bool     pending;
@@ -844,10 +850,14 @@ cell_net_ioctl(ifnet_t ifp, u_long command, void *data)
 	case SIOCSIFADDR:
 		/* bsd/netinet/in.c calls this with a struct ifaddr while it installs the address. */
 		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
+		if (cell_net.cc) {
+			/* CommCenter's own address: the link runs once the IPA carries packets. */
+			ifnet_set_flags(ifp, vayu_ipa_data_ready() ? IFF_RUNNING : 0, IFF_RUNNING);
+		}
 		break;
 	case SIOCSIFFLAGS:
 		lck_mtx_lock(&cell_net_lock);
-		configured = cell_net.applied.fully_configured;
+		configured = cell_net.cc ? vayu_ipa_data_ready() : cell_net.applied.fully_configured;
 		lck_mtx_unlock(&cell_net_lock);
 		flags = ifnet_flags(ifp);
 		ifnet_set_flags(ifp, ((flags & IFF_UP) && configured) ? IFF_RUNNING : 0, IFF_RUNNING);
@@ -981,6 +991,9 @@ vayu_cell_net_init(void)
 
 		PE_parse_boot_argn("vayu_wds_default", &wds_default, sizeof(wds_default));
 		cell_net.default_route = wds_default == 1;
+		wds_default = 0;
+		PE_parse_boot_argn("vayu_wds_cc", &wds_default, sizeof(wds_default));
+		cell_net.cc = wds_default == 1;
 	} else {
 		PE_parse_boot_argn("vayu_cell_net_default", &default_route, sizeof(default_route));
 		cell_net.default_route = default_route == 1;
@@ -1024,8 +1037,13 @@ vayu_cell_net_init(void)
 			say("vayu-cell-ping: no thread; the ping test is off\n");
 		}
 	}
-	say("vayu-cell-net: ready: %s, %s=1 default_route=%u; no CommCenter, no configd, no DNS publication\n",
-	    cell_net.name, want_wds ? "vayu_wds" : "vayu_cell_net", cell_net.default_route ? 1 : 0);
+	if (cell_net.cc) {
+		say("vayu-cell-net: ready: %s for CommCenter (vayu_wds_cc=1): it sets the address, configd the "
+		    "route and DNS; this file only carries packets once the IPA path is ready\n", cell_net.name);
+	} else {
+		say("vayu-cell-net: ready: %s, %s=1 default_route=%u; no CommCenter, no configd, no DNS publication\n",
+		    cell_net.name, want_wds ? "vayu_wds" : "vayu_cell_net", cell_net.default_route ? 1 : 0);
+	}
 }
 
 const char *

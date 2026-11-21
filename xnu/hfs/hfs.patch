@@ -29,7 +29,71 @@
  #endif /* hfs_iokit_h */
 --- a/bsd/hfs/hfs_vfsops.c
 +++ b/bsd/hfs/hfs_vfsops.c
-@@ -2622,6 +2622,10 @@
+@@ -119,6 +119,10 @@
+ 
+ #define HFS_MOUNT_DEBUG 1
+ 
++/* HakiOS, var_hfs_trace=1 (bsd/dev/hakios.ufs.c): the steps of a mount said */
++extern void hakios_hfs_note(const char *format, ...) __printflike(1, 2);
++#define HK_TRACE(...) hakios_hfs_note(__VA_ARGS__)
++
+ /* Enable/disable debugging code for live volume resizing, defined in hfs_resize.c */
+ extern int hfs_resize_debug;
+ 
+@@ -190,6 +194,7 @@
+ 	int retval = E_NONE;
+ 	u_int32_t cmdflags;
+ 
++	HK_TRACE("hfs_mount: flags 0x%llx, data %s\n", (unsigned long long)vfs_flags(mp), data ? "given" : "none");
+ 	if (data && (retval = copyin(data, (caddr_t)&args, sizeof(args)))) {
+ 		if (HFS_MOUNT_DEBUG) {
+ 			printf("hfs_mount: copyin returned %d for fs\n", retval);
+@@ -1131,6 +1136,7 @@
+ 	if (mp)
+ 		vfs_setlocklocal(mp);
+ 
++	HK_TRACE("hfs_mountfs: begins (read-only %d, replay only %d)\n", ronly, journal_replay_only);
+ 	/* Get the logical block size (treated as physical block size everywhere) */
+ 	if (VNOP_IOCTL(devvp, DKIOCGETBLOCKSIZE, (caddr_t)&log_blksize, 0, context)) {
+ 		if (HFS_MOUNT_DEBUG) {
+@@ -1255,6 +1261,8 @@
+ 	 */
+ 
+ 	mdb_offset = (daddr64_t)HFS_PRI_SECTOR(log_blksize);
++	HK_TRACE("hfs_mountfs: block %u (physical %u, least %u), %llu of them; the header at %lld\n", log_blksize,
++	    phys_blksize, minblksize, (unsigned long long)log_blkcnt, (long long)mdb_offset);
+ 
+ 	if ((retval = (int)buf_meta_bread(devvp, 
+ 				HFS_PHYSBLK_ROUNDDOWN(mdb_offset, (phys_blksize/log_blksize)), 
+@@ -1405,6 +1413,8 @@
+ 	microtime(&tv);
+ 	hfsmp->hfs_mount_time = tv.tv_sec;
+ 
++	HK_TRACE("hfs_mountfs: the header read: signature %04x, writable media %d\n", SWAP_BE16(mdbp->drSigWord),
++	    (hfsmp->hfs_flags & HFS_WRITEABLE_MEDIA) != 0);
+ 	/* Mount a standard HFS disk */
+ 	if ((SWAP_BE16(mdbp->drSigWord) == kHFSSigWord) &&
+ 	    (mntwrapper || (SWAP_BE16(mdbp->drEmbedSigWord) != kHFSPlusSigWord))) {
+@@ -1663,7 +1673,10 @@
+ 			goto error_exit;
+ 		}
+ 
++		HK_TRACE("hfs_mountfs: early journal: %s; the volume now (hfs_MountHFSPlusVolume)\n",
++		    hfsmp->jnl != NULL ? "open" : "none");
+ 		retval = hfs_MountHFSPlusVolume(hfsmp, vhp, embeddedOffset, disksize, p, args, cred);
++		HK_TRACE("hfs_mountfs: hfs_MountHFSPlusVolume: %d\n", retval);
+ 		/*
+ 		 * If the backend didn't like our physical blocksize
+ 		 * then retry with physical blocksize of 512.
+@@ -1865,6 +1878,7 @@
+ 	return (0);
+ 
+ error_exit:
++	HK_TRACE("hfs_mountfs: fails with %d\n", retval);
+ 	if (bp)
+ 		buf_brelse(bp);
+ 
+@@ -2622,6 +2636,10 @@
  
  	journal_init();
  
@@ -40,6 +104,52 @@
  	return (0);
  }
  
+--- a/bsd/hfs/hfs_vfsutils.c
++++ b/bsd/hfs/hfs_vfsutils.c
+@@ -84,6 +84,10 @@
+ 
+ #define HFS_MOUNT_DEBUG 1
+ 
++/* HakiOS, var_hfs_trace=1 (bsd/dev/hakios.ufs.c): the steps of a mount said */
++extern void hakios_hfs_note(const char *format, ...) __printflike(1, 2);
++#define HK_TRACE(...) hakios_hfs_note(__VA_ARGS__)
++
+ 
+ //*******************************************************************************
+ // Note: Finder information in the HFS/HFS+ metadata are considered opaque and
+@@ -189,6 +193,8 @@
+ 	hfs_version = SWAP_BE16(vhp->version);
+ 
+ 	retval = hfs_ValidateHFSPlusVolumeHeader(hfsmp, vhp);
++	HK_TRACE("hfs_MountHFSPlusVolume: header %d, %u blocks of %u, disk %llu bytes\n", retval,
++	    SWAP_BE32(vhp->totalBlocks), SWAP_BE32(vhp->blockSize), (unsigned long long)disksize);
+ 	if (retval)
+ 		return retval;
+ 
+@@ -703,6 +709,7 @@
+ 		buf_invalidateblks (hfsmp->hfs_allocation_vp, 0, 0, 0);
+ 	}
+ 
++	HK_TRACE("hfs_MountHFSPlusVolume: the B-trees and the root are open; journal %s\n", hfsmp->jnl ? "open" : "none");
+ 	/* mark the volume dirty (clear clean unmount bit) */
+ 	vcb->vcbAtrb &=	~kHFSVolumeUnmountedMask;
+ 	if (hfsmp->jnl && (hfsmp->hfs_flags & HFS_READ_ONLY) == 0) {
+@@ -725,6 +732,7 @@
+ 		&& (hfsmp->jnl == NULL)) {
+ 
+ 		retval = hfs_late_journal_init(hfsmp, vhp, args);
++		HK_TRACE("hfs_MountHFSPlusVolume: hfs_late_journal_init: %d, journal %s\n", retval, hfsmp->jnl ? "open" : "none");
+ 		if (retval != 0) {
+ 			if (retval == EROFS) {
+ 				// EROFS is a special error code that means the volume has an external
+@@ -993,6 +1001,7 @@
+ 	return (0);
+ 
+ ErrorExit:
++	HK_TRACE("hfs_MountHFSPlusVolume: fails with %d\n", retval);
+ 	/*
+ 	 * A fatal error occurred and the volume cannot be mounted, so 
+ 	 * release any resources that we acquired...
 --- a/bsd/hfs/kext-config.h
 +++ b/bsd/hfs/kext-config.h
 @@ -1,55 +1,16 @@

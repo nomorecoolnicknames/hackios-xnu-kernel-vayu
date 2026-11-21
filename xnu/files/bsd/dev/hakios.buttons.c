@@ -42,6 +42,9 @@
  * Register layouts: Linux drivers/spmi/spmi-pmic-arb.c (arbiter version 5),
  * drivers/input/misc/pm8941-pwrkey.c (the "pmk8350" kind), drivers/pinctrl/qcom/pinctrl-spmi-gpio.c,
  * and the phone's own device tree (qcom,spmi@c440000, pon_hlos@1300, gpio_keys).
+ *
+ * hakios_spmi_update() (a register written through this system's channel, for vayu_charge=1): from this repository's
+ * branch snatch, commit e777381; rewritten so that the read, the write and the read back hold the arbiter's lock.
  */
 #include <machine/machine_routines.h>
 #include <kern/clock.h>
@@ -289,6 +292,161 @@ hakios_spmi_peek(uint16_t id, uint8_t reg, uint8_t *value)
 	}
 	hakios_spmi_unlock();
 	return p->found && spmi_read(p, reg, value, 1) == NULL;
+}
+
+/*
+ * vayu_charge=1 (bsd/dev/hakios.battery.c; from snatch e777381): one register of a peripheral written,
+ * read-modify-write, through the arbiter channel this system owns for it -- never another's (cnfg ARB_OWNER is
+ * ours, as Linux spmi-pmic-arb.c pmic_arb_offset_v5 requires for PMIC_ARB_CHANNEL_RW). The channel's write
+ * window: "chnls" 0x0c600000 + 0x10000 * channel (pmic_arb_offset_v5); WDATA0 0x10, then the command
+ * EXT_WRITEL (opcode 0) [11:4] register, [2:0] bytes - 1, and STATUS 0x08 polled (pmic_arb_write_cmd). The read,
+ * the write and the read back are under the arbiter's one lock together: no other writer (the flashlight,
+ * WLED, haptics) gets between them. mask 0: `value` written as it is (a command register), nothing read.
+ * False if the arbiter is not mapped (buttons=1 maps it), the channel is not ours, or a transfer fails.
+ */
+#define ARB_CHNLS_PHYS          0x0c600000UL    /* "chnls": 0x10000 per channel, its owner's writes */
+#define CHANNEL_WDATA0          0x10
+#define COMMAND_WRITE           (0u << 27)      /* "extended register write long" */
+#define WRITE_TIMEOUT_US        2000
+
+static LCK_GRP_DECLARE(spmi_write_lck_grp, "hakios-spmi-write");
+static LCK_MTX_DECLARE(spmi_write_lock, &spmi_write_lck_grp);   /* the write windows' table (ml_io_map may block) */
+static struct {
+	uint16_t id, channel;
+	vm_offset_t write;
+} spmi_writable[8];
+static unsigned spmi_writable_count;
+
+/* the channel of `id` this system owns, or -1 (the arbiter's tables as they are now) */
+static int
+spmi_owned_channel(uint16_t id)
+{
+	uint32_t channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
+
+	channels = channels == 0 || channels > ARB_MAX_CHANNELS ? ARB_MAX_CHANNELS : channels;
+	for (uint32_t n = 0; n < channels; n++) {
+		uint32_t map = rd(arb_core + ARB_CHANNEL(n));
+
+		if (map != 0 && ((map >> 8) & 0xfff) == id && (rd(arb_cnfg + ARB_OWNER(n)) & 7) == ARB_SYSTEM) {
+			return (int)n;
+		}
+	}
+	return -1;
+}
+
+bool
+hakios_spmi_owned(uint16_t id)
+{
+	uint32_t version;
+
+	if (arb_core == 0 || arb_cnfg == 0) {
+		return false;
+	}
+	version = rd(arb_core + ARB_VERSION);
+	return version >= ARB_VERSION_5 && version < ARB_VERSION_7 && spmi_owned_channel(id) >= 0;
+}
+
+/* one observer read or channel write, with the lock held: the status, or 0 after WRITE_TIMEOUT_US */
+static uint32_t
+spmi_transfer_locked(vm_offset_t channel, uint32_t command)
+{
+	uint64_t start = mach_absolute_time(), interval;
+	uint32_t status;
+
+	nanoseconds_to_absolutetime(WRITE_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
+	wr(channel + OBSERVER_COMMAND, command);
+	do {
+		status = rd(channel + OBSERVER_STATUS);
+	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
+	return status & STATUS_DONE ? status : 0;
+}
+
+#define SPMI_OK(status)         ((status) != 0 && !((status) & (STATUS_DENIED | STATUS_FAILURE | STATUS_DROPPED)))
+
+bool
+hakios_spmi_update(uint16_t id, uint8_t reg, uint8_t mask, uint8_t value, uint8_t *before, uint8_t *after,
+    bool *written)
+{
+	vm_offset_t write = 0, observer;
+	uint16_t channel = 0;
+	uint8_t old = 0, next = value, back = 0;
+	uint32_t version, status;
+	bool ok = false;
+	int n;
+
+	*written = false;
+	*before = *after = 0;
+	if (arb_core == 0 || arb_cnfg == 0 || arb_observer == 0) {
+		return false;
+	}
+	version = rd(arb_core + ARB_VERSION);
+	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) {
+		return false;
+	}
+	lck_mtx_lock(&spmi_write_lock);
+	for (unsigned i = 0; i < spmi_writable_count && write == 0; i++) {
+		if (spmi_writable[i].id == id) {
+			write = spmi_writable[i].write;
+			channel = spmi_writable[i].channel;
+		}
+	}
+	if (write == 0 && (n = spmi_owned_channel(id)) >= 0 &&
+	    spmi_writable_count < sizeof(spmi_writable) / sizeof(spmi_writable[0])) {
+		channel = (uint16_t)n;
+		write = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * channel, 0x1000);
+		if (write != 0) {
+			spmi_writable[spmi_writable_count].id = id;
+			spmi_writable[spmi_writable_count].channel = channel;
+			spmi_writable[spmi_writable_count].write = write;
+			spmi_writable_count++;
+		}
+	}
+	lck_mtx_unlock(&spmi_write_lock);
+	if (write == 0) {
+		return false;
+	}
+	observer = arb_observer + 0x10000UL * ARB_SYSTEM + 0x80UL * channel;
+
+	hakios_spmi_lock();
+	/* (the channel still that peripheral's, and ours) */
+	if (((rd(arb_core + ARB_CHANNEL(channel)) >> 8) & 0xfff) != id || (rd(arb_cnfg + ARB_OWNER(channel)) & 7) != ARB_SYSTEM) {
+		goto out;
+	}
+	if (mask != 0) {
+		status = spmi_transfer_locked(observer, COMMAND_READ | (uint32_t)reg << 4);
+		if (!SPMI_OK(status)) {
+			goto out;
+		}
+		old = (uint8_t)rd(observer + OBSERVER_DATA0);
+		next = (uint8_t)((old & ~mask) | (value & mask));
+		if (next == old) {
+			*before = *after = old;
+			ok = true;
+			goto out;
+		}
+	}
+	wr(write + CHANNEL_WDATA0, next);
+	status = spmi_transfer_locked(write, COMMAND_WRITE | (uint32_t)reg << 4);
+	if (!SPMI_OK(status)) {
+		goto out;
+	}
+	if (mask != 0) {
+		status = spmi_transfer_locked(observer, COMMAND_READ | (uint32_t)reg << 4);
+		if (!SPMI_OK(status)) {
+			goto out;
+		}
+		back = (uint8_t)rd(observer + OBSERVER_DATA0);
+		if ((back & mask) != (next & mask)) {
+			goto out;
+		}
+	}
+	*before = old;
+	*after = mask != 0 ? back : next;
+	*written = true;
+	ok = true;
+out:
+	hakios_spmi_unlock();
+	return ok;
 }
 
 /* ---- the two peripherals ------------------------------------------------------------------------- */

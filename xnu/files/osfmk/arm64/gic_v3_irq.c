@@ -118,6 +118,7 @@ void gic_v3_spi_unmask(uint32_t intid);
 void gic_v3_spi_detach(uint32_t intid);
 uint64_t gic_v3_spi_count(uint32_t intid);
 void gic_v3_irq_cpu_shutdown(void);
+void gic_v3_irq_cpu_resume(void);
 void gic_v3_irq_signal(uint32_t phys_id);
 void gic_v3_irq_signal_stop(uint32_t phys_id);
 
@@ -390,6 +391,35 @@ gic_v3_irq_cpu_shutdown(void)
 		gic_write32(gicr + GICR_ICACTIVER0, 0xffffffffu);
 	}
 	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 0);
+	__builtin_arm_isb(ISB_SY);
+}
+
+/*
+ * Back from a power collapse (psci_idle_resumed(), cpu_suspend=N): the CPU interface is in the core
+ * and went with it; the redistributor and the distributor did not (Linux does the same on the way
+ * back: gic_cpu_pm_notifier() -> gic_cpu_sys_reg_init()). The values are gic_v3_irq_cpu_init()'s.
+ */
+void
+gic_v3_irq_cpu_resume(void)
+{
+	vm_offset_t gicr;
+
+	if (gicd_base == 0 || (gicr = gicr_cpu_base[cpu_number()]) == 0) {
+		return;
+	}
+	__builtin_arm_wsr64("ICC_SRE_EL1", __builtin_arm_rsr64("ICC_SRE_EL1") | 1);
+	__builtin_arm_isb(ISB_SY);
+	uint32_t waker = gic_read32(gicr + GICR_WAKER);
+	if (waker & GICR_WAKER_PROCSLEEP) {
+		gic_write32(gicr + GICR_WAKER, waker & ~GICR_WAKER_PROCSLEEP);
+		while (gic_read32(gicr + GICR_WAKER) & GICR_WAKER_CHILDASLEEP) {
+			/* spin until the redistributor is awake */
+		}
+	}
+	__builtin_arm_wsr64("ICC_AP1R0_EL1", 0);
+	__builtin_arm_wsr64("ICC_PMR_EL1", 0xff);
+	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
+	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
 	__builtin_arm_isb(ISB_SY);
 }
 

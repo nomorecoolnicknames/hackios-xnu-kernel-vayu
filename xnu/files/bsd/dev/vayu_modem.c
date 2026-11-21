@@ -35,7 +35,7 @@
  *
  *   vayu_modem=N      0: nothing; 1: read and survey; 2: load and start; 3: also GLINK and QRTR
  *   vayu_modem_wait=S how long vayu_pas_start watches for "ready" (default 15)
- *   vayu_modem_listen=S  QRTR listening time (default 20, at most 120)
+ *   vayu_modem_listen=S  QRTR listening time (default 20, at most 86400; see vayu_modem_keep)
  *   vayu_modem_secs=S  kept up after step 2 when the level is 2 (default 2, at most 60)
  *   vayu_modem_cx=1    RPMh's "cx.lvl" raised with "mss.lvl" while it boots, and left there
  *   vayu_modem_rails=0 no RPMh vote at all (default 1: "mss.lvl" only, given back at the stop)
@@ -57,6 +57,25 @@
  *                      data path is host<->WLAN; only its firmware service (WLFW, 0x45) lives on MPSS.
  *                      Pair it with vayu_wifi_smp2p_abort=0, or vayu-wifi's own SMP2P poll still ends
  *                      the station. Default 0: the old behaviour, everything is taken down.
+ *   vayu_modem_fw_wait=S  how long step 2 waits for fw/modem.mdt to be readable (default 0: no wait, as before;
+ *                     at most 600). With fw_part=1 it is in the phone's own "modem" partition as soon as the
+ *                     storage is up; with fw_var=1 in /private/var/hakios/fw once init has mounted it
+ *                     (bsd/dev/hakios.image.c). After telegdyd/ios-vayu, branch vayu-dev, vayu_modem.c
+ *                     (vayu_modem_fw_wait; there the default was 300).
+ *   vayu_modem_delay=S  wait S s more before the modem is loaded (default 0, at most 600): with the firmware
+ *                     always on the flash nothing has to be put there for a start, so this is the window in
+ *                     which the computer can still send "recovery" to the command port (usbnet_cmd=1) if a
+ *                     start of the modem took the phone down the boot before
+ *   vayu_modem_keep=1  step 3 listens until the modem says FATAL (or the kernel goes back to the loader),
+ *                     not vayu_modem_listen s: the modem, Wi-Fi, rmtfs and the cellular clients stay up.
+ *                     Without it the end of vayu_modem_listen (at most 86400 s, 24 h) takes all of them down
+ *                     -- the "24-hour timer". vayu_modem_listen is then only how long vayu_wifi waits for WLFW.
+ *   vayu_modem_ssr=N   after the modem says FATAL in step 3, take it down and start it again, at most N times
+ *                     (default 0: never, as before; at most 10) -- what Linux's remoteproc recovery does
+ *                     (rproc_trigger_recovery: stop, i.e. PAS shutdown, then the same start). The clients of
+ *                     step 3 (rmtfs, IPA, cell, SMS, voice, GNSS, Wi-Fi) are stopped and started again with it;
+ *                     vayu_modem_keep_wifi is not obeyed for a FATAL that is followed by a restart.
+ *   vayu_modem_ssr_wait=S  between the shutdown and the new start (default 10, 1..300)
  * After a FATAL, vayu_smem_census() lists the shared memory's items (its crash text was not in item 421).
  *
  * What it does NOT do: it runs no rmtfs server and no EFS of its own, it sends no QMI request
@@ -77,10 +96,13 @@
  *       comes from SMEM item 421.
  *
  * The payload: the modem image is 33 files, 77.5 MB (about 38 MB compressed in the small image),
- * read from fw/ by vayu_pas.c (modem.mdt and modem.bNN).
+ * read from fw/ by vayu_pas.c (modem.mdt and modem.bNN) -- too big for a flashed boot image's 63 MB
+ * payload, so a flash boot reads them from the phone's "modem" partition (fw_part=1) or
+ * /private/var/hakios/fw (fw_var=1): bsd/dev/hakios.image.c.
  */
 #include <machine/machine_routines.h>
 #include <kern/clock.h>
+#include <kern/kalloc.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -93,6 +115,7 @@
 #include <sys/vayu_ipa.h>
 #include <sys/vayu_modem.h>
 #include <sys/vayu_pas.h>
+#include <sys/vayu_qmux.h>
 #include <sys/vayu_rmtfs.h>
 #include <sys/vayu_sms.h>
 #include <sys/vayu_voice.h>
@@ -102,6 +125,8 @@ extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
 
 static uint32_t level, wait_s = 15, listen_s = 20, secs = 2;
+static uint32_t fw_wait_s, delay_s, keep, ssr, ssr_wait_s = 10;     /* see the top of this file */
+extern const uint8_t *hakios_image_file_once(const char *dir, const char *name, uint64_t *size, uint64_t *allocated);
 /*
  * vayu_modem_keep_wifi=1: when the modem says FATAL, leave the WLAN driver running instead of
  * stopping it in step_link()'s cleanup. Run 062247: the modem's IPA QMI server asserted (the
@@ -114,6 +139,7 @@ static uint32_t level, wait_s = 15, listen_s = 20, secs = 2;
  */
 static uint32_t keep_wifi;
 static bool glink_prepared;             /* its items were made: vayu_glink_down() on the way out */
+static volatile bool quiesced;          /* the kernel is on its way back to the loader: nothing is started again */
 
 /* Every line to the loader's log as well: what is done to the modem should be known even if the kernel dies. */
 static int say(const char *format, ...) __printflike(1, 2);
@@ -267,7 +293,7 @@ step_look(void)
 
 /* The modem loaded and started, its GLINK items made first: the order of vayu_audio.c's step_dsp(). */
 static bool
-step_up(void)
+step_up(bool again)
 {
 	uint32_t state;
 
@@ -277,7 +303,9 @@ step_up(void)
 		say("vayu-modem: 2: FAILED: TrustZone does not answer IS_CALL_AVAILABLE either way\n");
 		return false;
 	}
-	vayu_wifi_pre_modem();       /* W13: WLAN rails + AOP QDSS clock before the modem (vayu_wifi_qdss=1) */
+	if (!again) {
+		vayu_wifi_pre_modem();       /* W13: WLAN rails + AOP QDSS clock before the modem (vayu_wifi_qdss=1) */
+	}
 	if (!vayu_pas_load(&mpss)) {
 		say("vayu-modem: 2: FAILED: not loaded\n");
 		return false;
@@ -305,28 +333,40 @@ step_up(void)
  * GLINK up, then QRTR listened to: every second the modem's SMP2P state and the services it has
  * announced. No request is sent and no service of ours is announced.
  */
-static void
-step_link(void)
+static bool
+step_link(bool restart_next)
 {
 	bool seen[64] = { false };
-	bool modem_fatal = false;
+	bool modem_fatal = false, leave_wifi;
 	uint32_t heard = listen_s, s, node = 0, port = 0;
 
-	say("vayu-modem: 3: GLINK with the modem, QRTR on IPCRTR (%u s)\n", listen_s);
+	if (keep != 0) {
+		say("vayu-modem: 3: GLINK with the modem, QRTR on IPCRTR (until it says FATAL: vayu_modem_keep=1)\n");
+	} else {
+		say("vayu-modem: 3: GLINK with the modem, QRTR on IPCRTR (%u s)\n", listen_s);
+	}
 	if (!vayu_glink_up(&glink, 5000)) {
 		say("vayu-modem: 3: FAILED: the channel IPCRTR is not open\n");
-		return;
+		return false;
 	}
 	vayu_qrtr_attach(&qrtr);
 	vayu_rmtfs_start(&qrtr);
 	vayu_ipa_start(&qrtr);
 	vayu_cell_start(&qrtr);		/* vayu_cell=N: SIM/network; changes gated by vayu_cell_* args */
+	vayu_qmux_start(&qrtr);		/* vayu_qmux=1: QMux<->QRTR bridge for CommCenter */
 	vayu_sms_start(&qrtr);		/* vayu_sms=1: WMS client, inbox, /dev/vayu-sms */
 	vayu_voice_start(&qrtr);	/* vayu_voice=N: VOICE client, /dev/vayu-voice */
 	vayu_gnss_start(&qrtr);		/* vayu_gnss=1: the modem's GNSS engine (bsd/dev/vayu_gnss.c) */
 	vayu_wifi_start(&qrtr, listen_s);
-	for (s = 1; s <= listen_s; s++) {
+	for (s = 1; keep != 0 || s <= listen_s; s++) {
 		delay_for_interval(1, NSEC_PER_SEC);
+		if (quiesced) {
+			break;
+		}
+		if (keep != 0 && s % 3600 == 0) {
+			say("vayu-modem: 3: +%u s: the modem is up (\"slave-kernel\" %#x), %u services\n", s,
+			    vayu_pas_state(&mpss), vayu_qrtr_services(&qrtr));
+		}
 		for (unsigned i = 0; i < sizeof(seen) / sizeof(seen[0]); i++) {
 			if (!qrtr.servers[i].there || seen[i]) {
 				continue;
@@ -354,9 +394,11 @@ step_link(void)
 		say("vayu-modem: 3: WLFW (0x45) is not there\n");
 	}
 	vayu_gnss_stop();
+	vayu_qmux_stop();
 	vayu_sms_stop();
 	vayu_cell_stop();
-	if (modem_fatal && keep_wifi != 0) {
+	leave_wifi = modem_fatal && keep_wifi != 0 && !restart_next;
+	if (leave_wifi) {
 		/* the modem is gone, its WLFW is gone with it; the WLAN itself and its CE rings are not */
 		say("vayu-modem: the modem is lost; the WLAN and its QRTR transport are left running "
 		    "(vayu_modem_keep_wifi=1)\n");
@@ -365,9 +407,60 @@ step_link(void)
 	}
 	vayu_ipa_stop();
 	vayu_rmtfs_stop();
-	if (!(modem_fatal && keep_wifi != 0)) {
+	if (!leave_wifi) {
 		vayu_qrtr_detach(&qrtr);
 	}
+	return modem_fatal;
+}
+
+/* vayu_modem_fw_wait=S: until modem.mdt can be read (the storage or /private/var is not there at once). */
+static void
+fw_wait(void)
+{
+	uint64_t size = 0, allocated = 0;
+	const uint8_t *header;
+	uint32_t waited = 0;
+
+	if (fw_wait_s == 0) {
+		return;
+	}
+	while ((header = hakios_image_file_once("fw", "modem.mdt", &size, &allocated)) == NULL && waited < fw_wait_s) {
+		if (waited == 0) {
+			say("vayu-modem: 2: waiting up to %u s for fw/modem.mdt (small image, fw_part=1: the modem partition, "
+			    "fw_var=1: /private/var/hakios/fw)\n", fw_wait_s);
+		}
+		delay_for_interval(1, NSEC_PER_SEC);
+		waited++;
+	}
+	if (header == NULL) {
+		say("vayu-modem: 2: no fw/modem.mdt after %u s\n", waited);
+		return;
+	}
+	say("vayu-modem: 2: fw/modem.mdt found after %u s (%llu bytes)\n", waited, size);
+	if (allocated != 0) {
+		uint8_t *ours = __DECONST(uint8_t *, header);
+
+		kfree_data(ours, allocated);
+	}
+}
+
+/* vayu_modem_ssr=N: the modem said FATAL; it is shut down by TrustZone, to be loaded and started again. */
+static bool
+restart_prepare(uint32_t round)
+{
+	if (quiesced) {
+		return false;
+	}
+	say("vayu-modem: SSR %u of %u: the modem said FATAL: shut down, started again in %u s\n", round, ssr, ssr_wait_s);
+	vayu_pas_stop(&mpss, "it said FATAL (vayu_modem_ssr)");
+	glink_prepared = false;                 /* (taken down by the stop: rproc_shutdown) */
+	if (mpss.started) {
+		say("vayu-modem: SSR %u: FAILED: TrustZone did not shut it down; not started again\n", round);
+		return false;
+	}
+	mpss.restart_after_fatal = true;
+	delay_for_interval(ssr_wait_s, NSEC_PER_SEC);
+	return !quiesced;
 }
 
 static void
@@ -384,17 +477,26 @@ modem_thread(void *arg __unused, wait_result_t wr __unused)
 	} else if (level >= 2) {
 		/* IPA firmware and its SMP2P/filter prerequisites must exist before MPSS starts. */
 		vayu_ipa_prepare();
-		if (step_up()) {
+		fw_wait();
+		if (delay_s != 0) {
+			say("vayu-modem: 2: %u s before the modem is loaded (vayu_modem_delay)\n", delay_s);
+			delay_for_interval(delay_s, NSEC_PER_SEC);
+		}
+		for (uint32_t round = 0; step_up(round != 0); round++) {
 			int ipa = vayu_ipa_modem_probe();
+			bool fatal = false;
 
 			if (ipa >= 0) {
 				say("vayu-modem: 2: IPA after the modem: %s\n", ipa ? "UP" : "not up");
 			}
 			if (level >= 3) {
-				step_link();
+				fatal = step_link(round < ssr);
 			} else {
 				delay_for_interval(secs, NSEC_PER_SEC);
 				say("vayu-modem: after %u s more its \"slave-kernel\" says %#x\n", secs, vayu_pas_state(&mpss));
+			}
+			if (!fatal || round >= ssr || !restart_prepare(round + 1)) {
+				break;
 			}
 		}
 	}
@@ -412,6 +514,7 @@ modem_thread(void *arg __unused, wait_result_t wr __unused)
 void
 vayu_modem_quiesce(void)
 {
+	quiesced = true;
 	if (mpss.started) {
 		vayu_pas_quiesce(&mpss);
 	}
@@ -430,6 +533,23 @@ vayu_modem_init(void)
 	PE_parse_boot_argn("vayu_modem_listen", &listen_s, sizeof(listen_s));
 	if (listen_s > 86400) {
 		listen_s = 86400;                       /* vayu: the modem stays up for a usable system (was a 120 s probe) */
+	}
+	PE_parse_boot_argn("vayu_modem_fw_wait", &fw_wait_s, sizeof(fw_wait_s));
+	if (fw_wait_s > 600) {
+		fw_wait_s = 600;
+	}
+	PE_parse_boot_argn("vayu_modem_delay", &delay_s, sizeof(delay_s));
+	if (delay_s > 600) {
+		delay_s = 600;
+	}
+	PE_parse_boot_argn("vayu_modem_keep", &keep, sizeof(keep));
+	PE_parse_boot_argn("vayu_modem_ssr", &ssr, sizeof(ssr));
+	if (ssr > 10) {
+		ssr = 10;
+	}
+	PE_parse_boot_argn("vayu_modem_ssr_wait", &ssr_wait_s, sizeof(ssr_wait_s));
+	if (ssr_wait_s < 1 || ssr_wait_s > 300) {
+		ssr_wait_s = 10;
 	}
 	PE_parse_boot_argn("vayu_modem_secs", &secs, sizeof(secs));
 	if (secs > 60) {
@@ -452,6 +572,10 @@ vayu_modem_init(void)
 	vayu_rmtfs_prepare();           /* the 3 MB rmtfs buffer from low memory, before the userland */
 	say("vayu-modem: vayu_modem=%u vayu_modem_wait=%u vayu_modem_listen=%u vayu_modem_secs=%u vayu_modem_cx=%u vayu_modem_rails=%u "
 	    "vayu_pause=%u vayu_modem_chan=%u vayu_modem_gsi=%u vayu_modem_keep_wifi=%u\n", level, wait_s, listen_s, secs, cx, rails, pause, chan, gsi, keep_wifi);
+	if (fw_wait_s != 0 || delay_s != 0 || keep != 0 || ssr != 0) {
+		say("vayu-modem: vayu_modem_fw_wait=%u vayu_modem_delay=%u vayu_modem_keep=%u vayu_modem_ssr=%u vayu_modem_ssr_wait=%u\n",
+		    fw_wait_s, delay_s, keep, ssr, ssr_wait_s);
+	}
 	if (kernel_thread_start(modem_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}

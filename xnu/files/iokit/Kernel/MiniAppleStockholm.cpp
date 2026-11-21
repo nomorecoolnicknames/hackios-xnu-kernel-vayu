@@ -96,6 +96,23 @@
  * "no SE" init branch 0x1f45533e0 needs ctx[325..328] all 2. vayu_nfc_se=1 (default) therefore
  * answers 20 03 05 02 a0 ec a0 ed with A0EC=0/A0ED=0 and 22 00 with 0 NFCEEs; vayu_nfc_se=0
  * leaves both to the chip. This is the untested part: static evidence only, see REPORT.md §2.2.
+ *
+ * NFC-1 (2026-11-19, stage 0B of VAYU_NFC_PAY_PLAN_v2 §2.1/§2.4). Two switches, both of which
+ * leave the old behaviour in place unless given:
+ *   vayu_nfc_connid=1  read the conn id of an NCI data packet where NCI 1.0 puts it, the low
+ *                      nibble of byte 0 ([MT 000][PBF][conn id] [RFU] [length]), and pass the
+ *                      static RF connection on (byte0 & 0xEF) == 0x00, single and PBF=1
+ *                      segments alike. The N8 code read byte 1, the RFU byte, which is 0 in
+ *                      every data packet: every packet looked like conn 0, so data on the
+ *                      logical connections of 40 04 was forwarded whatever vayu_nfc_data said.
+ *                      Default 0: the N8 reading, bit for bit (see nciDataConn()).
+ *   vayu_nfc_verbose=0 no per-frame hex lines (nfcd writes, filter forwards, pn553 <- / ->,
+ *                      CRC strip/append, ff ff preambles): every loader_log_putc of them costs
+ *                      time inside the APDU window and run 1078 overflowed the log with them.
+ *                      Start-up lines, local answers, refusals and every error stay, and one
+ *                      "rf: summary" line follows each 61 06 RF_DEACTIVATE_NTF (and the
+ *                      disconnect). Default 1 (also when absent): the N12 one line per frame.
+ * The 258-byte frame limit of the same stage is vayu_nfc_frame258=1 in bsd/dev/vayu_nfc.c.
  */
 
 #include <IOKit/IOLib.h>
@@ -422,6 +439,22 @@ static uint32_t gNfceeNtfSeen;          /* 62 00 notifications passed since that
 static uint32_t gNfcCredits;            /* vayu_nfc_credits=N: after a successful CORE_CONN_CREATE_RSP send 60 06 with N credits; 0 = off */
 static uint32_t gNfcA0bf;               /* vayu_nfc_a0bf: 0 = answer 0xA0BF locally with success (default), 1 = forward as is, 3 = 2-byte probe */
 static uint32_t gNfcData;               /* vayu_nfc_data=1: forward data packets on the logical connections learnt from 40 04 */
+static uint32_t gNfcConnId;             /* vayu_nfc_connid=1: NCI 1.0 conn id (byte 0 & 0x0f), not byte 1 (NFC-1) */
+static uint32_t gNfcVerbose = 1;        /* vayu_nfc_verbose=0: no per-frame hex lines, an rf summary after 61 06 (NFC-1) */
+/*
+ * NFC-1: what vayu_nfc_verbose=0 still says about the traffic it no longer prints, per window:
+ * from one summary (or the connect) to the next 61 06, with the 61 05 of that window if any.
+ */
+static struct {
+	uint32_t toChip, toChipBytes, toChipData;       /* forwarded and accepted by the bridge */
+	uint32_t fromChip, fromChipBytes, fromChipData; /* PN553 frames delivered to nfcd */
+	uint32_t local;                                 /* answers the filter made itself */
+	uint32_t largest;                               /* longest frame either way */
+	uint32_t summaries;
+	bool     activated;                             /* a 61 05 in this window */
+	uint8_t  intf, proto, tech;                     /* its interface, protocol, technology and mode */
+	uint64_t activatedUs;
+} gRf;
 /*
  * N9: the PN553 never sends CORE_RESET_NTF (no "60 00" in any NCIDump of TEST17/20B/21), but the
  * re-init that phLibNfc_IoctlSetPropRfCfgComplete 0x1f456be04 starts after a successful 0xA0BF
@@ -559,6 +592,55 @@ filterLog(const uint8_t * packet, unsigned length, const char * decision)
 	    hexAll(packet, length, hex, sizeof(hex)), decision);
 }
 
+/* NFC-1: one frame of the window that vayu_nfc_verbose=0 summarises (counted in both modes). */
+static void
+rfCount(const uint8_t * packet, unsigned length, bool toChip)
+{
+	bool data = length != 0 && (packet[0] >> 5) == 0;
+
+	if (toChip) {
+		gRf.toChip++;
+		gRf.toChipBytes += length;
+		if (data) gRf.toChipData++;
+	} else {
+		gRf.fromChip++;
+		gRf.fromChipBytes += length;
+		if (data) gRf.fromChipData++;
+	}
+	if (length > gRf.largest) gRf.largest = length;
+}
+
+/*
+ * NFC-1: the vayu_nfc_verbose=0 line, printed after the 61 06 has already gone to nfcd (and at
+ * the disconnect), never between a 61 05 and its 61 06, where the APDUs run.
+ */
+static void
+rfSummary(const char * why)
+{
+	uint64_t now = stockholmUptime();
+	char activation[96];
+
+	if (gNfcVerbose != 0) return;
+	gRf.summaries++;
+	if (gRf.activated) {
+		snprintf(activation, sizeof(activation), "61 05 intf %02x proto %02x tech %02x, %llu us before this",
+		    gRf.intf, gRf.proto, gRf.tech, (unsigned long long)(now - gRf.activatedUs));
+	} else {
+		snprintf(activation, sizeof(activation), "no 61 05");
+	}
+	stockholmLog("MiniAppleStockholm: rf: summary #%u (%s): to the PN553 %u frames (%u data, %u bytes), "
+	    "from it %u (%u data, %u bytes), %u local answers, largest %u bytes; %s; errors so far: "
+	    "forward %u, rx %u, answer %u\n", gRf.summaries, why, gRf.toChip, gRf.toChipData,
+	    gRf.toChipBytes, gRf.fromChip, gRf.fromChipData, gRf.fromChipBytes, gRf.local, gRf.largest,
+	    activation, gForwardErrors, gBridgeRxErrors, gAnswerErrors);
+	{
+		uint32_t summaries = gRf.summaries;
+
+		memset(&gRf, 0, sizeof(gRf));
+		gRf.summaries = summaries;
+	}
+}
+
 /*
  * N11: CRC-16/CCITT-FALSE, the checksum of the SPMI transport iOS turns on with IO_STOCKHOLM_CRC.
  * phNciNfc_CalcCrc16 (libNFC_Comet 0x1f45f17ac) is the same table-driven CRC: poly 0x1021,
@@ -616,10 +698,12 @@ deliverToNfcd(kern_ctl_ref ref, uint32_t unit, const uint8_t * packet, unsigned 
 		framed[length + 1] = (uint8_t)(crc & 0xff);
 		gCrcAppended++;
 		error = ctl_enqueuedata(ref, unit, framed, length + 2, 0);
-		stockholmLog("MiniAppleStockholm: crc: %s %u bytes + crc %02x %02x (#%u)%s: %s\n", what,
-		    length, framed[length], framed[length + 1], gCrcAppended,
-		    error == 0 ? "" : " NOT DELIVERED",
-		    hexAll(framed, length + 2, hex, sizeof(hex)));
+		if (gNfcVerbose != 0 || error != 0) {
+			stockholmLog("MiniAppleStockholm: crc: %s %u bytes + crc %02x %02x (#%u)%s: %s\n", what,
+			    length, framed[length], framed[length + 1], gCrcAppended,
+			    error == 0 ? "" : " NOT DELIVERED",
+			    hexAll(framed, length + 2, hex, sizeof(hex)));
+		}
 		return error;
 	}
 	if (spmiCrcEnabled()) {
@@ -627,7 +711,7 @@ deliverToNfcd(kern_ctl_ref ref, uint32_t unit, const uint8_t * packet, unsigned 
 		    "(#%u): %s\n", what, length, gCrcAppended, hexAll(packet, length, hex, sizeof(hex)));
 	}
 	error = ctl_enqueuedata(ref, unit, (void *)(uintptr_t)packet, length, 0);
-	if (spmiCrcEnabled() || error != 0) {
+	if ((spmiCrcEnabled() && gNfcVerbose != 0) || error != 0) {
 		stockholmLog("MiniAppleStockholm: tx: %s %u bytes%s%s: %s\n", what, length,
 		    spmiCrcEnabled() ? "" : " (plain, no CRC asked for)",
 		    error == 0 ? "" : " NOT DELIVERED", hexAll(packet, length, hex, sizeof(hex)));
@@ -644,6 +728,7 @@ answerNfcd(const uint8_t * bytes, unsigned length)
 
 	if (ref == NULL) return;
 	error = deliverToNfcd(ref, unit, bytes, length, "answer");
+	if (error == 0) gRf.local++;
 	if (error != 0) {
 		gAnswerErrors++;
 		stockholmLog("MiniAppleStockholm: filter: answer of %u bytes not delivered: %d%s (#%u)\n",
@@ -658,19 +743,29 @@ forwardPacket(const uint8_t * log_packet, unsigned log_length,
 	char hex[3 * 270 + 8];
 	errno_t error;
 
-	filterLog(log_packet, log_length, decision);
-	/*
-	 * N12: the exact bytes the PN553 gets. "filter: ... -> forward" says what nfcd asked;
-	 * this says what crossed the SPMI link after the rewrite (CRC stripped, params cut,
-	 * hwspoof), and it is the line the next analysis needs when a chip answer looks wrong.
-	 */
-	stockholmLog("MiniAppleStockholm: pn553 <- %u bytes: %s\n", length,
-	    hexAll(packet, length, hex, sizeof(hex)));
+	if (gNfcVerbose != 0) {
+		filterLog(log_packet, log_length, decision);
+		/*
+		 * N12: the exact bytes the PN553 gets. "filter: ... -> forward" says what nfcd asked;
+		 * this says what crossed the SPMI link after the rewrite (CRC stripped, params cut,
+		 * hwspoof), and it is the line the next analysis needs when a chip answer looks wrong.
+		 */
+		stockholmLog("MiniAppleStockholm: pn553 <- %u bytes: %s\n", length,
+		    hexAll(packet, length, hex, sizeof(hex)));
+	} else {
+		gFilterDecisions++;     /* NFC-1: counted, printed only if the forward fails */
+	}
 	error = vayu_nfc_bridge_send(packet, length);
 	if (error != 0) {
 		gForwardErrors++;
+		if (gNfcVerbose == 0) {
+			stockholmLog("MiniAppleStockholm: pn553 <- %u bytes (%s): %s\n", length, decision,
+			    hexAll(packet, length, hex, sizeof(hex)));
+		}
 		stockholmLog("MiniAppleStockholm: filter: forward of %u bytes failed: %d%s (#%u)\n",
 		    length, error, error == EIO ? " (EIO)" : "", gForwardErrors);
+	} else {
+		rfCount(packet, length, true);
 	}
 }
 
@@ -1177,6 +1272,54 @@ filterNfcee(const uint8_t * packet, unsigned length)
 	answerRejected(packet, length, 0x42, oid);
 }
 
+/*
+ * NFC-1 (vayu_nfc_connid). NCI 1.0 §3.4.2: a data packet is
+ *   byte 0 = [MT 000][PBF][conn id, 4 bits], byte 1 = RFU (0), byte 2 = payload length.
+ * The static RF connection is conn 0, and a segment of a longer message (PBF = 1) carries the
+ * same conn id, so (byte 0 & 0xEF) == 0x00 is "conn 0, either PBF". With the switch off
+ * these return exactly what the N8 code tested (byte 1), so nothing changes by default.
+ */
+static uint8_t
+nciDataConn(const uint8_t * packet, uint32_t strict)
+{
+	return strict != 0 ? (uint8_t)(packet[0] & 0x0f) : packet[1];
+}
+
+static bool
+nciDataStaticRf(const uint8_t * packet, uint32_t strict)
+{
+	return strict != 0 ? (packet[0] & 0xef) == 0x00 : packet[1] == 0;
+}
+
+static void
+filterData(const uint8_t * packet, unsigned length)
+{
+	uint8_t conn = nciDataConn(packet, gNfcConnId);
+	char decision[64];
+
+	/*
+	 * N8: the HCI CORE_RESET/INIT traffic for the NFCEE runs on the logical connection
+	 * created by 20 04 (conn id 3 in TEST15B/17). Until vayu_nfc_data=1 these were meant to be
+	 * dropped; the whitelist is the conn id from a successful 40 04; conn 0 (static RF) is
+	 * always passed. NFC-1: only vayu_nfc_connid=1 finds that conn id where NCI puts it.
+	 */
+	if (nciDataStaticRf(packet, gNfcConnId)) {
+		forwardPacket(packet, length, packet, length, "forward");
+		return;
+	}
+	if (gNfcData != 0 && isLogConn(conn)) {
+		snprintf(decision, sizeof(decision), "forward (data, conn %u)", conn);
+		forwardPacket(packet, length, packet, length, decision);
+		return;
+	}
+	if (gNfcData == 0) {
+		snprintf(decision, sizeof(decision), "drop (data on conn %u; vayu_nfc_data=0)", conn);
+	} else {
+		snprintf(decision, sizeof(decision), "drop (data on unknown conn %u)", conn);
+	}
+	filterLog(packet, length, decision);
+}
+
 static void
 filter(const uint8_t * packet, unsigned length)
 {
@@ -1186,27 +1329,7 @@ filter(const uint8_t * packet, unsigned length)
 	char decision[64];
 
 	if (mt == 0) {                          /* data packet: straight to the chip */
-		/*
-		 * N8: the HCI CORE_RESET/INIT traffic for the NFCEE runs on the logical connection
-		 * created by 20 04 (conn id 3 in TEST15B/17), so it is a data packet 00 03 ... .
-		 * Until vayu_nfc_data=1 these were dropped and HCI could never start. The whitelist
-		 * is the conn id from a successful 40 04; conn 0 (static RF) is always passed.
-		 */
-		if (packet[1] == 0) {
-			forwardPacket(packet, length, packet, length, "forward");
-			return;
-		}
-		if (gNfcData != 0 && isLogConn(packet[1])) {
-			snprintf(decision, sizeof(decision), "forward (data, conn %u)", packet[1]);
-			forwardPacket(packet, length, packet, length, decision);
-			return;
-		}
-		if (gNfcData == 0) {
-			snprintf(decision, sizeof(decision), "drop (data on conn %u; vayu_nfc_data=0)", packet[1]);
-		} else {
-			snprintf(decision, sizeof(decision), "drop (data on unknown conn %u)", packet[1]);
-		}
-		filterLog(packet, length, decision);
+		filterData(packet, length);
 		return;
 	}
 	if (mt != 1) {
@@ -1534,12 +1657,14 @@ ctlReassemblyAppend(const uint8_t * bytes, size_t count, bool final)
 				char preamble_hex[3 * 300 + 8];
 
 				gPreambleStripped++;
-				stockholmLog("MiniAppleStockholm: reassembly: UART/HSU preamble ff ff "
-				    "stripped (#%u, %zu bytes left): %s\n", gPreambleStripped,
-				    gCtlReassemblyLength - 2,
-				    hexAll(gCtlReassembly + 2,
-				    (unsigned)(gCtlReassemblyLength - 2), preamble_hex,
-				    sizeof(preamble_hex)));
+				if (gNfcVerbose != 0) {
+					stockholmLog("MiniAppleStockholm: reassembly: UART/HSU preamble ff ff "
+					    "stripped (#%u, %zu bytes left): %s\n", gPreambleStripped,
+					    gCtlReassemblyLength - 2,
+					    hexAll(gCtlReassembly + 2,
+					    (unsigned)(gCtlReassemblyLength - 2), preamble_hex,
+					    sizeof(preamble_hex)));
+				}
 				gCtlReassemblyLength -= 2;
 				if (gCtlReassemblyLength != 0) {
 					memmove(gCtlReassembly, gCtlReassembly + 2,
@@ -1603,9 +1728,11 @@ ctlReassemblyAppend(const uint8_t * bytes, size_t count, bool final)
 				consumed = packet_length + 2;
 				gNfcdTxCrc = 1;
 				gCrcStripped++;
-				stockholmLog("MiniAppleStockholm: crc: nfcd frame %zu bytes crc %04x verified and "
-				    "stripped (#%u): %s\n", packet_length, calculated, gCrcStripped,
-				    hexAll(gCtlReassembly, (unsigned)(packet_length + 2), hex, sizeof(hex)));
+				if (gNfcVerbose != 0) {
+					stockholmLog("MiniAppleStockholm: crc: nfcd frame %zu bytes crc %04x verified and "
+					    "stripped (#%u): %s\n", packet_length, calculated, gCrcStripped,
+					    hexAll(gCtlReassembly, (unsigned)(packet_length + 2), hex, sizeof(hex)));
+				}
 			} else if (have_crc_bytes) {
 				gNfcdTxCrc = 0;
 				gCrcPlainFromNfcd++;
@@ -1755,10 +1882,12 @@ bridgeRx(const uint8_t * packet, unsigned length)
 
 	/*
 	 * N12: the PN553's answer as it came off the SPMI link, before hwspoof rewrites one byte
-	 * and before any filter drops it. One line per answer, always.
+	 * and before any filter drops it. One line per answer (NFC-1: unless vayu_nfc_verbose=0).
 	 */
-	stockholmLog("MiniAppleStockholm: pn553 -> %u bytes: %s\n", length,
-	    hexAll(packet, length, hex, sizeof(hex)));
+	if (gNfcVerbose != 0) {
+		stockholmLog("MiniAppleStockholm: pn553 -> %u bytes: %s\n", length,
+		    hexAll(packet, length, hex, sizeof(hex)));
+	}
 	if (ref == NULL) return;
 	/*
 	 * vayu_nfc_hwspoof=1. iOS's NXP stack checks the CORE_INIT_RSP hardware byte right after INIT
@@ -1834,6 +1963,21 @@ bridgeRx(const uint8_t * packet, unsigned length)
 		return;
 	}
 	/*
+	 * NFC-1: the window of vayu_nfc_verbose=0. 61 05 RF_INTF_ACTIVATED_NTF payload: [0] RF
+	 * discovery id, [1] interface, [2] protocol, [3] technology and mode; it is only remembered
+	 * here. The summary waits for the 61 06, which has already been delivered at this point.
+	 */
+	rfCount(packet, length, false);
+	if (length >= 7 && packet[0] == 0x61 && packet[1] == 0x05) {
+		gRf.activated = true;
+		gRf.intf = packet[4];
+		gRf.proto = packet[5];
+		gRf.tech = packet[6];
+		gRf.activatedUs = stockholmUptime();
+	} else if (length >= 3 && packet[0] == 0x61 && packet[1] == 0x06) {
+		rfSummary("61 06");
+	}
+	/*
 	 * N8: 40 04 CORE_CONN_CREATE_RSP, payload [status][max pld][count][conn id...]. Remember the
 	 * conn id for data forwarding and, with vayu_nfc_credits=N, answer the credit wait that
 	 * phNciNfc_RegForConnCredits started. The NTF goes after the RSP on the same socket, 20 ms
@@ -1896,6 +2040,7 @@ ctlConnect(kern_ctl_ref kctlref, struct sockaddr_ctl * sac, void ** unitinfo)
 	gCoreInits = 0;         /* N9: a new session starts with its own first CORE_RESET (no synthetic NTF) */
 	gSpmiCrc = 0;           /* N11: nfcd turns the SPMI CRC on again after its A0BF, per session */
 	gNfcdTxCrc = 0;         /* N12: no CRC frame seen in this session yet */
+	memset(&gRf, 0, sizeof(gRf));   /* NFC-1: the summary window starts with the session */
 	stockholmLog("MiniAppleStockholm: %s[%d] connected unit %u\n", procname, proc_selfpid(), gKctlUnit);
 	if (gIosLevel >= 2) {
 		int error = vayu_nfc_bridge_start(bridgeRx);
@@ -1917,6 +2062,7 @@ ctlDisconnect(kern_ctl_ref kctlref, u_int32_t unit, void * unitinfo)
 	if (gIosLevel >= 2) {
 		vayu_nfc_bridge_stop();
 	}
+	rfSummary("disconnect");
 	gCtlReassemblyLength = 0;
 	gNfceeAnnounced = -1;
 	gNfceeNtfSeen = 0;
@@ -1949,19 +2095,21 @@ ctlSend(kern_ctl_ref kctlref, u_int32_t unit, void * unitinfo, mbuf_t m, int fla
 
 		for (cur = m; cur != NULL; cur = mbuf_next(cur)) total += mbuf_len(cur);
 	}
-	copied = total > sizeof(data) ? sizeof(data) : total;
-	if (copied > 0 && mbuf_copydata(m, 0, copied, data) != 0) copied = 0;
-	proc_selfname(procname, sizeof(procname));
 	/*
 	 * N12: every write, whole, no "after the first 200 only every 50th". The old limit kept
 	 * the 2F 00 01 01 of TEST23C visible but hid nothing else that mattered - still, a log
 	 * that silently drops frames is exactly what made TEST23C's second CORE_RESET look like a
-	 * parse bug.
+	 * parse bug. NFC-1: vayu_nfc_verbose=0 counts the write and copies nothing for the log.
 	 */
 	gKctlWrites++;
-	stockholmLog("MiniAppleStockholm: %s[%d] write %u bytes: %s%s\n", procname, proc_selfpid(),
-	    (uint32_t) total, hexAll(data, (unsigned)copied, line, sizeof(line)),
-	    total > copied ? " ..." : "");
+	if (gNfcVerbose != 0) {
+		copied = total > sizeof(data) ? sizeof(data) : total;
+		if (copied > 0 && mbuf_copydata(m, 0, copied, data) != 0) copied = 0;
+		proc_selfname(procname, sizeof(procname));
+		stockholmLog("MiniAppleStockholm: %s[%d] write %u bytes: %s%s\n", procname, proc_selfpid(),
+		    (uint32_t) total, hexAll(data, (unsigned)copied, line, sizeof(line)),
+		    total > copied ? " ..." : "");
+	}
 	if (gIosLevel >= 2 && total != 0) {
 		ctlReassemblyMbuf(m, total);
 	}
@@ -2224,6 +2372,18 @@ MiniAppleStockholmStart(void)
 	if (gNfcData != 0) {
 		stockholmLog("MiniAppleStockholm: data: on (data packets on conn ids from "
 		    "CORE_CONN_CREATE_RSP are forwarded; 2F 2C stays refused)\n");
+	}
+	/* NFC-1: both off unless given; see the head of this file. */
+	(void)PE_parse_boot_argn("vayu_nfc_connid", &gNfcConnId, sizeof(gNfcConnId));
+	if (gNfcConnId != 0) {
+		stockholmLog("MiniAppleStockholm: data: conn id from byte 0 & 0x0f (vayu_nfc_connid=1, NCI 1.0); "
+		    "conn 0 passed on (byte0 & 0xEF) == 0, PBF 0 and 1; other conns per vayu_nfc_data=%u\n",
+		    gNfcData);
+	}
+	(void)PE_parse_boot_argn("vayu_nfc_verbose", &gNfcVerbose, sizeof(gNfcVerbose));
+	if (gNfcVerbose == 0) {
+		stockholmLog("MiniAppleStockholm: verbose: off (vayu_nfc_verbose=0: no per-frame lines; "
+		    "local answers, refusals, errors and an rf summary after every 61 06 stay)\n");
 	}
 	/*
 	 * N11: emulate the SPMI CRC16 on the bridge's side of the link. On by default; the nfcd

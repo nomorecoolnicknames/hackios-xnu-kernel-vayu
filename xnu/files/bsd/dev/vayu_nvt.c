@@ -90,6 +90,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
+#include <sys/vayu_display_power.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
@@ -1337,7 +1338,14 @@ nvt_thread(__unused void *parameter, __unused wait_result_t result)
 			 * The next look is due one period after the previous one was due, not one period after
 			 * the work ended: the sleep is short, but the wake is late, and at 4 ms both matter.
 			 */
-			if (idle_period != 0) {
+			uint32_t off_hz = vayu_display_touch_hz();      /* (touch_off_hz=N while the display is off; else 0) */
+
+			if (off_hz != 0) {
+				uint64_t off_period;
+
+				nanoseconds_to_absolutetime(NSEC_PER_SEC / off_hz, &off_period);
+				next += off_period;
+			} else if (idle_period != 0) {
 				uint64_t idle = hakios_touch_idle_abs();       /* (0: a finger is down; ~0: never touched) */
 
 				next += idle != 0 && idle > idle_after ? idle_period : period;

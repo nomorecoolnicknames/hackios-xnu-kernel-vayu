@@ -328,6 +328,7 @@ extern "C" void hakios_touch_driver_total(uint64_t *samples, uint32_t *down);  /
 extern "C" void hakios_nvt_stats(uint64_t *fresh, uint64_t *repeats, uint64_t *max_gap_abs);  /* bsd/dev/vayu_nvt.c */
 extern "C" void vayu_cpufreq_rows(uint32_t row[3], uint32_t mhz[3]);           /* bsd/dev/vayu_cpufreq.c: the rows now */
 extern "C" void vayu_cpufreq_display(bool on);  /* ... and iOS's display power, for cpufreq_screen_off=1 */
+extern "C" void vayu_display_power_state(bool on); /* bsd/dev/vayu_display_power.c: display_off_intf, touch_off_hz */
 static uint32_t gModeHz;                        /* the refresh the display is said to run at (fb_120: 120) */
 static bool gPictureFit;                        /* rows copied, not scaled: fb_fit, or a 120 Hz frame's cost */
 static uint32_t gVSyncsTold;                    /* refreshes told to user space since the last 5 s line (atomic) */
@@ -2330,6 +2331,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		bool done = hakios_display_power != NULL && hakios_display_power(on);
 
 		vayu_cpufreq_display(on);               /* (only noted there; cpufreq_screen_off=1 acts on it) */
+		vayu_display_power_state(on);           /* (nothing there without display_off_intf=1 or touch_off_hz=N) */
 
 		IOLog("MiniIOMobileFramebuffer: power change asked (scalars %u in [0x%llx 0x%llx]): display %s%s\n",
 		    args->scalarInputCount, args->scalarInputCount > 0 ? in[0] : 0, args->scalarInputCount > 1 ? in[1] : 0,

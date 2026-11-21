@@ -80,6 +80,7 @@
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>
 #include <libkern/libkern.h>
 #include <libkern/OSAtomic.h>
 #include <mach/mach_types.h>
@@ -108,6 +109,8 @@ static uint32_t mic_ios;                /* vayu_mic=1: /dev/hakios-mic for iOS's
 static uint32_t mic_order = 1;          /* 1: the codec's TX first, then AFE 0x4001 (R15); 0: the AFE port first (test9) */
 static uint32_t mic_words_once;         /* the ASM read command's words, said once per boot */
 static uint32_t command_step = 4;       /* the step command()'s lines carry (6 while the microphones are up) */
+static bool feed_quiet;                 /* vayu_sound_keep=1 after its first session: the "done" lines of the commands not said,
+                                         * the feeder's line every minute and the level line every 10th second */
 static vm_offset_t north, south;
 static bool sdz_driven;                 /* set once a step drives an SDZ pin; the quiesce only undoes what was done */
 
@@ -814,6 +817,9 @@ apr_post(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const 
  *                 holds the feeder ~130 ms, most of the DSP's 8 x 20 ms queue); default 1, the steps
  *   vayu_sound_quiet_ms=N  with vayu_sound=5: how long iOS writes silence before the amplifier is faded out and
  *                 shut down (default 3000; 0: never while the feeder runs)
+ *   vayu_sound_keep=1  with vayu_sound=4|5: no vayu_sound_secs: the sound step on demand for as long as the kernel
+ *                 runs -- up when iOS plays, down after vayu_sound_idle_ms (default 10000) without sound, out of the
+ *                 call's way (vayu_call_audio=1); the DVC held to -6 dB at the most (sound_on_demand(), below)
  *
  *   vayu_mic=1    the microphone for iOS: /dev/hakios-mic, the node the audio plug-in (userland/src/audio_plugin.c,
  *                 its device "Codec") opens while its input runs. Needs vayu_jack>=2 and vayu_audio>=3 (the codec
@@ -888,8 +894,10 @@ command_words(const char *what, uint8_t service, uint16_t port, uint32_t opcode,
 	}
 	mic_dsp_gone = false;
 	if (apr_answer.opcode == APR_BASIC_RSP_RESULT && apr_answer.words[0] == opcode) {
-		say("vayu-audio: %u: %s: %s%s\n", command_step, what, apr_answer.words[1] == 0 ? "done" : "REFUSED: ",
-		    apr_answer.words[1] == 0 ? "" : dsp_error(apr_answer.words[1]));
+		if (apr_answer.words[1] != 0 || !feed_quiet) {
+			say("vayu-audio: %u: %s: %s%s\n", command_step, what, apr_answer.words[1] == 0 ? "done" : "REFUSED: ",
+			    apr_answer.words[1] == 0 ? "" : dsp_error(apr_answer.words[1]));
+		}
 		ok = apr_answer.words[1] == 0 && wanted == 0;
 		lck_mtx_unlock(&apr_lock);
 		return ok;
@@ -3097,14 +3105,28 @@ longest(uint64_t duration, uint64_t *most)
 	}
 }
 
+/*
+ * vayu_sound_keep=1 (sound_on_demand(), by the audio thread): the feeder as one session of many. While no session
+ * runs, the ring takes what iOS writes from its first sound on (listen_sink()), so that the first sound of a
+ * session is not lost while the port and the stream come up; the session ends after feed_idle_ns with nothing
+ * but silence from iOS, or when the call's path wants the ports (sound_yield()). Off (all zero), feed() is as it was.
+ */
+static bool feed_keep_ring;                     /* the ring is not emptied at the start: listen_sink() filled it */
+static uint64_t feed_idle_ns;                   /* non-zero: the session ends after this long without sound */
+static bool sound_amp_banned;                   /* a session's watcher gave up on the amplifier: no later one drives it */
+static bool sound_yield(void);                  /* the call's path (vayu_call_audio=1) is up or asked for */
+
 static bool
 feed(uint32_t secs)
 {
 	uint64_t began = mach_absolute_time(), last_report = began, last_level = began, last_route = began, last_switch = began, last_pass = began, ns;
-	uint32_t sent = 0, done_before = written_done, said = 0, levels_said = 0, limited_before = hakios_guard_limited();
+	uint32_t sent = 0, done_before = written_done, said = feed_quiet ? 120 : 0, levels_said = feed_quiet ? 600 : 0;
+	uint32_t limited_before = hakios_guard_limited();
 	bool ok = true;
 
-	ring_head = ring_tail = 0;
+	if (!feed_keep_ring) {
+		ring_head = ring_tail = 0;
+	}
 	ios_frames = fed_frames = silent_frames = 0;
 	ios_peak = fed_peak = 0;
 	sec_ios_peak = sec_ios_full = sec_out_peak = sec_out_full = 0;
@@ -3178,6 +3200,19 @@ feed(uint32_t secs)
 		}
 		if (ns >= (uint64_t)secs * NSEC_PER_SEC) {
 			break;
+		}
+		if (feed_idle_ns != 0) {
+			uint64_t sound_at = last_sound > began ? last_sound : began, quiet;
+
+			absolutetime_to_nanoseconds(mach_absolute_time() - sound_at, &quiet);
+			if (quiet >= feed_idle_ns) {
+				say("vayu-audio: keep: the session ends after %llu ms without sound\n", quiet / NSEC_PER_MSEC);
+				break;
+			}
+			if (sound_yield()) {
+				say("vayu-audio: keep: the session ends: the call's path wants the ports\n");
+				break;
+			}
 		}
 		if (written_done == done_before && ns > NSEC_PER_SEC) {
 			say("vayu-audio: 4: THE DSP HAS GIVEN NO PERIOD BACK IN A SECOND\n");
@@ -4647,7 +4682,7 @@ step_sound(uint32_t sound, uint32_t secs)
 				bzero(&watcher, sizeof(watcher));
 				amp_was_on = false;
 				route_switches = 0;
-				watcher.amp = amp != 0 && xnu_tlmm != 0;
+				watcher.amp = amp != 0 && xnu_tlmm != 0 && !sound_amp_banned;
 				watcher.target = dvc_index;
 				guard_gain = (audio_route_jack && vayu_jack_keep()) ? jack_gain : speaker_gain;
 				hakios_guard_configure(true, guard_gain);
@@ -5239,6 +5274,22 @@ static uint32_t call_audio_retry = 30;  /* vayu_call_audio_retry: START VOICE's 
 static volatile uint32_t call_audio_pending;    /* what the client asked: 0 none, 1 up, 2 down */
 static volatile uint32_t call_audio_want;       /* the path mode asked for: 2 or 3 */
 static volatile bool call_audio_up;             /* the worker's path is up */
+/*
+ * vayu_call_route=1: the call's downlink is a route, as on an iPhone, instead of always the bottom
+ * speaker.  It starts on the earpiece (TAS2564 at 0x4d, the receiver) and follows CommCenter's
+ * SetAudioPath on Apple's audio service 0xE1 (bsd/dev/vayu_voice.c, vayu_call_bb=1).  The QMI
+ * downlink values are CommCenter's (getQmiDownLinkAudioPath, 20F66 0x1f0dd03ec: 1..10); which of
+ * them is the receiver and which the speaker is not named anywhere this port could read, so the
+ * two are boot-args learned from a run (the log prints every value CommCenter sends):
+ *   vayu_call_dl_receiver=N   the downlink value that means the receiver (default: none)
+ *   vayu_call_dl_speaker=N    the downlink value that means the loudspeaker (default: none)
+ * A value that is neither keeps the route as it is.
+ */
+static uint32_t call_route_arg;                 /* vayu_call_route=1 */
+static uint32_t call_dl_receiver = 0xffffffffu; /* vayu_call_dl_receiver */
+static uint32_t call_dl_speaker = 0xffffffffu;  /* vayu_call_dl_speaker */
+static volatile uint32_t call_route_want;       /* 0: as before (bottom speaker), 1 the earpiece, 2 the speaker */
+static uint32_t call_route_have;                /* what the amplifiers are set for (the worker's) */
 
 static bool
 voice_begin(uint32_t mode, struct voice_parms *p)
@@ -5433,7 +5484,80 @@ vayu_audio_call_audio_start(uint32_t path_mode)
 		return;                         /* (the path is up, or already asked for) */
 	}
 	call_audio_want = path_mode;
+	if (call_route_arg != 0 && call_route_want == 0) {
+		call_route_want = 1;            /* a call starts on the receiver, as an iPhone's does */
+	}
 	call_audio_pending = 1;
+}
+
+/*
+ * vayu_call_route=1: CommCenter's SetAudioPath (Apple's audio service 0xE1, answered by
+ * bsd/dev/vayu_voice.c).  Only a word for the worker: the amplifiers are switched in its thread.
+ */
+void
+vayu_audio_call_audio_path(uint16_t downlink, uint16_t uplink)
+{
+	uint32_t want = 0;
+
+	if (!call_audio || call_route_arg == 0) {
+		return;
+	}
+	if (downlink == call_dl_receiver) {
+		want = 1;
+	} else if (downlink == call_dl_speaker) {
+		want = 2;
+	}
+	voice_say("vayu_call_route=1: CommCenter's audio path: downlink %u, uplink %u -> %s\n", downlink, uplink,
+	    want == 1 ? "the earpiece" : want == 2 ? "the loudspeaker" :
+	    "not mapped (vayu_call_dl_receiver/vayu_call_dl_speaker): the route is kept");
+	if (want != 0) {
+		call_route_want = want;
+	}
+}
+
+/* CommCenter's SetVolume: logged only -- the gain's scale is not known yet, and the DVC stays. */
+void
+vayu_audio_call_audio_volume(uint8_t source, uint8_t gain)
+{
+	if (!call_audio || call_route_arg == 0) {
+		return;
+	}
+	voice_say("vayu_call_route=1: CommCenter's call volume: source %u, gain %u (not applied)\n", source, gain);
+}
+
+/* The worker's: put the amplifiers where call_route_want says, while the path is up. */
+static void
+call_route_apply(void)
+{
+	uint32_t want = call_route_want;
+
+	if (call_route_arg == 0 || want == 0 || want == call_route_have || !voice.rx_started || !xnu_tlmm) {
+		return;
+	}
+	if (want == 1) {
+		if (!amp_prepare(&amp_ear) || !amp_start(&amp_ear)) {
+			voice_say("vayu_call_route=1: the earpiece's amplifier did not come up: the route stays\n");
+			amp_stop(&amp_ear);
+			call_route_have = want;         /* (not retried for ever: the next SetAudioPath asks again) */
+			return;
+		}
+		amp_stop(&amp_bottom);
+		voice.amp_started = true;
+		voice_say("vayu_call_route=1: the call is on the earpiece (TAS2564 at 0x4d)\n");
+	} else {
+		if (!amp_prepare(&amp_bottom) || !amp_start(&amp_bottom)) {
+			voice_say("vayu_call_route=1: the speaker's amplifier did not come up: the route stays\n");
+			amp_stop(&amp_bottom);
+			call_route_have = want;
+			return;
+		}
+		if (!amp_ear_enabled) {
+			amp_stop(&amp_ear);
+		}
+		voice.amp_started = true;
+		voice_say("vayu_call_route=1: the call is on the loudspeaker (TAS2562 at 0x4c)\n");
+	}
+	call_route_have = want;
 }
 
 void
@@ -5490,7 +5614,8 @@ call_audio_thread(void *arg __unused, wait_result_t wr __unused)
 			}
 			continue;
 		}
-		/* the path is up: START VOICE's retries, and then the call's end */
+		/* the path is up: the route (vayu_call_route=1), START VOICE's retries, and then the call's end */
+		call_route_apply();
 		if (!voice.started && (mode == 2 || mode == 3) && !gave_up_said) {
 			if (voice_start_give_up(&p, call_audio_retry)) {
 				voice_say("vayu_call_audio=1: START VOICE was not taken in %u s: the path stays up "
@@ -5516,6 +5641,8 @@ call_audio_thread(void *arg __unused, wait_result_t wr __unused)
 			voice_end(&p);
 			call_audio_up = false;
 			voice_busy = false;
+			call_route_have = 0;
+			call_route_want = 0;
 			voice_say("vayu_call_audio=1: the call is over: the voice path is down\n");
 			continue;
 		}
@@ -5685,10 +5812,150 @@ step_link(void)
 	return up;
 }
 
+/* ---- vayu_sound_keep=1: the sound on demand ---------------------------------------------------------- */
+
+/*
+ * vayu_sound_keep=1 (with vayu_audio=4 and vayu_sound=4 or 5): the speaker's stream for as long as this kernel
+ * runs, with no vayu_sound_secs, and not as one session that holds the port and the stream all the time: a
+ * session is the sound step itself (step_sound(): the port, the stream, the feeder and, with 5, the guard and
+ * the watcher), brought up when iOS writes something that is not silence and taken down after
+ * vayu_sound_idle_ms (default 10000, 1000..600000) without sound. Between sessions the DSP stays up and the
+ * amplifiers are in shutdown (SDZ low), as at the end of any sound step. While nothing runs, what iOS writes
+ * from its first sound on is kept in the feeder's ring (0.68 s), so the session plays it once it is up.
+ *
+ * The call's path (vayu_call_audio=1, vayu_voice.c's QMI client) has the ports first: a session ends when the
+ * call's path is asked for or up, and none starts again until it is down (sound_yield(); the call's worker
+ * waits for steps_busy as it always has).
+ *
+ * The level: the amplifier's digital volume is held at -6 dB at the most (DVC_DEFAULT) whatever
+ * vayu_audio_dvc_max says -- a phone that plays all day with no speaker protection in the DSP -- and the
+ * guard stays as it is. A session whose watcher gave up on the amplifier (a fault) leaves it off for the rest
+ * of the boot. Three failed sessions in a row end the mode (the DSP has gone, most likely).
+ */
+static uint32_t sound_keep;                     /* vayu_sound_keep=1 */
+static uint32_t sound_idle_ms = 10000;          /* vayu_sound_idle_ms */
+static uint32_t listen_heard;                   /* the event listen_sink() wakes sound_on_demand() with */
+
+static bool
+sound_yield(void)
+{
+	return voice_busy || call_audio_pending == 1 || call_audio_up;
+}
+
+/* The sink while no session runs: nothing until the first sample that is not silence, then the ring (never waits). */
+static uint32_t
+listen_sink(const int16_t *frames, uint32_t count)
+{
+	uint32_t first = 0;
+
+	if (ring_head == ring_tail) {
+		for (; first < count; first++) {
+			int16_t l = frames[2 * first], r = frames[2 * first + 1];
+
+			if (l > SILENCE || l < -SILENCE || r > SILENCE || r < -SILENCE) {
+				break;
+			}
+		}
+		if (first == count) {
+			return count;           /* (silence before any sound: not kept) */
+		}
+		first += ios_sink(frames + 2 * first, count - first);
+		thread_wakeup((event_t)&listen_heard);
+		return first;
+	}
+	return ios_sink(frames, count);
+}
+
+static void
+listen_reset(const char *why)
+{
+	hakios_audio_set_sink("nothing", NULL);         /* (under hakios.audio.c's lock: no listen_sink() is running after it) */
+	ring_head = ring_tail = 0;
+	OSMemoryBarrier();
+	hakios_audio_set_sink(why, listen_sink);
+}
+
+static void
+sound_on_demand(uint32_t sound)
+{
+	uint32_t sessions = 0, failed = 0;
+	bool yielding = false;
+
+	feed_idle_ns = (uint64_t)sound_idle_ms * NSEC_PER_MSEC;
+	say("vayu-audio: keep: vayu_sound_keep=1: vayu_sound=%u on demand for as long as this kernel runs: a session "
+	    "when iOS plays, down after %u ms without sound; the DVC at most index %u (%d dB)\n", sound, sound_idle_ms,
+	    dvc_most, 2 * (int)dvc_most - 110);
+	listen_reset("the ring, until iOS plays (vayu_sound_keep=1)");
+	for (;;) {
+		bool ok;
+
+		if (sound_yield()) {
+			if (!yielding) {
+				say("vayu-audio: keep: the call's path has the ports: no session until it is down\n");
+				yielding = true;
+			}
+			delay_for_interval(100, NSEC_PER_MSEC);
+			continue;
+		}
+		if (yielding) {
+			yielding = false;
+			listen_reset("the ring, until iOS plays (vayu_sound_keep=1)");     /* (nothing of the call's time is played) */
+			say("vayu-audio: keep: the call's path is down: sessions again\n");
+		}
+		if (ring_head == ring_tail) {
+			/* (asleep until iOS plays: no polling while the phone is quiet; a look at the call's flags every second) */
+			assert_wait_timeout((event_t)&listen_heard, THREAD_UNINT, 1000, NSEC_PER_MSEC);
+			if (ring_head == ring_tail) {
+				thread_block(THREAD_CONTINUE_NULL);
+			} else {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			}
+			continue;
+		}
+		/*
+		 * The ports are taken first and the call's flags read after, 20 ms later: the call's worker reads
+		 * steps_busy before it sets voice_busy, so by then either it has seen steps_busy or voice_busy is set.
+		 */
+		steps_busy = true;
+		OSMemoryBarrier();
+		delay_for_interval(20, NSEC_PER_MSEC);
+		if (sound_yield()) {
+			steps_busy = false;
+			continue;
+		}
+		feed_keep_ring = true;
+		feed_quiet = sessions != 0;
+		if (sessions < 20 || sessions % 100 == 0) {
+			say("vayu-audio: keep: session %u: iOS plays (%u frames waiting)\n", sessions + 1, ring_head - ring_tail);
+		}
+		ok = step_sound(sound, UINT32_MAX);
+		feed_keep_ring = false;
+		feed_quiet = false;
+		steps_busy = false;
+		sessions++;
+		if (watcher.given_up && !sound_amp_banned) {
+			sound_amp_banned = true;
+			say("vayu-audio: keep: the watcher gave up on the amplifier in session %u: it stays off for the rest of "
+			    "this boot\n", sessions);
+		}
+		failed = ok ? 0 : failed + 1;
+		if (failed >= 3) {
+			say("vayu-audio: keep: three sessions in a row FAILED: vayu_sound_keep=1 ends here\n");
+			break;
+		}
+		listen_reset("the ring, until iOS plays (vayu_sound_keep=1)");
+		if (!ok) {
+			delay_for_interval(1, NSEC_PER_SEC);
+		}
+	}
+	feed_idle_ns = 0;
+	hakios_audio_set_sink("nothing", NULL);
+}
+
 static void
 audio_thread(void *arg __unused, wait_result_t wr __unused)
 {
-	uint32_t secs = 2, keep = 0;
+	uint32_t secs = 2, keep = 0, keep_sound = 0;
 
 	PE_parse_boot_argn("vayu_audio_secs", &secs, sizeof(secs));
 	PE_parse_boot_argn("vayu_audio_keep", &keep, sizeof(keep));
@@ -5746,7 +6013,12 @@ audio_thread(void *arg __unused, wait_result_t wr __unused)
 			if ((pre[0] != 0 || pre[1] != 0) && !vayu_jack_keep()) {
 				vayu_jack_finish();
 			}
-			if (sound >= 4) {
+			if (sound_keep && sound != 4 && sound != 5) {
+				say("vayu-audio: keep: vayu_sound_keep=1 needs vayu_sound=4 or 5, not %u: not done\n", sound);
+			}
+			if (sound_keep && (sound == 4 || sound == 5)) {
+				keep_sound = sound;                     /* (sound_on_demand(), below, after vayu_voice's step) */
+			} else if (sound >= 4) {
 				tone_secs = 40;                         /* the feeder: amplifiers off, any length */
 				PE_parse_boot_argn("vayu_sound_secs", &tone_secs, sizeof(tone_secs));
 				/* (a whole run: at most a day; it was 600 s, and Music and ringtones after ten minutes were silent, run 005616) */
@@ -5757,7 +6029,9 @@ audio_thread(void *arg __unused, wait_result_t wr __unused)
 			if (tone_secs == 0) {
 				tone_secs = 1;
 			}
-			step_sound(sound, tone_secs);
+			if (keep_sound == 0) {
+				step_sound(sound, tone_secs);
+			}
 			/* vayu_sound_then=N: a second step after the first, in the same boot (e.g. 2 = the headphone tone, then
 			 * 6 = the microphones' recording); only the short steps 1-3 and 6 */
 			if (PE_parse_boot_argn("vayu_sound_then", &then, sizeof(then)) && then != 0 && then != sound &&
@@ -5785,6 +6059,9 @@ audio_thread(void *arg __unused, wait_result_t wr __unused)
 			}
 		}
 		steps_busy = false;
+		if (keep_sound != 0) {
+			sound_on_demand(keep_sound);    /* (returns only when its sessions keep failing) */
+		}
 		/*
 		 * vayu_call_audio=1: instead of finishing the codec and the DSP after the steps, hold them
 		 * for the QMI VOICE client, whose thread brings the path up and down with the call
@@ -5889,6 +6166,16 @@ vayu_audio_init(void)
 	amp_ear_enabled = ear != 0;
 	ear_dvc_index = ear_dvc_index > EAR_DVC_TOP ? EAR_DVC_TOP : ear_dvc_index;
 	dvc_most = dvc_most > DVC_TOP ? DVC_TOP : dvc_most;
+	if (PE_parse_boot_argn("vayu_sound_keep", &sound_keep, sizeof(sound_keep)) && sound_keep != 0) {
+		sound_keep = 1;
+		PE_parse_boot_argn("vayu_sound_idle_ms", &sound_idle_ms, sizeof(sound_idle_ms));
+		sound_idle_ms = sound_idle_ms < 1000 ? 1000 : sound_idle_ms > 600000 ? 600000 : sound_idle_ms;
+		if (dvc_most > DVC_DEFAULT) {
+			say("vayu-audio: keep: vayu_audio_dvc_max=%u is held to %u (-6 dB) with vayu_sound_keep=1\n", dvc_most,
+			    DVC_DEFAULT);
+			dvc_most = DVC_DEFAULT;
+		}
+	}
 	if (dvc_index > dvc_most) {
 		dvc_index = dvc_most;                   /* -6 dB at the most, unless vayu_audio_dvc_max says more */
 	}
@@ -5927,6 +6214,15 @@ vayu_audio_init(void)
 				    "3 (CS) only\n", call_audio_forced);
 			}
 			call_audio_forced = 0;
+		}
+		PE_parse_boot_argn("vayu_call_route", &call_route_arg, sizeof(call_route_arg));
+		PE_parse_boot_argn("vayu_call_dl_receiver", &call_dl_receiver, sizeof(call_dl_receiver));
+		PE_parse_boot_argn("vayu_call_dl_speaker", &call_dl_speaker, sizeof(call_dl_speaker));
+		if (call_route_arg != 0) {
+			say("vayu-audio: vayu_call_route=1: a call starts on the earpiece and follows CommCenter's "
+			    "audio path (receiver = downlink %d, speaker = downlink %d; -1: not set)\n",
+			    call_dl_receiver == 0xffffffffu ? -1 : (int)call_dl_receiver,
+			    call_dl_speaker == 0xffffffffu ? -1 : (int)call_dl_speaker);
 		}
 		PE_parse_boot_argn("vayu_call_audio_retry", &call_audio_retry, sizeof(call_audio_retry));
 		if (call_audio_retry == 0) {

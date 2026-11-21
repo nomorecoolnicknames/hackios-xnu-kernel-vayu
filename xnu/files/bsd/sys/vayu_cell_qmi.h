@@ -53,6 +53,11 @@
 #define VAYU_CELL_NAS_GET_SERVING_SYSTEM        0x0024
 #define VAYU_CELL_NAS_GET_SIGNAL_INFO           0x004f
 #define VAYU_CELL_NAS_INITIATE_NETWORK_REGISTER 0x0022
+#define VAYU_CELL_NAS_ATTACH_DETACH             0x0023  /* libqmi "Attach Detach" */
+#define VAYU_CELL_NAS_SET_SYSTEM_SELECTION_PREF 0x0033  /* libqmi "Set System Selection Preference" */
+#define VAYU_CELL_NAS_PS_ATTACH                 1       /* QmiNasPsAttachAction ATTACH */
+#define VAYU_CELL_NAS_DOMAIN_CS_PS              2       /* QmiNasServiceDomainPreference CS_PS */
+#define VAYU_CELL_NAS_CHANGE_POWER_CYCLE        0       /* QmiNasChangeDuration POWER_CYCLE: not kept */
 
 /* The largest request this client builds (a read record: three TLVs, under 64 bytes). */
 #define VAYU_CELL_REQUEST_MAX                   128
@@ -788,6 +793,41 @@ struct vayu_cell_nas_initiate_register_req {
 static const struct qmi_elem_info vayu_cell_nas_initiate_register_req_ei[] = {
 	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
 	  .tlv_type = 0x01, .offset = offsetof(struct vayu_cell_nas_initiate_register_req, action) },
+	{ .data_type = QMI_EOTI },
+};
+
+/* Attach Detach (0x0023): TLV 0x10 Action (1 attach, 2 detach). Reply: the result alone. */
+struct vayu_cell_nas_attach_req {
+	uint8_t action_valid;
+	uint8_t action;
+};
+
+static const struct qmi_elem_info vayu_cell_nas_attach_req_ei[] = {
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x10, .offset = offsetof(struct vayu_cell_nas_attach_req, action_valid) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x10, .offset = offsetof(struct vayu_cell_nas_attach_req, action) },
+	{ .data_type = QMI_EOTI },
+};
+
+/* Set System Selection Preference (0x0033), only TLV 0x17 Change Duration (u8) and 0x18 Service
+ * Domain Preference (u32). Reply: the result alone. */
+struct vayu_cell_nas_ssp_req {
+	uint8_t duration_valid;
+	uint8_t duration;
+	uint8_t domain_valid;
+	uint32_t domain;
+};
+
+static const struct qmi_elem_info vayu_cell_nas_ssp_req_ei[] = {
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x17, .offset = offsetof(struct vayu_cell_nas_ssp_req, duration_valid) },
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x17, .offset = offsetof(struct vayu_cell_nas_ssp_req, duration) },
+	{ .data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x18, .offset = offsetof(struct vayu_cell_nas_ssp_req, domain_valid) },
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x18, .offset = offsetof(struct vayu_cell_nas_ssp_req, domain) },
 	{ .data_type = QMI_EOTI },
 };
 

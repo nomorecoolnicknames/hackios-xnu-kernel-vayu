@@ -17,6 +17,11 @@
  *                           then Change Provisioning Session (0x0038) if primary GW is unassigned
  *   vayu_cell_register=1    NAS Initiate Network Register automatic (0x0022), retried with backoff
  *                           while unregistered (UIM initialization and PS attach are asynchronous)
+ *   vayu_cell_ps_attach=N   a11 (h1/h2: REGISTERED on UMTS, CS attached, PS detached, WDS Start
+ *                           CALL_FAILED). While registered with PS detached:
+ *                           1  NAS Attach Detach (0x0023) action ATTACH, at most 3 times, 30 s apart;
+ *                           2  NAS Set System Selection Preference (0x0033) service domain CS+PS with
+ *                              change duration POWER_CYCLE (not kept by the modem), once.
  *   vayu_cell_data=1        after REGISTERED, a separate DPM/WDA/WDS client starts an IPv4 session
  *                           and reads its settings (bsd/dev/vayu_cell_data.c); no packets yet
  *   vayu_cell_lte=1         this task's switch: implies vayu_cell=2 and runs the WDS control plane
@@ -99,6 +104,8 @@ struct vayu_cell_state {
 	volatile bool stop, running;
 	bool started;
 	uint32_t level, wait_s, poll_s, register_arg, online_arg, provision_arg;
+	uint32_t ps_attach_arg, ps_attach_sent;   /* vayu_cell_ps_attach (a11) */
+	uint64_t ps_attach_next_ms;
 	bool online_sent, slot_switch_sent, provision_sent;
 	uint32_t online_attempts;
 	uint8_t online_stage;
@@ -1022,6 +1029,31 @@ cell_nas_round(struct vayu_cell_record *record)
 			    cell_attach_name(serving->ps_attach_state), (unsigned int)serving->ps_attach_state);
 		}
 		cell.last_registered = record->reg_state == VAYU_CELL_REG_REGISTERED;
+		if (cell.ps_attach_arg != 0 && cell.last_registered && serving->ps_attach_state == 2 &&
+		    now_ms() >= cell.ps_attach_next_ms && cell.ps_attach_sent < (cell.ps_attach_arg == 1 ? 3u : 1u)) {
+			struct vayu_cell_nas_register_resp response = { 0 };
+
+			cell.ps_attach_sent++;
+			cell.ps_attach_next_ms = now_ms() + 30000;
+			if (cell.ps_attach_arg == 1) {
+				struct vayu_cell_nas_attach_req request = { .action_valid = 1, .action = VAYU_CELL_NAS_PS_ATTACH };
+
+				ret = cell_request("attach detach", cell.nas_node, cell.nas_port, VAYU_CELL_NAS_ATTACH_DETACH,
+				    vayu_cell_nas_attach_req_ei, &request, vayu_cell_nas_register_resp_ei, &response,
+				    &response.result);
+				say("vayu-cell: vayu_cell_ps_attach=1: NAS Attach Detach ATTACH (%u/3): %s\n", cell.ps_attach_sent,
+				    ret == 0 ? "the modem agreed" : "refused (see above)");
+			} else {
+				struct vayu_cell_nas_ssp_req request = { .duration_valid = 1, .duration = VAYU_CELL_NAS_CHANGE_POWER_CYCLE,
+					.domain_valid = 1, .domain = VAYU_CELL_NAS_DOMAIN_CS_PS };
+
+				ret = cell_request("system selection", cell.nas_node, cell.nas_port,
+				    VAYU_CELL_NAS_SET_SYSTEM_SELECTION_PREF, vayu_cell_nas_ssp_req_ei, &request,
+				    vayu_cell_nas_register_resp_ei, &response, &response.result);
+				say("vayu-cell: vayu_cell_ps_attach=2: NAS Set System Selection Preference domain CS+PS "
+				    "(power cycle only): %s\n", ret == 0 ? "the modem agreed" : "refused (see above)");
+			}
+		}
 		vayu_cell_data_registered(cell.last_registered);
 		if (record->reg_state == VAYU_CELL_REG_DENIED) {
 			cell.registration_denied = true;
@@ -1380,6 +1412,19 @@ vayu_cell_start(struct vayu_qrtr *q)
 	PE_parse_boot_argn("vayu_cell_online", &online_arg, sizeof(online_arg));
 	PE_parse_boot_argn("vayu_cell_provision", &provision_arg, sizeof(provision_arg));
 	PE_parse_boot_argn("vayu_cell_register", &register_arg, sizeof(register_arg));
+	cell.ps_attach_arg = 0;
+	cell.ps_attach_sent = 0;
+	cell.ps_attach_next_ms = 0;
+	if (PE_parse_boot_argn("vayu_cell_ps_attach", &cell.ps_attach_arg, sizeof(cell.ps_attach_arg)) &&
+	    cell.ps_attach_arg > 2) {
+		say("vayu-cell: vayu_cell_ps_attach=%u is refused: 1 (attach) or 2 (CS+PS preference) only\n",
+		    cell.ps_attach_arg);
+		cell.ps_attach_arg = 0;
+	}
+	if (cell.ps_attach_arg != 0) {
+		say("vayu-cell: vayu_cell_ps_attach=%u: %s while registered with PS detached\n", cell.ps_attach_arg,
+		    cell.ps_attach_arg == 1 ? "NAS Attach Detach ATTACH" : "NAS system selection domain CS+PS (power cycle)");
+	}
 	if (online_arg != 0 && online_arg != 1) {
 		say("vayu-cell: vayu_cell_online=%u is refused: only 1 allows DMS ONLINE\n", online_arg);
 		online_arg = 0;

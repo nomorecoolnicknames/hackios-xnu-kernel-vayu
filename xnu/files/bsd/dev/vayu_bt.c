@@ -255,6 +255,18 @@
  *                     loader writes it. bluetoothd is still told 115200 (its termios and the DT's
  *                     transport-speed are never applied to the UART).
  *
+ *   vayu_bt_nv_mac=1  default 0 (off): the phone's own BD address in the NVM's tag 2 before it is sent in step 8, and
+ *                     in the early "marconi-bt"/"bluetooth" publish (vayu_bt_dt=1). It is read from fw/bt_mac
+ *                     (hakios_image_file(): the RAM disk's fw/, or /private/var/hakios/fw/ with fw_var=1): text,
+ *                     the first 12 hex digits in the order the box and Android's Settings print them
+ *                     (AA:BB:CC:DD:EE:FF; ':' '-' and spaces ignored, an optional "name=" before them). The
+ *                     stock crnv21.bin's tag 2 is all zeros (bt_dt_publish_early() below), and the factory address
+ *                     is not in anything of the phone that can be read offline: persist has no bluetooth/ entry
+ *                     and the modem's NV (item 447, in modemst1/modemst2/fsg) is encrypted (IMGEFS headers,
+ *                     8.0 bits/byte; the backup of 2026-11-17). No file, no valid address (zero, all ones, a
+ *                     group address): the NVM is sent as before and that is said. With it on, no line carries
+ *                     more of any BD address than its first three octets (the maker's part).
+ *
  * What userland must run after step 9:
  *
  *     BT_HCI_TRANSPORT=H4:POSIX:com.vayu.bt.uart,115200 bluetoothd
@@ -613,6 +625,10 @@ static bool g_leanswer_enabled;         /* vayu_bt_leanswer=1: answer 0x2007/0x2
 static bool g_lelegacy_enabled;         /* vayu_bt_lelegacy=1: hide ext/periodic adv LE features */
 static uint32_t g_lelegacy_cc_logged, g_lelegacy_adv_reports;
 static uint32_t g_randaddr_mode;        /* vayu_bt_randaddr: 0 off, 1/2 0xfd48 -> real 0x2005 */
+static bool g_nv_mac;                   /* vayu_bt_nv_mac=1: the phone's own BD address from fw/bt_mac into tag 2 */
+static bool g_nv_mac_valid;             /* fw/bt_mac was read and holds an address */
+static uint8_t g_nv_mac_addr[6];        /* that address in HCI order (the least significant octet first) */
+static void bt_addr_say(const char *what, const uint8_t a[6]);
 static volatile bool g_randaddr_reset_pending;
 static bool g_randaddr_pending;         /* a real 0x2005 is out; its CC becomes the 0xfd48 answer */
 static uint64_t g_randaddr_sent_us;
@@ -2204,9 +2220,7 @@ bt_step7(void)
 		printf("vayu-bt: Read_BD_ADDR: status %#x: stopping\n", (unsigned)payload[3]);
 		return false;
 	}
-	printf("vayu-bt: Read_BD_ADDR: %02x:%02x:%02x:%02x:%02x:%02x\n", (unsigned)payload[9],
-	    (unsigned)payload[8], (unsigned)payload[7], (unsigned)payload[6],
-	    (unsigned)payload[5], (unsigned)payload[4]);
+	bt_addr_say("Read_BD_ADDR", payload + 4);
 
 	printf("vayu-bt: step 7 done: the controller answers HCI\n");
 	return true;
@@ -2367,6 +2381,78 @@ bt_qca_send(const char *what, const uint8_t *data, uint64_t size, bool ack_each,
 }
 
 /*
+ * vayu_bt_nv_mac=1: fw/bt_mac, text, the first 12 hex digits in the order people write an address (the most
+ * significant octet first); ':' '-' '.' and white space between them are skipped, and an optional "name=" before
+ * them (a line like Android's "Intf0MacAddress=..."). Kept in HCI order, as tag 2 and Read_BD_ADDR carry it.
+ */
+static void
+bt_nv_mac_load(void)
+{
+	uint64_t size = 0;
+	const uint8_t *text = hakios_image_file("fw", "bt_mac", &size, NULL);
+	uint64_t start = 0, end = size < 256 ? size : 256;
+	uint8_t addr[6] = { 0 };
+	unsigned digits = 0;
+	bool zero = true, ones = true;
+
+	if (text == NULL || size == 0) {
+		printf("vayu-bt: nv_mac: no fw/bt_mac: the NVM's tag 2 is sent as it is\n");
+		return;
+	}
+	for (uint64_t i = 0; i < end && text[i] != '\n'; i++) {
+		if (text[i] == '=') {
+			start = i + 1;          /* (what came before it was a name) */
+			break;
+		}
+	}
+	for (uint64_t i = start; i < end && digits < 12; i++) {
+		uint8_t c = text[i], v;
+
+		if (c >= '0' && c <= '9') {
+			v = c - '0';
+		} else if (c >= 'a' && c <= 'f') {
+			v = c - 'a' + 10;
+		} else if (c >= 'A' && c <= 'F') {
+			v = c - 'A' + 10;
+		} else if (c == ':' || c == '-' || c == '.' || c == ' ' || c == '\t') {
+			continue;
+		} else {
+			break;
+		}
+		addr[5 - digits / 2] |= (uint8_t)(v << ((digits & 1) ? 0 : 4));
+		digits++;
+	}
+	for (unsigned i = 0; i < 6; i++) {
+		zero = zero && addr[i] == 0;
+		ones = ones && addr[i] == 0xff;
+	}
+	if (digits != 12 || zero || ones || (addr[5] & 0x01) != 0) {
+		printf("vayu-bt: nv_mac: fw/bt_mac (%llu bytes) has no usable address (%u hex digits%s): the NVM's tag 2 "
+		    "is sent as it is\n", (unsigned long long)size, digits, digits != 12 ? "" : zero || ones ?
+		    ", all zeros or all ones" : ", a group address");
+		return;
+	}
+	memcpy(g_nv_mac_addr, addr, 6);
+	g_nv_mac_valid = true;
+	printf("vayu-bt: nv_mac: fw/bt_mac: %02x:%02x:%02x:**:**:** (the phone's own, into the NVM's tag 2)\n",
+	    (unsigned)addr[5], (unsigned)addr[4], (unsigned)addr[3]);
+}
+
+/* A BD address (HCI order) for the log: whole as before, or with vayu_bt_nv_mac=1 its maker's part only. */
+static void
+bt_addr_say(const char *what, const uint8_t a[6])
+{
+	if (g_nv_mac) {
+		printf("vayu-bt: %s: %02x:%02x:%02x:**:**:**%s\n", what, (unsigned)a[5], (unsigned)a[4], (unsigned)a[3],
+		    !g_nv_mac_valid ? "" : memcmp(a, g_nv_mac_addr, 6) == 0 ? " (the phone's own, from fw/bt_mac)" :
+		    " (NOT the one of fw/bt_mac)");
+		return;
+	}
+	printf("vayu-bt: %s: %02x:%02x:%02x:%02x:%02x:%02x\n", what, (unsigned)a[5], (unsigned)a[4], (unsigned)a[3],
+	    (unsigned)a[2], (unsigned)a[1], (unsigned)a[0]);
+}
+
+/*
  * The NVM's tags (btqca.c qca_tlv_check_data): a multi TLV (type 4) around a type 2 set, or a
  * type 2 file itself. Each tag is id le16, len le16, 8 reserved bytes and len data bytes; the
  * walk stops at the inner set's end. Patch tag 17 (HCI: stay at 115200) and tag 27 (deep
@@ -2378,7 +2464,7 @@ static bool
 bt_nvm_patch(uint8_t *data, uint64_t size)
 {
 	uint32_t at, end, tags = 0;
-	bool hci = false, deep = false;
+	bool hci = false, deep = false, nv_mac_put = false;
 
 	if (size < 8) {
 		printf("vayu-bt: step 8: the NVM is only %llu bytes: stopping\n",
@@ -2422,7 +2508,16 @@ bt_nvm_patch(uint8_t *data, uint64_t size)
 		tags++;
 		switch (id) {
 		case QCA_TAG_ID_BD_ADDR:
-			if (len >= 6) {
+			if (len >= 6 && g_nv_mac_valid) {
+				memcpy(tag, g_nv_mac_addr, 6);
+				nv_mac_put = true;
+				bt_addr_say("step 8: nvm tag 2 (BD address) <- fw/bt_mac", tag);
+				g_leinit_addr_valid = vayu_bt_leinit_random_address(tag, g_leinit_random_addr);
+			} else if (len >= 6 && g_nv_mac) {
+				g_leinit_addr_valid = vayu_bt_leinit_random_address(tag, g_leinit_random_addr);
+				printf("vayu-bt: nvm tag 2 (BD address): %02x:%02x:%02x:**:**:** (as it is)\n",
+				    (unsigned)tag[0], (unsigned)tag[1], (unsigned)tag[2]);
+			} else if (len >= 6) {
 				g_leinit_addr_valid = vayu_bt_leinit_random_address(tag, g_leinit_random_addr);
 				printf("vayu-bt: nvm tag 2 (BD address): %02x:%02x:%02x:%02x:%02x:%02x\n",
 				    (unsigned)tag[0], (unsigned)tag[1], (unsigned)tag[2],
@@ -2463,6 +2558,9 @@ bt_nvm_patch(uint8_t *data, uint64_t size)
 	printf("vayu-bt: step 8: nvm: %u tags; tag 17 %s, tag 27 %s; in-band sleep %s, deep sleep %s "
 	    "(vayu_bt_ibs=%u)\n", tags, hci ? "patched" : "not found", deep ? "patched" : "not found",
 	    g_ibs ? "on" : "off", g_ibs ? "on" : "off", g_ibs ? 1 : 0);
+	if (g_nv_mac_valid && !nv_mac_put) {
+		printf("vayu-bt: nv_mac: the NVM has no 6-byte tag 2: the phone's own address is NOT put\n");
+	}
 	return true;
 }
 
@@ -2778,9 +2876,7 @@ bt_step8(void)
 		printf("vayu-bt: Read_BD_ADDR: status %#x: stopping\n", (unsigned)payload[3]);
 		return false;
 	}
-	printf("vayu-bt: Read_BD_ADDR: %02x:%02x:%02x:%02x:%02x:%02x\n", (unsigned)payload[9],
-	    (unsigned)payload[8], (unsigned)payload[7], (unsigned)payload[6],
-	    (unsigned)payload[5], (unsigned)payload[4]);
+	bt_addr_say("Read_BD_ADDR", payload + 4);
 	/* the controller's own answer wins over the NVM file the early publish read */
 	bt_dt_publish(payload + 4, "the controller's Read_BD_ADDR");
 
@@ -5323,6 +5419,11 @@ bt_dt_publish(const uint8_t addr[6], const char *source)
 	printf("vayu-bt: S10 dt: IOService \"marconi-bt\" and \"bluetooth\": local-mac-address 6 bytes, "
 	    "transport-encoding %u (H4), transport-speed %u, from %s\n", (unsigned)BT_DT_TRANSPORT_H4,
 	    (unsigned)BT_TTY_BAUD, source);
+	if (g_nv_mac) {
+		printf("vayu-bt: S10 mac: %02x:%02x:%02x:**:**:** (%s)\n", (unsigned)addr[5], (unsigned)addr[4],
+		    (unsigned)addr[3], source);
+		return;
+	}
 	printf("vayu-bt: S10 mac: xx:xx:xx:xx:%02x:%02x (%s, HCI order %02x:%02x:%02x:%02x:%02x:%02x)\n",
 	    (unsigned)addr[5], (unsigned)addr[4], source, (unsigned)addr[0], (unsigned)addr[1],
 	    (unsigned)addr[2], (unsigned)addr[3], (unsigned)addr[4], (unsigned)addr[5]);
@@ -5337,6 +5438,10 @@ bt_dt_publish_early(void)
 
 	if (!g_dt) {
 		bt_dt_publish(NULL, "vayu_bt_dt=0");    /* the one line, then nothing */
+		return;
+	}
+	if (g_nv_mac_valid) {
+		bt_dt_publish(g_nv_mac_addr, "fw/bt_mac");     /* (what step 8 puts in tag 2: Read_BD_ADDR will say the same) */
 		return;
 	}
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -5358,6 +5463,9 @@ vayu_bt_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t reached = 0;
 
 	printf("vayu-bt: %u step(s) asked of 9, waiting %u s before step 1\n", g_level, g_wait_s);
+	if (g_nv_mac) {
+		bt_nv_mac_load();
+	}
 	if (g_level >= 9) {
 		(void)bt_tty_create();
 		(void)bt_kctl_create();
@@ -5508,6 +5616,10 @@ vayu_bt_init(void)
 	value = 0;
 	if (PE_parse_boot_argn("vayu_bt_dt", &value, sizeof(value))) {
 		g_dt = value != 0;
+	}
+	value = 0;
+	if (PE_parse_boot_argn("vayu_bt_nv_mac", &value, sizeof(value))) {
+		g_nv_mac = value != 0;
 	}
 	if (g_lelegacy_enabled && g_leanswer_enabled) {
 		printf("vayu-bt: lelegacy: vayu_bt_leanswer=1 ignored (this test needs the real answers)\n");

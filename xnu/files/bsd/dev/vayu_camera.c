@@ -169,6 +169,8 @@
  *   vayu_camera_gain=N        when 0 / absent (default). 0x0204 (analog gain) <- N likewise. Needs the
  *                             the maintainers' ruling (volatile SMIA registers, outside the vendor blocks;
  *                             granted 2026-10-25).
+ *   vayu_cam_pm=1             step 6: a read-only line after every session's teardown (and one before the
+ *                             first) with what of the camera is still on (cam_pm_look()); nothing written.
  *   vayu_camera_af=1          step 6: the rear DW9800 lens motor (GPIO 24 VAF, 0x0c: 0x02, 0x03/0x04
  *                             only; amendment 3); frames report its position, FOCUS moves it.
  *   vayu_camera_fps=N         steps 4/6 mode 0 (cam30): 0x0340's frame length for N frames a second
@@ -5440,6 +5442,60 @@ cam_af_down(void)
 	}
 }
 
+/*
+ * vayu_cam_pm=1: a read-only look, after every step-6 session's teardown (and once before the first), at what of
+ * the camera is still on: the titan_top GDSC, PLL0 (locked), the four MCLK branches, the output pins of TLMM
+ * exception 3 that read high (the resets, the VDIG enables, the lens motor's VAF), a sensor still marked powered,
+ * and which shared rails this run has voted on (they are never voted off: see the safety rules above). Nothing
+ * is written; camcc is read only while GCC's camera_ahb (CLK_IS_CRITICAL) runs. The line is what a current
+ * measurement after Camera.app closes is set against: "nothing of the camera on" with the current still up
+ * points away from this file.
+ */
+static uint32_t g_cam_pm;
+
+static void
+cam_pm_look(const char *when)
+{
+	char on[240] = "", rails[64] = "";
+	uint32_t ahb = gcc_va != 0 ? rd(gcc_va + GCC_CAMERA_AHB_CBCR) : GCC_CBCR_OFF;
+
+	if (camcc_va != 0 && (ahb & GCC_CBCR_OFF) == 0) {
+		if ((rd(camcc_va + CAMCC_TITAN_TOP_GDSC) & CAMCC_GDSCR_POWER_ON) != 0) {
+			cam_append(on, sizeof(on), " titan_top-gdsc");
+		}
+		if ((rd(camcc_va + CAMCC_PLL0_MODE) & CAMCC_PLL0_LOCKED) != 0) {
+			cam_append(on, sizeof(on), " pll0");
+		}
+		for (unsigned n = 0; n < 4; n++) {
+			if ((rd(camcc_va + CAMCC_MCLK_CBCR(n)) & GCC_CBCR_OFF) == 0) {
+				cam_append(on, sizeof(on), " mclk%u", n);
+			}
+		}
+	} else {
+		cam_append(on, sizeof(on), " (camcc not read: camera_ahb %#x)", ahb);
+	}
+	for (unsigned i = 0; i < CAM_PIN_COUNT; i++) {
+		vm_offset_t page;
+
+		if (!cam_pin_is_output(cam_pins[i].pin) || (page = cam_pin_page(cam_pins[i].pin)) == 0) {
+			continue;
+		}
+		if ((rd(page) & TLMM_CFG_OE) != 0 && (rd(page + 4) & TLMM_IO_OUT) != 0) {
+			cam_append(on, sizeof(on), " gpio%u(%s)", cam_pins[i].pin, cam_pins[i].name);
+		}
+	}
+	if (g_sensor_powered) {
+		cam_append(on, sizeof(on), " a sensor marked powered");
+	}
+	for (unsigned i = 0; i < CAM_RAIL_COUNT; i++) {
+		if (cam_rails[i].shared && cam_rails[i].voted_on) {
+			cam_append(rails, sizeof(rails), " %s", cam_rails[i].id);
+		}
+	}
+	printf("vayu-camera: pm: %s: %s%s; shared rails this run voted on (never off):%s\n", when,
+	    on[0] != 0 ? "STILL ON:" : "nothing of the camera on", on, rails[0] != 0 ? rails : " none");
+}
+
 static void
 cam_real_stop(void)
 {
@@ -5448,6 +5504,9 @@ cam_real_stop(void)
 	}
 	cam_af_down();
 	cam_stream_down(&cam_real_stream);
+	if (g_cam_pm) {
+		cam_pm_look("after the session");
+	}
 }
 
 static const struct cam_source cam_fake_real = {
@@ -6021,6 +6080,9 @@ cam_step6(void)
 		printf("vayu-camera: step 6: /dev/hakios-camera cannot be made\n");
 		return;
 	}
+	if (g_cam_pm) {
+		cam_pm_look("before the first session");
+	}
 	if (!cam_fake_ring_alloc(cam_real_sensors, CAM_REAL_SENSOR_COUNT, "step 6")) {
 		cam_fake_broken = true;
 		printf("vayu-camera: step 6: no ring: reads will say EIO\n");
@@ -6150,6 +6212,7 @@ vayu_camera_init(void)
 	PE_parse_boot_argn("vayu_camera_gain", &g_gain, sizeof(g_gain));
 	PE_parse_boot_argn("vayu_camera_ae", &g_ae, sizeof(g_ae));
 	PE_parse_boot_argn("vayu_camera_af", &g_af, sizeof(g_af));
+	PE_parse_boot_argn("vayu_cam_pm", &g_cam_pm, sizeof(g_cam_pm));
 	PE_parse_boot_argn("vayu_camera_fps", &g_cam_fps, sizeof(g_cam_fps));
 	cam_fps_apply();
 	g_exposure &= 0xffff;

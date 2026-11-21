@@ -9,8 +9,29 @@
  * command must complete and the resulting SRAM headers are read back. data_ready is
  * never set by MMIO writes alone. A modem filter request not implemented yet clears it.
  * No default route, call, internet or configd success is claimed here.
+ *
+ * a10-gsi switches (e1-e4, 18.11: with vayu_ipa_data=1 the SoC stops right after "about to cmd",
+ * the first GSI group of the command channel). All default 0, i.e. the old sequence:
+ *   vayu_ipa_data_trace=1     (bit 0) from the cmd channel's setup until the tables are read back,
+ *                             every single GSI/IPA register access is said first ("vayu-ipa-data: mmio
+ *                             #N wr|rd <pa> (<name>) ...") and left as a persist breadcrumb, then a
+ *                             pause of vayu_ipa_data_trace_ms (default 300) before the access itself;
+ *                             a read's value follows ("mmio #N rd -> <value>"). Inside a poll loop only
+ *                             the first read is said; the rest are breadcrumbs and one summary line.
+ *                             Any nonzero value still gives the old per-packet lines (2: only those).
+ *   vayu_gsi_mainline=1       channel_setup() as mainline v6.12 gsi.c does it for the v4.0 register set
+ *                             (gsi_evt_ring_program, gsi_channel_program): EV_CH_E_CNTXT_8 MODT 32 /
+ *                             MODC 1, CH_C_QOS WRR 15 for the command channel and 0 + USE_ESCAPE_BUF_ONLY
+ *                             (bit 10) for the others, GPI scratch (max_outstanding_tre = tlv * 16,
+ *                             outstanding_threshold = 2 * 16) with SCRATCH_3's low 16 bits kept, no
+ *                             DOORBELL_1 and no ENDP_GSI_CFG1 read. ALLOCATE/START/... are polled
+ *                             (interrupts stay off): SRC_CH/EV_IRQ bit or the CNTXT_0 state, and
+ *                             each command says "vayu-ipa-data: mainline: ...".
+ *   vayu_gsi_mainline=2       only: no DOORBELL_1 writes (event ring and channel), the rest as before.
+ *   vayu_gsi_mainline=4       only: ENDP_GSI_CFG1 (0x1e42794 + 4 * ep) is not read.
  */
 #include <kern/clock.h>
+#include <kern/cpu_number.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
@@ -55,6 +76,7 @@ extern kern_return_t thread_terminate(thread_t thread);
 #define GSI_EV_CMD              (GSI_EE0 + 0x3010)
 #define GSI_HW_PARAM_2          (GSI_EE0 + 0x3040)
 #define GSI_SW_VERSION          (GSI_EE0 + 0x3044)
+#define CNTXT_TYPE_IRQ          (GSI_EE0 + 0x3080)
 #define CNTXT_TYPE_IRQ_MSK      (GSI_EE0 + 0x3088)
 #define CNTXT_SRC_CH_IRQ        (GSI_EE0 + 0x3090)
 #define CNTXT_SRC_EV_IRQ        (GSI_EE0 + 0x3094)
@@ -85,6 +107,10 @@ extern kern_return_t thread_terminate(thread_t thread);
 #define GSI_DEALLOCATE          10
 #define GSI_TYPE_GPI            2
 #define GSI_EVT_TYPE_GPI        2
+#define GSI_EVT_RING_INT_MODT   32              /* mainline gsi.c: 1 ms of the 32 kHz clock */
+#define GSI_ML_SEQUENCE         1u              /* vayu_gsi_mainline bits */
+#define GSI_ML_NO_DB1           2u
+#define GSI_ML_NO_CFG1          4u
 
 #define ENDP_CTRL(ep)           (0x800 + 0x70 * (ep))
 #define ENDP_CFG(ep)            (0x808 + 0x70 * (ep))
@@ -138,24 +164,179 @@ static vm_offset_t ipa_regs, ipa_debug, gsi_regs;
 static LCK_GRP_DECLARE(ipa_data_lock_group, "vayu-ipa-data");
 static LCK_MTX_DECLARE(ipa_data_lock, &ipa_data_lock_group);
 
-static inline uint32_t
-ipa_rd(uint32_t off) { return *(volatile uint32_t *)(ipa_regs + off); }
-static inline void
-ipa_wr(uint32_t off, uint32_t value)
+/*
+ * vayu_ipa_data_trace=1: the per-access trace. e1-e4 stopped somewhere in the cmd group with the
+ * line before it already out; a line and a breadcrumb before each access, then a pause long enough
+ * for the line to leave, make the last line in the live log the access that never finished.
+ */
+static bool mmio_trace, mmio_quiet;
+static uint32_t mmio_trace_ms = 300, mmio_seq, mmio_quiet_reads, mmio_quiet_pa, mmio_quiet_value;
+static char mmio_tag[32];
+static uint32_t gsi_mainline;
+
+static uint32_t
+mmio_pa(char block, uint32_t off)
 {
-	*(volatile uint32_t *)(ipa_regs + off) = value;
-	__asm__ volatile("dsb sy" ::: "memory");
+	return (uint32_t)(block == 'G' ? GSI_PHYS : block == 'I' ? IPA_PHYS : IPA_DEBUG_PHYS) + off;
 }
-static inline uint32_t
-debug_rd(uint32_t off) { return *(volatile uint32_t *)(ipa_debug + off); }
-static inline uint32_t
-gsi_rd(uint32_t off) { return *(volatile uint32_t *)(gsi_regs + off); }
-static inline void
-gsi_wr(uint32_t off, uint32_t value)
+
+static void
+mmio_name(char block, uint32_t off, char *name, size_t size)
 {
-	*(volatile uint32_t *)(gsi_regs + off) = value;
-	__asm__ volatile("dsb sy" ::: "memory");
+	static const struct { uint32_t off; const char *name; } gsi_fixed[] = {
+		{ GSI_STATUS, "GSI_STATUS" }, { GSI_CH_CMD, "CH_CMD" }, { GSI_EV_CMD, "EV_CH_CMD" },
+		{ GSI_HW_PARAM_2, "HW_PARAM_2" }, { GSI_SW_VERSION, "SW_VERSION" },
+		{ CNTXT_TYPE_IRQ, "CNTXT_TYPE_IRQ" }, { CNTXT_TYPE_IRQ_MSK, "CNTXT_TYPE_IRQ_MSK" },
+		{ CNTXT_SRC_CH_IRQ, "CNTXT_SRC_CH_IRQ" }, { CNTXT_SRC_EV_IRQ, "CNTXT_SRC_EV_IRQ" },
+		{ CNTXT_SRC_CH_IRQ_MSK, "CNTXT_SRC_CH_IRQ_MSK" }, { CNTXT_SRC_EV_IRQ_MSK, "CNTXT_SRC_EV_IRQ_MSK" },
+		{ CNTXT_SRC_CH_IRQ_CLR, "CNTXT_SRC_CH_IRQ_CLR" }, { CNTXT_SRC_EV_IRQ_CLR, "CNTXT_SRC_EV_IRQ_CLR" },
+		{ CNTXT_SRC_IEOB_IRQ_MSK, "CNTXT_SRC_IEOB_MSK" }, { CNTXT_SRC_IEOB_IRQ_CLR, "CNTXT_SRC_IEOB_CLR" },
+		{ CNTXT_GLOB_IRQ_STTS, "CNTXT_GLOB_IRQ_STTS" }, { CNTXT_GLOB_IRQ_EN, "CNTXT_GLOB_IRQ_EN" },
+		{ CNTXT_GLOB_IRQ_CLR, "CNTXT_GLOB_IRQ_CLR" }, { CNTXT_GSI_IRQ_STTS, "CNTXT_GSI_IRQ_STTS" },
+		{ CNTXT_GSI_IRQ_EN, "CNTXT_GSI_IRQ_EN" }, { CNTXT_GSI_IRQ_CLR, "CNTXT_GSI_IRQ_CLR" },
+		{ CNTXT_INTSET, "CNTXT_INTSET" }, { CNTXT_MSI_LSB, "CNTXT_MSI_LSB" }, { CNTXT_MSI_MSB, "CNTXT_MSI_MSB" },
+		{ GSI_ERROR_LOG, "ERROR_LOG" }, { GSI_ERROR_LOG_CLR, "ERROR_LOG_CLR" },
+		{ CNTXT_SCRATCH_0, "CNTXT_SCRATCH_0" }, { CNTXT_SCRATCH_1, "CNTXT_SCRATCH_1" },
+	};
+	static const char *const endp[0x70 / 4] = {
+		[0x00 / 4] = "CTRL", [0x08 / 4] = "CFG", [0x0c / 4] = "NAT", [0x10 / 4] = "HDR",
+		[0x14 / 4] = "HDR_EXT", [0x18 / 4] = "HDR_METADATA_MASK", [0x20 / 4] = "MODE",
+		[0x24 / 4] = "AGGR", [0x2c / 4] = "HOL_BLOCK_EN", [0x34 / 4] = "DEAGGR",
+		[0x38 / 4] = "RSRC_GRP", [0x3c / 4] = "SEQ", [0x40 / 4] = "STATUS",
+	};
+
+	if (block == 'D') {
+		if (off >= 0x794 && off < 0x794 + 4 * 32 && (off & 3) == 0) {
+			snprintf(name, size, "EP%u_GSI_CFG1", (off - 0x794) / 4);
+		} else {
+			snprintf(name, size, "IPA_DEBUG+%#x", off);
+		}
+		return;
+	}
+	if (block == 'I') {
+		uint32_t r = (off - 0x800) % 0x70;
+
+		if (off >= 0x800 && off < 0x800 + 0x70 * 32 && (r & 3) == 0 && endp[r / 4] != NULL) {
+			snprintf(name, size, "EP%u_%s", (off - 0x800) / 0x70, endp[r / 4]);
+		} else {
+			if (off == IPA_ENABLED_PIPES) strlcpy(name, "ENABLED_PIPES", size);
+			else if (off == IPA_LOCAL_PROC_BASE) strlcpy(name, "LOCAL_PROC_BASE", size);
+			else if (off == IPA_HASH_FLUSH) strlcpy(name, "HASH_FLUSH", size);
+			else snprintf(name, size, "IPA+%#x", off);
+		}
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(gsi_fixed) / sizeof(gsi_fixed[0]); i++) {
+		if (gsi_fixed[i].off == off) {
+			strlcpy(name, gsi_fixed[i].name, size);
+			return;
+		}
+	}
+	if (off >= GSI_EE0 && off < GSI_EE0 + 0x1000) {
+		uint32_t c = (off - GSI_EE0) / 0x80, r = (off - GSI_EE0) % 0x80;
+
+		if (r < 0x10) snprintf(name, size, "CH%u_CNTXT_%u", c, r / 4);
+		else if (r == 0x5c) snprintf(name, size, "CH%u_QOS", c);
+		else if (r >= 0x60 && r < 0x70) snprintf(name, size, "CH%u_SCRATCH_%u", c, (r - 0x60) / 4);
+		else snprintf(name, size, "CH%u+%#x", c, r);
+	} else if (off >= GSI_EE0 + 0x1000 && off < GSI_EE0 + 0x2000) {
+		uint32_t e = (off - GSI_EE0 - 0x1000) / 0x80, r = (off - GSI_EE0 - 0x1000) % 0x80;
+
+		if (r < 0x38) snprintf(name, size, "EV%u_CNTXT_%u", e, r / 4);
+		else snprintf(name, size, "EV%u+%#x", e, r);
+	} else if (off >= GSI_EE0 + 0x2000 && off < GSI_EE0 + 0x2200) {
+		uint32_t at = off - GSI_EE0 - 0x2000;
+
+		snprintf(name, size, "%s%u_DOORBELL_%u", at < 0x100 ? "CH" : "EV", (at & 0xff) / 8, (at & 7) / 4);
+	} else {
+		snprintf(name, size, "GSI+%#x", off);
+	}
 }
+
+static void
+mmio_before(char block, uint32_t off, bool write, uint32_t value)
+{
+	char name[32];
+	uint32_t pa = mmio_pa(block, off);
+
+	mmio_seq++;
+	if (!write && mmio_quiet) {
+		mmio_quiet_reads++;
+		mmio_quiet_pa = pa;
+		snprintf(mmio_tag, sizeof(mmio_tag), "d#%u rd poll", mmio_seq);
+		vayu_ipa_data_mark(mmio_tag, pa, false, false);
+		return;
+	}
+	mmio_name(block, off, name, sizeof(name));
+	if (write) {
+		say("vayu-ipa-data: mmio #%u wr %#x (%s) <- %#x, cpu %u\n", mmio_seq, pa, name, value,
+		    (unsigned)cpu_number());
+	} else {
+		say("vayu-ipa-data: mmio #%u rd %#x (%s), cpu %u\n", mmio_seq, pa, name, (unsigned)cpu_number());
+	}
+	snprintf(mmio_tag, sizeof(mmio_tag), "d#%u %s %s", mmio_seq, write ? "wr" : "rd", name);
+	vayu_ipa_data_mark(mmio_tag, pa, write, false);
+	if (mmio_trace_ms != 0) delay_for_interval(mmio_trace_ms, NSEC_PER_MSEC);
+}
+
+static void
+mmio_after(char block, uint32_t off, bool write, uint32_t value)
+{
+	vayu_ipa_data_mark(mmio_tag, mmio_pa(block, off), write, true);
+	if (write) return;
+	if (mmio_quiet) {
+		mmio_quiet_value = value;
+	} else {
+		say("vayu-ipa-data: mmio #%u rd -> %#x\n", mmio_seq, value);
+	}
+}
+
+/* Poll loops: after the first round only breadcrumbs, then one line for the rest. */
+static inline void
+poll_quiet(void)
+{
+	mmio_quiet = mmio_trace;
+}
+static void
+poll_end(void)
+{
+	if (mmio_quiet && mmio_quiet_reads != 0) {
+		say("vayu-ipa-data: mmio poll: %u more reads, the last %#x -> %#x (up to #%u)\n", mmio_quiet_reads,
+		    mmio_quiet_pa, mmio_quiet_value, mmio_seq);
+	}
+	mmio_quiet = false;
+	mmio_quiet_reads = 0;
+}
+
+static inline uint32_t
+mmio_rd(char block, vm_offset_t base, uint32_t off)
+{
+	uint32_t value;
+
+	if (mmio_trace) mmio_before(block, off, false, 0);
+	value = *(volatile uint32_t *)(base + off);
+	if (mmio_trace) mmio_after(block, off, false, value);
+	return value;
+}
+static inline void
+mmio_wr(char block, vm_offset_t base, uint32_t off, uint32_t value)
+{
+	if (mmio_trace) mmio_before(block, off, true, value);
+	*(volatile uint32_t *)(base + off) = value;
+	__asm__ volatile("dsb sy" ::: "memory");
+	if (mmio_trace) mmio_after(block, off, true, value);
+}
+
+static inline uint32_t
+ipa_rd(uint32_t off) { return mmio_rd('I', ipa_regs, off); }
+static inline void
+ipa_wr(uint32_t off, uint32_t value) { mmio_wr('I', ipa_regs, off, value); }
+static inline uint32_t
+debug_rd(uint32_t off) { return mmio_rd('D', ipa_debug, off); }
+static inline uint32_t
+gsi_rd(uint32_t off) { return mmio_rd('G', gsi_regs, off); }
+static inline void
+gsi_wr(uint32_t off, uint32_t value) { mmio_wr('G', gsi_regs, off, value); }
 static inline uint64_t
 sram_rd64(vm_offset_t sram, uint32_t off) { return *(volatile uint64_t *)(sram + off); }
 
@@ -240,6 +421,7 @@ struct channel {
 	uint32_t event_id;
 	bool to_ipa, command, qmap, aggregate, close_eof;
 	uint32_t slots, buffer_size, low_weight;
+	uint32_t tlv;                            /* msm-4.14 ipa_utils.c IPA_4_1 ipa_if_tlv */
 	struct dma tre_ring, event_ring, data;
 	uint32_t next, done, events;
 	bool event_allocated, allocated, started;
@@ -248,14 +430,14 @@ struct channel {
 
 static struct channel channels[] = {
 	{ .name = "cmd", .id = 4, .endpoint = 5, .event_id = ~0u, .to_ipa = true,
-	  .command = true, .slots = 16, .buffer_size = 256, .low_weight = 15 },
+	  .command = true, .slots = 16, .buffer_size = 256, .low_weight = 15, .tlv = 20 },
 	{ .name = "lan-rx", .id = 5, .endpoint = 10, .event_id = ~0u,
-	  .aggregate = true, .slots = 8, .buffer_size = 8192, .low_weight = 1 },
+	  .aggregate = true, .slots = 8, .buffer_size = 8192, .low_weight = 1, .tlv = 9 },
 	{ .name = "wan-tx", .id = 3, .endpoint = 2, .event_id = ~0u, .to_ipa = true,
-	  .qmap = true, .slots = 64, .buffer_size = 2048, .low_weight = 1 },
+	  .qmap = true, .slots = 64, .buffer_size = 2048, .low_weight = 1, .tlv = 16 },
 	{ .name = "wan-rx", .id = 6, .endpoint = 11, .event_id = ~0u,
 	  .qmap = true, .aggregate = true, .close_eof = true, .slots = 16,
-	  .buffer_size = 16384, .low_weight = 1 },
+	  .buffer_size = 16384, .low_weight = 1, .tlv = 9 },
 };
 #define NCHANNELS (sizeof(channels) / sizeof(channels[0]))
 #define COMMAND (&channels[0])
@@ -316,13 +498,34 @@ channel_state(const struct channel *ch, bool event)
 static bool
 gsi_command(struct channel *ch, bool event, uint32_t opcode, uint32_t wanted)
 {
-	uint32_t number = event ? ch->event_id : ch->id, state = 0;
+	uint32_t number = event ? ch->event_id : ch->id, state = 0, source = 0, us;
+	uint32_t source_reg = event ? CNTXT_SRC_EV_IRQ : CNTXT_SRC_CH_IRQ;
+	bool mainline = (gsi_mainline & GSI_ML_SEQUENCE) != 0;
 
+	/* vayu_gsi_mainline=1: gsi_irq_{ch,ev}_ctrl_enable() clears every stale completion first; the
+	 * completion mainline waits for is this context's bit in CNTXT_SRC_{CH,EV_CH}_IRQ (gsi_isr_*_ctrl),
+	 * polled here because the GSI interrupt stays masked. */
+	if (mainline) gsi_wr(event ? CNTXT_SRC_EV_IRQ_CLR : CNTXT_SRC_CH_IRQ_CLR, ~0u);
 	gsi_wr(event ? GSI_EV_CMD : GSI_CH_CMD, number | opcode << 24);
-	for (unsigned us = 0; us < 250000; us += 100) {
+	for (us = 0; us < 250000; us += 100) {
+		if (mainline) {
+			source = gsi_rd(source_reg);
+			if (source & 1u << number) break;
+		}
 		state = channel_state(ch, event);
 		if (state == wanted) break;
+		poll_quiet();
 		delay_for_interval(100, NSEC_PER_USEC);
+	}
+	poll_end();
+	if (mainline) {
+		uint32_t type = gsi_rd(CNTXT_TYPE_IRQ);
+
+		if (!(source & 1u << number)) source = gsi_rd(source_reg);
+		state = channel_state(ch, event);
+		say("vayu-ipa-data: mainline: %s command %u on %s %u: state %u (wanted %u) after %u us, "
+		    "TYPE_IRQ %#x, SRC_%s_IRQ %#x\n", ch->name, opcode, event ? "event" : "channel", number, state,
+		    wanted, us, type, event ? "EV" : "CH", source);
 	}
 	gsi_wr(event ? CNTXT_SRC_EV_IRQ_CLR : CNTXT_SRC_CH_IRQ_CLR, 1u << number);
 	if (state != wanted) {
@@ -383,9 +586,14 @@ endpoint_check(const struct channel *ch)
 	 * write the register, but allow a bounded 100 ms for it to appear. */
 	for (unsigned ms = 0; ms < 100; ms++) {
 		cfg = debug_rd(ENDP_GSI_CFG1(ch->endpoint));
-		if ((cfg & 0x11f0f) == expected) return true;
+		if ((cfg & 0x11f0f) == expected) {
+			poll_end();
+			return true;
+		}
+		poll_quiet();
 		delay_for_interval(1, NSEC_PER_MSEC);
 	}
+	poll_end();
 	say("vayu-ipa-data: EP%u GSI_CFG1 %#x, expected %#x after 100 ms (TZ owns binding); refusing\n",
 	    ch->endpoint, cfg, expected);
 	return false;
@@ -440,8 +648,17 @@ static bool
 channel_setup(struct channel *ch)
 {
 	uint32_t c = ch->id;
+	bool mainline = (gsi_mainline & GSI_ML_SEQUENCE) != 0;
+	bool doorbell_1 = (gsi_mainline & (GSI_ML_SEQUENCE | GSI_ML_NO_DB1)) == 0;
+	bool gsi_cfg1 = (gsi_mainline & (GSI_ML_SEQUENCE | GSI_ML_NO_CFG1)) == 0;
 
-	if (!event_claim(ch) || !endpoint_check(ch)) return false;
+	if (!event_claim(ch)) return false;
+	if (!gsi_cfg1) {
+		say("vayu-ipa-data: %s: EP%u GSI_CFG1 not read (vayu_gsi_mainline=%u; mainline never reads it)\n",
+		    ch->name, ch->endpoint, gsi_mainline);
+	} else if (!endpoint_check(ch)) {
+		return false;
+	}
 	if (((gsi_rd(CH_CNTXT(c, 0)) >> 20) & 0xf) != 0) {
 		say("vayu-ipa-data: %s channel %u is already in use\n", ch->name, c);
 		return false;
@@ -453,8 +670,11 @@ channel_setup(struct channel *ch)
 	gsi_wr(EV_CNTXT(e, 1), ch->slots * ELEMENT_SIZE);
 	gsi_wr(EV_CNTXT(e, 2), (uint32_t)ch->event_ring.phys);
 	gsi_wr(EV_CNTXT(e, 3), (uint32_t)(ch->event_ring.phys >> 32));
-	for (unsigned n = 8; n <= 13; n++) gsi_wr(EV_CNTXT(e, n), 0);
-	gsi_wr(EV_DOORBELL(e) + 4, (uint32_t)(ch->event_ring.phys >> 32));
+	/* mainline gsi_evt_ring_program: moderation MODT 1 ms, MODC 1, no counter; 9..13 (MSI data and
+	 * address, RP update address) zero, as here. */
+	gsi_wr(EV_CNTXT(e, 8), mainline ? GSI_EVT_RING_INT_MODT | 1u << 16 : 0);
+	for (unsigned n = 9; n <= 13; n++) gsi_wr(EV_CNTXT(e, n), 0);
+	if (doorbell_1) gsi_wr(EV_DOORBELL(e) + 4, (uint32_t)(ch->event_ring.phys >> 32));
 	gsi_wr(EV_DOORBELL(e), (uint32_t)(ch->event_ring.phys + (ch->slots - 1) * ELEMENT_SIZE));
 
 	if (!gsi_command(ch, false, GSI_ALLOCATE, 1)) return false;
@@ -464,9 +684,22 @@ channel_setup(struct channel *ch)
 	gsi_wr(CH_CNTXT(c, 1), ch->slots * ELEMENT_SIZE);
 	gsi_wr(CH_CNTXT(c, 2), (uint32_t)ch->tre_ring.phys);
 	gsi_wr(CH_CNTXT(c, 3), (uint32_t)(ch->tre_ring.phys >> 32));
-	gsi_wr(CH_QOS(c), ch->low_weight);         /* direct mode, one prefetch, no escape-only */
-	for (unsigned n = 0; n < 4; n++) gsi_wr(CH_SCRATCH(c, n), 0); /* v4.0+: no MCS smart prefetch */
-	gsi_wr(CH_DOORBELL(c) + 4, (uint32_t)(ch->tre_ring.phys >> 32));
+	if (mainline) {
+		/* gsi_channel_program, v4.0..v4.4: the command channel the highest WRR weight and the
+		 * prefetch buffers; every other channel weight 0 and the escape buffer only (bit 10). */
+		gsi_wr(CH_QOS(c), ch->command ? 15 : 1u << 10);
+		/* GPI scratch: word 3 bits 16..31 max_outstanding_tre, word 4 bits 16..31
+		 * outstanding_threshold; SCRATCH_3's bits 0..15 belong to the firmware and are kept. */
+		gsi_wr(CH_SCRATCH(c, 0), 0);
+		gsi_wr(CH_SCRATCH(c, 1), 0);
+		gsi_wr(CH_SCRATCH(c, 2), (ch->tlv * ELEMENT_SIZE) << 16);
+		uint32_t keep = gsi_rd(CH_SCRATCH(c, 3)) & 0xffff;
+		gsi_wr(CH_SCRATCH(c, 3), (2u * ELEMENT_SIZE) << 16 | keep);
+	} else {
+		gsi_wr(CH_QOS(c), ch->low_weight);     /* direct mode, one prefetch, no escape-only */
+		for (unsigned n = 0; n < 4; n++) gsi_wr(CH_SCRATCH(c, n), 0); /* v4.0+: no MCS smart prefetch */
+	}
+	if (doorbell_1) gsi_wr(CH_DOORBELL(c) + 4, (uint32_t)(ch->tre_ring.phys >> 32));
 	endpoint_program(ch);
 	return true;
 }
@@ -527,9 +760,12 @@ channel_events(struct channel *ch, void (*each)(struct channel *, const struct e
 		each(ch, e, context);
 		ch->events++;
 		count++;
-		/* vayu_qup_spi and vendor gsi.c: after advancing the software index,
-	 * the doorbell points at that next position in the event ring. */
-		gsi_wr(EV_DOORBELL(ch->event_id), (uint32_t)(ch->event_ring.phys + (ch->events % ch->slots) * ELEMENT_SIZE));
+		/* mainline gsi_evt_ring_doorbell and vendor gsi_incr_ring_wp: the event doorbell is the
+		 * last element handed back, (index - 1) mod count (count - 1 at program time). Writing
+		 * the next unused position itself leaves the ring with no free element: the second
+		 * command then fails with ERROR_LOG type 3 code 5 (EVT_RING_EMPTY), seen in run f2. */
+		gsi_wr(EV_DOORBELL(ch->event_id), (uint32_t)(ch->event_ring.phys +
+		    ((ch->events + ch->slots - 1) % ch->slots) * ELEMENT_SIZE));
 	}
 	return count;
 }
@@ -580,8 +816,12 @@ ipa_command(const char *what, uint8_t opcode, const void *payload, size_t size)
 	channel_doorbell(ch);
 	for (unsigned us = 0; us < 250000 && !waiting.done; us += 100) {
 		channel_events(ch, command_event, &waiting);
-		if (!waiting.done) delay_for_interval(100, NSEC_PER_USEC);
+		if (!waiting.done) {
+			poll_quiet();
+			delay_for_interval(100, NSEC_PER_USEC);
+		}
 	}
+	poll_end();
 	if (!waiting.done || !event_ok(&(struct event){ .code = waiting.code })) {
 		say("vayu-ipa-data: immediate command %s (%#x) failed: done %u code %#x state %u\n",
 		    what, opcode, waiting.done, waiting.code, channel_state(ch, false));
@@ -925,6 +1165,16 @@ vayu_ipa_data_prepare(void)
 		return false;
 	}
 	PE_parse_boot_argn("vayu_ipa_data_trace", &trace, sizeof(trace));
+	PE_parse_boot_argn("vayu_ipa_data_trace_ms", &mmio_trace_ms, sizeof(mmio_trace_ms));
+	PE_parse_boot_argn("vayu_gsi_mainline", &gsi_mainline, sizeof(gsi_mainline));
+	if (trace & 1) say("vayu-ipa-data: vayu_ipa_data_trace=%u: every GSI/IPA access from the cmd channel "
+	    "on is said first, then %u ms\n", trace, mmio_trace_ms);
+	if (gsi_mainline != 0) {
+		say("vayu-ipa-data: vayu_gsi_mainline=%u: mainline sequence %s, DOORBELL_1 %s, GSI_CFG1 %s\n",
+		    gsi_mainline, gsi_mainline & GSI_ML_SEQUENCE ? "on" : "off",
+		    gsi_mainline & (GSI_ML_SEQUENCE | GSI_ML_NO_DB1) ? "not written" : "written",
+		    gsi_mainline & (GSI_ML_SEQUENCE | GSI_ML_NO_CFG1) ? "not read" : "read");
+	}
 	stopping = false;
 	filter_failed = false;
 	ready = false;
@@ -936,29 +1186,43 @@ vayu_ipa_data_prepare(void)
 	}
 	/* Small table images first: allocating the large packet buffers first would
 	 * waste the last pool bytes on PAGE_SIZE alignment before the zero rule. */
-	if (!registers_map_and_check() || !pool_init() || !table_images() || !channel_memory()) return false;
+	vayu_ipa_data_step("data: map and read GSI_STATUS/SW_VERSION/HW_PARAM_2, IPA_ENABLED_PIPES");
+	if (!registers_map_and_check()) return false;
+	vayu_ipa_data_step("data: DMA pool, table images, channel memory (no MMIO)");
+	if (!pool_init() || !table_images() || !channel_memory()) return false;
 	/* The whole pool was zeroed through the cacheable CPU mapping. Push those dirty
 	 * zero lines out before any doorbell: a later dc civac on a device-written event
 	 * or RX buffer must never write stale zeros over the hardware's fresh data. */
 	dma_sync((vm_offset_t)ipa_pool, sizeof(ipa_pool));
+	vayu_ipa_data_step("data: GSI interrupts off");
 	gsi_interrupts_off();
+	mmio_seq = 0;
+	mmio_trace = (trace & 1) != 0;            /* from here to the table readback; off on every exit */
 	for (unsigned i = 0; i < NCHANNELS; i++) {
+		vayu_ipa_data_step(channels[i].name);   /* (channel_setup: event ring, channel, endpoint) */
 		if (!channel_setup(&channels[i])) {
 			(void)channels_down();
+			mmio_trace = false;
 			return false;
 		}
 	}
 	for (unsigned i = 0; i < NCHANNELS; i++) {
+		vayu_ipa_data_step("data: channel start (GSI START, RX post, doorbell)");
 		if (!channel_start(&channels[i])) {
 			(void)channels_down();
+			mmio_trace = false;
 			return false;
 		}
 	}
+	vayu_ipa_data_step("data: table init commands through APPS_CMD_PROD, then read back");
 	if (!tables_setup() || !tables_verify()) {
 		say("vayu-ipa-data: tables are not initialized; stopping channels, no data_ready\n");
 		(void)channels_down();
+		mmio_trace = false;
 		return false;
 	}
+	if (mmio_trace) say("vayu-ipa-data: mmio trace off after #%u accesses\n", mmio_seq);
+	mmio_trace = false;
 	thread_t thread;
 	thread_running = true;                    /* readiness cannot race the new thread */
 	if (kernel_thread_start(ipa_data_thread, NULL, &thread) != KERN_SUCCESS) {

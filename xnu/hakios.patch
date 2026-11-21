@@ -80,10 +80,10 @@ index 4b83160780c3..d26319d82640 100644
  include $(MakeInc_rule)
  include $(MakeInc_dir)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..8cc5e7e8a29c 100644
+index 44274016a4cf..377da8d7f5f3 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,83 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,88 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -117,6 +117,7 @@ index 44274016a4cf..8cc5e7e8a29c 100644
 +bsd/dev/hakios.adsp.c		standard
 +bsd/dev/hakios.mpss.c		standard
 +bsd/dev/hakios.image.c		standard
++bsd/dev/hakios.fat.c		standard
 +bsd/dev/hakios.virtio_blk.c	standard
 +bsd/dev/hakios.sparse.c	standard
 +bsd/dev/hakios.apfs_check.c	optional apfs
@@ -134,9 +135,12 @@ index 44274016a4cf..8cc5e7e8a29c 100644
 +bsd/dev/vayu_modem.c		standard
 +bsd/dev/vayu_rmtfs.c		standard
 +bsd/dev/vayu_cell.c		standard
++bsd/dev/vayu_qmux.c		standard
++bsd/dev/vayu_qmux_proto.c	standard
 +bsd/dev/vayu_cell_data.c	standard
 +bsd/dev/vayu_sms.c		standard
 +bsd/dev/vayu_voice.c		standard
++bsd/dev/vayu_voice_bb_proto.c	standard
 +bsd/dev/vayu_gnss.c		standard
 +bsd/dev/vayu_bt.c		standard
 +bsd/dev/vayu_slpi.c		standard
@@ -145,6 +149,7 @@ index 44274016a4cf..8cc5e7e8a29c 100644
 +bsd/dev/vayu_camera.c		standard
 +bsd/dev/vayu_venus.c		standard
 +bsd/dev/vayu_wled.c		standard
++bsd/dev/vayu_display_power.c	standard
 +bsd/dev/vayu_mdp.c		standard
 +bsd/dev/vayu_panel.c		standard
 +bsd/dev/vayu_wifi.c		standard
@@ -167,7 +172,7 @@ index 44274016a4cf..8cc5e7e8a29c 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +232,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +237,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -220,7 +225,7 @@ index 44274016a4cf..8cc5e7e8a29c 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +484,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +489,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -228,7 +233,7 @@ index 44274016a4cf..8cc5e7e8a29c 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +507,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +512,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -236,7 +241,7 @@ index 44274016a4cf..8cc5e7e8a29c 100644
  bsd/kern/kern_event.c			standard
  bsd/kern/kern_control.c			optional networking
  bsd/kern/kern_exec.c			standard
-@@ -594,3 +719,8 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
+@@ -594,3 +724,8 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
  bsd/skywalk/packet/pbufpool.c			optional skywalk
  bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
  bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
@@ -1687,10 +1692,100 @@ index f64d8c647365..f2e13c1aa7f3 100644
  	void *dir_pos;
  	void *dir_end;
 diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
-index 2bbba037c2dd..ee65d5943196 100644
+index 2bbba037c2dd..32c97464b6d4 100644
 --- a/bsd/vfs/vfs_syscalls.c
 +++ b/bsd/vfs/vfs_syscalls.c
-@@ -7261,7 +7261,7 @@ readlinkat_internal(vfs_context_t ctx, int fd, vnode_t lnk_vp, user_addr_t path,
+@@ -126,6 +126,9 @@
+ #include <libkern/OSAtomic.h>
+ #include <os/atomic_private.h>
+ #include <pexpert/pexpert.h>
++
++extern int hakios_hfs_trace(void);     /* bsd/dev/hakios.ufs.c: var_hfs_trace=1 */
++extern void hakios_hfs_note(const char *format, ...) __printflike(1, 2);
+ #include <IOKit/IOBSD.h>
+ 
+ // deps for MIG call
+@@ -1028,6 +1031,8 @@ mount_common(const char *fstypename, vnode_t pvp, vnode_t vp,
+ 	boolean_t have_usecount = FALSE;
+ 	boolean_t did_set_lmount = FALSE;
+ 	boolean_t kernelmount = !!(internal_flags & KERNEL_MOUNT_KMOUNT);
++	/* HakiOS, var_hfs_trace=1 (bsd/dev/hakios.ufs.c): how far a mount of HFS Plus got, said at its end */
++	int hk_trace = fstypename != NULL && strcmp(fstypename, "hfs") == 0 && hakios_hfs_trace(), hk_step = 0;
+ 
+ #if CONFIG_ROSV_STARTUP || CONFIG_MOUNT_VM || CONFIG_BASESYSTEMROOT
+ 	/* Check for mutually-exclusive flag bits */
+@@ -1358,9 +1363,11 @@ update:
+ #endif // CONFIG_BASESYSTEMROOT
+ 
+ 			NDINIT(&nd, LOOKUP, OP_MOUNT, FOLLOW, seg, devpath, ctx);
++			hk_step = 1;    /* the device's lookup */
+ 			if ((error = namei(&nd))) {
+ 				goto out1;
+ 			}
++			hk_step = 2;    /* the device's type and access */
+ 
+ 			strlcpy(mp->mnt_vfsstat.f_mntfromname, nd.ni_cnd.cn_pnbuf, MAXPATHLEN);
+ 			devvp = nd.ni_vp;
+@@ -1392,6 +1399,7 @@ update:
+ 		}
+ 		/* On first mount, preflight and open device */
+ 		if (devpath && ((flags & MNT_UPDATE) == 0)) {
++			hk_step = 3;    /* vnode_ref, vfs_mountedon, vcount */
+ 			if ((error = vnode_ref(devvp))) {
+ 				goto out2;
+ 			}
+@@ -1409,13 +1417,16 @@ update:
+ 				error = EBUSY;
+ 				goto out3;
+ 			}
++			hk_step = 4;    /* the device's fsync */
+ 			if ((error = VNOP_FSYNC(devvp, MNT_WAIT, ctx))) {
+ 				error = ENOTBLK;
+ 				goto out3;
+ 			}
++			hk_step = 5;    /* its buffers invalidated */
+ 			if ((error = buf_invalidateblks(devvp, BUF_WRITE_DATA, 0, 0))) {
+ 				goto out3;
+ 			}
++			hk_step = 6;    /* MAC's check, the device's open */
+ 
+ 			ronly = (mp->mnt_flag & MNT_RDONLY) != 0;
+ #if CONFIG_MACF
+@@ -1594,8 +1605,12 @@ update:
+ 		error = EINVAL;
+ #endif
+ 	} else {
++		hk_step = 7;    /* the filesystem's own mount */
+ 		error = VFS_MOUNT(mp, device_vnode, fsmountargs, ctx);
+ 	}
++	if (hk_trace) {
++		hakios_hfs_note("mount_common: VFS_MOUNT of %s returned %d\n", mp->mnt_vfsstat.f_mntfromname, error);
++	}
+ 
+ 	if (flags & MNT_UPDATE) {
+ 		if (mp->mnt_kern_flag & MNTK_WANTRDWR) {
+@@ -1804,6 +1819,9 @@ exit:
+ 		mount_unlock(mp);
+ 	}
+ 
++	if (hk_trace) {
++		hakios_hfs_note("mount_common: %d (steps done: %d)\n", error, hk_step);
++	}
+ 	return error;
+ 
+ /* Error condition exits */
+@@ -1880,6 +1898,10 @@ out1:
+ 		mount_list_unlock();
+ 	}
+ 
++	if (hk_trace) {
++		hakios_hfs_note("mount_common: failed %d at step %d (0 before the device; 1 lookup; 2 type/access; "
++		    "3 ref/in use; 4 fsync; 5 buffers; 6 MAC/open; 7 the filesystem's mount)\n", error, hk_step);
++	}
+ 	return error;
+ }
+ 
+@@ -7261,7 +7283,7 @@ readlinkat_internal(vfs_context_t ctx, int fd, vnode_t lnk_vp, user_addr_t path,
  	uio_t auio;
  	int error;
  	struct nameidata nd;
@@ -1699,7 +1794,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  	bool put_vnode;
  
  	if (bufsize > INT32_MAX) {
-@@ -10314,7 +10314,7 @@ getdirentries_common(int fd, user_addr_t bufp, user_size_t bufsize, ssize_t *byt
+@@ -10314,7 +10336,7 @@ getdirentries_common(int fd, user_addr_t bufp, user_size_t bufsize, ssize_t *byt
  	int spacetype = proc_is64bit(vfs_context_proc(&context)) ? UIO_USERSPACE64 : UIO_USERSPACE32;
  	off_t loff;
  	int error, numdirent;
@@ -1708,7 +1803,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  
  get_from_fd:
  	error = fp_getfvp(vfs_context_proc(&context), fd, &fp, &vp);
-@@ -10613,7 +10613,7 @@ getdirentriesattr(proc_t p, struct getdirentriesattr_args *uap, int32_t *retval)
+@@ -10613,7 +10635,7 @@ getdirentriesattr(proc_t p, struct getdirentriesattr_args *uap, int32_t *retval)
  	struct attrlist attributelist;
  	vfs_context_t ctx = vfs_context_current();
  	int fd = uap->fd;
@@ -1717,7 +1812,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  	kauth_action_t action;
  
  	AUDIT_ARG(fd, fd);
-@@ -10954,7 +10954,7 @@ searchfs(proc_t p, struct searchfs_args *uap, __unused int32_t *retval)
+@@ -10954,7 +10976,7 @@ searchfs(proc_t p, struct searchfs_args *uap, __unused int32_t *retval)
  	size_t mallocsize;
  	uint32_t nameiflags;
  	vfs_context_t ctx = vfs_context_current();
@@ -1726,7 +1821,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  
  	/* Start by copying in fsearchblock parameter list */
  	if (IS_64BIT_PROCESS(p)) {
-@@ -12906,7 +12906,7 @@ getxattr(proc_t p, struct getxattr_args *uap, user_ssize_t *retval)
+@@ -12906,7 +12928,7 @@ getxattr(proc_t p, struct getxattr_args *uap, user_ssize_t *retval)
  	size_t namelen;
  	u_int32_t nameiflags;
  	int error;
@@ -1735,7 +1830,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  
  	if (uap->options & (XATTR_NOSECURITY | XATTR_NODEFAULT)) {
  		return EINVAL;
-@@ -12990,7 +12990,7 @@ fgetxattr(proc_t p, struct fgetxattr_args *uap, user_ssize_t *retval)
+@@ -12990,7 +13012,7 @@ fgetxattr(proc_t p, struct fgetxattr_args *uap, user_ssize_t *retval)
  	size_t attrsize = 0;
  	size_t namelen;
  	int error;
@@ -1744,7 +1839,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  
  	if (uap->options & (XATTR_NOFOLLOW | XATTR_NOSECURITY | XATTR_NODEFAULT)) {
  		return EINVAL;
-@@ -13038,7 +13038,7 @@ out:
+@@ -13038,7 +13060,7 @@ out:
  struct setxattr_ctx {
  	struct nameidata nd;
  	char attrname[XATTR_MAXNAMELEN + 1];
@@ -1753,7 +1848,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  };
  
  /*
-@@ -13134,7 +13134,7 @@ fsetxattr(proc_t p, struct fsetxattr_args *uap, int *retval)
+@@ -13134,7 +13156,7 @@ fsetxattr(proc_t p, struct fsetxattr_args *uap, int *retval)
  	int spacetype = IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
  	size_t namelen;
  	int error;
@@ -1762,7 +1857,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  
  	if (uap->options & (XATTR_NOFOLLOW | XATTR_NOSECURITY | XATTR_NODEFAULT)) {
  		return EINVAL;
-@@ -13311,7 +13311,7 @@ listxattr(proc_t p, struct listxattr_args *uap, user_ssize_t *retval)
+@@ -13311,7 +13333,7 @@ listxattr(proc_t p, struct listxattr_args *uap, user_ssize_t *retval)
  	size_t attrsize = 0;
  	u_int32_t nameiflags;
  	int error;
@@ -1771,7 +1866,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  
  	if (uap->options & (XATTR_NOSECURITY | XATTR_NODEFAULT)) {
  		return EINVAL;
-@@ -13353,7 +13353,7 @@ flistxattr(proc_t p, struct flistxattr_args *uap, user_ssize_t *retval)
+@@ -13353,7 +13375,7 @@ flistxattr(proc_t p, struct flistxattr_args *uap, user_ssize_t *retval)
  	int spacetype = proc_is64bit(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
  	size_t attrsize = 0;
  	int error;
@@ -2270,7 +2365,7 @@ index 0316792a3f42..b9c195b09cd1 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..f91095c98d26 100644
+index e26a1d70f470..4fc85f60980e 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -73,6 +73,9 @@
@@ -2429,6 +2524,15 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
+@@ -823,5 +856,8 @@ arm_init_idle_cpu(
+ 
+ 	fiq_context_init(FALSE);
+ 
++#if defined(GENERIC_PSCI_SMP)
++	psci_idle_resumed();            /* (the GIC's CPU interface and the timer: psci_smp.c, cpu_suspend=N) */
++#endif
+ 	cpu_idle_exit(TRUE);
+ }
 diff --git a/osfmk/arm/io_map.c b/osfmk/arm/io_map.c
 index 18ef2f02122f..55945dceb39f 100644
 --- a/osfmk/arm/io_map.c
@@ -2572,10 +2676,18 @@ index b9549da357b4..cca31ea32502 100644
  #else
  #define __USES_V_CRYPTO_INTRINSICS 0
 diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
-index 94e91306b143..0ec1323086b7 100644
+index 94e91306b143..e2ed054101f2 100644
 --- a/osfmk/arm64/cpu.c
 +++ b/osfmk/arm64/cpu.c
-@@ -568,7 +568,12 @@ cpu_idle(void)
+@@ -42,6 +42,7 @@
+ #include <arm/cpuid.h>
+ #include <arm/caches_internal.h>
+ #include <arm/cpu_data_internal.h>
++#include <arm64/psci_smp.h>
+ #include <arm/cpu_internal.h>
+ #include <arm/misc_protos.h>
+ #include <arm/machine_cpu.h>
+@@ -568,7 +569,12 @@ cpu_idle(void)
  #endif /* MONOTONIC */
  
  	if (wfi) {
@@ -2589,6 +2701,24 @@ index 94e91306b143..0ec1323086b7 100644
  		platform_cache_idle_enter();
  #endif
  
+@@ -585,11 +591,17 @@ cpu_idle(void)
+ 		typhoon_prepare_for_wfi();
+ #endif
+ 		__builtin_arm_dsb(DSB_SY);
++#if defined(GENERIC_PSCI_SMP)
++		/* cpu_suspend=N: power collapse instead, where it may (psci_smp.c); back here only if not */
++		if (!psci_idle_enter(cpu_data_ptr))
++#endif
++		{
+ #if HAS_RETENTION_STATE
+ 		arm64_retention_wfi();
+ #else
+ 		__builtin_arm_wfi();
+ #endif
++		}
+ 
+ #if defined(APPLETYPHOON)
+ 		// <rdar://problem/15827409> CPU1 Stuck in WFIWT Because of MMU Prefetch
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
 index e76e7e70ab9c..828a51171c7e 100644
 --- a/osfmk/arm64/machine_routines.c

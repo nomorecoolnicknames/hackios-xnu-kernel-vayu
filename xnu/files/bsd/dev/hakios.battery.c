@@ -6,6 +6,9 @@
  * Qualcomm charger drivers.  xnuloader owns that firmware context on core 0,
  * polls it, and publishes a read-only cache; XNU only consumes that cache.
  * Charger limits and JEITA protection therefore remain firmware-owned.
+ *
+ * vayu_charge=1 (charge_*, below): from this repository's branch snatch, commit e777381, which followed the SMB5
+ * sequence of Akhdaa/hakios-xiaomi-munch (drivers/input/hakios.buttons.c, commit 15014aa2); rewritten for this tree.
  */
 #include <machine/machine_routines.h>
 #include <kern/clock.h>
@@ -353,6 +356,76 @@ charger_dump(void)
 	}
 }
 
+/*
+ * battery_log_s=N (default 0: off; 10..3600): one line every N seconds for comparing runs, from the
+ * gauge samples of the 0.5 s poll (only those that read):
+ *   "power: 60 s: battery -152 mA avg (-190..-98), 3957 mV, -601 mW, 62 %, 31 C; charger charging,
+ *    USB ICL 500 mA; display on; cpu 1785/2419/2956 MHz; idle resets 1234"
+ * The current has iOS's sign (into the battery > 0: the gauge counts discharge as positive, see above),
+ * the power is V x I of the same samples; "display" is iOS's display power (vayu_display_power.c), the
+ * MHz the rows the cpufreq driver wants now (none: "-"), "idle resets" the power collapses the cores
+ * came back from since the start (cpu_suspend=N, psci_smp.c). Read only, like everything here.
+ */
+static uint32_t power_log_secs;
+
+extern bool vayu_display_is_off(void);
+extern void vayu_cpufreq_rows(uint32_t row[3], uint32_t mhz[3]);
+extern uint64_t psci_idle_resets_total(void);
+
+static void
+power_log(const struct fg_live *f)
+{
+	static uint64_t next, every;
+	static int64_t sum_ma, sum_mv, sum_mw;
+	static int min_ma, max_ma, n;
+	uint64_t now = mach_absolute_time();
+	uint32_t row[3], mhz[3];
+	uint8_t icl = 0;
+	char cpu[40];
+
+	if (power_log_secs == 0) {
+		return;
+	}
+	if (every == 0) {
+		nanoseconds_to_absolutetime((uint64_t)power_log_secs * NSEC_PER_SEC, &every);
+		next = now + every;
+	}
+	if (f->current_ok && f->voltage_ok) {
+		int ma = -f->current_ma;
+
+		sum_ma += ma;
+		sum_mv += f->voltage_mv;
+		sum_mw += (int64_t)ma * f->voltage_mv / 1000;
+		min_ma = n == 0 || ma < min_ma ? ma : min_ma;
+		max_ma = n == 0 || ma > max_ma ? ma : max_ma;
+		n++;
+	}
+	if (now < next) {
+		return;
+	}
+	next = now + every;
+	vayu_cpufreq_rows(row, mhz);
+	if (row[0] == UINT32_MAX && row[1] == UINT32_MAX && row[2] == UINT32_MAX) {
+		strlcpy(cpu, "-", sizeof(cpu));
+	} else {
+		snprintf(cpu, sizeof(cpu), "%u/%u/%u MHz", mhz[0], mhz[1], mhz[2]);
+	}
+	(void)hakios_spmi_peek(0x213, 0x70, &icl);      /* USB ICL, 50 mA a step (charger_limits()) */
+	if (n == 0) {
+		printf("power: %u s: no gauge sample read; %d %%; charger %s; display %s; cpu %s; idle resets %llu\n",
+		    power_log_secs, battery_soc_percent, battery_charging ? "charging" : battery_charger_present ?
+		    "plugged, not charging" : "unplugged", vayu_display_is_off() ? "off" : "on", cpu, psci_idle_resets_total());
+		return;
+	}
+	printf("power: %u s: battery %lld mA avg (%d..%d), %lld mV, %lld mW, %d %%, %d C; charger %s, USB ICL %u mA; "
+	    "display %s; cpu %s; idle resets %llu\n", power_log_secs, sum_ma / n, min_ma, max_ma, sum_mv / n, sum_mw / n,
+	    battery_soc_percent, battery_temperature_c, battery_charging ? "charging" : battery_charger_present ?
+	    "plugged, not charging" : "unplugged", icl * 50u, vayu_display_is_off() ? "off" : "on", cpu,
+	    psci_idle_resets_total());
+	sum_ma = sum_mv = sum_mw = 0;
+	n = 0;
+}
+
 static bool
 charger_read(bool *plugged, int *status)
 {
@@ -437,6 +510,7 @@ battery_poll(void)
 			charger_limits();               /* (said when it changes; looked at once a minute) */
 		}
 		charger_dump();                         /* (battery_charger_dump=S: every S s) */
+		power_log(&f);                          /* (battery_log_s=N: every N s) */
 		if (said_fg++ % 120 == 0) {                      /* (once a minute) */
 			printf("battery: live: %s%d%%, %s%d mV, gauge current %s%d mA (raw sign), %s%d C (%s, rradc %#x raw, subtype %d); charger %s\n",
 			    f.soc_ok ? "" : "?", f.percent, f.voltage_ok ? "" : "?", f.voltage_mv, f.current_ok ? "" : "?", f.current_ma,
@@ -527,6 +601,127 @@ hakios_battery_report(const struct hakios_battery_state *b)
 	HakiosBatteryReport(b, sizeof(*b));
 }
 
+/*
+ * vayu_charge=1 (default 0; from snatch e777381, after Akhdaa/hakios-xiaomi-munch's SMB5 sequence): keep the
+ * PM8150B charging. Every 10 s: pet the SMB5 watchdog (MISC BARK_BITE_WDOG_PET_REG 0x1643 bit 0, as smb5-lib.c
+ * does); and, only while a cable is in (USBIN_INT_RT_STS 0x1310 bit 4) and APSD says CDP or DCP
+ * (APSD_RESULT_STATUS_REG 0x1308 bits 2, 3), raise -- never lower -- the input limit to 1500 mA
+ * (USBIN_CURRENT_LIMIT_CFG_REG 0x1370, 50 mA steps) in the high-current mode smblib_icl_override
+ * SW_OVERRIDE_HC_MODE sets (USBIN_ICL_OPTIONS_REG 0x1366 USBIN_MODE_CHG_BIT 1, CMD_ICL_OVERRIDE_REG 0x1342
+ * ICL_OVERRIDE_BIT 0, USBIN_LOAD_CFG_REG 0x1365 ICL_OVERRIDE_AFTER_APSD_BIT 1) and the fast-charge current to
+ * 1800 mA (CHGR_FAST_CHARGE_CURRENT_CFG_REG 0x1061, 50 mA steps). A computer's port (SDP): the watchdog only.
+ * The registers checked against msm-4.14 smb5-reg.h and smb5-lib.c. Writes only through channels this system owns
+ * (hakios_spmi_update: read, write and read back under the arbiter's lock); one failure and nothing more is
+ * written this run. Needs buttons=1 (the buttons' driver maps the arbiter). Nothing else is touched.
+ */
+#define CHARGE_MISC_ID          0x216           /* slave 2, peripheral 0x16 */
+#define CHARGE_ICL_MA           1500
+#define CHARGE_FCC_MA           1800
+#define CHARGE_APSD_CDP         (1u << 2)
+#define CHARGE_APSD_DCP         (1u << 3)
+#define CHARGE_USBIN_PLUGIN     (1u << 4)
+
+static bool charge_broken, charge_seen, charge_read_failed, charge_owner_known, charge_owner;
+static uint8_t charge_input, charge_apsd, charge_state;
+
+static bool
+charge_put(uint16_t id, uint8_t reg, uint8_t mask, uint8_t value, const char *what)
+{
+	uint8_t before = 0, after = 0;
+	bool written = false;
+
+	if (!hakios_spmi_update(id, reg, mask, value, &before, &after, &written)) {
+		printf("vayu-charge: %s (%#x) not written: no more writes this run\n", what, (id << 8 | reg) & 0xffff);
+		charge_broken = true;
+		return false;
+	}
+	if (written) {
+		printf("vayu-charge: %s (%#x): %#x -> %#x\n", what, (id << 8 | reg) & 0xffff, before, after);
+	}
+	return true;
+}
+
+static void
+charge_poll(void)
+{
+	uint8_t input, apsd, state, icl, fcc;
+	bool owner;
+
+	if (charge_broken) {
+		return;
+	}
+	owner = hakios_spmi_owned(CHARGE_MISC_ID) && hakios_spmi_owned(CHARGER_USBIN_ID) &&
+	    hakios_spmi_owned(CHARGER_CHGR_ID);
+	if (!charge_owner_known || owner != charge_owner) {
+		printf("vayu-charge: the charger's channels (MISC, USBIN, CHGR) %s\n", owner ? "are this system's" :
+		    "are not all this system's (or the arbiter is not mapped: buttons=1): nothing written");
+		charge_owner_known = true;
+		charge_owner = owner;
+	}
+	if (!owner || !charge_put(CHARGE_MISC_ID, 0x43, 0, 0x01, "charger watchdog pet")) {
+		return;
+	}
+	if (!hakios_spmi_peek(CHARGER_USBIN_ID, 0x10, &input) || !hakios_spmi_peek(CHARGER_USBIN_ID, 0x08, &apsd) ||
+	    !hakios_spmi_peek(CHARGER_CHGR_ID, 0x06, &state)) {
+		if (!charge_read_failed) {
+			printf("vayu-charge: USBIN/APSD/CHGR not read: no limits changed this time\n");
+		}
+		charge_read_failed = true;
+		return;
+	}
+	charge_read_failed = false;
+	if (!charge_seen || input != charge_input || apsd != charge_apsd || state != charge_state) {
+		printf("vayu-charge: USBIN_INT_RT_STS 0x1310 %#x, APSD 0x1308 %#x (%s), BATTERY_CHARGER_STATUS_1 0x1006 %#x\n",
+		    input, apsd, (apsd & CHARGE_APSD_DCP) ? "DCP" : (apsd & CHARGE_APSD_CDP) ? "CDP" : "not CDP/DCP", state);
+		charge_seen = true;
+		charge_input = input;
+		charge_apsd = apsd;
+		charge_state = state;
+	}
+	if (!(input & CHARGE_USBIN_PLUGIN) || !(apsd & (CHARGE_APSD_CDP | CHARGE_APSD_DCP))) {
+		return;
+	}
+	if (hakios_spmi_peek(CHARGER_USBIN_ID, 0x70, &icl) && icl < CHARGE_ICL_MA / 50 &&
+	    (!charge_put(CHARGER_USBIN_ID, 0x70, 0xff, CHARGE_ICL_MA / 50, "USB input current limit") ||
+	    !charge_put(CHARGER_USBIN_ID, 0x66, 0x01, 0x01, "USBIN_ICL_OPTIONS high-current mode") ||
+	    !charge_put(CHARGER_USBIN_ID, 0x42, 0x01, 0x00, "CMD_ICL_OVERRIDE off") ||
+	    !charge_put(CHARGER_USBIN_ID, 0x65, 0x10, 0x10, "ICL_OVERRIDE_AFTER_APSD"))) {
+		return;
+	}
+	if (hakios_spmi_peek(CHARGER_CHGR_ID, 0x61, &fcc) && fcc < CHARGE_FCC_MA / 50) {
+		(void)charge_put(CHARGER_CHGR_ID, 0x61, 0xff, CHARGE_FCC_MA / 50, "fast-charge current");
+	}
+}
+
+static void
+charge_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	for (;;) {
+		charge_poll();
+		delay_for_interval(10, NSEC_PER_SEC);
+	}
+}
+
+static void
+charge_init(void)
+{
+	uint32_t enabled = 0;
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("vayu_charge", &enabled, sizeof(enabled)) || enabled == 0) {
+		return;
+	}
+	if (enabled != 1) {
+		printf("vayu-charge: vayu_charge=%u: only 1 turns it on; off\n", enabled);
+		return;
+	}
+	printf("vayu-charge: vayu_charge=1: the PM8150B charger watchdog petted every 10 s; with CDP/DCP the input "
+	    "limit raised to %u mA and the fast-charge current to %u mA (never lowered)\n", CHARGE_ICL_MA, CHARGE_FCC_MA);
+	if (kernel_thread_start(charge_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
 static void
 battery_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -551,11 +746,15 @@ hakios_battery_init(void)
 	vm_offset_t page;
 	thread_t thread;
 
+	charge_init();
 	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) return;
 	PE_parse_boot_argn("battery_ios", &battery_ios, sizeof(battery_ios));
 	if (PE_parse_boot_argn("battery_charger_dump", &charger_dump_secs, sizeof(charger_dump_secs)) &&
 	    charger_dump_secs != 0 && charger_dump_secs < 30) {
 		charger_dump_secs = 30;
+	}
+	if (PE_parse_boot_argn("battery_log_s", &power_log_secs, sizeof(power_log_secs)) && power_log_secs != 0) {
+		power_log_secs = power_log_secs < 10 ? 10 : power_log_secs > 3600 ? 3600 : power_log_secs;
 	}
 	if (!PE_parse_boot_argn("battery_shared_pa", &shared_pa, sizeof(shared_pa)) || shared_pa == 0) {
 		printf("battery: xnuloader did not provide battery_shared_pa\n");

@@ -54,8 +54,9 @@ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm64/caches_asm.s */
 extern void loader_log_putc(char c);
-extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern const uint8_t *hakios_image_file_once(const char *dir, const char *name, uint64_t *size, uint64_t *allocated);
 extern void loader_checkpoint(uint64_t n);      /* osfmk/arm64/loader_return.c: "xl run N" stops there */
+extern uint32_t vayu_ipa_smp2p_initial(void);    /* vayu_ipa.c: 3, or 0 with vayu_ipa_smp2p_mainline=1 */
 
 /* (hakios.wifi.c's: whoever opens the mailbox or allocates in the shared memory takes them) */
 extern lck_mtx_t hakios_aop_mailbox_lock;
@@ -1527,8 +1528,11 @@ our_item_fill(struct vayu_rproc *rp)
 		for (uint32_t word = 0; word < 4; word++) {
 			vayu_smem_poke(rp->our_item + SMP2P_AT_NAME(1) + 4 * word, name[word]);
 		}
-		vayu_smem_poke(rp->our_item + SMP2P_AT_VALUE(1), 3); /* answer valid + clock on */
-		say("%s: our SMP2P entry \"ipa\" = 3 (valid + clock on)\n", rp->name);
+		/* 3: the pre-set answer valid + clock on; 0 with vayu_ipa_smp2p_mainline=1 (mainline and
+		 * vendor write it only in answer to the modem's clock query on its 435 entry). */
+		vayu_smem_poke(rp->our_item + SMP2P_AT_VALUE(1), vayu_ipa_smp2p_initial());
+		say("%s: our SMP2P entry \"ipa\" = %u%s\n", rp->name, vayu_ipa_smp2p_initial(),
+		    vayu_ipa_smp2p_initial() == 3 ? " (valid + clock on)" : " (vayu_ipa_smp2p_mainline=1: answered on the modem's query)");
 	}
 	vayu_smem_poke(rp->our_item + SMP2P_AT_COUNTS, 16 | ((extra != 0 && rp->smp2p_extra != NULL) || ipa_enabled ? 2u : 1u) << 16);
 	vayu_smem_poke(rp->our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8);
@@ -2003,13 +2007,16 @@ root_file(const struct vayu_rproc *rp, const char *name, uint64_t *size)
 	return data;
 }
 
-/* fw/ of the small image, else /fw of the root; *allocated: not 0 if it is memory of ours, to be given back. */
+/*
+ * fw/ of the small image (or the phone's firmware partitions with fw_part=1, /private/var/hakios/fw with fw_var=1:
+ * hakios.image.c), else /fw of the root; *allocated: not 0 if it is memory of ours, to be given back once the image
+ * is written (image_forget).
+ */
 static const uint8_t *
 image_file(const struct vayu_rproc *rp, const char *name, uint64_t *size, uint64_t *allocated)
 {
-	const uint8_t *data = hakios_image_file("fw", name, size, NULL);
+	const uint8_t *data = hakios_image_file_once("fw", name, size, allocated);
 
-	*allocated = 0;
 	if (data != NULL) {
 		return data;
 	}
@@ -2319,7 +2326,7 @@ rproc_shutdown(struct vayu_rproc *rp, const char *why)
 	say("%s: SHUT DOWN\n", rp->name);
 	rp->started = false;
 	snprintf(text, sizeof(text), "{class: image, res: load_state, name: %s, val: off}", rp->name);
-	if (strcmp(rp->name, "ipa") != 0) vayu_aop_send(text);
+	if (strncmp(rp->name, "ipa", 3) != 0) vayu_aop_send(text);
 	rails_give_back(rp);
 	return true;
 }
@@ -2365,7 +2372,15 @@ vayu_pas_load(struct vayu_rproc *rp)
 		say("%s: INIT_IMAGE/MEM_SETUP/image skipped (vayu_ipa_pas bit 1 off)\n", rp->name);
 		goto out;
 	}
-	if (rp->smp2p_theirs != 0 && their_words(rp, &words) && (slave_state(&words) & VAYU_RPROC_READY)) {
+	if (rp->restart_after_fatal) {
+		/*
+		 * Its words are those of before its FATAL; TrustZone has shut it down since (vayu_modem.c,
+		 * vayu_modem_ssr). A crashed processor never acknowledges a stop, and Linux's recovery
+		 * (rproc_trigger_recovery: stop, then start) loads it again all the same.
+		 */
+		rp->restart_after_fatal = false;
+		say("%s: started again after its FATAL and TrustZone's shutdown\n", rp->name);
+	} else if (rp->smp2p_theirs != 0 && their_words(rp, &words) && (slave_state(&words) & VAYU_RPROC_READY)) {
 		show_words(rp, "it has left words in the shared memory and may be running", &words);
 		if (!rproc_shutdown(rp, "it may be running")) {
 			goto out;
@@ -2443,7 +2458,7 @@ vayu_pas_start(struct vayu_rproc *rp, uint32_t wait_ms)
 	/* The always-on processor has no load_state for IPA (Linux sends it only for the remote processors):
 	 * on hardware it did not take "name: ipa", so IPA goes straight to AUTH_AND_RESET. */
 	snprintf(text, sizeof(text), "{class: image, res: load_state, name: %s, val: on}", rp->name);
-	if (strcmp(rp->name, "ipa") != 0 && !vayu_aop_send(text)) {
+	if (strncmp(rp->name, "ipa", 3) != 0 && !vayu_aop_send(text)) {
 		goto undo;
 	}
 	if (rp->pas_id == 15) {
@@ -2461,7 +2476,7 @@ vayu_pas_start(struct vayu_rproc *rp, uint32_t wait_ms)
 	if (result != 0 || answer != 0) {
 		say("%s: TRUSTZONE DOES NOT START IT: %d, answer %#llx\n", rp->name, result, answer);
 		snprintf(text, sizeof(text), "{class: image, res: load_state, name: %s, val: off}", rp->name);
-		if (strcmp(rp->name, "ipa") != 0) vayu_aop_send(text);
+		if (strncmp(rp->name, "ipa", 3) != 0) vayu_aop_send(text);
 		goto undo;
 	}
 	rp->started = true;
@@ -3259,7 +3274,9 @@ static LCK_MTX_DECLARE(qrtr_lock, &pas_lock_group);     /* the routers, the port
 static struct vayu_qrtr *qrtr_routers[QRTR_ROUTERS];
 static uint32_t qrtr_next_port = QRTR_FIRST_PORT;
 static uint32_t qrtr_lookup_announce_service;    /* vayu_ipa_seq: NEW_LOOKUP for this service; 0: none */
-static struct hakios_qrtr_port qrtr_ports[16];
+/* Every router's clients share these (the kernel's QMI clients, the published servers). The QMux bridge with
+ * vayu_qmux_per_client=1 takes one more per CommCenter client (up to its 32): 16 would not do. */
+static struct hakios_qrtr_port qrtr_ports[64];
 static struct {
 	struct hakios_qrtr_port *port;
 	uint32_t service, instance;

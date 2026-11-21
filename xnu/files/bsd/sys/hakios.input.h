@@ -79,6 +79,10 @@ int hakios_battery_temperature(void);  /* the battery's temperature in C, -273 i
 void hakios_spmi_lock(void);
 void hakios_spmi_unlock(void);
 bool hakios_spmi_peek(uint16_t id, uint8_t reg, uint8_t *value);    /* hakios.buttons.c: one PMIC register, read only */
+/* vayu_charge=1 (hakios.battery.c): may this system write the peripheral; one register read-modify-written */
+bool hakios_spmi_owned(uint16_t id);
+bool hakios_spmi_update(uint16_t id, uint8_t reg, uint8_t mask, uint8_t value, uint8_t *before, uint8_t *after,
+    bool *written);
 /*
  * How the battery is, as the audio DSP's battery manager says (bsd/dev/hakios.adsp.c, with adsp=1):
  * handed to bsd/dev/hakios.battery.c, which keeps it for the sysctls kern.hakios.battery_* and

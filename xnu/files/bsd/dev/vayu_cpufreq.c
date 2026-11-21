@@ -261,7 +261,8 @@ build_ladder(vm_offset_t base, uint32_t rows, bool turbo, const struct osm_row *
 		uint32_t at;
 
 		read_row(base, i, &r);
-		if ((r.cores == OSM_SINGLE_CORE && !turbo) || r.khz > top->khz) {
+		/* (the top row itself always: a firmware row kept at its top may be a single-core one) */
+		if ((r.cores == OSM_SINGLE_CORE && !turbo && r.index != top->index) || r.khz > top->khz) {
 			continue;
 		}
 		for (at = 0; at < n && d->ladder_khz[at] > r.khz; at++) {
@@ -327,6 +328,15 @@ raise_domain(uint32_t domain, uint32_t cores, bool dry, bool force, bool turbo, 
 			raised[domain].was = state;
 			raised[domain].per_core = (dcvs & 1) != 0;
 			thermal_rows(base, rows, turbo, &now, raised[domain].row, raised[domain].khz);
+			/*
+			 * The proportional governor's ladder too, topped by the firmware's row (it was built only
+			 * for a raised group, and a group left at its top then stayed there under
+			 * cpufreq_gov_prop=1 whatever the load). `wrote' stays false until thermal_apply() really
+			 * writes a row: only then is `was' put back on the way out.
+			 */
+			if (!monitor) {
+				build_ladder(base, rows, turbo, &now, &raised[domain]);
+			}
 			raised[domain].written = state;
 			raised[domain].managed = true;
 		}
@@ -939,7 +949,7 @@ governor_prop_sample(uint32_t domain, uint32_t most)
 	}
 	share = (governor.share[domain] + 5) / 10;
 	governor.percent[domain] = share;
-	if (!d->wrote || d->steps < 2) {
+	if (!d->managed || d->steps < 2) {
 		return;
 	}
 	now = governor.step[domain] < d->steps ? governor.step[domain] : d->steps - 1;
@@ -1504,7 +1514,7 @@ governor_power_init(void)
 		for (uint32_t domain = 0; domain < OSM_DOMAINS; domain++) {
 			const struct raised_domain *d = &raised[domain];
 
-			if (d->wrote) {
+			if (d->managed) {
 				tell("cpufreq: vayu: group %u ladder: %u steps, row %u %u MHz .. row %u %u MHz%s\n", domain, d->steps,
 				    d->steps ? d->ladder_row[0] : 0, d->steps ? d->ladder_khz[0] / 1000 : 0,
 				    d->steps ? d->ladder_row[d->steps - 1] : 0, d->steps ? d->ladder_khz[d->steps - 1] / 1000 : 0,

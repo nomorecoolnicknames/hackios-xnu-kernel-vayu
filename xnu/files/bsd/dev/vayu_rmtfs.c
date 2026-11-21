@@ -30,6 +30,12 @@
  *   vayu_rmtfs=0   nothing (the default)
  *   vayu_rmtfs=1   publish service 14 and log every request; answers nothing (the safe first look)
  *   vayu_rmtfs=2   the server above
+ *   vayu_rmtfs_strict=1  with 2: a write the RAM overlay cannot keep (no page: the partition is not in
+ *                  the storage table, its read failed, or no memory) is answered as an error instead of
+ *                  being dropped and acknowledged (R3.1). The policy, said once at start: every write
+ *                  lives in RAM for this boot only, a force-sync is acknowledged as that and never
+ *                  reaches the storage; nothing is ever written to the phone's partitions, with or
+ *                  without it. Default 0: the drop is acknowledged, as before.
  *
  * Nothing here logs bytes of an EFS image, an identifier, or a path the modem did not ask for.
  * The first few requests are logged with their sizes and sectors only; after that only totals.
@@ -295,6 +301,8 @@ static uint64_t rmtfs_alloc_next;
 static uint32_t rmtfs_opens, rmtfs_allocs, rmtfs_iovecs, rmtfs_reads, rmtfs_writes, rmtfs_unknown;
 static uint64_t rmtfs_sectors_in, rmtfs_sectors_out, rmtfs_bytes_in, rmtfs_bytes_out;
 static uint32_t rmtfs_logged;
+static bool rmtfs_strict;               /* vayu_rmtfs_strict=1 */
+static uint32_t rmtfs_write_refused;
 static uint64_t rmtfs_drop_warning_ms, rmtfs_sync_warning_ms;
 
 static struct vayu_rmtfs_iovec_req rmtfs_request;
@@ -401,6 +409,12 @@ rmtfs_write_sector(struct vayu_rmtfs_part *part, uint64_t sector, const uint8_t 
 	}
 	page = rmtfs_page(part, offset);
 	if (page == NULL) {
+		if (rmtfs_strict) {
+			rmtfs_write_refused++;
+			rmtfs_write_warning(&rmtfs_drop_warning_ms,
+			    "a sector write cannot be kept (no RAM page): answered as an error (vayu_rmtfs_strict=1)");
+			return false;
+		}
 		rmtfs_write_warning(&rmtfs_drop_warning_ms, "a sector write was dropped (no RAM page)");
 		return true;                            /* keep the RAM-only write acknowledgement */
 	}
@@ -897,7 +911,17 @@ vayu_rmtfs_start(struct vayu_qrtr *q)
 	if (rmtfs_level > 2) {
 		rmtfs_level = 2;
 	}
+	{
+		uint32_t strict = 0;
+
+		rmtfs_strict = PE_parse_boot_argn("vayu_rmtfs_strict", &strict, sizeof(strict)) && strict == 1;
+	}
 	say("vayu-rmtfs: vayu_rmtfs=%u\n", rmtfs_level);
+	if (rmtfs_strict) {
+		say("vayu-rmtfs: vayu_rmtfs_strict=1: EFS writes live in RAM for this boot only (a force-sync is "
+		    "acknowledged as that); a write that cannot be kept, or a read that cannot be served, is an error; "
+		    "the storage is never written\n");
+	}
 	rmtfs_started = true;
 	rmtfs_stopping = false;
 	rmtfs_alloc_next = 0;
@@ -968,5 +992,8 @@ vayu_rmtfs_stop(void)
 	    "%llu out (%llu bytes read, %llu written and kept in RAM), %u unknown message(s)\n", opens, allocs,
 	    iovecs, reads, writes, (unsigned long long)in, (unsigned long long)out,
 	    (unsigned long long)bytes_in, (unsigned long long)bytes_out, unknown);
+	if (rmtfs_strict) {
+		say("vayu-rmtfs: vayu_rmtfs_strict=1: %u sector write(s) answered as an error\n", rmtfs_write_refused);
+	}
 	rmtfs_started = false;
 }

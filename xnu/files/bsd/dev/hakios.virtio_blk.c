@@ -144,6 +144,13 @@ static LCK_GRP_DECLARE(blk_lck_grp, "hakios-virtio-blk");
 static struct blk_device blk_dev;
 static bool blk_ready;
 static bool blk_writable;               /* virtio_blk=2 */
+/*
+ * virtio_blk_bs=4096 (QEMU's tests only): the disk answers as the phone's /dev/ufs_var does (bsd/dev/hakios.ufs.c) --
+ * a native block of 4096 (DKIOCGETPHYSICALBLOCKSIZE), counted in 4096 to begin with, and in any power of two from
+ * 512 to 4096 that is asked for -- so that HFS Plus meets the same block sizes in QEMU as on the phone. 0: virtio's
+ * 512-byte sectors and nothing else, as ever.
+ */
+static uint32_t blk_native, blk_bsize = VIRTIO_BLK_SECTOR;
 static int blk_bmajor = -1, blk_cmajor = -1;
 
 /* One of this driver's devices: every request is a trip through the hypervisor */
@@ -318,7 +325,7 @@ blk_dev_strategy(buf_t bp)
 		buf_biodone(bp);
 		return;
 	}
-	offset = (uint64_t)buf_blkno(bp) * VIRTIO_BLK_SECTOR;
+	offset = (uint64_t)buf_blkno(bp) * blk_bsize;
 	len = buf_count(bp);
 
 	/* trim a request that runs off the end, and refuse one that starts past it */
@@ -375,9 +382,23 @@ blk_dev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag,
 	}
 	switch (cmd) {
 	case DKIOCGETBLOCKSIZE:
-		*(uint32_t *)data = VIRTIO_BLK_SECTOR;
+		*(uint32_t *)data = blk_bsize;
+		return 0;
+	case DKIOCGETPHYSICALBLOCKSIZE:
+		if (blk_native == 0) {
+			return ENOTTY;
+		}
+		*(uint32_t *)data = blk_native;
 		return 0;
 	case DKIOCSETBLOCKSIZE:
+		if (blk_native != 0) {
+			if (*(uint32_t *)data < VIRTIO_BLK_SECTOR || *(uint32_t *)data > blk_native ||
+			    (*(uint32_t *)data & (*(uint32_t *)data - 1)) != 0) {
+				return EINVAL;
+			}
+			blk_bsize = *(uint32_t *)data;
+			return 0;
+		}
 		/*
 		 * spec_open() sets the block size to 512 to count the device in 512-byte
 		 * blocks and then sets it back, and treats a refusal of either as the device
@@ -389,14 +410,14 @@ blk_dev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag,
 		}
 		return 0;
 	case DKIOCGETBLOCKCOUNT:
-		*(uint64_t *)data = d->capacity;
+		*(uint64_t *)data = d->capacity * VIRTIO_BLK_SECTOR / blk_bsize;
 		return 0;
 	case DKIOCISWRITABLE:
 		*(uint32_t *)data = blk_writable;
 		return 0;
 	case DKIOCGETMAXBLOCKCOUNTREAD:
 	case DKIOCGETMAXBLOCKCOUNTWRITE:
-		*(uint64_t *)data = BLK_MAX_XFER / VIRTIO_BLK_SECTOR;
+		*(uint64_t *)data = BLK_MAX_XFER / blk_bsize;
 		return 0;
 	case DKIOCSYNCHRONIZE:
 	case DKIOCSYNCHRONIZECACHE:
@@ -411,7 +432,7 @@ static int
 blk_dev_size(dev_t dev)
 {
 	(void)dev;
-	return blk_ready ? VIRTIO_BLK_SECTOR : -1;
+	return blk_ready ? (int)blk_bsize : -1;
 }
 
 static int
@@ -532,6 +553,12 @@ hakios_virtio_blk_init(void)
 		return;
 	}
 	blk_writable = enabled == 2;
+	if (PE_parse_boot_argn("virtio_blk_bs", &blk_native, sizeof(blk_native)) && blk_native != 4096) {
+		blk_native = 0;
+	}
+	if (blk_native != 0) {
+		blk_bsize = blk_native;
+	}
 	bus = ml_io_map(VIRTIO_BUS, VIRTIO_SLOTS * VIRTIO_SLOT_SIZE);
 	for (slot = 0; slot < VIRTIO_SLOTS; slot++) {
 		d->regs = bus + (vm_offset_t)slot * VIRTIO_SLOT_SIZE;

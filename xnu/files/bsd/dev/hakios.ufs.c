@@ -32,7 +32,13 @@
  * ones) is made whole: the blocks around it are read, patched and written (ufs_var_write). Its writes are flushed
  * and read back by the loader as /dev/rufs_darwin's are; with ufs_var_fast=1 and a loader that offers it
  * (BLOCK_CAN_FAST) they are only written, and the flash's cache is flushed when the filesystem asks
- * (DKIOCSYNCHRONIZE, HFS's journal).
+ * (DKIOCSYNCHRONIZE, HFS's journal). With var_fsck=1 the slice is /dev/rufs_var as well, a character device for
+ * fsck_hfs to mend the volume with before it is mounted, writing through ufs_var_write too; it writes only while
+ * the block device is closed, and the block device does not open while it is open for writing.
+ *
+ * With bcb_reboot=1 one block outside darwin takes a write as well: misc's first block, Android's bootloader control
+ * block, and of it only the command -- "boot-recovery" or nothing (below, "misc's boot control block"); the loader 2.6
+ * offers misc by its GPT identity and refuses every other change of it.
  *
  * One request at a time (the page has one), so requests are serialized by a mutex and split into
  * pieces of the buffer's size. The kernel writes only the request's cache lines and core 0 only
@@ -63,8 +69,10 @@
 #include <sys/errno.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
+#include <sys/proc_internal.h>
 #include <sys/sysctl.h>
 #include <sys/uio.h>
+#include <stdarg.h>
 #include <sys/hakios.input.h>
 #include <sys/hakios.ufs_area.h>
 #include <libkern/crc.h>
@@ -74,6 +82,8 @@
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern void IOSleep(unsigned int milliseconds);
 extern void loader_return(void);        /* osfmk/arm64/loader_return.c */
+int hakios_hfs_trace(void);
+void hakios_hfs_note(const char *format, ...) __printflike(1, 2);
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm64/caches_asm.s */
 extern int sync_internal(void);         /* bsd/vfs/vfs_syscalls.c: every filesystem synced, 5 s at most */
 
@@ -131,6 +141,12 @@ struct loader_block {
 	uint32_t write_part_plus_one;
 	uint32_t write_caps;                   /* BLOCK_CAN_FAST; zero from a loader that has only BLOCK_OP_WRITE */
 	uint64_t write_first;
+	/*
+	 * bcb_reboot=1, loader 2.6: misc (by its GPT identity, the loader's) as its index plus one -- its first block takes
+	 * a write of its command alone. Zero from an older loader or without the argument: no such write.
+	 */
+	uint32_t bcb_part_plus_one;
+	uint32_t bcb_reserved;
 	struct {
 		volatile uint32_t request;
 		uint32_t part;
@@ -207,6 +223,14 @@ static uint64_t ufs_var_first, ufs_var_blocks;
 static bool ufs_var_on, ufs_var_fast;
 static uint8_t *ufs_var_block;                  /* one block for a write that is not whole blocks (under ufs_write_mtx) */
 static uint64_t ufs_var_writes, ufs_var_patched, ufs_var_flushes;
+/*
+ * var_fsck=1: /dev/rufs_var as well, the same slice as a character device, for fsck_hfs to check and mend the volume
+ * before init mounts it (userland/src/var_hfs.h). Never both at once: a write through it is refused while the block
+ * device is open (a filesystem on it), and the block device is refused while it is open for writing.
+ */
+static bool ufs_var_raw;
+static bool ufs_var_bopen, ufs_var_rwopen;
+static uint32_t ufs_var_traced;                 /* var_hfs_trace=1: the first 16 I/Os of /dev/ufs_var said, every error */
 
 /*
  * Saving the data volume without being asked (userland/src/var_store.c).
@@ -255,6 +279,59 @@ static bool ufs_write_out, ufs_write_was_native;        /* the list is out for w
 static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;
 
 SYSCTL_DECL(_kern_hakios);
+
+/* ---- var_hfs_trace=1: the steps of a mount of HFS Plus (bsd/vfs/vfs_syscalls.c, bsd/hfs/) ---- */
+
+/*
+ * var_hfs_trace=1: the way of a mount of HFS Plus said step by step -- bsd/vfs/vfs_syscalls.c's mount_common,
+ * hfs_mount and hfs_mountfs (bsd/hfs/hfs_vfsops.c), the journal's start (hfs_vfsutils.c) and the errors of the
+ * disk under it (bsd/dev/hakios.ufs.c): for a volume that does not mount on the phone and does in QEMU.
+ */
+int
+hakios_hfs_trace(void)
+{
+	static int trace = -1;
+
+	if (trace < 0) {
+		int on = 0;
+
+		trace = PE_parse_boot_argn("var_hfs_trace", &on, sizeof(on)) && on == 1;
+	}
+	return trace;
+}
+
+/*
+ * A line of the trace: printed, and kept in kern.hakios.hfs_trace (the last 4 KB of them) for init to say after a
+ * mount that failed -- the kernel's own log of the phone may not have a printf of a system call in it.
+ */
+static char hakios_hfs_lines[4096];
+SYSCTL_STRING(_kern_hakios, OID_AUTO, hfs_trace, CTLFLAG_RD | CTLFLAG_LOCKED, hakios_hfs_lines, sizeof(hakios_hfs_lines),
+    "var_hfs_trace=1: the steps of the mounts of HFS Plus");
+
+void
+hakios_hfs_note(const char *format, ...)
+{
+	char line[256];
+	size_t have, n;
+	va_list ap;
+
+	if (!hakios_hfs_trace()) {
+		return;
+	}
+	va_start(ap, format);
+	vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	printf("hfs trace: %s", line);
+	n = strlen(line);
+	have = strlen(hakios_hfs_lines);
+	if (have + n + 1 > sizeof(hakios_hfs_lines)) {
+		/* full: the older half goes, the newest lines stay */
+		memmove(hakios_hfs_lines, hakios_hfs_lines + have / 2, have - have / 2 + 1);
+		have = strlen(hakios_hfs_lines);
+	}
+	memcpy(hakios_hfs_lines + have, line, n + 1);
+}
+
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_requests, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_requests,
     "requests the phone's storage has answered through the loader");
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_errors,
@@ -743,6 +820,307 @@ ufs_write_restore(void)
 	lck_mtx_unlock(&ufs_write_mtx);
 }
 
+/* ---- misc's boot control block and the count of starts (loader 2.6, xnuloader/bcb.h) ---- */
+
+/*
+ * bcb_reboot=1: misc, where Android's bootloader control block is, takes one write -- its first block with the
+ * command alone set to "boot-recovery" or cleared, every other byte as the flash holds it. The loader offers misc by
+ * its GPT identity (type, GUID, place, unit), reads the block itself, refuses any other change and reads the write
+ * back; here only its name and block size are checked. ABL reads that block at every start and boots the recovery
+ * while it says "boot-recovery": iOS sends the phone there (vayu_usbnet_ecm.c's command port), and from the
+ * recovery "adb reboot bootloader" reaches the stock fastboot, with nobody at the phone.
+ *
+ * ufs_tries_block= (the loader's, with boot_tries=N): darwin's block that counts the standalone starts since the
+ * last good one. boot_tries_ok=SECS (120 when not given; 0: as soon as the storage is up, QEMU's test) seconds into
+ * this start the count goes back to 0: the start came good. A start that hangs or panics before then is counted, and after N of them in a row the loader
+ * sends the phone to the recovery.
+ *
+ * boot_tries_user=1: a start is good only once userland is: the process user_ready_proc= ("SpringBoard" when not
+ * given) has lived user_ready_secs= seconds (60 when not given) under one pid -- a SpringBoard that keeps crashing
+ * never gets there. The storage's coming up, and boot_tries_ok=, then count for nothing. user_ready_deadline=SECS
+ * (0, the default: none): if that has not happened SECS seconds after the storage came up, the kernel ends the run
+ * itself, the orderly way the command port's "reboot" takes (loader_live_stop_set), and the loader restarts the
+ * phone -- a start with a live kernel and a dead userland (no SpringBoard, no 5141) then counts against boot_tries=
+ * like any other bad one, instead of hanging for good. Only a start the loader counted does this: without a count
+ * nothing would ever end the restarts.
+ */
+#define BCB_BYTES          4096
+#define BCB_COMMAND        32
+#define TRIES_OK_SECONDS   120
+
+static int ufs_bcb_part = -1;
+static uint8_t ufs_bcb_block[BCB_BYTES] __attribute__((aligned(64)));  /* under ufs_write_mtx */
+static uint64_t ufs_tries_block;
+static uint32_t ufs_tries_ok = TRIES_OK_SECONDS;
+#define USER_READY_SECONDS 60
+static uint32_t ufs_user_ready;                         /* boot_tries_user=1 */
+static uint32_t ufs_user_secs = USER_READY_SECONDS;     /* user_ready_secs= */
+static uint32_t ufs_user_deadline;                      /* user_ready_deadline= (0: none) */
+static char ufs_user_proc[MAXCOMLEN + 1] = "SpringBoard";      /* user_ready_proc= */
+extern void loader_live_stop_set(void);                 /* osfmk/arm64/loader_return.c: the orderly end of the run */
+static const char ufs_bcb_recovery[] = "boot-recovery";
+
+int hakios_ufs_bcb_get(char *out, size_t size);
+int hakios_ufs_bcb_set(bool recovery);
+int hakios_ufs_bcb_fields(char *status, size_t ssize, char *recovery, size_t rsize, uint32_t *dirty);
+
+/* misc's command as the flash holds it, as text ('.' for what is not printable): 0, or an errno */
+int
+hakios_ufs_bcb_get(char *out, size_t size)
+{
+	int error;
+
+	if (size == 0) {
+		return EINVAL;
+	}
+	out[0] = 0;
+	if (!ufs_ready || ufs_bcb_part < 0) {
+		return EROFS;
+	}
+	lck_mtx_lock(&ufs_write_mtx);
+	error = ufs_read_mailbox((uint32_t)ufs_bcb_part, 0, ufs_bcb_block, BCB_BYTES);
+	if (error == 0) {
+		size_t n = 0;
+
+		for (; n < BCB_COMMAND && n + 1 < size && ufs_bcb_block[n] != 0; n++) {
+			out[n] = ufs_bcb_block[n] >= 0x20 && ufs_bcb_block[n] < 0x7f ? (char)ufs_bcb_block[n] : '.';
+		}
+		out[n] = 0;
+	}
+	lck_mtx_unlock(&ufs_write_mtx);
+	return error;
+}
+
+/*
+ * What is past the command, for the eye only (xnuloader/bcb.h): status (bytes 32..63) and the recovery field (64..831,
+ * AOSP's bootloader_message) up to their first zero, '|' for a newline and '.' for what is not printable, and how
+ * many of the block's bytes 32..4095 are not zero. RescueParty leaves "recovery\n--prompt_and_wipe_data" there; a
+ * TWRP-like recovery would act on it. 0, or an errno.
+ */
+#define BCB_STATUS_AT      32
+#define BCB_RECOVERY_AT    64
+#define BCB_RECOVERY_BYTES 768
+
+static void
+ufs_bcb_text(const uint8_t *p, size_t n, char *out, size_t size)
+{
+	size_t i;
+
+	for (i = 0; i < n && i + 1 < size && p[i] != 0; i++) {
+		out[i] = p[i] == '\n' ? '|' : p[i] >= 0x20 && p[i] < 0x7f ? (char)p[i] : '.';
+	}
+	out[i] = 0;
+}
+
+int
+hakios_ufs_bcb_fields(char *status, size_t ssize, char *recovery, size_t rsize, uint32_t *dirty)
+{
+	int error;
+
+	if (ssize == 0 || rsize == 0) {
+		return EINVAL;
+	}
+	status[0] = recovery[0] = 0;
+	*dirty = 0;
+	if (!ufs_ready || ufs_bcb_part < 0) {
+		return EROFS;
+	}
+	lck_mtx_lock(&ufs_write_mtx);
+	error = ufs_read_mailbox((uint32_t)ufs_bcb_part, 0, ufs_bcb_block, BCB_BYTES);
+	if (error == 0) {
+		ufs_bcb_text(ufs_bcb_block + BCB_STATUS_AT, BCB_RECOVERY_AT - BCB_STATUS_AT, status, ssize);
+		ufs_bcb_text(ufs_bcb_block + BCB_RECOVERY_AT, BCB_RECOVERY_BYTES, recovery, rsize);
+		for (unsigned i = BCB_COMMAND; i < BCB_BYTES; i++) {
+			*dirty += ufs_bcb_block[i] != 0;
+		}
+	}
+	lck_mtx_unlock(&ufs_write_mtx);
+	return error;
+}
+
+/* misc's command set to "boot-recovery" (recovery) or cleared, the rest of its block as it is; read back here too */
+int
+hakios_ufs_bcb_set(bool recovery)
+{
+	int error;
+
+	if (!ufs_ready || ufs_bcb_part < 0) {
+		printf("bcb: misc takes no write this run (bcb_reboot=1, and a loader 2.6 that offers it)\n");
+		return EROFS;
+	}
+	lck_mtx_lock(&ufs_write_mtx);
+	error = ufs_read_mailbox((uint32_t)ufs_bcb_part, 0, ufs_bcb_block, BCB_BYTES);
+	if (error == 0) {
+		for (unsigned i = 0; i < BCB_COMMAND; i++) {
+			ufs_bcb_block[i] = recovery && i < sizeof(ufs_bcb_recovery) - 1 ? (uint8_t)ufs_bcb_recovery[i] : 0;
+		}
+		ufs_write_list_out();
+		lck_mtx_lock(&ufs_lock);
+		error = ufshc_list_in() ? EIO : ufs_request(BLOCK_OP_WRITE, (uint32_t)ufs_bcb_part, 0, 1, NULL, ufs_bcb_block);
+		lck_mtx_unlock(&ufs_lock);
+	}
+	if (error == 0) {
+		uint8_t want[BCB_COMMAND];
+
+		memcpy(want, ufs_bcb_block, sizeof(want));
+		error = ufs_read_mailbox((uint32_t)ufs_bcb_part, 0, ufs_bcb_block, BCB_BYTES);
+		if (error == 0 && memcmp(want, ufs_bcb_block, sizeof(want)) != 0) {
+			error = EIO;
+		}
+	}
+	lck_mtx_unlock(&ufs_write_mtx);
+	ufs_write_restore();
+	printf("bcb: misc's command %s: %s (%d)\n", recovery ? "set to \"boot-recovery\"" : "cleared",
+	    error == 0 ? "written, read back the same" : "NOT written", error);
+	return error;
+}
+
+/* this start is a good one: darwin's count of starts back to 0, and its trips away since the last good one (an errno, or 0) */
+static int
+ufs_tries_zero(void)
+{
+	static uint8_t block[BCB_BYTES] __attribute__((aligned(64)));
+	uint64_t at = ufs_tries_block * 4096;
+	int error;
+
+	lck_mtx_lock(&ufs_write_mtx);
+	error = ufs_read_mailbox((uint32_t)ufs_write_part, at, block, sizeof(block));
+	/* (xnuloader/bcb.h tries_read/tries_make: "HKTRIES\0", version 1, count at 12, cycles at 32, CRC-32 at 4092) */
+	if (error == 0 && (memcmp(block, "HKTRIES", 8) != 0 || *(uint32_t *)(block + 8) != 1 ||
+	    crc32(0, block, 4092) != *(uint32_t *)(block + 4092))) {
+		error = EINVAL;
+	}
+	if (error == 0) {
+		*(uint32_t *)(block + 12) = 0;
+		*(uint32_t *)(block + 32) = 0;  /* (boot_tries_max_cycles=: HakiOS is no longer held back) */
+		*(uint32_t *)(block + 4092) = crc32(0, block, 4092);
+		error = ufs_write_locked(BLOCK_OP_WRITE, (uint32_t)ufs_write_part, at, block, sizeof(block), false);
+	}
+	lck_mtx_unlock(&ufs_write_mtx);
+	ufs_write_restore();
+	return error;
+}
+
+/* boot_tries_ok seconds in: this start is a good one, darwin's count of starts back to 0 */
+static void
+ufs_tries_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	int error;
+
+	if (ufs_tries_ok != 0) {
+		IOSleep(ufs_tries_ok * 1000);
+	}
+	error = ufs_tries_zero();
+	printf("boot_tries: %u s up, a good start: the count of starts in darwin's block %llu %s (%d)\n", ufs_tries_ok,
+	    ufs_tries_block, error == 0 ? "is 0 again" : "could NOT be put back to 0", error);
+}
+
+/* boot_tries_user=1: the pid of the process called ufs_user_proc, if there is one (looked at under the list's lock) */
+static int
+ufs_user_match(proc_t p, void *arg)
+{
+	pid_t *pid = arg;
+
+	if (*pid < 0 && strncmp(proc_best_name(p), ufs_user_proc, sizeof(ufs_user_proc)) == 0) {
+		*pid = proc_pid(p);
+	}
+	return 0;               /* (nothing for the callout: the pid is all that is wanted) */
+}
+
+static int
+ufs_user_none(__unused proc_t p, __unused void *arg)
+{
+	return PROC_RETURNED;
+}
+
+static uint64_t
+ufs_seconds_now(void)
+{
+	uint64_t now, ns;
+
+	clock_get_uptime(&now);
+	absolutetime_to_nanoseconds(now, &ns);
+	return ns / NSEC_PER_SEC;
+}
+
+/*
+ * boot_tries_user=1: once a second, is ufs_user_proc there, and since when under this pid. user_ready_secs of it:
+ * the count back to 0. user_ready_deadline seconds without that: the run ends, and the next start is counted.
+ */
+static void
+ufs_tries_user_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	uint64_t start = ufs_seconds_now(), since = 0;
+	pid_t seen = -1;
+	int error;
+
+	for (;;) {
+		pid_t pid = -1;
+		uint64_t now;
+
+		proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS, ufs_user_none, NULL, ufs_user_match, &pid);
+		now = ufs_seconds_now();
+		if (pid != seen) {
+			if (pid >= 0) {
+				printf("boot_tries: %s[%d] is up, %llu s after the storage; the start is good once it has lived %u s\n",
+				    ufs_user_proc, pid, now - start, ufs_user_secs);
+			} else {
+				printf("boot_tries: %s[%d] is gone, %llu s after the storage: its time starts again\n",
+				    ufs_user_proc, seen, now - start);
+			}
+			seen = pid;
+			since = now;
+		} else if (seen >= 0 && now - since >= ufs_user_secs) {
+			break;
+		}
+		if (ufs_user_deadline != 0 && now - start >= ufs_user_deadline) {
+			printf("boot_tries: user_ready_deadline=%u: %s has not lived %u s in this start (%s): the run ends, and the "
+			    "next start counts against boot_tries\n", ufs_user_deadline, ufs_user_proc, ufs_user_secs,
+			    seen >= 0 ? "it is up, not long enough" : "it never came up");
+			(void)sync_internal();
+			loader_live_stop_set();
+			return;
+		}
+		IOSleep(1000);
+	}
+	error = ufs_tries_zero();
+	printf("boot_tries: %s[%d] has lived %u s, userland is up: a good start: the count of starts in darwin's block %llu "
+	    "%s (%d)\n", ufs_user_proc, seen, ufs_user_secs, ufs_tries_block,
+	    error == 0 ? "is 0 again" : "could NOT be put back to 0", error);
+}
+
+/*
+ * bcb_selftest=1 (QEMU, qemu/run-standalone-test.sh): what the loader takes and refuses of misc -- a block with more
+ * than the command changed, a second block, then "boot-recovery". On a phone it sends the next start to the recovery.
+ */
+static void
+ufs_bcb_selftest(void)
+{
+	char now[BCB_COMMAND + 1];
+	int error;
+
+	lck_mtx_lock(&ufs_write_mtx);
+	error = ufs_read_mailbox((uint32_t)ufs_bcb_part, 0, ufs_bcb_block, BCB_BYTES);
+	if (error == 0) {
+		ufs_bcb_block[100] ^= 0xff;
+		ufs_write_list_out();
+		lck_mtx_lock(&ufs_lock);
+		error = ufs_request(BLOCK_OP_WRITE, (uint32_t)ufs_bcb_part, 0, 1, NULL, ufs_bcb_block);
+		printf("bcb selftest: a byte past the command changed: %s\n", error == 0 ? "WRITTEN" : "refused");
+		ufs_bcb_block[100] ^= 0xff;
+		error = ufs_request(BLOCK_OP_WRITE, (uint32_t)ufs_bcb_part, 1, 1, NULL, ufs_bcb_block);
+		printf("bcb selftest: misc's second block: %s\n", error == 0 ? "WRITTEN" : "refused");
+		lck_mtx_unlock(&ufs_lock);
+	}
+	lck_mtx_unlock(&ufs_write_mtx);
+	ufs_write_restore();
+	error = hakios_ufs_bcb_set(true);
+	if (error == 0) {
+		error = hakios_ufs_bcb_get(now, sizeof(now));
+	}
+	printf("bcb selftest: misc's command is \"%s\" (%d)\n", error == 0 ? now : "?", error);
+}
+
 /* ---- the devices ---- */
 
 /*
@@ -849,7 +1227,17 @@ static int
 ufs_open(dev_t dev, int flags, __unused int devtype, __unused proc_t p)
 {
 	if ((uint32_t)minor(dev) == UFS_VAR_MINOR) {
-		return ufs_ready && ufs_var_on ? 0 : ENXIO;     /* the one block device that writes */
+		if (!ufs_ready || !ufs_var_on) {
+			return ENXIO;
+		}
+		if (ufs_var_rwopen) {
+			return EBUSY;   /* fsck_hfs is writing it through /dev/rufs_var */
+		}
+		if (hakios_hfs_trace()) {
+			hakios_hfs_note("/dev/ufs_var opened (flags 0x%x), counted in %u\n", flags, ufs_bsize[UFS_VAR_MINOR]);
+		}
+		ufs_var_bopen = true;
+		return 0;               /* the one block device that writes */
 	}
 	if (!ufs_ready || (uint32_t)minor(dev) >= ufs_parts || (ufs_page->part[minor(dev)].flags & BLOCK_PART_UNIT)) {
 		return ENXIO;
@@ -864,15 +1252,31 @@ ufs_open(dev_t dev, int flags, __unused int devtype, __unused proc_t p)
 static int
 ufs_copen(dev_t dev, int flags, int devtype, proc_t p)
 {
+	if ((uint32_t)minor(dev) == UFS_VAR_MINOR) {
+		if (!ufs_ready || !ufs_var_on || !ufs_var_raw) {
+			return ENXIO;
+		}
+		if (flags & FWRITE) {
+			if (ufs_var_bopen) {
+				return EBUSY;   /* a filesystem has the block device */
+			}
+			ufs_var_rwopen = true;
+		}
+		return 0;
+	}
 	if ((flags & FWRITE) && ufs_write_part >= 0 && (uint32_t)minor(dev) == (uint32_t)ufs_write_part) {
 		flags &= ~FWRITE;
 	}
 	return ufs_open(dev, flags, devtype, p);
 }
 
+/* (a device's close comes at its last close only) */
 static int
-ufs_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
+ufs_close(dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
 {
+	if ((uint32_t)minor(dev) == UFS_VAR_MINOR) {
+		ufs_var_bopen = false;
+	}
 	return 0;
 }
 
@@ -882,6 +1286,10 @@ static void ufs_write_restore(void);
 static int
 ufs_cclose(dev_t dev, int flags, int devtype, proc_t p)
 {
+	if ((uint32_t)minor(dev) == UFS_VAR_MINOR) {
+		ufs_var_rwopen = false;
+		return 0;
+	}
 	if (ufs_write_part >= 0 && (uint32_t)minor(dev) == (uint32_t)ufs_write_part) {
 		ufs_write_restore();
 	}
@@ -898,6 +1306,9 @@ ufs_strategy(buf_t bp)
 	int error;
 
 	if (!ufs_dev_range(buf_device(bp), &part, &base, &size)) {
+		if (m == UFS_VAR_MINOR && hakios_hfs_trace()) {
+			hakios_hfs_note("/dev/ufs_var: no range (ENXIO)\n");
+		}
 		buf_seterror(bp, ENXIO);
 		buf_biodone(bp);
 		return;
@@ -909,6 +1320,10 @@ ufs_strategy(buf_t bp)
 	}
 	offset = (uint64_t)buf_blkno(bp) * ufs_bsize[m];
 	len = buf_count(bp);
+	if (offset >= size && m == UFS_VAR_MINOR && hakios_hfs_trace()) {
+		hakios_hfs_note("/dev/ufs_var: block %lld of %u is past its end (%llu bytes)\n", (long long)buf_blkno(bp),
+		    ufs_bsize[m], size);
+	}
 	if (offset >= size) {
 		buf_seterror(bp, offset == size ? 0 : EINVAL);
 		buf_setresid(bp, buf_count(bp));
@@ -928,6 +1343,11 @@ ufs_strategy(buf_t bp)
 		return;
 	}
 	error = reading ? ufs_read(part, base + offset, (uint8_t *)va, len) : ufs_var_write(offset, (const uint8_t *)va, len);
+	if ((error != 0 || ufs_var_traced < 16) && m == UFS_VAR_MINOR && hakios_hfs_trace()) {
+		ufs_var_traced++;
+		hakios_hfs_note("/dev/ufs_var: %s of %llu bytes at %llu (block %lld of %u): %d\n", reading ? "read" : "write",
+		    len, offset, (long long)buf_blkno(bp), ufs_bsize[m], error);
+	}
 	buf_unmap(bp);
 	buf_setresid(bp, (uint32_t)(buf_count(bp) - (error ? 0 : len)));
 	if (error) {
@@ -937,7 +1357,7 @@ ufs_strategy(buf_t bp)
 }
 
 static int
-ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
+ufs_ioctl_of(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
 {
 	uint32_t m = (uint32_t)minor(dev), part, native;
 	uint64_t base, bytes;
@@ -983,6 +1403,20 @@ ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc
 	}
 }
 
+/* var_hfs_trace=1: what a filesystem asks of /dev/ufs_var, and the answer */
+static int
+ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, proc_t p)
+{
+	uint32_t in = data != NULL ? *(uint32_t *)data : 0;
+	int error = ufs_ioctl_of(dev, cmd, data, fflag, p);
+
+	if ((uint32_t)minor(dev) == UFS_VAR_MINOR && hakios_hfs_trace()) {
+		hakios_hfs_note("/dev/ufs_var: ioctl 0x%lx (in %u): %d, out %u\n", cmd, in, error,
+		    error == 0 && data != NULL ? *(uint32_t *)data : 0);
+	}
+	return error;
+}
+
 static int
 ufs_psize(dev_t dev)
 {
@@ -1002,15 +1436,14 @@ ufs_psize(dev_t dev)
 static int
 ufs_cread(dev_t dev, struct uio *uio, __unused int ioflag)
 {
-	uint32_t part = (uint32_t)minor(dev);
-	uint64_t size;
+	uint32_t part;
+	uint64_t base, size;
 	uint8_t *bounce;
 	int error = 0;
 
-	if (!ufs_ready || part >= ufs_parts) {
-		return ENXIO;
+	if (!ufs_dev_range(dev, &part, &base, &size)) {
+		return ENXIO;           /* a partition, all of it, or /dev/rufs_var's slice (base past darwin's start) */
 	}
-	size = ufs_part_bytes(part);
 	if (uio_offset(uio) < 0) {
 		return EINVAL;
 	}
@@ -1027,9 +1460,53 @@ ufs_cread(dev_t dev, struct uio *uio, __unused int ioflag)
 		if (want > size - at) {
 			want = size - at;
 		}
-		error = ufs_read(part, at, bounce, want);
+		error = ufs_read(part, base + at, bounce, want);
 		if (error == 0) {
 			error = uiomove((caddr_t)bounce, (int)want, uio);
+		}
+	}
+	kfree_data(bounce, ufs_buffer_size);
+	return error;
+}
+
+/*
+ * A write to /dev/rufs_var (var_fsck=1, fsck_hfs mending the volume before it is mounted): ufs_var_write's, as the
+ * filesystem's own writes are -- in 512-byte sectors, a block that is not whole patched -- and only while no
+ * filesystem has the block device.
+ */
+static int
+ufs_var_cwrite(struct uio *uio)
+{
+	uint8_t *bounce;
+	int error = 0;
+
+	if (!ufs_ready || !ufs_var_on || !ufs_var_raw || ufs_write_part < 0) {
+		return EROFS;
+	}
+	if (ufs_var_bopen) {
+		return EBUSY;
+	}
+	if (uio_offset(uio) < 0 || (uint64_t)uio_offset(uio) % 512 != 0 || (uint64_t)uio_resid(uio) % 512 != 0) {
+		return EINVAL;
+	}
+	bounce = kalloc_data(ufs_buffer_size, Z_WAITOK);
+	if (bounce == NULL) {
+		return ENOMEM;
+	}
+	while (error == 0 && uio_resid(uio) > 0) {
+		user_ssize_t want = uio_resid(uio);
+		off_t at = uio_offset(uio);
+
+		if (want > (user_ssize_t)ufs_buffer_size) {
+			want = (user_ssize_t)ufs_buffer_size;
+		}
+		error = uiomove((caddr_t)bounce, (int)want, uio);
+		if (error == 0) {
+			error = ufs_var_write((uint64_t)at, bounce, (uint64_t)want);
+			if (error != 0) {
+				uio_setoffset(uio, at);
+				uio_setresid(uio, uio_resid(uio) + want);
+			}
 		}
 	}
 	kfree_data(bounce, ufs_buffer_size);
@@ -1049,6 +1526,9 @@ ufs_cwrite(dev_t dev, struct uio *uio, __unused int ioflag)
 	uint8_t *bounce;
 	int error = 0;
 
+	if (part == UFS_VAR_MINOR) {
+		return ufs_var_cwrite(uio);
+	}
 	if (!ufs_ready || part >= ufs_parts || ufs_write_part < 0 || part != (uint32_t)ufs_write_part) {
 		return EROFS;
 	}
@@ -2034,6 +2514,79 @@ hakios_ufs_init(void)
 		}
 	}
 
+	/* bcb_reboot=1: misc's boot control block, as the loader offers it (above, "misc's boot control block") */
+	check = 0;
+	if (PE_parse_boot_argn("bcb_reboot", &check, sizeof(check)) && check == 1) {
+		uint32_t offered = ufs_page->bcb_part_plus_one;
+		const char *why = NULL;
+
+		if (offered == 0 || offered > ufs_parts) {
+			why = "the loader offers no misc (a loader 2.6, and its misc_ identity for this device)";
+		} else if (strncmp((const char *)ufs_page->part[offered - 1].name, "misc", 5) != 0) {
+			why = "the loader offers another partition";
+		} else if (ufs_page->part[offered - 1].flags & BLOCK_PART_UNIT) {
+			why = "it is a whole logical unit, not the partition";
+		} else if (ufs_page->part[offered - 1].block_size != BCB_BYTES || ufs_page->part[offered - 1].blocks < 2) {
+			why = "its blocks are not 4096 bytes";
+		} else if (ufs_entry("misc") != offered - 1) {
+			why = "another partition of the same name comes first";
+		}
+		if (why == NULL) {
+			ufs_bcb_part = (int)(offered - 1);
+			printf("bcb: misc's boot control block may be set to \"boot-recovery\" or cleared (its command alone)\n");
+		} else {
+			printf("bcb: misc's boot control block is not written: %s\n", why);
+		}
+	}
+	if (ufs_bcb_part >= 0 && PE_parse_boot_argn("bcb_selftest", &check, sizeof(check)) && check == 1) {
+		ufs_bcb_selftest();
+	}
+	/* ufs_tries_block= (the loader's, boot_tries=N counted this start): zeroed boot_tries_ok seconds in */
+	if (PE_parse_boot_argn("ufs_tries_block", &ufs_tries_block, sizeof(ufs_tries_block)) && ufs_tries_block != 0) {
+		thread_t thread;
+
+		(void)PE_parse_boot_argn("boot_tries_ok", &ufs_tries_ok, sizeof(ufs_tries_ok));
+		if (ufs_tries_ok > 3600) {
+			ufs_tries_ok = 3600;
+		}
+		(void)PE_parse_boot_argn("boot_tries_user", &ufs_user_ready, sizeof(ufs_user_ready));
+		if (ufs_user_ready == 1) {
+			char name[sizeof(ufs_user_proc)];
+
+			(void)PE_parse_boot_argn("user_ready_secs", &ufs_user_secs, sizeof(ufs_user_secs));
+			(void)PE_parse_boot_argn("user_ready_deadline", &ufs_user_deadline, sizeof(ufs_user_deadline));
+			if (PE_parse_boot_argn("user_ready_proc", name, sizeof(name)) && name[0] != 0) {
+				strlcpy(ufs_user_proc, name, sizeof(ufs_user_proc));
+			}
+			if (ufs_user_secs > 3600) {
+				ufs_user_secs = 3600;
+			}
+			if (ufs_user_deadline != 0 && ufs_user_deadline <= ufs_user_secs + 10) {
+				printf("boot_tries: user_ready_deadline=%u leaves %s no time for its %u s: no deadline\n",
+				    ufs_user_deadline, ufs_user_proc, ufs_user_secs);
+				ufs_user_deadline = 0;
+			}
+		}
+		if (ufs_write_part < 0 || ufs_tries_block < ufs_write_first ||
+		    ufs_tries_block >= ufs_page->part[ufs_write_part].blocks) {
+			printf("boot_tries: darwin's block %llu is not one this kernel writes: the count stays\n", ufs_tries_block);
+		} else if (ufs_user_ready == 1) {
+			if (kernel_thread_start(ufs_tries_user_thread, NULL, &thread) == KERN_SUCCESS) {
+				thread_deallocate(thread);
+				printf("boot_tries: this start is counted (darwin's block %llu); it is a good one once %s has lived %u s "
+				    "(boot_tries_user=1), %s%u%s\n", ufs_tries_block, ufs_user_proc, ufs_user_secs,
+				    ufs_user_deadline != 0 ? "or the run ends " : "no deadline (user_ready_deadline=", ufs_user_deadline,
+				    ufs_user_deadline != 0 ? " s after the storage came up without it" : ")");
+			}
+		} else if (ufs_tries_ok == 0) {
+			ufs_tries_thread(NULL, THREAD_AWAKENED);        /* (boot_tries_ok=0: a start that gets this far is good) */
+		} else if (kernel_thread_start(ufs_tries_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+			printf("boot_tries: this start is counted (darwin's block %llu); %u s up, it is a good one\n",
+			    ufs_tries_block, ufs_tries_ok);
+		}
+	}
+
 	/*
 	 * ufs_var_first= and ufs_var_blocks=: /dev/ufs_var, a slice of darwin past ufs_write_first that a filesystem
 	 * writes (init's var_hfs=1). ufs_var_fast=1: its writes the loader's fast way, if the loader offers one.
@@ -2071,6 +2624,13 @@ hakios_ufs_init(void)
 			    "each write flushed and read back by the loader");
 			if (check == 1 && !ufs_var_fast) {
 				printf("ufs: ufs_var_fast=1, but this loader offers no fast writes: each one flushed and read back\n");
+			}
+			check = 0;
+			if (PE_parse_boot_argn("var_fsck", &check, sizeof(check)) && check == 1) {
+				ufs_var_raw = devfs_make_node(makedev(ufs_cmajor, UFS_VAR_MINOR), DEVFS_CHAR, UID_ROOT, GID_OPERATOR,
+				    0640, "rufs_var") != NULL;
+				printf("ufs: /dev/rufs_var: %s\n", ufs_var_raw ? "the same slice, for fsck_hfs before the mount (var_fsck=1)" :
+				    "no node for it");
 			}
 		}
 	}

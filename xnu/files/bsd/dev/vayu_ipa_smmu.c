@@ -43,6 +43,11 @@
 #define SMMU_CB_MAIR0           0x38
 #define SMMU_CB_MAIR1           0x3c
 #define SMMU_CB_FSR             0x58
+#define SMMU_CB_FAR             0x60
+#define SMMU_CB_FSYNR0          0x68
+#define SMMU_SGFAR              0x040   /* the global (non-context) fault: Arm SMMUv2 / MMU-500 */
+#define SMMU_SGFSR              0x048
+#define SMMU_SGFSYNR0           0x050
 #define SMMU_CB_TLBIASID        0x610
 #define SMMU_CB_TLBSYNC         0x7f0
 #define SMMU_CB_TLBSTATUS       0x7f4
@@ -87,6 +92,16 @@ struct ipa_smmu_stream {
 };
 static struct ipa_smmu_stream ipa_smmu[3];
 static uint32_t ipa_smmu_wlan = 1;     /* vayu_ipa_smmu_wlan=0: skip SID 0x521 (pre-0064) */
+/*
+ * vayu_ipa_smmu_high=1 (a9-ipa round 3, default 0): also identity-map the DDR above 4 GiB,
+ * 0x100000000..0x27fffffff, with 1 GiB level-1 blocks root[4..9] (the RAM Linux reports on this
+ * phone: /proc/iomem System RAM 0xc0000000-0x1ffffffff and 0x200000000-0x27fffffff, lab
+ * docs/research/VAYU_QUP_HANG_ANALYSIS.md §10.6). Before, only root[2..3] (0x80000000..0xffffffff)
+ * were mapped: an IPA/GSI DMA to a kernel buffer above 4 GiB would take a translation fault.
+ * (vayu_ipa_data.c's DMA pool is a static array that refuses a PA outside the low window, so that
+ * path is guarded already; the page tables themselves are walked by PA and need no mapping.)
+ */
+static uint32_t ipa_smmu_high;
 
 static uint32_t
 rd(vm_offset_t at)
@@ -178,6 +193,11 @@ ipa_smmu_map(struct ipa_smmu_stream *s)
 	 * context (sm8150.dtsi ipa_smmu_wlan "ipa-uc ram", ipa.c:8194). Mapping a superset of
 	 * stock in every context cannot create a missing-translation fault. */
 	low_l2[(0x1e60000U >> 21) & 0x1ff] = 0x1e60000ULL | PTE_DEVICE;
+	if (ipa_smmu_high == 1) {
+		for (unsigned i = 4; i <= 9; i++) {
+			root[i] = ((uint64_t)i << 30) | PTE_BLOCK;
+		}
+	}
 	for (vm_offset_t line = s->tables; line < s->tables + 4 * PAGE_SIZE; line += 64) {
 		__asm__ volatile("dc civac, %0" : : "r" (line));
 	}
@@ -252,6 +272,11 @@ vayu_ipa_smmu_enable(void)
 	}
 	PE_parse_boot_argn("vayu_ipa_ttbrfix", &ipa_smmu_ttbrfix, sizeof(ipa_smmu_ttbrfix));
 	PE_parse_boot_argn("vayu_ipa_smmu_wlan", &ipa_smmu_wlan, sizeof(ipa_smmu_wlan));
+	PE_parse_boot_argn("vayu_ipa_smmu_high", &ipa_smmu_high, sizeof(ipa_smmu_high));
+	if (ipa_smmu_high == 1) {
+		say("vayu-ipa: SMMU: vayu_ipa_smmu_high=1: DDR 0x100000000..0x27fffffff identity-mapped too "
+		    "(1 GiB blocks)\n");
+	}
 	idr0 = rd(base + SMMU_IDR0);
 	idr1 = rd(base + SMMU_IDR1);
 	if (rd(base + SMMU_SCR0) & (1U << 3)) {
@@ -285,4 +310,45 @@ vayu_ipa_smmu_enable(void)
 	}
 	lck_mtx_unlock(&hakios_smmu_lock);
 	return true;
+}
+
+/*
+ * vayu_ipa_fault_dump=1 (a9-ipa): read-only, the faults the SMMU has recorded for the IPA's streams --
+ * the global fault (sGFSR/sGFAR/sGFSYNR0) and each programmed IPA context's FSR/FAR/FSYNR0. The
+ * contexts report faults (SCTLR CFRE) and terminate them (no CFCFG stall), so an IPA/uC DMA that missed
+ * the identity map after AUTH leaves its address here instead of a stalled master. One "ipa-fault:"
+ * line; returns the OR of all fault status words (0: nothing recorded).
+ */
+uint32_t
+vayu_ipa_smmu_faults(const char *when)
+{
+	static vm_offset_t global;
+	char line[300];
+	uint32_t gfsr, any;
+	int at;
+
+	if (global == 0) {
+		global = ml_io_map_unmappable(APPS_SMMU, 0x1000, VM_WIMG_IO);
+	}
+	if (global == 0) {
+		say("ipa-fault: %s: the SMMU did not map\n", when);
+		return 0;
+	}
+	gfsr = rd(global + SMMU_SGFSR);
+	any = gfsr;
+	at = snprintf(line, sizeof(line), "ipa-fault: %s: sGFSR %#x sGFAR %#x%08x sGFSYNR0 %#x", when, gfsr,
+	    rd(global + SMMU_SGFAR + 4), rd(global + SMMU_SGFAR), rd(global + SMMU_SGFSYNR0));
+	for (unsigned i = 0; i < 3; i++) {
+		const struct ipa_smmu_stream *st = &ipa_smmu[i];
+		uint32_t fsr;
+
+		if (!st->on || st->context_base == 0 || at >= (int)sizeof(line)) continue;
+		fsr = rd(st->context_base + SMMU_CB_FSR);
+		any |= fsr;
+		at += snprintf(line + at, sizeof(line) - (size_t)at, "; SID %#x cb %u FSR %#x FAR %#x%08x FSYNR0 %#x",
+		    st->sid, st->context, fsr, rd(st->context_base + SMMU_CB_FAR + 4), rd(st->context_base + SMMU_CB_FAR),
+		    rd(st->context_base + SMMU_CB_FSYNR0));
+	}
+	say("%s%s\n", line, any ? " -- FAULT RECORDED" : "");
+	return any;
 }

@@ -35,6 +35,16 @@ extern void             psci_smp_stop_here(void);
 extern int64_t          psci_system_off(void);
 extern int64_t          psci_system_reset(void);
 
+/*
+ * Idle by power collapse, PSCI CPU_SUSPEND (boot-arg cpu_suspend=N; psci_smp.c): instead of WFI in
+ * cpu_idle() (false: do WFI), and on the way back through the reset vector (arm_init_idle_cpu()).
+ */
+struct cpu_data;
+extern bool             psci_idle_enter(struct cpu_data *cdp);
+extern void             psci_idle_resumed(void);
+extern void             psci_idle_counts(int cpu, char *line, size_t size);
+extern uint64_t         psci_idle_resets_total(void);
+
 /* osfmk/arm64/gic_v3_irq.c */
 extern void             gic_v3_irq_signal(uint32_t phys_id);
 extern void             gic_v3_irq_signal_stop(uint32_t phys_id);

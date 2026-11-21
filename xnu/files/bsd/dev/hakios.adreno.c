@@ -3404,6 +3404,14 @@ hakios_gpu_done(uint32_t fence)
 	if (vayu_gpu_kept()) {
 		return vayu_gpu_done(fence);
 	}
+	if (!gpu_kept || core_scratch.memory == 0) {
+		/*
+		 * No core (vayu's stopped at the run's end, vayu_gpu_stop, or this driver's never made): nothing will
+		 * finish, so nothing is to be waited for. The framebuffer's presenter still asks in the seconds between
+		 * the GPU's stop and loader_return (P2c: a data abort at core_scratch.memory 0 + GPU_FENCE_AT).
+		 */
+		return true;
+	}
 	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
 
 	to_memory((vm_offset_t)word, 4);

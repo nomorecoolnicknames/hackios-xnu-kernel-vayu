@@ -16,10 +16,16 @@
  * STATUS -> SETUP. The bulk rings are Linux's (gadget.c: 31 TRBs and a link TRB back to the first,
  * no LST, so the transfer never ends and UPDATETRANSFER tells the controller about new TRBs). The
  * memory is uncached (vayu_usbnet.c dma_area()); vayu_usbnet_clean/inval are barriers.
+ *
+ * usbnet_cmd=1: a command port on en2 alone, TCP 5141 (below, "the command port"). It follows another HakiOS
+ * port: telegdyd/ios-vayu, branch vayu-dev, commit 66d2e6bcb3c0 (its command port, from ios-jasmine).
+ *
+ * usbnet_log=1: the kernel's log, live, on en2 alone, TCP 5140 (below, "the live log"; the same commit's log port).
  */
 #include <machine/machine_routines.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <net/bpf.h>
@@ -1107,6 +1113,312 @@ usbnet_ipv4(void)
 	}
 }
 
+/* ---- the command port ----------------------------------------------------------------------- */
+
+/*
+ * usbnet_cmd=1: TCP 5141 on en2 alone (IP_BOUND_IF: nothing from Wi-Fi or the cell reaches it), one line per
+ * connection, one line back (devices/poco-x3-pro/tools/phone-mode.sh is the host's end):
+ *
+ *   ping       "pong"
+ *   bcb        misc's command as the flash holds it (bcb_reboot=1), and what is past it: the status and recovery
+ *              fields (RescueParty's "--prompt_and_wipe_data" would be in the latter) and how many bytes of the
+ *              block past the command are not zero -- read only
+ *   bcb set    misc's command set to "boot-recovery", nothing else done: the next start of the phone is the
+ *   bcb clear  recovery's / misc's command cleared, nothing else done: the next start is boot's
+ *   recovery   misc's command set to "boot-recovery" (bcb_reboot=1: hakios.ufs.c, the loader 2.6 writes it and
+ *              reads it back), then the orderly end of the run; the loader restarts the phone and ABL starts the
+ *              recovery. Not written: nothing else is done.
+ *   android    the other way (the multiboot: HakiOS in the recovery partition, Android in boot): misc's command
+ *              cleared and read back, then the orderly end of the run; ABL starts boot. Not written: nothing done.
+ *   reboot     the orderly end of the run alone: the phone starts again as it would
+ *
+ * The end of the run is the loader's way, "xl stop" (loader_return.c loader_live_stop_set): the filesystems
+ * synced first, then var_store's save, the GPU, Wi-Fi and the DSP stopped. iOS's own shutdown (reboot_kernel) is
+ * not taken: from a kernel thread it hung after unmounting /dev on vayu-dev (its run 020558).
+ */
+#define USBNET_CMD_PORT         5141
+
+extern int hakios_ufs_bcb_get(char *out, size_t size);
+extern int hakios_ufs_bcb_set(bool recovery);
+extern int hakios_ufs_bcb_fields(char *status, size_t ssize, char *recovery, size_t rsize, uint32_t *dirty);
+extern void loader_live_stop_set(void);
+extern int sync_internal(void);
+extern void IOSleep(unsigned int milliseconds);
+
+/* length bytes to the peer; false when it is gone (or did not take them in SO_SNDTIMEO) */
+static bool
+usbnet_cmd_send_bytes(socket_t cs, const char *data, size_t length)
+{
+	while (length > 0) {
+		struct iovec iov = { .iov_base = (void *)(uintptr_t)data, .iov_len = length };
+		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+		size_t sent = 0;
+
+		if (sock_send(cs, &msg, 0, &sent) != 0 || sent == 0) {
+			return false;
+		}
+		data += sent;
+		length -= sent;
+	}
+	return true;
+}
+
+static bool
+usbnet_cmd_send(socket_t cs, const char *text)
+{
+	size_t length = strlen(text);
+
+	while (length > 0) {
+		struct iovec iov = { .iov_base = (void *)(uintptr_t)text, .iov_len = length };
+		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+		size_t sent = 0;
+
+		if (sock_send(cs, &msg, 0, &sent) != 0 || sent == 0) {
+			return false;
+		}
+		text += sent;
+		length -= sent;
+	}
+	return true;
+}
+
+/* text has word somewhere in it (RescueParty's "--prompt_and_wipe_data" in misc's recovery field) */
+static bool
+usbnet_cmd_has(const char *text, const char *word)
+{
+	size_t n = strlen(word);
+
+	for (; *text != 0; text++) {
+		if (strncmp(text, word, n) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+usbnet_cmd_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	struct sockaddr_in me = { .sin_len = sizeof(me), .sin_family = AF_INET, .sin_port = htons(USBNET_CMD_PORT) };
+	socket_t ls = NULL;
+	int on = 1, index;
+
+	/* en2 is there once usbnet_attach() has been (the thread starts after it); the listener is bound to it */
+	for (;;) {
+		index = usbnet_ifp != NULL ? (int)ifnet_index(usbnet_ifp) : 0;
+		if (index != 0 && sock_socket(PF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &ls) == 0) {
+			(void)sock_setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+			if (sock_setsockopt(ls, IPPROTO_IP, IP_BOUND_IF, &index, sizeof(index)) == 0 &&
+			    sock_bind(ls, (struct sockaddr *)&me) == 0 && sock_listen(ls, 2) == 0) {
+				break;
+			}
+			sock_close(ls);
+			ls = NULL;
+		}
+		IOSleep(1000);
+	}
+	printf("vayu-usbnet: the command port is TCP %u on en2 (ping, bcb, bcb set, bcb clear, recovery, android, reboot)\n",
+	    USBNET_CMD_PORT);
+	for (;;) {
+		struct timeval patience = { .tv_sec = 10, .tv_usec = 0 };
+		char line[64], reply[256];
+		socket_t cs = NULL;
+		size_t got = 0;
+		bool end = false;
+
+		if (sock_accept(ls, NULL, 0, 0, NULL, NULL, &cs) != 0 || cs == NULL) {
+			IOSleep(500);
+			continue;
+		}
+		/* (a host that says nothing, or went away with the cable, frees this thread in 10 s) */
+		(void)sock_setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, &patience, sizeof(patience));
+		(void)sock_setsockopt(cs, SOL_SOCKET, SO_SNDTIMEO, &patience, sizeof(patience));
+		while (got < sizeof(line) - 1) {
+			struct iovec iov = { .iov_base = line + got, .iov_len = sizeof(line) - 1 - got };
+			struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+			size_t n = 0;
+
+			if (sock_receive(cs, &msg, 0, &n) != 0 || n == 0) {
+				break;
+			}
+			got += n;
+			line[got] = 0;
+			if (strchr(line, '\n') != NULL) {
+				break;
+			}
+		}
+		line[got] = 0;
+		for (char *c = line; *c != 0; c++) {
+			if (*c == '\r' || *c == '\n') {
+				*c = 0;
+				break;
+			}
+		}
+		if (strcmp(line, "ping") == 0) {
+			strlcpy(reply, "pong\n", sizeof(reply));
+		} else if (strcmp(line, "bcb") == 0) {
+			char now[40], status[33], recovery[97];
+			uint32_t dirty = 0;
+			int error = hakios_ufs_bcb_get(now, sizeof(now));
+
+			if (error == 0) {
+				error = hakios_ufs_bcb_fields(status, sizeof(status), recovery, sizeof(recovery), &dirty);
+			}
+			if (error == 0) {
+				snprintf(reply, sizeof(reply), "bcb: \"%s\" status \"%s\" recovery \"%s\" past-command %u%s\n", now,
+				    status, recovery, dirty, usbnet_cmd_has(recovery, "wipe_data") ? " WIPE-ASKED" : "");
+			} else {
+				snprintf(reply, sizeof(reply), "bcb: not read (%d; bcb_reboot=1?)\n", error);
+			}
+		} else if (strcmp(line, "bcb set") == 0 || strcmp(line, "bcb clear") == 0) {
+			bool set = strcmp(line, "bcb set") == 0;
+			int error = hakios_ufs_bcb_set(set);
+
+			if (error == 0) {
+				snprintf(reply, sizeof(reply), "bcb: misc's command %s (read back); nothing else done\n",
+				    set ? "says boot-recovery" : "is clear");
+			} else {
+				snprintf(reply, sizeof(reply), "bcb: misc NOT written (%d; bcb_reboot=1?)\n", error);
+			}
+		} else if (strcmp(line, "android") == 0) {
+			int error = hakios_ufs_bcb_set(false);
+
+			if (error == 0) {
+				strlcpy(reply, "android: misc's command is clear (read back); the run ends, the phone restarts\n",
+				    sizeof(reply));
+				end = true;
+			} else {
+				snprintf(reply, sizeof(reply), "android: misc NOT written (%d; bcb_reboot=1?): nothing done\n", error);
+			}
+		} else if (strcmp(line, "recovery") == 0) {
+			int error = hakios_ufs_bcb_set(true);
+
+			if (error == 0) {
+				strlcpy(reply, "recovery: misc says boot-recovery (read back); the run ends, the phone restarts\n",
+				    sizeof(reply));
+				end = true;
+			} else {
+				snprintf(reply, sizeof(reply), "recovery: misc NOT written (%d; bcb_reboot=1?): nothing done\n", error);
+			}
+		} else if (strcmp(line, "reboot") == 0) {
+			strlcpy(reply, "reboot: the run ends, the phone restarts\n", sizeof(reply));
+			end = true;
+		} else {
+			strlcpy(reply, "? (ping, bcb, bcb set, bcb clear, recovery, android, reboot)\n", sizeof(reply));
+		}
+		(void)usbnet_cmd_send(cs, reply);
+		sock_close(cs);
+		printf("vayu-usbnet: command port: \"%s\": %s", line, reply);
+		if (end) {
+			(void)sync_internal();
+			IOSleep(1000);          /* (the reply on its way out, the flash's last writes done) */
+			loader_live_stop_set();
+		}
+	}
+}
+
+static void
+usbnet_cmd_start(void)
+{
+	uint32_t on = 0;
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("usbnet_cmd", &on, sizeof(on)) || on != 1) {
+		return;
+	}
+	if (kernel_thread_start(usbnet_cmd_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
+/* ---- the live log --------------------------------------------------------------------------- */
+
+/*
+ * usbnet_log=1: TCP 5140 on en2 alone (IP_BOUND_IF, as the command port), to one reader at a time: the kernel's log
+ * as the loader gets it back after a run (osfmk/arm64/loader_return.c loader_log_copy: the first 512 KB of the
+ * boot, then the ring of the newest), the whole of it so far and then as it grows. The host's end is
+ * devices/poco-x3-pro/tools/phone-mode.sh log. The log goes on into loader_return.c's buffer as ever: a run
+ * that ends hands the loader the same text.
+ *
+ * Nothing this thread does may print: every line of its own would come back to it as more log to send.
+ * After telegdyd/ios-vayu, branch vayu-dev, commit 66d2e6bcb3c0 (its log_port_thread, from ios-jasmine).
+ */
+#define USBNET_LOG_PORT         5140
+
+extern uint32_t loader_log_copy(uint64_t *pos, char *out, uint32_t max);
+
+static void
+usbnet_log_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	static char chunk[16384];
+	struct sockaddr_in me = { .sin_len = sizeof(me), .sin_family = AF_INET, .sin_port = htons(USBNET_LOG_PORT) };
+	socket_t ls = NULL;
+	int on = 1, index;
+
+	for (;;) {
+		index = usbnet_ifp != NULL ? (int)ifnet_index(usbnet_ifp) : 0;
+		if (index != 0 && sock_socket(PF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &ls) == 0) {
+			(void)sock_setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+			if (sock_setsockopt(ls, IPPROTO_IP, IP_BOUND_IF, &index, sizeof(index)) == 0 &&
+			    sock_bind(ls, (struct sockaddr *)&me) == 0 && sock_listen(ls, 1) == 0) {
+				break;
+			}
+			sock_close(ls);
+			ls = NULL;
+		}
+		IOSleep(1000);
+	}
+	/* (said once, before the first reader: from here on the thread is silent) */
+	printf("vayu-usbnet: the live log is TCP %u on en2\n", USBNET_LOG_PORT);
+	for (;;) {
+		struct timeval patience = { .tv_sec = 20, .tv_usec = 0 };
+		socket_t cs = NULL;
+		uint64_t pos = 0;
+
+		if (sock_accept(ls, NULL, 0, 0, NULL, NULL, &cs) != 0 || cs == NULL) {
+			IOSleep(500);
+			continue;
+		}
+		/* (a reader that went away without a word -- the cable pulled -- frees this thread in 20 s) */
+		(void)sock_setsockopt(cs, SOL_SOCKET, SO_SNDTIMEO, &patience, sizeof(patience));
+		for (;;) {
+			uint32_t n = loader_log_copy(&pos, chunk, sizeof(chunk));
+
+			if (n == 0) {
+				char c;
+				struct iovec iov = { .iov_base = &c, .iov_len = 1 };
+				struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+				size_t got = 0;
+
+				IOSleep(100);
+				/* (a reader that closed its end is let go while the log is quiet: the next one is waiting) */
+				if (!link_up || (sock_receive(cs, &msg, MSG_DONTWAIT | MSG_PEEK, &got) == 0 && got == 0)) {
+					break;
+				}
+				continue;
+			}
+			if (!usbnet_cmd_send_bytes(cs, chunk, n)) {
+				break;
+			}
+		}
+		sock_close(cs);
+	}
+}
+
+static void
+usbnet_log_start(void)
+{
+	uint32_t on = 0;
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("usbnet_log", &on, sizeof(on)) || on != 1) {
+		return;
+	}
+	if (kernel_thread_start(usbnet_log_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
 /* ---- what the controller's side calls -------------------------------------------------------- */
 
 void
@@ -1134,6 +1446,8 @@ vayu_usbnet_ecm_init(void)
 		HakiosEthernetStart("en2", usbnet_address);
 		printf("vayu-usbnet: en2 left to configd (DHCP); usbnet_static=1 would set it here\n");
 	}
+	usbnet_cmd_start();
+	usbnet_log_start();
 }
 
 void

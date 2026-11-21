@@ -53,6 +53,8 @@ struct vayu_rproc {
 	uint32_t our_item;
 	struct vayu_glink *glink;       /* its GLINK edge, if one was prepared: taken down before it is stopped */
 	bool started, rails_asked, stopped_by_its_word;
+	bool restart_after_fatal;       /* set by its driver after it said FATAL and TrustZone shut it down: the next
+	                                 * vayu_pas_load starts it again although it never acknowledged a stop */
 	bool smp2p_agreed, smp2p_restart_acks, smp2p_restart_acked;
 };
 

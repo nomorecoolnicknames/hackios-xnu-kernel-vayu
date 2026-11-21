@@ -41,6 +41,11 @@
 #include <arm/cpu_data_internal.h>
 #include <arm/cpu_internal.h>
 #include <arm/machine_routines.h>
+#include <arm/rtclock.h>
+#include <kern/sched_prim.h>
+#include <kern/timer_call.h>
+#include <kern/percpu.h>
+#include <kern/thread.h>
 #include <arm64/proc_reg.h>
 #include <arm64/psci_smp.h>
 #include <pexpert/pexpert.h>
@@ -120,6 +125,10 @@ psci_error(int64_t status)
 	return (status <= 0 && status > -(int64_t)(sizeof(names) / sizeof(names[0]))) ? names[-status] : "?";
 }
 
+static void psci_idle_init(void);
+static void psci_idle_core_started(void);
+static void psci_idle_final_counts(void);
+
 void
 psci_smp_init(void)
 {
@@ -132,6 +141,7 @@ psci_smp_init(void)
 	    size >= 3 && strncmp((const char *)prop, "hvc", 3) == 0) {
 		psci_smp_hvc = 1;
 	}
+	psci_idle_init();
 }
 
 /* A processor other than the boot processor says how far it has come. */
@@ -207,6 +217,7 @@ psci_smp_start_cpu(int cpu)
 	do {
 		stage = os_atomic_load(&psci_smp_cpu_stage[cpu], acquire);
 		if (stage >= PSCI_SMP_CPU_RUNNING) {
+			psci_idle_core_started();
 			return KERN_SUCCESS;
 		}
 		/* memory, not this processor's copy of it */
@@ -310,6 +321,7 @@ psci_smp_stop_others(void)
 		return;                 /* there is only this one */
 	}
 	__builtin_arm_wsr("DAIFSet", DAIFSC_ALL);
+	psci_idle_final_counts();
 	me = cpu_number();
 	max_cpu = ml_get_max_cpu_number();
 	if (!os_atomic_cmpxchg(&psci_smp_stop_owner, -1, me, acq_rel) && psci_smp_stop_owner != me && me != master_cpu) {
@@ -437,6 +449,336 @@ int64_t
 psci_system_reset(void)
 {
 	return psci_system_end(PSCI_SYSTEM_RESET);
+}
+
+
+/*
+ * Idle by power collapse (boot-arg cpu_suspend=N, default 0: off, idle is WFI as before).
+ *
+ * WFI only stops a core's clock: it stays powered, at the voltage of its OSM row, and leaks like a
+ * running one. PSCI CPU_SUSPEND with a power-down state lets the firmware switch the core off
+ * until an interrupt for it arrives; it then starts again at the entry point we give, with its MMU
+ * and caches off, like a core that CPU_ON started. That entry is the kernel's reset vector, and
+ * the cpu data's reset handler is already resume_idle_cpu (cpu_machine_idle_init()): XNU's own way
+ * back from a non-retention idle, start.s -> arm_init_idle_cpu() -> cpu_idle_exit(TRUE) ->
+ * Idle_load_context(), which returns into machine_idle() as if WFI had ended. What the core lost
+ * and the kernel does not set up again on that path is put back by psci_idle_resumed(): the GIC's
+ * CPU interface (its ICC_* registers live in the core) and the timer's compare value.
+ *
+ * The power state is the SM8150's per-core "rail power collapse": arm,psci-suspend-param
+ * 0x40000004 of the cpu idle states in the mainline sm8150 device tree (bit 30 power down, state
+ * 4; entry/exit 355/909 us for the little cores, 241/1461 us for the big ones; read from
+ * sm8150-hdk.dtb). Only the core, never its cluster:
+ * the cluster state (0x4100c244) is for OS-initiated mode, which the firmware has not been put in.
+ *
+ * Those states are "local-timer-stop": a core that is off does not see its own timer. So:
+ *   cpu_suspend=1  a core is switched off only when it has no deadline at all (no timer of its
+ *                  own is due: psci_idle_deadline()): nothing can be missed, it wakes for an interrupt or a signal from
+ *                  another processor (the GIC wakes it).
+ *   cpu_suspend=2  also with a deadline at least cpu_suspend_min_us (5000) away. A thread of the
+ *                  boot processor's, which never collapses, then signals the core
+ *                  cpu_suspend_lead_us (2000, the exit latency and some) before it: a broadcast
+ *                  timer in software. If that thread would not look in time, the core takes WFI.
+ * cpu_suspend_cpus=MASK (default every core CPU_ON started; bit n = XNU cpu n) and
+ * cpu_suspend_after_ms=N (20000: not during the boot) narrow it, cpu_suspend_state=X overrides the
+ * power state, cpu_suspend_log_s=N (60; 0: none) is the period of the count line:
+ *   "psci: idle: cpu N: S suspends, R back by reset, F returned, E refused (last E), L late, T WFI for a deadline"
+ * A firmware that refuses the state 8 times in a row turns it off for good ("psci: idle: off").
+ * The core that refuses goes on with WFI; so does any core under QEMU, whose PSCI rejects a
+ * power-down state as invalid parameters.
+ */
+#define PSCI_CPU_SUSPEND        0xC4000001u     /* SMC64: the entry point is a 64-bit address */
+#define PSCI_IDLE_STATE_DEFAULT 0x40000004u     /* sm8150 cpu rail power collapse (see above) */
+#define PSCI_IDLE_REFUSALS      8
+
+struct psci_idle_count {
+	uint64_t suspends, resets, returned, refused, late, timed;
+	int64_t  last_error;
+	uint32_t refused_in_a_row;
+} __attribute__((aligned(64)));
+
+static uint32_t psci_idle_mode;                 /* cpu_suspend */
+static uint32_t psci_idle_state = PSCI_IDLE_STATE_DEFAULT;
+static uint32_t psci_idle_cpus = ~0u;
+static uint32_t psci_idle_log_s = 60;
+static uint64_t psci_idle_entry;                /* physical address of LowResetVectorBase */
+static uint64_t psci_idle_from;                 /* mach_absolute_time() before which nothing collapses */
+static uint64_t psci_idle_min_abs, psci_idle_lead_abs;
+static bool     psci_idle_off;                  /* the firmware refuses it */
+static bool     psci_idle_thread_started;
+static struct psci_idle_count psci_idle_count[MAX_CPUS];
+/* cpu_suspend=2: when each core that is off wants its signal (0: none), and when the boot processor's
+ * thread looks next (UINT64_MAX: it does not run, nobody may count on it) */
+static uint64_t psci_idle_wake_at[MAX_CPUS];
+static uint64_t psci_idle_watch_next = UINT64_MAX;
+
+extern void gic_v3_irq_cpu_resume(void);
+
+static void
+psci_idle_init(void)
+{
+	uint32_t after_ms = 20000, min_us = 5000, lead_us = 2000;
+
+	if (!PE_parse_boot_argn("cpu_suspend", &psci_idle_mode, sizeof(psci_idle_mode)) || psci_idle_mode == 0) {
+		psci_idle_mode = 0;
+		return;
+	}
+	PE_parse_boot_argn("cpu_suspend_state", &psci_idle_state, sizeof(psci_idle_state));
+	PE_parse_boot_argn("cpu_suspend_cpus", &psci_idle_cpus, sizeof(psci_idle_cpus));
+	PE_parse_boot_argn("cpu_suspend_after_ms", &after_ms, sizeof(after_ms));
+	PE_parse_boot_argn("cpu_suspend_min_us", &min_us, sizeof(min_us));
+	PE_parse_boot_argn("cpu_suspend_lead_us", &lead_us, sizeof(lead_us));
+	PE_parse_boot_argn("cpu_suspend_log_s", &psci_idle_log_s, sizeof(psci_idle_log_s));
+	if (lead_us < 1000) {
+		lead_us = 1000;
+	}
+	if (min_us < lead_us + 1000) {
+		min_us = lead_us + 1000;
+	}
+	nanoseconds_to_absolutetime((uint64_t)min_us * NSEC_PER_USEC, &psci_idle_min_abs);
+	nanoseconds_to_absolutetime((uint64_t)lead_us * NSEC_PER_USEC, &psci_idle_lead_abs);
+	nanoseconds_to_absolutetime((uint64_t)after_ms * NSEC_PER_MSEC, &psci_idle_from);
+	psci_idle_from += mach_absolute_time();
+	psci_idle_entry = ml_static_vtop((vm_offset_t)&LowResetVectorBase);
+	printf("psci: idle: CPU_SUSPEND state 0x%x (cpu_suspend=%u: %s), cpus 0x%x, from %u ms on\n", psci_idle_state,
+	    psci_idle_mode, psci_idle_mode >= 2 ? "also with a deadline, the boot processor signals" : "only with no deadline",
+	    psci_idle_cpus, after_ms);
+}
+
+static void
+psci_idle_say(const char *line)
+{
+	for (const char *c = line; *c; c++) {
+		loader_log_putc(*c);
+	}
+	if (ml_get_interrupts_enabled()) {
+		printf("%s", line);
+	}
+}
+
+/* The count line (also for other drivers' power lines): one core's, into `line'. */
+void
+psci_idle_counts(int cpu, char *line, size_t size)
+{
+	const struct psci_idle_count *n = &psci_idle_count[cpu];
+
+	snprintf(line, size, "psci: idle: cpu %d: %llu suspends, %llu back by reset, %llu returned, %llu refused "
+	    "(last %lld), %llu late, %llu WFI for a deadline%s\n", cpu, n->suspends, n->resets, n->returned, n->refused,
+	    n->last_error, n->late, n->timed,
+	    psci_idle_off ? " (psci: idle: off, the firmware refuses the state)" : "");
+}
+
+/* The power collapses every core came back from, for the battery's power line (battery_log_s). */
+uint64_t
+psci_idle_resets_total(void)
+{
+	uint64_t total = 0;
+
+	for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+		total += psci_idle_count[cpu].resets;
+	}
+	return total;
+}
+
+/*
+ * The boot processor's thread: the counts every cpu_suspend_log_s, and with cpu_suspend=2 the signal
+ * to every core that is off and whose deadline is near. Before it looks at the deadlines it says
+ * when it will look next (psci_idle_watch_next); a core that goes off with a deadline first writes
+ * its own and then reads that, so one of the two always sees the other.
+ */
+static void
+psci_idle_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint64_t log_every = 0, log_next, idle_look;
+
+	thread_bind(master_processor);
+	thread_block(THREAD_CONTINUE_NULL);     /* (now on the boot processor) */
+	nanoseconds_to_absolutetime((uint64_t)psci_idle_log_s * NSEC_PER_SEC, &log_every);
+	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &idle_look);
+	log_next = mach_absolute_time() + log_every;
+	for (;;) {
+		uint64_t now = mach_absolute_time(), next = log_every != 0 ? log_next : now + 10 * idle_look;
+		int max_cpu = ml_get_max_cpu_number();
+
+		if (psci_idle_mode >= 2 && !psci_idle_off) {
+			if (now + idle_look < next) {
+				next = now + idle_look;
+			}
+			os_atomic_store(&psci_idle_watch_next, next, seq_cst);
+			for (int cpu = 0; cpu <= max_cpu && cpu < MAX_CPUS; cpu++) {
+				uint64_t wake = os_atomic_load(&psci_idle_wake_at[cpu], seq_cst);
+
+				if (wake == 0) {
+					continue;
+				}
+				if (wake <= now) {
+					if (os_atomic_cmpxchg(&psci_idle_wake_at[cpu], wake, 0, relaxed) && cpu_datap(cpu) != NULL) {
+						gic_v3_irq_signal(cpu_datap(cpu)->cpu_phys_id);
+					}
+				} else if (wake < next) {
+					next = wake;
+				}
+			}
+			os_atomic_store(&psci_idle_watch_next, next, seq_cst);
+		}
+		if (log_every != 0 && now >= log_next) {
+			log_next = now + log_every;
+			for (int cpu = 0; cpu <= max_cpu && cpu < MAX_CPUS; cpu++) {
+				char line[200];
+
+				if ((psci_smp_started & psci_idle_cpus & (1u << cpu)) != 0) {
+					psci_idle_counts(cpu, line, sizeof(line));
+					psci_idle_say(line);
+				}
+			}
+			if (log_next < next) {
+				next = log_next;
+			}
+		}
+		if (next <= mach_absolute_time()) {
+			continue;
+		}
+		assert_wait_deadline_with_leeway((event_t)&psci_idle_watch_next, THREAD_UNINT, TIMEOUT_URGENCY_SYS_CRITICAL,
+		    next, 0);
+		thread_block(THREAD_CONTINUE_NULL);
+	}
+}
+
+/* The counts once more at the end of the run (psci_smp_stop_others(), into the loader's log only). */
+static void
+psci_idle_final_counts(void)
+{
+	static bool said;
+
+	if (psci_idle_mode == 0 || said) {
+		return;
+	}
+	said = true;
+	for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+		char line[200];
+
+		if ((psci_smp_started & psci_idle_cpus & (1u << cpu)) != 0) {
+			psci_idle_counts(cpu, line, sizeof(line));
+			psci_idle_say(line);
+		}
+	}
+}
+
+/* From psci_smp_start_cpu(), on the boot processor, once a core has joined. */
+static void
+psci_idle_core_started(void)
+{
+	thread_t thread;
+
+	if (psci_idle_mode == 0 || psci_idle_thread_started) {
+		return;
+	}
+	psci_idle_thread_started = true;
+	if (kernel_thread_start_priority(psci_idle_thread, NULL, MAXPRI_KERNEL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	} else {
+		printf("psci: idle: cannot start the boot processor's thread: no deadline is signalled\n");
+	}
+}
+
+/*
+ * The next thing this core's timer is for, as timer_resync_deadlines() works it out (arm_timer.c):
+ * rtcPop is not it -- with nothing due it is the furthest the decrementer reaches, not the end of
+ * all time.
+ */
+static uint64_t
+psci_idle_deadline(cpu_data_t *cdp)
+{
+	const rtclock_timer_t *timer = &cdp->rtclock_timer;
+	uint64_t deadline = EndOfAllTime, run;
+
+	if (!timer->has_expired && timer->deadline > 0 && timer->deadline < deadline) {
+		deadline = timer->deadline;
+	}
+	if (cdp->idle_timer_deadline > 0 && cdp->idle_timer_deadline < deadline) {
+		deadline = cdp->idle_timer_deadline;
+	}
+	run = running_timers_deadline(PERCPU_GET_RELATIVE(processor, cpu_data, cdp));
+	return run < deadline ? run : deadline;
+}
+
+/*
+ * cpu_idle(), interrupts off, instead of WFI: true if the core went into the firmware and came
+ * straight back (an interrupt was already pending, or the firmware gave up the power down; WFI would
+ * end at once too), false for WFI as usual. When the core is switched off this does not return: the
+ * core comes back through the reset vector to psci_idle_resumed().
+ */
+bool
+psci_idle_enter(cpu_data_t *cdp)
+{
+	int cpu = cdp->cpu_number;
+	struct psci_idle_count *n;
+	uint64_t now, pop, wake = 0;
+	int64_t status;
+
+	if (psci_idle_mode == 0 || psci_idle_off || cpu < 0 || cpu >= MAX_CPUS || cpu == master_cpu ||
+	    (psci_smp_started & psci_idle_cpus & (1u << cpu)) == 0 ||
+	    os_atomic_load(&psci_smp_cpu_stage[cpu], relaxed) != PSCI_SMP_CPU_RUNNING ||
+	    os_atomic_load(&psci_smp_stopping, relaxed)) {
+		return false;
+	}
+	now = mach_absolute_time();
+	if (now < psci_idle_from) {
+		return false;
+	}
+	n = &psci_idle_count[cpu];
+	pop = psci_idle_deadline(cdp);
+	if (pop != EndOfAllTime) {
+		if (psci_idle_mode < 2 || pop < now + psci_idle_min_abs) {
+			psci_idle_count[cpu].timed++;   /* (a deadline too near, or cpu_suspend=1: WFI) */
+			return false;
+		}
+		wake = pop - psci_idle_lead_abs;
+		os_atomic_store(&psci_idle_wake_at[cpu], wake, seq_cst);
+		if (os_atomic_load(&psci_idle_watch_next, seq_cst) > wake) {
+			os_atomic_store(&psci_idle_wake_at[cpu], 0, relaxed);
+			n->late++;              /* (the boot processor's thread would look too late) */
+			return false;
+		}
+	}
+	if (cpu_interrupt_is_pending()) {
+		os_atomic_store(&psci_idle_wake_at[cpu], 0, relaxed);
+		return false;
+	}
+	n->suspends++;
+	/* what the reset vector reads of this core with its MMU off (the rest: psci_smp_start_cpu()) */
+	CleanPoC_DcacheRegion((vm_offset_t)cdp, sizeof(cpu_data_t));
+	CleanPoC_DcacheRegion((vm_offset_t)n, sizeof(*n));
+	__builtin_arm_dsb(DSB_SY);
+	status = psci_call(PSCI_CPU_SUSPEND, psci_idle_state, psci_idle_entry, 0);
+
+	os_atomic_store(&psci_idle_wake_at[cpu], 0, relaxed);
+	if (status == 0) {
+		n->returned++;
+		n->refused_in_a_row = 0;
+		return true;
+	}
+	n->refused++;
+	n->last_error = status;
+	if (++n->refused_in_a_row >= PSCI_IDLE_REFUSALS) {
+		psci_idle_off = true;
+	}
+	return false;
+}
+
+/* arm_init_idle_cpu(), interrupts off, on the way back from a power collapse. */
+void
+psci_idle_resumed(void)
+{
+	int cpu = cpu_number();
+
+	if (cpu >= 0 && cpu < MAX_CPUS) {
+		os_atomic_store(&psci_idle_wake_at[cpu], 0, relaxed);
+		psci_idle_count[cpu].resets++;
+		psci_idle_count[cpu].refused_in_a_row = 0;
+	}
+	gic_v3_irq_cpu_resume();
+	ClearIdlePop(FALSE);                    /* the timer's compare value went with the core */
 }
 
 #endif /* defined(GENERIC_PSCI_SMP) */

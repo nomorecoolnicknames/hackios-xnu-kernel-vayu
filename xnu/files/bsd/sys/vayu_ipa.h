@@ -18,9 +18,17 @@ void vayu_ipa_start(struct vayu_qrtr *q);
 void vayu_ipa_stop(void);
 void vayu_ipa_prepare_stop(void);
 bool vayu_ipa_smmu_enable(void);
+/* vayu_ipa_fault_dump=1: one "ipa-fault:" line of the SMMU's recorded faults for the IPA streams (reads only);
+ * the OR of the fault status words, 0 when none. */
+uint32_t vayu_ipa_smmu_faults(const char *when);
 /* SMP2P "ipa" entries: ours (item 428) and the modem's (item 435), found by name. */
 void vayu_ipa_smp2p_read(bool *ours_found, uint32_t *ours, bool *theirs_found, uint32_t *theirs);
-/* True only after this boot's MPSS SMP2P verification, never from stale Android SMEM. */
+/* a11-qmi: the value our 428 "ipa" entry is made with before MPSS (3, or 0 with vayu_ipa_smp2p_mainline=1),
+ * and whether that mainline mode is on (vayu_ipa_qmi.c then skips its 0 -> 3 dance). */
+uint32_t vayu_ipa_smp2p_initial(void);
+bool vayu_ipa_smp2p_is_mainline(void);
+/* True only after this boot's verification of our own 428 entry after MPSS, never from stale Android
+ * SMEM. It says nothing about the modem's 435 entry. */
 bool vayu_ipa_modem_started(void);
 /* vayu_ipa_qmi=N stage (absent: 2). 0 none, 1 SMP2P + lookup, 2 INIT_MODEM_DRIVER handshake,
  * 3 + read-only WDS probe, 4 + WDS Start allowed (vayu_cell_data). */
@@ -28,6 +36,10 @@ uint32_t vayu_ipa_qmi_stage(void);
 /* Only true after the modem accepted INIT_MODEM_DRIVER and INIT_COMPLETE was sent. WDS Start must
  * not run before this: 0641 showed ipa_ipfltr.init_done FATAL without it. */
 bool vayu_ipa_ready(void);
+/* a11: read only, one or two lines: the modem's crash-reason item 421 and its SMP2P item 435 entries. */
+void vayu_ipa_modem_snapshot(const char *when);
+/* a11: the modem sent DRIVER_INIT_COMPLETE (0x35) and it was answered (INIT said "init pending" until then). */
+bool vayu_ipa_modem_init_complete(void);
 /* True when a run was explicitly enabled but has not become ready; useful to explain the gate. */
 bool vayu_ipa_pending(void);
 /* AP->modem and modem->AP IPA endpoint IDs from the vayu IPA 4.1 table (2 and 11). */
@@ -41,6 +53,11 @@ uint32_t vayu_ipa_sram_base(void);
 bool vayu_ipa_uc_look(const char *when, uint64_t ms);
 /* "about to <what>" with the usual pause (ipa_post_auth_ms/ipa_step_ms), for other IPA files. */
 void vayu_ipa_step(const char *what);
+/* The same, only with vayu_ipa_pause_trace=1 (vayu_ipa_data.c: before each GSI/endpoint group). */
+void vayu_ipa_data_step(const char *what);
+/* vayu_ipa_data_trace=1 (vayu_ipa_data.c): one persist breadcrumb (stage "GSI data path") for a single
+ * GSI/IPA access at pa, BEFORE it (done false) or AFTER it. The tag is copied into the record. */
+void vayu_ipa_data_mark(const char *tag, uint32_t pa, bool write, bool done);
 #endif
 
 #endif /* _SYS_VAYU_IPA_H_ */

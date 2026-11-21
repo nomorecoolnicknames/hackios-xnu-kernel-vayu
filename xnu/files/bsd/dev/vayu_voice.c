@@ -49,6 +49,26 @@
  *                        module's own flag for the path is still "vayu_voice".
  *   vayu_call_auto=1     dial vayu_call_allow by itself vayu_call_auto_delay s after READY, hold
  *                        CONVERSATION vayu_call_auto_end s, then End Call (no shell needed).
+ *   vayu_call_bb=1       answer Apple's QMI Audio Service 0xE1 for the stock CommCenter behind the
+ *                        QMux bridge (vayu_qmux=1); its SetAudioPath steers the call's route in
+ *                        vayu_audio.c (vayu_call_route=1).  sys/vayu_voice_bb.h; independent of
+ *                        vayu_call.  vayu_call_bb_trace=1: a line per request.
+ *   vayu_call_sub=N      diagnosis of run 1068 (Dial Call answered QMI_ERR_NO_SERVICE 13 with the SIM
+ *                        in the second tray slot, provisioned as the primary GW subscription): before
+ *                        its Indication Register (and so before any Dial) this client sends VOICE Bind
+ *                        Subscription 0x0044 (CommCenter's vs::BindSubscription, message 68, 20F66),
+ *                        once per appearance of the service, and
+ *                        logs the answer.  1 primary, 2 secondary; default 0: not sent.  The request's
+ *                        TLV 0x01 carries the subscription; its coding is NOT a fact yet (libqmi has
+ *                        no VOICE Bind Subscription; WDS's 0x00af, vayu_cell_wds_sub, is a u32 with
+ *                        1 = primary): vayu_call_sub_wire=V puts V in it instead of N (Qualcomm's
+ *                        enums elsewhere count from 0), vayu_call_sub_len=4 makes it a u32 (default
+ *                        a u8).  A wrong coding is answered MALFORMED/INVALID_ARG and is logged as such.
+ *
+ * With the QMux bridge up (vayu_qmux=1) the stock CommCenter owns the calls: it speaks VOICE 0x09
+ * itself through the bridge.  This client is then held to vayu_call=1 (it only listens -- its
+ * own Indication Register is per client and touches nothing of CommCenter's), and it is what
+ * makes the q6voice path follow the call (vayu_call_audio=1).
  *
  * The device: reads return whole lines (EVENT ..., OK ..., ERR ..., STATE ...); a
  * write is one or more '\n'-separated commands whose answers are queued for the
@@ -63,6 +83,7 @@
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <miscfs/devfs/devfs.h>
@@ -77,6 +98,7 @@
 #include <sys/vayu_audio.h>
 #include <sys/vayu_pas.h>
 #include <sys/vayu_voice.h>
+#include <sys/vayu_voice_bb.h>
 #include <sys/vayu_voice_qmi.h>
 
 extern void loader_log_putc(char c);
@@ -139,6 +161,9 @@ struct voice_state {
 	bool auto_dialled, auto_ended;
 	uint64_t auto_dial_ms, auto_conversation_ms;
 	char allow[VAYU_VOICE_NUMBER_MAX];
+	/* vayu_call_sub=N: VOICE Bind Subscription before the register */
+	uint32_t sub, sub_wire, sub_len;
+	uint32_t sub_generation;        /* the service appearance it was sent for */
 	uint32_t state;                 /* VAYU_VOICE_* */
 	bool registered;
 	uint32_t register_tries;
@@ -703,6 +728,55 @@ static const struct qmi_msg_handler voice_handlers[] = {
 
 /* ---- the one thing the client may send without being asked: the register ------------------------ */
 
+/* VOICE Bind Subscription 0x0044, TLV 0x01: the subscription as a u8 (default) or a u32 (vayu_call_sub_len=4). */
+#define VOICE_QMI_BIND_SUBSCRIPTION     0x0044
+
+struct voice_bind_subscription_req {
+	uint8_t subscription8;
+	uint32_t subscription32;
+};
+
+static const struct qmi_elem_info voice_bind_subscription8_req_ei[] = {
+	{ .data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x01, .offset = offsetof(struct voice_bind_subscription_req, subscription8) },
+	{ .data_type = QMI_EOTI },
+};
+
+static const struct qmi_elem_info voice_bind_subscription32_req_ei[] = {
+	{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t), .array_type = NO_ARRAY,
+	  .tlv_type = 0x01, .offset = offsetof(struct voice_bind_subscription_req, subscription32) },
+	{ .data_type = QMI_EOTI },
+};
+
+/* vayu_call_sub=N: once per appearance of the service, before the register; its failure does not stop the register. */
+static void
+voice_bind_subscription(void)
+{
+	struct voice_bind_subscription_req request = {
+		.subscription8 = (uint8_t)voice.sub_wire, .subscription32 = voice.sub_wire };
+	struct vayu_voice_qmi_result result = { 0 };
+	int ret;
+
+	voice.sub_generation = voice.generation;
+	ret = voice_request("bind subscription", VOICE_QMI_BIND_SUBSCRIPTION,
+	    voice.sub_len == 4 ? voice_bind_subscription32_req_ei : voice_bind_subscription8_req_ei, &request, &result,
+	    NULL, true);
+	if (ret == 0) {
+		say("vayu-voice: vayu_call_sub=%u: VOICE Bind Subscription (0x0044, TLV 0x01 = %u as a u%u): OK\n",
+		    (unsigned int)voice.sub, (unsigned int)voice.sub_wire, (unsigned int)voice.sub_len * 8);
+	} else if (ret == -EIO) {
+		say("vayu-voice: vayu_call_sub=%u: VOICE Bind Subscription (0x0044, TLV 0x01 = %u as a u%u): refused, "
+		    "result %u error %u%s\n", (unsigned int)voice.sub, (unsigned int)voice.sub_wire,
+		    (unsigned int)voice.sub_len * 8, (unsigned int)result.result, (unsigned int)result.error,
+		    result.error == 1 ? " (MALFORMED: try the other vayu_call_sub_len)" :
+		    result.error == 48 ? " (INVALID_ARG: try another vayu_call_sub_wire)" :
+		    result.error == 71 ? " (INVALID_QMI_CMD: this modem's VOICE has no Bind Subscription)" : "");
+	} else {
+		say("vayu-voice: vayu_call_sub=%u: VOICE Bind Subscription (0x0044): no answer (%d)\n",
+		    (unsigned int)voice.sub, ret);
+	}
+}
+
 static void
 voice_register(void)
 {
@@ -714,6 +788,12 @@ voice_register(void)
 	if (voice.register_tries == 0) {
 		say("vayu-voice: the VOICE service (0x09) is there: node %u port %u version %u; registering the indications\n",
 		    (unsigned int)voice.node, (unsigned int)voice.port, (unsigned int)voice.version);
+	}
+	if (voice.sub != 0 && voice.sub_generation != generation) {
+		voice_bind_subscription();
+		if (voice.generation != generation) {
+			return;
+		}
 	}
 	vayu_voice_qmi_indication_register_fill(&request, voice.ind_all != 0, voice.ind_invert != 0);
 	voice.register_tries++;
@@ -1486,12 +1566,22 @@ vayu_voice_start(struct vayu_qrtr *q)
 	uint32_t level = 0, wait_s = 30, poll_s = 0, dial_arg = 0, ind_all = 0, ind_invert = 0, dump_arg = 0;
 	uint32_t call_audio_arg = 0;
 	uint32_t auto_arg = 0, auto_delay = 30, auto_end = 45;
+	uint32_t sub = 0, sub_wire = 0, sub_len = 1;
+	bool sub_wire_given;
 
 	if (!PE_parse_boot_argn("vayu_call", &level, sizeof(level)) || level == 0) {
 		return 0;
 	}
 	if (level > 2) {
 		level = 2;
+	}
+	{
+		uint32_t qmux_arg = 0;
+
+		if (PE_parse_boot_argn("vayu_qmux", &qmux_arg, sizeof(qmux_arg)) && qmux_arg != 0 && level > 1) {
+			say("vayu-voice: vayu_qmux=1: CommCenter owns the calls; this client only listens (vayu_call=1)\n");
+			level = 1;
+		}
 	}
 	if (voice.started) {
 		say("vayu-voice: already started\n");
@@ -1542,6 +1632,19 @@ vayu_voice_start(struct vayu_qrtr *q)
 	if (auto_end > 600) {
 		auto_end = 600;
 	}
+	PE_parse_boot_argn("vayu_call_sub", &sub, sizeof(sub));
+	sub_wire_given = PE_parse_boot_argn("vayu_call_sub_wire", &sub_wire, sizeof(sub_wire));
+	PE_parse_boot_argn("vayu_call_sub_len", &sub_len, sizeof(sub_len));
+	if (sub > 2) {
+		say("vayu-voice: vayu_call_sub=%u is refused: 1 (primary) or 2 (secondary)\n", sub);
+		sub = 0;
+	}
+	if (!sub_wire_given || sub_wire > 255) {
+		sub_wire = sub;
+	}
+	if (sub_len != 4) {
+		sub_len = 1;
+	}
 	if (auto_arg != 0 && (level < 2 || dial_arg == 0)) {
 		say("vayu-voice: vayu_call_auto=1 needs vayu_call=2 and vayu_call_dial=1: the auto-dial is off\n");
 		auto_arg = 0;
@@ -1568,6 +1671,9 @@ vayu_voice_start(struct vayu_qrtr *q)
 	voice.auto_arg = auto_arg;
 	voice.auto_delay_s = auto_delay;
 	voice.auto_hold_s = auto_end;
+	voice.sub = sub;
+	voice.sub_wire = sub_wire;
+	voice.sub_len = sub_len;
 	voice.stop = false;
 	voice.running = true;
 	voice.state = VAYU_VOICE_WAITING;
@@ -1575,6 +1681,10 @@ vayu_voice_start(struct vayu_qrtr *q)
 	say("vayu-voice: vayu_call=%u vayu_call_wait=%u vayu_call_poll=%u vayu_call_dial=%u "
 	    "vayu_call_ind_all=%u vayu_call_ind_invert=%u vayu_call_dump=%u\n", level, wait_s, poll_s,
 	    dial_arg, ind_all, ind_invert, dump_arg);
+	if (voice.sub != 0) {
+		say("vayu-voice: vayu_call_sub=%u: VOICE Bind Subscription (TLV 0x01 = %u as a u%u) before the indication "
+		    "register\n", sub, sub_wire, sub_len * 8);
+	}
 	if (voice.call_audio) {
 		say("vayu-voice: vayu_call_audio=1: the q6voice path follows the call (CONVERSATION: up, "
 		    "none: down); it needs vayu_audio>=3, vayu_jack>=2 and the audio module's hold window\n");
@@ -1636,4 +1746,166 @@ vayu_voice_stop(void)
 		    (unsigned int)voice.indications, (unsigned int)voice.requests, (unsigned int)voice.failures,
 		    VAYU_VOICE_DEVICE);
 	}
+}
+
+/* ---- the baseband side: Apple's QMI Audio Service 0xE1 for CommCenter (vayu_call_bb=1) ---------- */
+
+/*
+ * sys/vayu_voice_bb.h has the why and the message table.  The QMux bridge (bsd/dev/vayu_qmux.c)
+ * hands us the requests of the clients it allocated for 0xE1; the answers go back synchronously,
+ * the indications that follow some of them (BurstDtmfTone, StopTone) through a thread call, so
+ * that the bridge is never re-entered from inside its own request path.
+ */
+#define VOICE_BB_PENDING        8
+
+struct voice_bb_pending {
+	uint8_t service, client;
+	uint8_t length;
+	uint8_t sdu[VAYU_VOICE_BB_IND_MAX];
+};
+
+static struct {
+	bool parsed, on, trace;
+	vayu_voice_bb_deliver_t deliver;
+	thread_call_t call;
+	struct voice_bb_pending pending[VOICE_BB_PENDING];
+	uint32_t head, tail;
+	uint32_t requests, errors, dropped;
+} voice_bb;
+
+static LCK_GRP_DECLARE(vayu_voice_bb_lck_grp, "vayu-voice-bb");
+static LCK_SPIN_DECLARE(vayu_voice_bb_lock, &vayu_voice_bb_lck_grp);
+
+static void
+voice_bb_args(void)
+{
+	uint32_t on = 0, trace = 0;
+
+	if (voice_bb.parsed) {
+		return;
+	}
+	PE_parse_boot_argn("vayu_call_bb", &on, sizeof(on));
+	PE_parse_boot_argn("vayu_call_bb_trace", &trace, sizeof(trace));
+	voice_bb.on = on != 0;
+	voice_bb.trace = trace != 0;
+	voice_bb.parsed = true;
+	if (voice_bb.on) {
+		say("vayu-voice: vayu_call_bb=1: Apple's QMI Audio Service 0xe1 is answered here for CommCenter "
+		    "(vayu_call_bb_trace=%u)\n", trace != 0 ? 1 : 0);
+	}
+}
+
+static void
+voice_bb_flush(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
+{
+	for (;;) {
+		struct voice_bb_pending one;
+		vayu_voice_bb_deliver_t deliver;
+
+		lck_spin_lock(&vayu_voice_bb_lock);
+		if (voice_bb.head == voice_bb.tail) {
+			lck_spin_unlock(&vayu_voice_bb_lock);
+			return;
+		}
+		one = voice_bb.pending[voice_bb.tail % VOICE_BB_PENDING];
+		voice_bb.tail++;
+		deliver = voice_bb.deliver;
+		lck_spin_unlock(&vayu_voice_bb_lock);
+		if (deliver != NULL) {
+			deliver(one.service, one.client, one.sdu, one.length);
+		}
+	}
+}
+
+bool
+vayu_voice_bb_local(uint8_t service)
+{
+	voice_bb_args();
+	return voice_bb.on && service == VAYU_VOICE_BB_SVC_AUDIO;
+}
+
+void
+vayu_voice_bb_attach(vayu_voice_bb_deliver_t deliver)
+{
+	voice_bb_args();
+	if (voice_bb.call == NULL) {
+		voice_bb.call = thread_call_allocate(voice_bb_flush, NULL);
+	}
+	lck_spin_lock(&vayu_voice_bb_lock);
+	voice_bb.deliver = deliver;
+	lck_spin_unlock(&vayu_voice_bb_lock);
+}
+
+void
+vayu_voice_bb_release(uint8_t service, uint8_t client)
+{
+	if (!vayu_voice_bb_local(service)) {
+		return;
+	}
+	lck_spin_lock(&vayu_voice_bb_lock);
+	for (uint32_t i = voice_bb.tail; i != voice_bb.head; i++) {
+		struct voice_bb_pending *one = &voice_bb.pending[i % VOICE_BB_PENDING];
+
+		if (one->service == service && one->client == client) {
+			one->length = 0;        /* (delivered as nothing: deliver() is not called for it) */
+		}
+	}
+	lck_spin_unlock(&vayu_voice_bb_lock);
+}
+
+int
+vayu_voice_bb_request(uint8_t service, uint8_t client, const uint8_t *sdu, size_t length, uint8_t *answer,
+    size_t answer_size, size_t *answer_length)
+{
+	struct vayu_voice_bb_out out;
+	struct vayu_voice_bb_effect effect;
+	bool queued = false;
+
+	if (!vayu_voice_bb_local(service) || answer == NULL || answer_length == NULL) {
+		return -ENOTSUP;
+	}
+	if (vayu_voice_bb_audio_handle(sdu, length, &out, &effect) != 0 || out.answer_length > answer_size) {
+		voice_bb.errors++;
+		return -EINVAL;
+	}
+	memcpy(answer, out.answer, out.answer_length);
+	*answer_length = out.answer_length;
+	voice_bb.requests++;
+
+	if (out.indication_length != 0 && voice_bb.call != NULL) {
+		lck_spin_lock(&vayu_voice_bb_lock);
+		if (voice_bb.head - voice_bb.tail < VOICE_BB_PENDING) {
+			struct voice_bb_pending *one = &voice_bb.pending[voice_bb.head % VOICE_BB_PENDING];
+
+			one->service = service;
+			one->client = client;
+			one->length = (uint8_t)out.indication_length;
+			memcpy(one->sdu, out.indication, out.indication_length);
+			voice_bb.head++;
+			queued = true;
+		} else {
+			voice_bb.dropped++;
+		}
+		lck_spin_unlock(&vayu_voice_bb_lock);
+		if (queued) {
+			thread_call_enter(voice_bb.call);
+		}
+	}
+
+	/* what the request asks of the call's path: the audio module's worker does it */
+	if (effect.flags & VAYU_VOICE_BB_EFFECT_PATH) {
+		vayu_audio_call_audio_path(effect.downlink, effect.uplink);
+	}
+	if (effect.flags & VAYU_VOICE_BB_EFFECT_VOLUME) {
+		vayu_audio_call_audio_volume(effect.volume_source, effect.volume_gain);
+	}
+	if (voice_bb.trace || out.error == VAYU_VOICE_BB_ERR_INVALID_QMI_CMD) {
+		say("vayu-voice: 0xe1 client %u: %s (0x%04x) -> %s%s%s\n", (unsigned int)client,
+		    vayu_voice_bb_audio_message_name(out.message), (unsigned int)out.message,
+		    out.error == 0 ? "success" : out.error == VAYU_VOICE_BB_ERR_NOT_SUPPORTED ? "NOT_SUPPORTED" :
+		    out.error == VAYU_VOICE_BB_ERR_MALFORMED ? "MALFORMED" : "INVALID_QMI_CMD",
+		    out.indication_length != 0 ? (queued ? ", indication queued" : ", indication DROPPED") : "",
+		    (effect.flags & VAYU_VOICE_BB_EFFECT_TTY) ? (effect.tty != 0 ? ", TTY on" : ", TTY off") : "");
+	}
+	return 0;
 }

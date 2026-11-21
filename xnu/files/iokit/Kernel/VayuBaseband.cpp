@@ -6,7 +6,12 @@
  * zeros, for an A/B against a caller that treats a failure as fatal), or
  * vayu_bb=3 (plausible answers read out of the 16.5 client: no reset, manager
  * started/stopped echoed back, valid self-identify, baseband booted; see the
- * table above VayuBBUserClient::externalMethod and REPORT.md section 1).
+ * table above VayuBBUserClient::externalMethod and REPORT.md section 1), or
+ * vayu_bb=4 (mode 3 plus the asynchronous half: after the first AppleBaseband
+ * user client opens, the baseband state is walked Not Booted -> Resetting ->
+ * Booting -> Booted -> IsReady, each step is sent to every IOGeneralInterest
+ * client of the AppleBaseband service with IOService::messageClients(), and
+ * sel 26 reports the current value; see REPORT.md section 2 of the bb4 run).
  *
  * What CommCenter asks for, and where that was read from (docs/research/
  * VAYU_APPLE_BASEBAND_ABI.md has the addresses and the full tables):
@@ -36,11 +41,13 @@
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOKitKeys.h>
+#include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOReturn.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <kern/thread.h>
+#include <libkern/OSAtomic.h>
 #include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
@@ -84,10 +91,54 @@ static uint32_t gVayuBBExtra;
  *   sel 27 (set baseband state) is expected to be the driver telling itself the state;
  *   it is remembered and reported back by sel 26.
  */
-static uint32_t gVayuBBBasebandState = 4;       /* mode 3: value sel 26 reports */
+static uint32_t gVayuBBBasebandState = 4;       /* mode 3/4: value sel 26 reports */
 static uint32_t gVayuBBManagerState;            /* mode 3: last value set by sel 22 */
 static uint32_t gVayuBBSelfIdentify;            /* mode 3: number of 64-byte self-identifies seen */
 static char     gVayuBBSelfIdentifyText[64];    /* mode 3: the last one, printable only */
+
+/*
+ * Mode 4: the asynchronous half.
+ *
+ * The 16.5 client does not poll the baseband state while it waits for the modem: it
+ * registers an IOKit general-interest notification on the "AppleBaseband" service
+ * (IOServiceAddInterestNotification with "IOGeneralInterest", libTelephonyBasebandDynamic
+ * 0x1e9a4938c, callback 0x1e9a49448) and reacts to the message types the kext sends with
+ * IOService::messageClients().  The values that have a consumer in 16.5 are:
+ *
+ *   0xE3FF8000  "baseband reset detected"   ResetDetection 0x1b7f40dd0..0x1b7f40e88
+ *                                           ("Baseband state: reset detected");
+ *                                           CommCenter 0x100439cd0..0x100439d04
+ *   0xE3FF8001  "baseband alive detected"   same sites ("#I baseband alive detected")
+ *   0xE3FF8007  "wake asserted"             libTelephonyBasebandDynamic 0x1e9a49470..0x1e9a494a4
+ *   0xE3FF800D  "coredump ready"            libTelephonyBasebandDynamic 0x1e9a494d4..0x1e9a49508
+ *
+ * Messages with any other type are delivered to the block registered by
+ * TelephonyBasebandRegisterForReset and ignored by both consumers, so mode 4 sends
+ * 0xE3FF8002 (= 0xE3FF8000 + state 2 "Booting") and 0xE3FF8004 (+ state 4 "IsReady") only
+ * to make the transition visible in a client that logs the raw type.  The payload is the
+ * abm::BasebandState value, four bytes.
+ *
+ * The state numbers are the ones from libBasebandManager itself, not a guess: the
+ * "boot state changing %s -> %s" table in BootModule::changeState_sync (0x1b7eda1a0,
+ * table 0x1d90f1420) is indexed by the value directly, and BootModule::boot_sync indexes
+ * the same names with state-2 (0x1b7ee5a90, table 0x1d90f14f8).  The first entry of the
+ * direct table is "Not Booted", so:
+ *
+ *   0 Not Booted, 1 Resetting, 2 Booting, 3 Booted, 4 IsReady, 5 Boot Error,
+ *   6 Dead, 7 Shutting Down, 8 Shutdown.
+ *
+ * That also matches the code: boot_sync sets 2 ("Booting") before it powers the modem
+ * (0x1b7ee5aac, `mov w1,#2`), the boot-success path sets 3 ("Booted") at 0x1b7eea150,
+ * and finishInitialization turns 3 into 4 when it logs "Baseband state: transport is
+ * ready" (0x1b7ee2634..0x1b7ee2684).
+ */
+#define VAYU_BB_MSG_RESET   0xE3FF8000u
+#define VAYU_BB_MSG_ALIVE   0xE3FF8001u
+
+static uint32_t gVayuBBEventDelayMs = 5000;     /* mode 4: wait after the first client opens */
+static uint32_t gVayuBBEventsStarted;           /* mode 4: the walk is started once */
+static uint32_t gVayuBBAliveMs;                 /* mode 4: repeat 0xE3FF8001 every N ms (0 = off) */
+static uint32_t gVayuBBStateTarget = 4;         /* mode 4: last state of the walk */
 
 /* Per-selector call counters, printed as a one-line summary every VAYU_BB_SUMMARY_EVERY
  * calls.  The point is the tail of a run: which selectors were new, and how often the
@@ -119,13 +170,30 @@ static uint32_t gVayuBBPdpCalls;
  * a QMI message in the first place.
  */
 #define VAYU_BB_TRACE_SIZE 32768
+#define VAYU_BB_BOOT_SIZE  16384
 
 static char vayu_bb_trace_buf[VAYU_BB_TRACE_SIZE];
+/* The boot ring never forgets.  The tail ring above keeps the last 32 KB, which is the
+ * right thing for a long run; the first 16 KB are the only copy of "stubs up", "which
+ * user client opened" and the first selector, and msgbuf overwrites them long before the
+ * log is read.  This buffer stops appending when full, so those lines survive any msgbuf
+ * setting and any run length.  Read it as sysctl kern.vayu_bb_boot. */
+static char vayu_bb_boot_buf[VAYU_BB_BOOT_SIZE];
+static size_t vayu_bb_boot_used;
+
+/* One-line state for a dumper job: open counts and selector counts.  Rebuilt after every
+ * call (a few thousand in a run), so a reader always sees the latest summary. */
+static char vayu_bb_summary_buf[640];
+
 static LCK_GRP_DECLARE(vayu_bb_trace_lck_grp, "vayu-bb-trace");
 static LCK_MTX_DECLARE(vayu_bb_trace_lock, &vayu_bb_trace_lck_grp);
 
 SYSCTL_STRING(_kern, OID_AUTO, vayu_bb_trace, CTLFLAG_RD, vayu_bb_trace_buf,
     sizeof(vayu_bb_trace_buf), "VayuBaseband stub trace (IOLog lines, tail kept)");
+SYSCTL_STRING(_kern, OID_AUTO, vayu_bb_boot, CTLFLAG_RD, vayu_bb_boot_buf,
+    sizeof(vayu_bb_boot_buf), "VayuBaseband stub trace (the first 16 KB, never overwritten)");
+SYSCTL_STRING(_kern, OID_AUTO, vayu_bb_summary, CTLFLAG_RD, vayu_bb_summary_buf,
+    sizeof(vayu_bb_summary_buf), "VayuBaseband stub summary (open and selector counts)");
 
 static void
 vayu_bb_say(const char *format, ...) __printflike(1, 2);
@@ -172,8 +240,72 @@ vayu_bb_say(const char *format, ...)
 	}
 	memcpy(vayu_bb_trace_buf + used, line, length);
 	vayu_bb_trace_buf[used + length] = 0;
+
+	/* The first-16-KB ring: append while there is room, then stop for good. */
+	if (vayu_bb_boot_used + length + 1 <= VAYU_BB_BOOT_SIZE) {
+		memcpy(vayu_bb_boot_buf + vayu_bb_boot_used, line, length);
+		vayu_bb_boot_used += length;
+		vayu_bb_boot_buf[vayu_bb_boot_used] = 0;
+	}
 	lck_mtx_unlock(&vayu_bb_trace_lock);
 }
+
+/* Open counters: [0] AppleBaseband, [1] AppleIPAppender, [2] PCI control,
+ * [3] PCI data interface.  Declared here because vayu_bb_say/summary use them and the
+ * user client start() below increments them. */
+static uint32_t gVayuBBOpenCount[4];
+
+/* Build the one-line summary that a root job can read as kern.vayu_bb_summary.  It is
+ * deliberately narrow: open counts, call totals, the two state words and a compact list
+ * of the selectors that were actually used.  No payload, no identifiers. */
+static void
+vayu_bb_refresh_summary(void)
+{
+	char line[sizeof(vayu_bb_summary_buf)];
+	size_t used;
+	int written;
+
+	written = snprintf(line, sizeof(line),
+	    "opens bb=%u pdp=%u pci=%u iface=%u; calls bb=%u pdp=%u; state=%u mgr=%u; sel:",
+	    (unsigned) gVayuBBOpenCount[0], (unsigned) gVayuBBOpenCount[1],
+	    (unsigned) gVayuBBOpenCount[2], (unsigned) gVayuBBOpenCount[3],
+	    (unsigned) gVayuBBSelCalls, (unsigned) gVayuBBPdpCalls,
+	    (unsigned) gVayuBBBasebandState, (unsigned) gVayuBBManagerState);
+	if (written <= 0) {
+		return;
+	}
+	used = (size_t) written;
+
+	for (uint32_t i = 0; i < VAYU_BB_SEL_MAX && used + 12 < sizeof(line); i++) {
+		if (gVayuBBSelCount[i] == 0) {
+			continue;
+		}
+		written = snprintf(line + used, sizeof(line) - used, " %u=%u", (unsigned) i,
+		    (unsigned) gVayuBBSelCount[i]);
+		if (written <= 0) {
+			break;
+		}
+		used += (size_t) written;
+	}
+	for (uint32_t i = 0; i < VAYU_BB_PDP_MAX && used + 12 < sizeof(line); i++) {
+		if (gVayuBBPdpCount[i] == 0) {
+			continue;
+		}
+		written = snprintf(line + used, sizeof(line) - used, " p%u=%u", (unsigned) i,
+		    (unsigned) gVayuBBPdpCount[i]);
+		if (written <= 0) {
+			break;
+		}
+		used += (size_t) written;
+	}
+	lck_mtx_lock(&vayu_bb_trace_lock);
+	strlcpy(vayu_bb_summary_buf, line, sizeof(vayu_bb_summary_buf));
+	lck_mtx_unlock(&vayu_bb_trace_lock);
+}
+
+/* Mode 4/5: defined with the rest of the event code, after the services exist. */
+static void vayu_bb_start_events(void);
+static const char * vayu_bb_state_name(uint32_t state);
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
@@ -264,8 +396,16 @@ public:
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
+	/* Mode 4: the 16.5 baseband client does not call this (it uses
+	 * IOServiceAddInterestNotification on the service instead), but the call exists in
+	 * the IOKit ABI and "accept the port" is cheaper than a surprise. */
+	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type,
+	    io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
 	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
+
+	/* Mode 5: complete an IOConnectCallAsync* call now (see the definition). */
+	static void asyncDone(IOExternalMethodArguments * args, uint64_t value, bool hasValue);
 };
 
 OSDefineMetaClassAndStructors(VayuBBUserClient, IOUserClient);
@@ -289,9 +429,33 @@ VayuBBUserClient::start(IOService * provider)
 	}
 	vayu_bb_say("VayuBaseband: %s opened (type 0x%x, mode %u: %s)\n",
 	    getMetaClass()->getClassName(), (unsigned) fType, gVayuBBMode,
-	    gVayuBBMode == 3 ? "answers plausible success (vayu_bb=3)" :
-	    (gVayuBBMode == 2 ? "answers success with zeros" : "answers kIOReturnNotReady"));
+	    gVayuBBMode == 5 ? "answered as already booted; state events and the durable trace (vayu_bb=5)" :
+	    (gVayuBBMode == 4 ? "answers plausible success and sends state events (vayu_bb=4)" :
+	    (gVayuBBMode == 3 ? "answers plausible success (vayu_bb=3)" :
+	    (gVayuBBMode == 2 ? "answers success with zeros" : "answers kIOReturnNotReady"))));
+
+	if (fKind < 4) {
+		gVayuBBOpenCount[fKind]++;
+	}
+	vayu_bb_refresh_summary();
+
+	if (gVayuBBMode >= 4 && fKind == 0) {
+		/* First controller client: the kext would have a listener for its events
+		 * from now on.  The walk itself is idempotent and time-delayed. */
+		vayu_bb_start_events();
+	}
 	return true;
+}
+
+IOReturn
+VayuBBUserClient::registerNotificationPort(mach_port_t port, UInt32 type,
+    io_user_reference_t refCon)
+{
+	vayu_bb_say("VayuBaseband: %s registerNotificationPort(type %u, port 0x%llx, ref %llu) "
+	    "accepted (events are delivered through IOGeneralInterest)\n",
+	    getMetaClass()->getClassName(), (unsigned) type,
+	    (unsigned long long)(uintptr_t) port, (unsigned long long) refCon);
+	return kIOReturnSuccess;
 }
 
 IOReturn
@@ -333,6 +497,46 @@ vayu_bb_struct_out_zero(IOExternalMethodArguments * args, uint32_t bytes)
 	} else {
 		args->structureOutputSize = 0;
 	}
+}
+
+/* Mode 5: zero-fill an out-of-line output buffer.  libIOABP's readAsync passes the user
+ * buffer this way; a stub that refuses the descriptor makes the transport look broken, so
+ * fill it with zeros and let the caller move on.  Nothing is read from the modem here. */
+static void
+vayu_bb_zero_descriptor(IOMemoryDescriptor * descriptor, IOByteCount bytes)
+{
+	char zeros[512];
+	IOByteCount offset = 0;
+
+	if (descriptor == NULL || bytes == 0) {
+		return;
+	}
+	bzero(zeros, sizeof(zeros));
+	while (offset < bytes) {
+		IOByteCount chunk = bytes - offset;
+
+		if (chunk > sizeof(zeros)) {
+			chunk = sizeof(zeros);
+		}
+		if (descriptor->writeBytes(offset, zeros, chunk) != chunk) {
+			break;
+		}
+		offset += chunk;
+	}
+}
+
+/* Mode 5: finish an IOConnectCallAsync* call now.  libIOABP's readAsync/writeAsync are
+ * asynchronous; without a result the client's callback never fires and the transport
+ * open times out.  One scalar (bytes, or 0 for "no data yet") is what its callback reads.
+ * A member function because IOUserClient::sendAsyncResult64 is protected. */
+void
+VayuBBUserClient::asyncDone(IOExternalMethodArguments * args, uint64_t value, bool hasValue)
+{
+	if (args->asyncReference == NULL || args->asyncReferenceCount < 2) {
+		return;
+	}
+	sendAsyncResult64((io_user_reference_t *) args->asyncReference, kIOReturnSuccess,
+	    hasValue ? &value : NULL, hasValue ? 1 : 0);
 }
 
 /* Which property ids ABM asks for is not reversed; every one answers 0 ("not set"), which is
@@ -394,6 +598,7 @@ vayu_bb_note_call(uint32_t kind, uint32_t selector)
 		used += (size_t) written;
 	}
 	vayu_bb_say("%s\n", line);
+	vayu_bb_refresh_summary();
 }
 
 IOReturn
@@ -408,9 +613,15 @@ VayuBBUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * 
 		name = vayu_pdp_selector_name(selector);
 		who = "ApplePDPHelperInterface";
 	} else if (fKind == 2) {
-		/* The PCI control interface's selectors were not reversed. */
+		/* The PCI control interface's selectors were not reversed; they are logged by
+		 * number and answered success in mode 5. */
 		name = NULL;
 		who = "AppleBasebandPCIControlClient";
+	} else if (fKind == 3) {
+		/* libIOABP's data class (AppleBasebandPCIInterface): selectors 2 and 3 are
+		 * writeAsync/readAsync, the rest are the channel and memory calls. */
+		name = NULL;
+		who = "AppleBasebandPCIInterfaceClient";
 	} else {
 		name = vayu_bb_selector_name(selector);
 		who = "AppleBasebandUserClient";
@@ -440,16 +651,16 @@ VayuBBUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * 
 	    (unsigned long long) (args->scalarInput != NULL && args->scalarInputCount > 3 ?
 	    args->scalarInput[3] : 0));
 
-	if (name == NULL && fKind != 2) {
+	if (name == NULL && fKind != 2 && fKind != 3) {
 		/* Not one of the selectors the 16.5 caller was seen to use. */
 		args->scalarOutputCount = 0;
 		args->structureOutputSize = 0;
 		return kIOReturnUnsupported;
 	}
-	if (mode == 3) {
+	if (mode >= 3) {
 		vayu_bb_note_call(fKind, selector);
 	}
-	if (mode != 2 && mode != 3) {
+	if (mode != 2 && mode != 3 && mode != 4 && mode != 5) {
 		/* The stub knows the request (or, for the PCI control, does not) and has no hardware. */
 		args->scalarOutputCount = 0;
 		args->structureOutputSize = 0;
@@ -460,8 +671,30 @@ VayuBBUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * 
 	 * Modes 2 and 3: a well-formed answer.  Out-of-line output is not touched -- no caller
 	 * seen in 16.5 asks for one of these structures out of line, and writing a user's
 	 * memory descriptor from a stub is not worth the code until one does.
+	 *
+	 * Mode 5 does touch it: libIOABP's data class passes readAsync's destination there,
+	 * and the transport only needs the call to complete.  Zeros, never modem data.
 	 */
 	if (args->structureOutputDescriptor != NULL) {
+		if (mode == 5 && (fKind == 2 || fKind == 3)) {
+			vayu_bb_zero_descriptor(args->structureOutputDescriptor,
+			    args->structureOutputDescriptorSize);
+			args->scalarOutputCount = 0;
+			args->structureOutputSize = 0;
+			vayu_bb_say("VayuBaseband: %s selector %u: out-of-line output %llu bytes "
+			    "zero-filled (mode 5)\n", who, (unsigned) selector,
+			    (unsigned long long) args->structureOutputDescriptorSize);
+			if (fKind == 3) {
+				/* This is how libIOABP posts readAsync (buf/size in the
+				 * descriptor).  Do not complete it at once: see the note in
+				 * the data-class block below. */
+				if (selector == 3 && args->asyncReference != NULL) {
+					IOSleep(10);
+				}
+				asyncDone(args, 0, true);
+			}
+			return kIOReturnSuccess;
+		}
 		args->scalarOutputCount = 0;
 		args->structureOutputSize = 0;
 		return kIOReturnUnsupported;
@@ -511,6 +744,90 @@ VayuBBUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * 
 	 *    selector instead of failing on the first one; nothing is mapped and nothing is
 	 *    read from the modem.
 	 */
+	/*
+	 * Mode 5, the libIOABP data class (AppleBasebandPCIInterface).  Selectors 0..12 are
+	 * the channel/memory calls; 2 is writeAsync, 3 readAsync.  Nothing is transferred to
+	 * the modem through this path in this build: the QMux seam in userland carries the
+	 * frames over /dev/vayu-qmux.  A call that completes is what the transport needs to
+	 * reach "open"; an async call that never completes would leave it waiting forever.
+	 */
+	if (mode == 5 && fKind == 3) {
+		uint64_t out = 0;
+
+		if (selector == 3) {
+			/*
+			 * readAsync: no data in this stub; 0 bytes is a legal short read.
+			 * An immediate completion makes libIOABP re-arm at once, which is a
+			 * userspace busy loop (the same shape as the "burning CPU" thread
+			 * reported in d-1081).  Throttle it: the QMux seam, not this class,
+			 * carries the modem frames.
+			 */
+			out = 0;
+			if (args->asyncReference != NULL) {
+				IOSleep(10);
+			}
+		} else if (selector == 2) {
+			/* writeAsync: report the whole buffer as accepted. */
+			out = (args->scalarInput != NULL && args->scalarInputCount > 1) ?
+			    args->scalarInput[1] : 0;
+			if (args->structureInputDescriptor != NULL) {
+				out = args->structureInputDescriptor->getLength();
+			}
+		}
+		if (args->scalarOutput != NULL && args->scalarOutputCount > 0) {
+			args->scalarOutput[0] = out;
+			args->scalarOutputCount = 1;
+		} else {
+			args->scalarOutputCount = 0;
+		}
+		args->structureOutputSize = 0;
+		vayu_bb_say("VayuBaseband: AppleBasebandPCIInterfaceClient selector %u -> "
+		    "success %llu (mode 5, async=%s)\n", (unsigned) selector,
+		    (unsigned long long) out, args->asyncReference != NULL ? "yes" : "no");
+		if (args->asyncReference != NULL) {
+			asyncDone(args, out, true);
+		}
+		return kIOReturnSuccess;
+	}
+
+	/* Mode 5, the PCI control class: every selector the 16.5 client can send is answered
+	 * success.  The selectors were not reversed; the log records the numbers, and a
+	 * zero output is the "nothing attached, nothing logged" answer a quiet control
+	 * channel would give. */
+	if (mode == 5 && fKind == 2) {
+		uint64_t out = 0;
+
+		if (selector == 3) {
+			/* getLastKnownBootStage / getLogInternalBufferSize share this number
+			 * in IOABPControlClass; a booted baseband and a 4 KB log buffer are
+			 * both plausible and non-zero (the caller only checks success). */
+			out = 0x1000;
+		}
+		if (args->scalarOutput != NULL && args->scalarOutputCount > 0) {
+			bzero(args->scalarOutput,
+			    (size_t) args->scalarOutputCount * sizeof(uint64_t));
+			args->scalarOutput[0] = out;
+		} else if (args->scalarOutput != NULL) {
+			args->scalarOutput[0] = out;
+			args->scalarOutputCount = 1;
+		} else {
+			args->scalarOutputCount = 0;
+		}
+		if (args->structureOutput != NULL && args->structureOutputSize != 0) {
+			bzero(args->structureOutput, args->structureOutputSize);
+		}
+		args->structureOutputSize = 0;
+		vayu_bb_say("VayuBaseband: AppleBasebandPCIControlClient selector %u -> success "
+		    "(mode 5, scalars in %u out %u, struct in %u, async=%s)\n", (unsigned) selector,
+		    (unsigned) args->scalarInputCount, (unsigned) args->scalarOutputCount,
+		    (unsigned) args->structureInputSize,
+		    args->asyncReference != NULL ? "yes" : "no");
+		if (args->asyncReference != NULL) {
+			asyncDone(args, 0, true);
+		}
+		return kIOReturnSuccess;
+	}
+
 	if (fKind == 2) {
 		if (selector > 12) {
 			args->scalarOutputCount = 0;
@@ -547,13 +864,20 @@ VayuBBUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * 
 	}
 
 	switch (selector) {
+	case 1:                 /* power on modem: the call that starts the boot flow */
+		vayu_bb_say("VayuBaseband: power on modem accepted (mode %u); baseband state %u (%s)\n",
+		    (unsigned) mode, (unsigned) gVayuBBBasebandState,
+		    vayu_bb_state_name(gVayuBBBasebandState));
+		args->scalarOutputCount = 0;
+		args->structureOutputSize = 0;
+		break;
 	case 3:                 /* get reset: no reset */
 		vayu_bb_scalar_out(args, 0);
 		vayu_bb_say("VayuBaseband: get reset -> success, reset 0\n");
 		break;
 	case 6:                 /* powercycle modem: accepted, no hardware behind it */
-		vayu_bb_say("VayuBaseband: powercycle modem accepted (mode 3); baseband state %u\n",
-		    (unsigned) gVayuBBBasebandState);
+		vayu_bb_say("VayuBaseband: powercycle modem accepted (mode %u); baseband state %u\n",
+		    (unsigned) mode, (unsigned) gVayuBBBasebandState);
 		args->scalarOutputCount = 0;
 		args->structureOutputSize = 0;
 		break;
@@ -610,15 +934,15 @@ VayuBBUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * 
 		break;
 	case 26:                /* get baseband state */
 		vayu_bb_scalar_out(args, gVayuBBBasebandState);
-		vayu_bb_say("VayuBaseband: get baseband state -> %u\n",
-		    (unsigned) gVayuBBBasebandState);
+		vayu_bb_say("VayuBaseband: get baseband state -> %u (%s)\n",
+		    (unsigned) gVayuBBBasebandState, vayu_bb_state_name(gVayuBBBasebandState));
 		break;
 	case 27:                /* set baseband state */
 		gVayuBBBasebandState = (uint32_t) in0;
 		args->scalarOutputCount = 0;
 		args->structureOutputSize = 0;
-		vayu_bb_say("VayuBaseband: baseband state set to %u\n",
-		    (unsigned) gVayuBBBasebandState);
+		vayu_bb_say("VayuBaseband: baseband state set to %u (%s)\n",
+		    (unsigned) gVayuBBBasebandState, vayu_bb_state_name(gVayuBBBasebandState));
 		break;
 	case 28:                /* get baseband property */
 		vayu_bb_scalar_out(args, vayu_bb_baseband_property(in0));
@@ -649,6 +973,16 @@ class AppleBasebandPCIControlClient : public VayuBBUserClient
 };
 
 OSDefineMetaClassAndStructors(AppleBasebandPCIControlClient, VayuBBUserClient);
+
+/* Mode 5: the data class of libIOABP (AppleBasebandPCIInterface).  A separate
+ * IOUserClient subclass only so the trace says which half opened; the method body is the
+ * shared VayuBBUserClient::externalMethod with fKind 3. */
+class AppleBasebandPCIInterfaceClient : public VayuBBUserClient
+{
+	OSDeclareDefaultStructors(AppleBasebandPCIInterfaceClient);
+};
+
+OSDefineMetaClassAndStructors(AppleBasebandPCIInterfaceClient, VayuBBUserClient);
 
 class ApplePDPHelperInterface : public VayuBBUserClient
 {
@@ -687,6 +1021,9 @@ VayuBBService::newUserClient(task_t owningTask, void * securityID, UInt32 type,
 		break;
 	case 2:
 		client = OSTypeAlloc(AppleBasebandPCIControlClient);
+		break;
+	case 3:
+		client = OSTypeAlloc(AppleBasebandPCIInterfaceClient);
 		break;
 	default:
 		client = OSTypeAlloc(AppleBasebandUserClient);
@@ -760,7 +1097,7 @@ class AppleBasebandPCIInterface : public VayuBBService
 	OSDeclareDefaultStructors(AppleBasebandPCIInterface);
 
 protected:
-	virtual uint32_t vayuKind(void) const APPLE_KEXT_OVERRIDE { return 2; }
+	virtual uint32_t vayuKind(void) const APPLE_KEXT_OVERRIDE { return 3; }
 };
 
 OSDefineMetaClassAndStructors(AppleBasebandPCIInterface, VayuBBService);
@@ -822,6 +1159,158 @@ vayu_bb_publish(IOService * service, IOService * provider, const char * name,
 	return service;
 }
 
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/* The abm::BasebandState names, in the order that libBasebandManager indexes them
+ * (BootModule::changeState_sync, table 0x1d90f1420; see the block comment above). */
+static const char *
+vayu_bb_state_name(uint32_t state)
+{
+	switch (state) {
+	case 0:  return "Not Booted";
+	case 1:  return "Resetting";
+	case 2:  return "Booting";
+	case 3:  return "Booted";
+	case 4:  return "IsReady";
+	case 5:  return "Boot Error";
+	case 6:  return "Dead";
+	case 7:  return "Shutting Down";
+	case 8:  return "Shutdown";
+	default: return "Unknown";
+	}
+}
+
+/* Tell every IOGeneralInterest client of the AppleBaseband service that the baseband
+ * state changed.  This is the kernel end of IOServiceAddInterestNotification: the client
+ * owns the notification port (IONotificationPortCreate), IOKit wraps it in an
+ * IOServiceMessageUserNotification, and messageClients() posts one mach message per
+ * registered client.  The message type is the AppleBaseband message id, the payload is
+ * the abm::BasebandState value (4 bytes).  Nothing is sent when no client is registered
+ * -- messageClients() then just walks an empty notifier list. */
+static void
+vayu_bb_notify_state(uint32_t state)
+{
+	uint32_t message;
+	uint32_t payload = state;
+	IOReturn result;
+
+	switch (state) {
+	case 1:
+		/* "Reset detected": the only type ABM treats as "the baseband is rebooting". */
+		message = VAYU_BB_MSG_RESET;
+		break;
+	case 3:
+		/* "Alive": ABM's ResetDetection logs "#I baseband alive detected" for this
+		 * one, so it is the closest thing 16.5 has to a "baseband booted" event. */
+		message = VAYU_BB_MSG_ALIVE;
+		break;
+	case 2:
+	case 4:
+		/* No consumer in 16.5 (both callbacks ignore unknown types); sent so the
+		 * transition is visible if anything ever logs the raw message type. */
+		message = VAYU_BB_MSG_RESET + state;
+		break;
+	default:
+		return;
+	}
+
+	if (gBaseband == NULL) {
+		vayu_bb_say("VayuBaseband: mode %u: no AppleBaseband service; state %u not sent\n",
+		    (unsigned) gVayuBBMode, (unsigned) state);
+		return;
+	}
+
+	result = gBaseband->messageClients(message, &payload, sizeof(payload));
+	vayu_bb_say("VayuBaseband: mode %u: state -> %u (%s), messageClients(0x%08x, %u) = 0x%x\n",
+	    (unsigned) gVayuBBMode, (unsigned) state, vayu_bb_state_name(state),
+	    (unsigned) message, (unsigned) state, (unsigned) result);
+}
+
+/* Mode 4 walk.  It starts when the first AppleBaseband user client opens (that is the
+ * point where a client exists to receive the notification), waits vayu_bb_delay ms so
+ * the client has finished registering its port, then moves the state forward.  Each step
+ * is one message (see vayu_bb_notify_state) and one change of what sel 26 reports. */
+static void
+vayu_bb_events_thread(void * arg, wait_result_t result)
+{
+	static const uint32_t states[] = { 1, 2, 3, 4 };
+	uint32_t target = gVayuBBStateTarget > 4 ? 4 : gVayuBBStateTarget;
+	uint32_t i;
+
+	(void) arg;
+	(void) result;
+
+	IOSleep(gVayuBBEventDelayMs);
+	vayu_bb_say("VayuBaseband: mode %u: starting the state walk after %u ms (target %u %s)\n",
+	    (unsigned) gVayuBBMode, (unsigned) gVayuBBEventDelayMs, (unsigned) target,
+	    vayu_bb_state_name(target));
+
+	if (gVayuBBMode >= 5) {
+		/* Mode 5 presents a baseband that is already up: no reset, no "Booting".
+		 * ABM's own state machine is what boots the modem on a real iPhone, and this
+		 * port has no Apple firmware to give it; the userland side (libvayu-abm)
+		 * tells ABM the boot is done.  What the kext must do is not contradict that:
+		 * answer sel 26 with Booted from the first call, then send "alive" and move
+		 * to IsReady once a client is attached. */
+		gVayuBBBasebandState = 3;
+		if (gBaseband != NULL) {
+			gBaseband->setProperty("BasebandState", (unsigned long long) 3, 32);
+		}
+		vayu_bb_notify_state(3);
+		IOSleep(800);
+		gVayuBBBasebandState = target;
+		if (gBaseband != NULL) {
+			gBaseband->setProperty("BasebandState", (unsigned long long) target, 32);
+		}
+		if (target > 3) {
+			vayu_bb_notify_state(target);
+		}
+	} else {
+		for (i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
+			uint32_t state = states[i];
+
+			gVayuBBBasebandState = state;
+			if (gBaseband != NULL) {
+				gBaseband->setProperty("BasebandState", (unsigned long long) state, 32);
+			}
+			vayu_bb_notify_state(state);
+
+			if (state >= target) {
+				break;
+			}
+			/* Short, but long enough for a client that logs a transition to see two
+			 * different values if it samples sel 26 in between. */
+			IOSleep(state == 1 ? 500 : (state == 2 ? 1000 : 1500));
+		}
+	}
+
+	if (gVayuBBAliveMs != 0) {
+		for (;;) {
+			IOSleep(gVayuBBAliveMs);
+			vayu_bb_notify_state(3);
+		}
+	}
+}
+
+static void
+vayu_bb_start_events(void)
+{
+	thread_t thread = NULL;
+
+	if (gVayuBBMode < 4) {
+		return;
+	}
+	if (!OSCompareAndSwap(0, 1, &gVayuBBEventsStarted)) {
+		return;
+	}
+	if (kernel_thread_start(vayu_bb_events_thread, NULL, &thread) != KERN_SUCCESS) {
+		vayu_bb_say("VayuBaseband: mode %u: cannot start the state walk thread\n",
+		    (unsigned) gVayuBBMode);
+		return;
+	}
+	thread_deallocate(thread);
+}
+
 static void
 vayu_bb_register(IOService * platform)
 {
@@ -841,6 +1330,19 @@ vayu_bb_register(IOService * platform)
 	    "AppleBaseband", "com.apple.driver.AppleBasebandPCI", "AppleBasebandUserClient");
 	if (gBaseband == NULL) {
 		vayu_bb_say("VayuBaseband: no AppleBaseband nub\n");
+	} else if (gVayuBBMode >= 5) {
+		/* libTelephonyBasebandDynamic has one optional lookup by registry name
+		 * (IOServiceNameMatching("baseband"), 0x1e9a4ae2c) next to the class match.
+		 * Class matching is independent of the name, so renaming the same object
+		 * costs nothing and covers that path too.  vayu_bb_named=0 turns it off. */
+		uint32_t named = 1;
+
+		PE_parse_boot_argn("vayu_bb_named", &named, sizeof(named));
+		if (named != 0) {
+			gBaseband->setName("baseband");
+			vayu_bb_say("VayuBaseband: mode 5: the AppleBaseband nub is also named "
+			    "\"baseband\" (IOServiceNameMatching)\n");
+		}
 	}
 
 	/* libPCITransport's isServicePresent() probes this one before it picks a transport. */
@@ -860,15 +1362,16 @@ vayu_bb_register(IOService * platform)
 		}
 	}
 
-	/* The data half of libIOABP; mode 3 only (see the class comment above). */
-	if (gVayuBBMode == 3) {
+	/* The data half of libIOABP; mode 3 and 4 (see the class comment above). */
+	if (gVayuBBMode >= 3) {
 		gInterface = (AppleBasebandPCIInterface *) vayu_bb_publish(
 		    OSTypeAlloc(AppleBasebandPCIInterface), gPCI, "AppleBasebandPCIInterface",
-		    "com.apple.driver.AppleBasebandPCI", "AppleBasebandPCIControlClient");
+		    "com.apple.driver.AppleBasebandPCI", "AppleBasebandPCIInterfaceClient");
 		if (gInterface == NULL) {
 			vayu_bb_say("VayuBaseband: no AppleBasebandPCIInterface\n");
 		} else {
-			vayu_bb_say("VayuBaseband: AppleBasebandPCIInterface up (mode 3: libIOABP data class)\n");
+			vayu_bb_say("VayuBaseband: AppleBasebandPCIInterface up (mode %u: libIOABP data class)\n",
+			    (unsigned) gVayuBBMode);
 		}
 	}
 
@@ -918,8 +1421,10 @@ vayu_bb_init(void)
 	if (!PE_parse_boot_argn("vayu_bb", &mode, sizeof(mode)) || mode == 0) {
 		return;
 	}
-	if (mode > 3) {
-		vayu_bb_say("VayuBaseband: vayu_bb=%u is not 1 (refuse), 2 (zeros) or 3 (plausible); using 1\n", mode);
+	if (mode > 5) {
+		vayu_bb_say("VayuBaseband: vayu_bb=%u is not 1 (refuse), 2 (zeros), 3 (plausible), "
+		    "4 (plausible + state events) or 5 (booted baseband + events + durable trace); "
+		    "using 1\n", mode);
 		mode = 1;
 	}
 	gVayuBBMode = mode;
@@ -929,17 +1434,53 @@ vayu_bb_init(void)
 		gVayuBBExtra = extra != 0;
 	}
 
-	/* Mode 3 only: the scalar sel 26 reports.  4 is "Booted" in the abm::BasebandBootState
-	 * string order found in libBasebandManager (REPORT.md section 2, HYPOTHESIS); a run can
-	 * sweep it without a new kernel. */
+	/* Mode 3: the scalar sel 26 reports.  The value is the abm::BasebandState enum that
+	 * libBasebandManager itself uses (0 Not Booted, 1 Resetting, 2 Booting, 3 Booted,
+	 * 4 IsReady, 5 Boot Error, 6 Dead, 7 Shutting Down, 8 Shutdown; see the table above
+	 * vayu_bb_notify_state).  Mode 4 starts at 0 and walks to this value. */
 	uint32_t bbstate = 0;
-	if (PE_parse_boot_argn("vayu_bb_bbstate", &bbstate, sizeof(bbstate))) {
+	bool have_bbstate = PE_parse_boot_argn("vayu_bb_bbstate", &bbstate, sizeof(bbstate)) != 0;
+	if (mode == 4) {
+		/* Mode 4 shows the transition: the first answer is "Not Booted" and the walk
+		 * ends at 4 ("IsReady", the state ABM sets once it considers the transport
+		 * up: 0x1b7ee2684 in finishInitialization_sync).  vayu_bb_bbstate=N moves
+		 * the end of the walk. */
+		gVayuBBBasebandState = 0;
+		gVayuBBStateTarget = have_bbstate ? bbstate : 4;
+	} else if (mode == 5) {
+		/* Mode 5 presents a booted baseband from the first selector: 3 (Booted) is
+		 * what ABM reads as "the modem is already up", and the event thread then
+		 * sends "alive" and moves to 4 (IsReady).  vayu_bb_bbstate=N moves the end. */
+		gVayuBBBasebandState = have_bbstate ? bbstate : 3;
+		gVayuBBStateTarget = have_bbstate ? bbstate : 4;
+	} else if (have_bbstate) {
 		gVayuBBBasebandState = bbstate;
 	}
 
-	vayu_bb_say("VayuBaseband: vayu_bb=%u%s: registering the CommCenter stubs%s\n", mode,
+	/* Mode 4/5 timing: how long after the first controller client opens the walk starts,
+	 * and an optional "alive" heartbeat afterwards (0 = one-shot walk). */
+	uint32_t delay = 0;
+	if (PE_parse_boot_argn("vayu_bb_delay", &delay, sizeof(delay))) {
+		gVayuBBEventDelayMs = delay;
+	} else if (mode >= 5) {
+		gVayuBBEventDelayMs = 1500;
+	}
+	uint32_t alive = 0;
+	if (PE_parse_boot_argn("vayu_bb_alive", &alive, sizeof(alive))) {
+		gVayuBBAliveMs = alive;
+	} else if (mode >= 5) {
+		gVayuBBAliveMs = 20000;        /* one "baseband alive" every 20 s */
+	}
+	if (mode >= 4 && gVayuBBEventDelayMs > 600000) {
+		gVayuBBEventDelayMs = 600000;
+	}
+
+	vayu_bb_say("VayuBaseband: vayu_bb=%u%s: registering the CommCenter stubs (k31-stockcell2)%s\n", mode,
 	    gVayuBBExtra ? " extra=1 (also AppleConvergedIPCBBControl)" : "",
-	    mode == 3 ? "; mode 3 answers: reset 0, manager echo, self-identify ok, baseband state" : "");
+	    mode == 3 ? "; mode 3 answers: reset 0, manager echo, self-identify ok, baseband state" :
+	    (mode == 4 ? "; mode 4 answers like mode 3 and walks NotBooted->Resetting->Booting->Booted->IsReady" :
+	    (mode == 5 ? "; mode 5 presents Booted/IsReady, sends alive, answers every PCI "
+	    "selector, and keeps the first 16 KB of this trace in kern.vayu_bb_boot" : "")));
 
 	/* Usually the platform expert is already there by bsd_init(); if not, wait in a thread. */
 	if (IOService::getPlatform() != NULL && IOService::getRegistryRoot() != NULL) {

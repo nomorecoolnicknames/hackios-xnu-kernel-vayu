@@ -59,6 +59,13 @@
  *                          packet. The controller holds the line high until it is read, so a packet
  *                          is only later, not lost; 500 wakes a second for as long as nfcd runs is
  *                          what the 2 ms cost.
+ *   vayu_nfc_frame258=1    (NFC-1; default 0: 255 as before) a whole NCI frame may be 258 bytes,
+ *                          3 + the 255-byte payload the PN553 announces in CORE_INIT_RSP; the
+ *                          old limit of 255 counted the header too, so a full-size segment from
+ *                          nfcd came back EIO. Every buffer here is NFC_BUF (260) already.
+ *   vayu_nfc_verbose=0     (NFC-1; default 1, also when absent: every packet as before) no
+ *                          "tx/rx N: ..." line per packet while the nfcd bridge runs; the probe's
+ *                          own steps keep theirs. MiniAppleStockholm reads the same boot-arg.
  *
  * What each step does:
  *   1  reads pins 39, 40, 47, 48 and 102 into the loader's log and prints a verdict: VEN on,
@@ -133,6 +140,8 @@ extern void loader_log_putc(char c);
 #define I2C_BYTE_US             200
 
 #define NFC_BUF                 260             /* every packet buffer is this size (hard rule) */
+#define NFC_FRAME_MAX_OLD       255             /* the whole frame, header included, before NFC-1 */
+#define NFC_FRAME_MAX_NCI       258             /* 3 + 255: NCI's own maximum (vayu_nfc_frame258=1) */
 #define NFC_SHOW_BYTES          48              /* at most this many bytes of a packet are shown */
 #define NFC_LOG_ALWAYS          400             /* the first packets are all logged ... */
 #define NFC_LOG_EVERY           20              /* ... after that, one in this many */
@@ -166,6 +175,8 @@ static uint32_t nfc_xnu_tlmm;                           /* vayu_nfc_xnu_tlmm=1 *
 static uint32_t nfc_secs = 120;                         /* vayu_nfc_secs=S */
 static uint32_t nfc_tech = 0x7;                         /* vayu_nfc_tech=MASK */
 static uint32_t nfc_pause = 2000;                       /* vayu_nfc_pause=MS */
+static unsigned nfc_frame_max = NFC_FRAME_MAX_OLD;      /* vayu_nfc_frame258=1: NFC_FRAME_MAX_NCI */
+static uint32_t nfc_verbose = 1;                        /* vayu_nfc_verbose=0: no packet lines on the bridge */
 static bool nfc_step4_read_ok;                          /* a Type 2 tag was read in step 4 */
 static bool nfc_step4_failed;                           /* the Type 2 read was attempted and failed */
 
@@ -491,13 +502,21 @@ hex_string(const uint8_t *bytes, unsigned count, char *out, size_t capacity, uns
 	}
 }
 
-/* Every packet, sent or received, as hex: at most 48 bytes, then "...". */
+static volatile bool bridge_running;     /* (the bridge's, below) */
+
+/*
+ * Every packet, sent or received, as hex: at most 48 bytes, then "...". NFC-1: not while the
+ * nfcd bridge runs with vayu_nfc_verbose=0; MiniAppleStockholm prints a summary instead.
+ */
 static void
 log_packet(const char *direction, const uint8_t *bytes, unsigned count)
 {
 	static uint32_t packets;
 	char shown[200];
 
+	if (nfc_verbose == 0 && bridge_running) {
+		return;
+	}
 	packets++;
 	if (packets > NFC_LOG_ALWAYS && (packets % NFC_LOG_EVERY) != 0) {
 		return;
@@ -517,7 +536,7 @@ nfc_write(const uint8_t *bytes, unsigned count)
 {
 	bool answered = false, address_ok = false;
 
-	if (count == 0 || count > 255 || bus_dead) {
+	if (count == 0 || count > nfc_frame_max || bus_dead) {
 		return false;
 	}
 	for (unsigned attempt = 0; attempt < 4; attempt++) {
@@ -1798,6 +1817,12 @@ vayu_nfc_init(void)
 	if (PE_parse_boot_argn("vayu_nfc_xnu_tlmm", &value, sizeof(value))) {
 		nfc_xnu_tlmm = value;
 	}
+	if (PE_parse_boot_argn("vayu_nfc_frame258", &value, sizeof(value)) && value != 0) {
+		nfc_frame_max = NFC_FRAME_MAX_NCI;
+	}
+	if (PE_parse_boot_argn("vayu_nfc_verbose", &value, sizeof(value))) {
+		nfc_verbose = value;
+	}
 	if (!PE_parse_boot_argn("vayu_nfc", &nfc_level_wanted, sizeof(nfc_level_wanted)) ||
 	    nfc_level_wanted == 0) {
 		return;
@@ -1827,7 +1852,6 @@ vayu_nfc_init(void)
 /* ---- the nfcd bridge (boot-arg vayu_nfc_ios >= 2) ---------------------------------------------- */
 
 static vayu_nfc_rx_fn bridge_rx;
-static volatile bool bridge_running;
 static volatile unsigned bridge_generation;      /* a stop makes every older thread exit */
 static uint32_t bridge_packets_in, bridge_packets_out;
 static uint32_t bridge_idle_ms;                  /* vayu_nfc_idle_ms (0: every 2 ms) */
@@ -1960,6 +1984,10 @@ vayu_nfc_bridge_start(vayu_nfc_rx_fn rx)
 			say("bridge: the IRQ line every %u ms after %u ms with no packet (vayu_nfc_idle_ms), every 2 ms otherwise\n",
 			    bridge_idle_ms, after);
 		}
+		if (nfc_frame_max != NFC_FRAME_MAX_OLD || nfc_verbose == 0) {
+			say("bridge: frames up to %u bytes (vayu_nfc_frame258), packet lines %s (vayu_nfc_verbose)\n",
+			    nfc_frame_max, nfc_verbose ? "on" : "off");
+		}
 	}
 	bridge_generation++;
 	generation = bridge_generation;
@@ -1980,6 +2008,17 @@ vayu_nfc_bridge_start(vayu_nfc_rx_fn rx)
 	return 0;
 }
 
+/*
+ * One whole NCI frame: the header and exactly the payload its length byte announces, at most
+ * nfc_frame_max bytes. Segments (PBF = 1) are frames of their own here; nfcd and the PN553 put
+ * them together, the bridge never does.
+ */
+static bool
+bridge_frame_ok(const uint8_t *packet, unsigned length)
+{
+	return packet != NULL && length >= 3 && length <= nfc_frame_max && length == 3 + (unsigned)packet[2];
+}
+
 int
 vayu_nfc_bridge_send(const uint8_t *packet, unsigned length)
 {
@@ -1988,7 +2027,7 @@ vayu_nfc_bridge_send(const uint8_t *packet, unsigned length)
 	if (!bridge_running) {
 		return EIO;
 	}
-	if (packet == NULL || length < 3 || length > 255 || length != 3 + (unsigned)packet[2]) {
+	if (!bridge_frame_ok(packet, length)) {
 		return EIO;
 	}
 	nfc_bus_lock();

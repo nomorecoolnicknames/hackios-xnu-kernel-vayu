@@ -23,6 +23,14 @@ void vayu_audio_quiesce(void);          /* both amplifiers into hardware shutdow
 void vayu_audio_call_audio_start(uint32_t path_mode);
 void vayu_audio_call_audio_stop(void);
 bool vayu_audio_call_audio_up(void);    /* the path is up (a failed bring-up is retried by the caller) */
+
+/*
+ * vayu_call_route=1 (with vayu_call_audio=1): the call's downlink is a route -- the earpiece first,
+ * then what CommCenter's SetAudioPath on Apple's audio service 0xE1 says (sys/vayu_voice_bb.h).
+ * Both only leave a word for the worker, like the two above.  The volume is logged, not applied.
+ */
+void vayu_audio_call_audio_path(uint16_t downlink, uint16_t uplink);
+void vayu_audio_call_audio_volume(uint8_t source, uint8_t gain);
 #endif
 
 #endif /* _SYS_VAYU_AUDIO_H_ */

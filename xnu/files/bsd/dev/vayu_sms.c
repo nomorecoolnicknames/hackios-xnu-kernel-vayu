@@ -40,7 +40,11 @@
  * 1: tag 1 only; 2: tag 0 only), vayu_sms_ims_tlv=2|19|0 (Raw Send's SMS-on-IMS
  * TLV type: 2 per qmi-service-wms.json, 19 = 0x13 the k25 form, 0 omit),
  * vayu_sms_format=N (Raw Send's message format byte, default 6),
- * vayu_sms_send_timeout=S (30, how long Raw Send waits for the network's answer).
+ * vayu_sms_send_timeout=S (30, how long Raw Send waits for the network's answer),
+ * vayu_sms=3 (CommCenter is the WMS client through the baseband bridge, vayu_qmux=1:
+ * no kernel client, only content-free log lines of the frames that pass -- see the
+ * "CommCenter is the WMS client" section; vayu_sms=1/2 with vayu_qmux=1 is taken as 3
+ * unless vayu_sms_coexist=1), vayu_sms_strict=1 (/dev/vayu-sms 0600 instead of 0666).
  *
  * The two WMS requests that matter here, as qmi-service-wms.json has them:
  *   List Messages 0x0031: 0x01 storage, 0x11 message tag, 0x12 message mode
@@ -63,6 +67,7 @@
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <miscfs/devfs/devfs.h>
@@ -77,6 +82,7 @@
 #include <sys/vayu_pas.h>
 #include <sys/vayu_sms.h>
 #include <sys/vayu_sms_qmi.h>
+#include <sys/vayu_sms_wms.h>
 
 extern void loader_log_putc(char c);
 
@@ -126,6 +132,8 @@ struct sms_state {
 	volatile bool wms_there, stop, running, started;
 	uint32_t node, port, version, instance, generation;
 	uint32_t level, wait_s, routes_arg, store, refresh_s, scan_max, smsc_prefix;
+	bool observer;                          /* vayu_sms=3: CommCenter is the WMS client */
+	bool strict;                            /* vayu_sms_strict=1: the node is 0600 */
 	uint32_t list_mode, ims_tlv, send_format, send_timeout_s;
 	/* what the last List Messages attempt did, so a quiet sweep can say when it changes */
 	uint32_t list_last_tag, list_last_result, list_last_error, list_last_id;
@@ -1264,6 +1272,421 @@ out:
 	thread_terminate(current_thread());
 }
 
+/* ---- vayu_sms=3: CommCenter is the WMS client, the kernel watches ------------------------------------ */
+
+/*
+ * On the stock path CommCenter's QMISMSCommandDriver is the modem's WMS client (bsd/sys/
+ * vayu_sms_wms.h has what it sends), and its frames pass through the baseband bridge.  A
+ * second, kernel client would be wrong there: both would get the transfer route's MT and
+ * both would answer its ack, and the kernel would keep a copy of a message that belongs to
+ * Messages.  So the kernel starts none, and reads what passes instead, for three things
+ * the run needs to tell apart -- the modem never delivered, CommCenter never acked, the
+ * network refused the send -- with no address, body, PDU byte or SMSC in the log.
+ *
+ * Checkpoints, as log lines (grep "vayu-sms: cc"):
+ *   cc> bind subscription / indication register / set event report / set routes ...
+ *   cc< <request>: result R error E           (a failure is always printed)
+ *   cc< service ready: 3GPP                    (WMS is ready for CommCenter)
+ *   cc< MT #n: transfer route, ack owed, ...   (the modem gave CommCenter a message)
+ *   cc> MT #n: CommCenter acks it (success 1) after T ms
+ *   cc: MT #n: no ack from CommCenter in 35 s  (CommCenter got it and did nothing)
+ *   cc> raw send: format F, L-byte PDU / cc< raw send: OK, message id M | failed ... RP cause C
+ */
+#define SMS_CC_ACK_MS           35000   /* how long an owed ack may take before it is reported */
+#define SMS_CC_PENDING          8
+#define SMS_CC_QUIET_AFTER      6       /* routine requests of one id logged this many times, failures always */
+
+struct sms_cc_pending {
+	bool used;
+	uint32_t number;                /* the MT's ordinal in this boot, the log's #n */
+	uint32_t transaction;
+	uint64_t at_ms;
+};
+
+struct sms_cc_state {
+	bool on;
+	uint32_t frames, mt, mt_acked, mt_nacked, mt_unacked, mt_stored, mo, mo_ok, mo_failed;
+	uint32_t ack_failed, failures, deletes;
+	uint32_t ready_status;
+	bool ready_known, event_report, routes_set;
+	uint32_t route_count;
+	uint32_t last_message, last_result, last_error, last_rp_cause;
+	uint8_t seen[2][0x80];          /* per direction and id, how often it was logged */
+	struct sms_cc_pending pending[SMS_CC_PENDING];
+	thread_call_t ack_call;
+	bool ack_armed;
+};
+
+static struct sms_cc_state cc;
+
+static LCK_MTX_DECLARE(vayu_sms_cc_lock, &vayu_sms_lck_grp);
+
+static const char *
+sms_cc_name(uint16_t message, char buffer[8])
+{
+	const char *name = vayu_sms_wms_name(message);
+
+	if (name != NULL) {
+		return name;
+	}
+	snprintf(buffer, 8, "0x%04x", (unsigned int)message);
+	return buffer;
+}
+
+/* Routine traffic is logged the first few times per id; a failure or a checkpoint always. */
+static bool
+sms_cc_routine_locked(uint8_t direction, uint16_t message)
+{
+	uint8_t *seen;
+
+	if (message >= 0x80) {
+		return true;
+	}
+	seen = &cc.seen[direction ? 1 : 0][message];
+	if (*seen >= SMS_CC_QUIET_AFTER) {
+		return false;
+	}
+	(*seen)++;
+	return true;
+}
+
+static void
+sms_cc_arm_locked(void)
+{
+	uint64_t deadline;
+
+	if (cc.ack_call == NULL || cc.ack_armed) {
+		return;
+	}
+	clock_interval_to_deadline(SMS_CC_ACK_MS / 1000 + 1, NSEC_PER_SEC, &deadline);
+	cc.ack_armed = true;
+	thread_call_enter_delayed(cc.ack_call, deadline);
+}
+
+static void
+sms_cc_ack_check(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t now = now_ms();
+	bool left = false;
+
+	lck_mtx_lock(&vayu_sms_cc_lock);
+	cc.ack_armed = false;
+	for (uint32_t i = 0; i < SMS_CC_PENDING; i++) {
+		struct sms_cc_pending *p = &cc.pending[i];
+
+		if (!p->used) {
+			continue;
+		}
+		if (now - p->at_ms >= SMS_CC_ACK_MS) {
+			cc.mt_unacked++;
+			say("vayu-sms: cc: MT #%u: no ack from CommCenter in %u s (the network will repeat it); "
+			    "%u of %u MT unacknowledged\n", (unsigned int)p->number, SMS_CC_ACK_MS / 1000,
+			    (unsigned int)cc.mt_unacked, (unsigned int)cc.mt);
+			p->used = false;
+		} else {
+			left = true;
+		}
+	}
+	if (left) {
+		sms_cc_arm_locked();
+	}
+	lck_mtx_unlock(&vayu_sms_cc_lock);
+}
+
+static void
+sms_cc_summary_locked(void)
+{
+	say("vayu-sms: cc: MT %u (acked %u, refused %u, unacked %u, stored %u), MO %u (ok %u, failed %u), "
+	    "%u failed WMS answer(s)\n", (unsigned int)cc.mt, (unsigned int)cc.mt_acked,
+	    (unsigned int)cc.mt_nacked, (unsigned int)cc.mt_unacked, (unsigned int)cc.mt_stored,
+	    (unsigned int)cc.mo, (unsigned int)cc.mo_ok, (unsigned int)cc.mo_failed, (unsigned int)cc.failures);
+}
+
+static void
+sms_cc_request_locked(const struct vayu_sms_wms_note *n)
+{
+	char buffer[8];
+	const char *name = sms_cc_name(n->message, buffer);
+
+	switch (n->message) {
+	case VAYU_SMS_WMS_SEND_ACK:
+	case VAYU_SMS_WMS_ASYNC_SEND_ACK:
+		if (n->ack_valid) {
+			uint32_t number = 0;
+			uint64_t waited = 0;
+
+			for (uint32_t i = 0; i < SMS_CC_PENDING; i++) {
+				if (cc.pending[i].used && cc.pending[i].transaction == n->ack_transaction) {
+					number = cc.pending[i].number;
+					waited = now_ms() - cc.pending[i].at_ms;
+					cc.pending[i].used = false;
+					break;
+				}
+			}
+			if (n->ack_success) {
+				cc.mt_acked++;
+			} else {
+				cc.mt_nacked++;
+			}
+			if (number != 0) {
+				say("vayu-sms: cc> MT #%u: CommCenter acks it (%s, success %u, protocol %u) after %llu ms\n",
+				    (unsigned int)number, name, (unsigned int)n->ack_success, (unsigned int)n->ack_protocol,
+				    (unsigned long long)waited);
+			} else {
+				say("vayu-sms: cc> %s (success %u) for a transaction this observer did not see\n", name,
+				    (unsigned int)n->ack_success);
+			}
+			return;
+		}
+		break;
+	case VAYU_SMS_WMS_RAW_SEND:
+	case VAYU_SMS_WMS_ASYNC_RAW_SEND:
+		cc.mo++;
+		if (n->send_valid) {
+			say("vayu-sms: cc> MO #%u: %s, format %u, %u-byte PDU\n", (unsigned int)cc.mo, name,
+			    (unsigned int)n->send_format, (unsigned int)n->send_length);
+		} else {
+			say("vayu-sms: cc> MO #%u: %s without a whole raw message TLV\n", (unsigned int)cc.mo, name);
+		}
+		return;
+	case VAYU_SMS_WMS_SET_ROUTES:
+		if (n->routes_valid) {
+			say("vayu-sms: cc> set routes: %u route(s)%s\n", (unsigned int)n->route_count,
+			    n->transfer_ind_valid ? (n->transfer_ind ? ", transfer status reports" :
+			    ", status reports stored") : "");
+			for (uint32_t i = 0; i < n->route_count && i < VAYU_SMS_WMS_ROUTES_MAX; i++) {
+				say("vayu-sms: cc> route %u: type %u, class %u, storage %u, action %s\n",
+				    (unsigned int)i + 1, (unsigned int)n->route[i].type,
+				    (unsigned int)n->route[i].message_class, (unsigned int)n->route[i].storage,
+				    sms_action_name(n->route[i].action));
+			}
+			cc.route_count = n->route_count;
+			return;
+		}
+		break;
+	case VAYU_SMS_WMS_EVENT_REPORT:
+		if (n->report_mt_valid) {
+			say("vayu-sms: cc> set event report: new MT messages %s\n", n->report_mt ? "on" : "off");
+			return;
+		}
+		break;
+	case VAYU_SMS_WMS_BIND_SUBSCRIPTION:
+		if (n->subscription_valid) {
+			say("vayu-sms: cc> bind subscription %u\n", (unsigned int)n->subscription);
+			return;
+		}
+		break;
+	case VAYU_SMS_WMS_DELETE:
+		cc.deletes++;
+		break;
+	default:
+		break;
+	}
+	if (sms_cc_routine_locked(n->direction, n->message)) {
+		say("vayu-sms: cc> %s (txn %u)\n", name, (unsigned int)n->transaction);
+	}
+}
+
+static void
+sms_cc_response_locked(const struct vayu_sms_wms_note *n)
+{
+	char buffer[8];
+	const char *name = sms_cc_name(n->message, buffer);
+	bool failed = !n->result_valid || n->result != 0;
+
+	if (failed) {
+		cc.failures++;
+		cc.last_message = n->message;
+		cc.last_result = n->result_valid ? n->result : 0xffff;
+		cc.last_error = n->result_valid ? n->error : 0xffff;
+	}
+	switch (n->message) {
+	case VAYU_SMS_WMS_RAW_SEND:
+		if (!failed) {
+			cc.mo_ok++;
+			say("vayu-sms: cc< raw send: OK%s%u\n", n->message_id_valid ? ", message id " : "",
+			    n->message_id_valid ? (unsigned int)n->message_id : 0);
+		} else {
+			cc.mo_failed++;
+			if (n->gw_cause_valid) {
+				cc.last_rp_cause = n->rp_cause;
+			}
+			say("vayu-sms: cc< raw send: failed, result %u error %u (%s); cause %d, class %d, RP cause %d, "
+			    "TP cause %d\n", (unsigned int)cc.last_result, (unsigned int)cc.last_error,
+			    sms_error_name((uint16_t)cc.last_error), n->cause_valid ? (int)n->cause : -1,
+			    n->error_class_valid ? (int)n->error_class : -1, n->gw_cause_valid ? (int)n->rp_cause : -1,
+			    n->gw_cause_valid ? (int)n->tp_cause : -1);
+		}
+		sms_cc_summary_locked();
+		return;
+	case VAYU_SMS_WMS_SEND_ACK:
+		if (failed) {
+			cc.ack_failed++;
+			say("vayu-sms: cc< send ack: failed, result %u error %u (%s), failure cause %d\n",
+			    (unsigned int)cc.last_result, (unsigned int)cc.last_error,
+			    sms_error_name((uint16_t)cc.last_error), n->ack_failure_valid ? (int)n->ack_failure : -1);
+		} else {
+			say("vayu-sms: cc< send ack: OK\n");
+		}
+		sms_cc_summary_locked();
+		return;
+	case VAYU_SMS_WMS_EVENT_REPORT:
+		cc.event_report = !failed;
+		break;
+	case VAYU_SMS_WMS_SET_ROUTES:
+		cc.routes_set = !failed;
+		break;
+	case VAYU_SMS_WMS_GET_READY_STATUS:
+		if (n->ready_valid) {
+			cc.ready_known = true;
+			cc.ready_status = n->ready_status;
+			say("vayu-sms: cc< get service ready status: %s\n", vayu_sms_wms_ready_name(n->ready_status));
+			if (!failed) {
+				return;
+			}
+		}
+		break;
+	case VAYU_SMS_WMS_LIST:
+		if (!failed && n->list_valid && sms_cc_routine_locked(n->direction, n->message)) {
+			say("vayu-sms: cc< list messages: %u stored\n", (unsigned int)n->list_count);
+			return;
+		}
+		break;
+	default:
+		break;
+	}
+	if (failed) {
+		say("vayu-sms: cc< %s: result %u error %u (%s)\n", name, (unsigned int)cc.last_result,
+		    (unsigned int)cc.last_error, sms_error_name((uint16_t)cc.last_error));
+	} else if (sms_cc_routine_locked(n->direction, n->message)) {
+		say("vayu-sms: cc< %s: OK\n", name);
+	}
+}
+
+static void
+sms_cc_indication_locked(const struct vayu_sms_wms_note *n)
+{
+	char buffer[8];
+
+	switch (n->message) {
+	case VAYU_SMS_WMS_EVENT_REPORT:
+		if (n->mt_transfer) {
+			cc.mt++;
+			say("vayu-sms: cc< MT #%u: transfer route, %s, format %u, %u-byte PDU%s%s\n",
+			    (unsigned int)cc.mt, n->ack_indicator == 0 ? "ack owed" : "no ack owed",
+			    (unsigned int)n->format, (unsigned int)n->pdu_length,
+			    n->sms_on_ims_valid && n->sms_on_ims ? ", over IMS" : "",
+			    n->mt_stored ? ", also stored" : "");
+			if (n->ack_indicator == 0) {
+				struct sms_cc_pending *slot = NULL;
+
+				for (uint32_t i = 0; i < SMS_CC_PENDING && slot == NULL; i++) {
+					if (!cc.pending[i].used) {
+						slot = &cc.pending[i];
+					}
+				}
+				if (slot == NULL) {
+					slot = &cc.pending[0];          /* the oldest is reported lost */
+					for (uint32_t i = 1; i < SMS_CC_PENDING; i++) {
+						if (cc.pending[i].at_ms < slot->at_ms) {
+							slot = &cc.pending[i];
+						}
+					}
+					cc.mt_unacked++;
+				}
+				slot->used = true;
+				slot->number = cc.mt;
+				slot->transaction = n->wms_transaction;
+				slot->at_ms = now_ms();
+				sms_cc_arm_locked();
+			}
+		} else if (n->mt_stored) {
+			cc.mt++;
+			cc.mt_stored++;
+			say("vayu-sms: cc< MT #%u: stored in %s, index %u (a store route: CommCenter reads it)\n",
+			    (unsigned int)cc.mt, n->storage == VAYU_SMS_QMI_STORAGE_UIM ? "UIM" :
+			    n->storage == VAYU_SMS_QMI_STORAGE_NV ? "NV" : "?", (unsigned int)n->index);
+		} else {
+			say("vayu-sms: cc< event report without an MT message (other TLVs only)\n");
+		}
+		return;
+	case VAYU_SMS_WMS_SERVICE_READY:
+		if (n->ready_valid) {
+			cc.ready_known = true;
+			cc.ready_status = n->ready_status;
+			say("vayu-sms: cc< service ready: %s\n", vayu_sms_wms_ready_name(n->ready_status));
+			return;
+		}
+		break;
+	case VAYU_SMS_WMS_ASYNC_RAW_SEND:
+		if (n->status_valid) {
+			if (n->status == 0) {
+				cc.mo_ok++;
+			} else {
+				cc.mo_failed++;
+			}
+			say("vayu-sms: cc< async raw send: status %u; cause %d, RP cause %d\n", (unsigned int)n->status,
+			    n->cause_valid ? (int)n->cause : -1, n->gw_cause_valid ? (int)n->rp_cause : -1);
+			sms_cc_summary_locked();
+			return;
+		}
+		break;
+	case VAYU_SMS_WMS_MEMORY_FULL:
+		say("vayu-sms: cc< memory full\n");
+		return;
+	case VAYU_SMS_WMS_NW_REG:
+		if (n->nw_reg_valid) {
+			say("vayu-sms: cc< transport NW reg: %u\n", (unsigned int)n->nw_reg);
+			return;
+		}
+		break;
+	default:
+		break;
+	}
+	if (sms_cc_routine_locked(n->direction, n->message)) {
+		say("vayu-sms: cc< indication %s\n", sms_cc_name(n->message, buffer));
+	}
+}
+
+void
+vayu_sms_wms_observe(uint32_t direction, const void *qmi, size_t length)
+{
+	struct vayu_sms_wms_note note;
+
+	if (!cc.on) {
+		return;
+	}
+	if (vayu_sms_wms_parse(direction == VAYU_SMS_WMS_MODEM_TO_AP ? VAYU_SMS_WMS_MODEM_TO_AP :
+	    VAYU_SMS_WMS_AP_TO_MODEM, qmi, length, &note) != 0) {
+		return;
+	}
+	lck_mtx_lock(&vayu_sms_cc_lock);
+	cc.frames++;
+	if (note.direction == VAYU_SMS_WMS_AP_TO_MODEM && note.qmi_type == VAYU_SMS_WMS_REQUEST) {
+		sms_cc_request_locked(&note);
+	} else if (note.direction == VAYU_SMS_WMS_MODEM_TO_AP && note.qmi_type == VAYU_SMS_WMS_RESPONSE) {
+		sms_cc_response_locked(&note);
+	} else if (note.direction == VAYU_SMS_WMS_MODEM_TO_AP && note.qmi_type == VAYU_SMS_WMS_INDICATION) {
+		sms_cc_indication_locked(&note);
+	}
+	lck_mtx_unlock(&vayu_sms_cc_lock);
+}
+
+static void
+sms_cc_start(void)
+{
+	lck_mtx_lock(&vayu_sms_cc_lock);
+	if (!cc.on) {
+		thread_call_t call = cc.ack_call;
+
+		memset(&cc, 0, sizeof(cc));
+		cc.ack_call = call != NULL ? call : thread_call_allocate(sms_cc_ack_check, NULL);
+		cc.last_result = cc.last_error = cc.last_rp_cause = 0xffff;
+		cc.on = true;
+	}
+	lck_mtx_unlock(&vayu_sms_cc_lock);
+}
+
 /* ---- the device ---------------------------------------------------------------------------------- */
 
 static int
@@ -1487,12 +1910,37 @@ sms_ioctl_status(caddr_t data)
 	status->last_message = sms.last_message;
 	status->last_gsm_cause = sms.last_gsm_cause;
 	lck_mtx_unlock(&vayu_sms_lock);
+	if (sms.observer) {
+		/* The same record, read as CommCenter's traffic: see sms status in userland/src/sms.c. */
+		lck_mtx_lock(&vayu_sms_cc_lock);
+		status->wms_present = cc.frames != 0 ? 1 : 0;
+		status->event_report = cc.event_report ? 1 : 0;
+		status->routes_known = cc.ready_known ? 1 : 0;
+		status->routes_written = cc.routes_set ? 1 : 0;
+		status->route_count = cc.route_count;
+		status->received = cc.mt;
+		status->sent = cc.mo_ok;
+		status->deleted = cc.deletes;
+		status->dropped = cc.mt_unacked;
+		status->requests = cc.frames;
+		status->failures = cc.failures;
+		status->last_result = cc.last_result;
+		status->last_error = cc.last_error;
+		status->last_message = cc.last_message;
+		status->last_gsm_cause = cc.last_rp_cause;
+		status->last_failure = cc.ready_known ? cc.ready_status : 0xffffffffu;
+		lck_mtx_unlock(&vayu_sms_cc_lock);
+	}
 	return 0;
 }
 
 static int
 sms_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flag, __unused struct proc *p)
 {
+	if (sms.observer && (command == VAYU_SMS_IOC_SEND || command == VAYU_SMS_IOC_DELETE ||
+	    command == VAYU_SMS_IOC_REFRESH)) {
+		return ENOTSUP;                 /* CommCenter owns WMS: Messages sends and deletes */
+	}
 	switch (command) {
 	case VAYU_SMS_IOC_COUNT:
 		return sms_ioctl_count(data);
@@ -1522,11 +1970,13 @@ sms_make_node(void)
 {
 	int major = cdevsw_add(-1, &sms_cdevsw);
 
-	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, SMS_DEVICE) == NULL) {
+	int mode = sms.strict ? 0600 : 0666;
+
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, mode, SMS_DEVICE) == NULL) {
 		say("vayu-sms: /dev/%s cannot be made\n", SMS_DEVICE);
 		return false;
 	}
-	say("vayu-sms: /dev/%s (0666) is made: the count record is %u bytes\n", SMS_DEVICE,
+	say("vayu-sms: /dev/%s (0%o) is made: the count record is %u bytes\n", SMS_DEVICE, mode,
 	    (unsigned int)sizeof(struct vayu_sms_count));
 	return true;
 }
@@ -1550,6 +2000,35 @@ vayu_sms_start(struct vayu_qrtr *q)
 	}
 	if (sms.running) {
 		return -EBUSY;
+	}
+	{
+		uint32_t qmux = 0, coexist = 0, strict = 0;
+
+		PE_parse_boot_argn("vayu_qmux", &qmux, sizeof(qmux));
+		PE_parse_boot_argn("vayu_sms_coexist", &coexist, sizeof(coexist));
+		PE_parse_boot_argn("vayu_sms_strict", &strict, sizeof(strict));
+		sms.strict = strict == 1;
+		if ((level == 1 || level == 2) && qmux != 0 && coexist != 1) {
+			say("vayu-sms: vayu_sms=%u with vayu_qmux=%u: CommCenter is the WMS client through the bridge, so "
+			    "the kernel's is not started (taken as vayu_sms=3; vayu_sms_coexist=1 keeps both)\n", level, qmux);
+			level = 3;
+		}
+		if (level == 3) {
+			sms.level = level;
+			sms.observer = true;
+			sms.state = VAYU_SMS_STATE_COMMCENTER;
+			sms_cc_start();
+			say("vayu-sms: vayu_sms=3: CommCenter owns WMS 0x05; the kernel starts no client (no event report, "
+			    "route, ack, delete or inbox) and logs the bridge's WMS frames without content%s\n",
+			    qmux != 0 ? "" : " -- but vayu_qmux=0: no bridge, nothing will pass");
+			(void)sms_make_node();
+			sms.started = true;
+			return 0;
+		}
+		if (level > 3) {
+			say("vayu-sms: vayu_sms=%u is refused: 0, 1, 2 or 3\n", level);
+			return 0;
+		}
 	}
 	if (q == NULL || q->glink == NULL || !q->glink->up) {
 		say("vayu-sms: vayu_sms=%u, but the modem's GLINK channel is not up: nothing is done\n", level);
@@ -1679,6 +2158,13 @@ void
 vayu_sms_stop(void)
 {
 	if (!sms.started) {
+		return;
+	}
+	if (sms.observer) {
+		/* nothing of ours runs; the frames stop when the bridge stops */
+		lck_mtx_lock(&vayu_sms_cc_lock);
+		sms_cc_summary_locked();
+		lck_mtx_unlock(&vayu_sms_cc_lock);
 		return;
 	}
 	lck_mtx_lock(&vayu_sms_lock);
