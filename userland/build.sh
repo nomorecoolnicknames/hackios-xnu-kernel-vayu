@@ -11,12 +11,20 @@
 #                      JOBS="..."   labels of the stock iOS launchd jobs to load (default: IOS_JOBS)
 #                      REST=1       ... and the rest of them, started only when asked for (see mkjobs.py)
 #                      WIFID=0      without wifid, iOS's Wi-Fi daemon, which is in by default (see below)
+#                      BLUETOOTHD=0 NFCD=0 COMMCENTER=0
+#                                   without bluetoothd (and its boot-script service com.apple.BlueTool), nfcd,
+#                                   CommCenter: iOS's daemons of the phone's radios, in by default on a phone
+#                                   that says how to run them (devices/<name>/userland/jobs; see below). =1 puts
+#                                   one in on another phone too, as Apple wrote it
 #                      OSLOG="..."  labels of the jobs whose os_log output goes to the console ("all": every
 #                                   one of JOBS; default: only the window server, which says little)
 #                      OSLOGFWD=0   without com.hakios.oslogfwd: the program that carries the os_log of the
 #                                   subsystems named in the boot-arg oslog=... to the console (docs/oslog.md).
 #                                   It is the only thing that shows an application's os_log -- OSLOG above
 #                                   reaches the jobs of ours it names, and no application is one of them.
+#                      SWEETD=1     com.hakios.sweetd: the test bench's command runner on TCP 5143 of en2 (src/sweetd.c),
+#                                   started only by sweetd=1 on the kernel's command line; its token is
+#                                   userland/sweetd.token, made here once (never in git)
 #                      INJECT="..." the programs started with a library of ours, "LIBRARY NAME..." per line
 #                                   (default: src/inject.c in backboardd, src/inject_sb.c in SpringBoard,
 #                                   src/inject_media.c in mediaserverd);
@@ -163,6 +171,26 @@ IOS_JOBS=${JOBS-"
 # (Count a QEMU run log with its duplicate lines removed: run-ios.sh prints launchd's log twice.)
 # WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
+# iOS's daemons of the phone's other radios: bluetoothd (with com.apple.BlueTool, which it asks for the controller's
+# boot script before it opens the transport), nfcd and CommCenter. mkjobs.py's DENY keeps them out of REST, since
+# none of them can do anything without its kernel side; a phone whose kernel has one says so with
+# devices/<name>/userland/jobs/<label>.plist -- what that kernel needs changed in Apple's job (mkjobs.py --overlay:
+# vayu's bluetoothd is told the kernel control com.vayu.bt.uart, its BlueTool is src/bluetool_stub.c) -- and the job
+# is then in by default. The kernel's side is still a boot-arg each (vayu: vayu_bt=9 ..., vayu_nfc_ios=2 ...,
+# vayu_bb=1 ...): without it bluetoothd exits, nfcd finds no controller and CommCenter aborts and is started again.
+# BLUETOOTHD=0, NFCD=0, COMMCENTER=0 leave one out; =1 puts it in on a phone without the file, as Apple wrote it.
+JOB_OVERLAY=../devices/$DEVICE/userland/jobs
+radio_jobs() { # radio_jobs SWITCH LABEL...
+	local on=$1 label
+	shift
+	[ "$on" = 0 ] && return 0
+	for label in "$@"; do
+		if [ -f $JOB_OVERLAY/$label.plist ] || [ "$on" = 1 ]; then IOS_JOBS="$IOS_JOBS $label"; fi
+	done
+}
+radio_jobs "${BLUETOOTHD-}" com.apple.bluetoothd com.apple.BlueTool
+radio_jobs "${NFCD-}" com.apple.nfcd
+radio_jobs "${COMMCENTER-}" com.apple.CommCenter
 # iOS's location daemon, for the modem's GPS (LOCATIOND=1; xreactx/oneplus-6t-upstream 12d310ec3 did the same for the
 # 6T's): mkjobs.py's DENY keeps it out while no phone had a GPS. Its fixes come from src/gnssd.m (com.hakios.gnssd).
 if [ -n "$LOCATIOND" ]; then
@@ -266,6 +294,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework IOSurface -framework IOKit -framework CoreFoundation -framework CoreGraphics \
 			-framework ImageIO -o obj/fbshot src/fbshot.c
 		$DYN -o obj/usbctld src/usbctld.c src/minish.c
+		# the test bench's command runner on en2 (TCP 5143; com.hakios.sweetd.plist, SWEETD=1)
+		$DYN -o obj/sweetd src/sweetd.c
+		${LDID:-ldid} -S obj/sweetd 2>/dev/null || echo "build.sh: no ldid: sweetd is unsigned"
 		$DYN -fno-objc-arc -L. -lxpc -framework Foundation -framework CoreFoundation -lobjc \
 			-o obj/ctshimd src/ctshimd.m
 		$DYN -fno-objc-arc -framework Foundation -framework CoreFoundation -lobjc \
@@ -597,9 +628,13 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	sed -i.bak -e 's|^l\t/usr/share/zoneinfo\t/private/var/db/timezone/zoneinfo$|l\t/usr/share/zoneinfo.default\t/private/var/db/timezone/zoneinfo|' \
 		-e "s|^l\t/var/db/timezone/zoneinfo/[^\t]*\t/private/var/db/timezone/localtime\$|l\t/var/db/timezone/zoneinfo/$zone\t/private/var/db/timezone/localtime|" root/etc/var.skel
 	rm -f root/etc/var.skel.bak
-	# ... and the files of ours it puts there (var/): those under mobile/ belong to the user mobile
+	# ... and the files of ours it puts there (var/, and the phone's own in devices/<name>/userland/var): those
+	# under mobile/ belong to the user mobile. Each is a first value only: a data volume on the flash that has
+	# the file from an earlier boot keeps its own (src/init.c).
 	cp -r var root/var
-	(cd var && find . -type f | sed 's|^\./||' | sort) | while read -r f; do
+	DEVICE_VAR=../devices/$DEVICE/userland/var
+	[ -d $DEVICE_VAR ] && cp -r $DEVICE_VAR/. root/var/
+	(cd root/var && find . -type f | sed 's|^\./||' | sort) | while read -r f; do
 		case $f in mobile/*) owner=501 ;; *) owner=0 ;; esac
 		printf 'f\t644\t%s\t%s\t/private/var/%s\t/var/%s\n' $owner $owner "$f" "$f"
 	done >> root/etc/var.skel
@@ -669,6 +704,17 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		install -m 0600 ../fw-wifi/wifi.pmk root/etc/vayu-wifi/wifi.pmk
 	fi
 	[ -f obj/usbctld ] && cp com.hakios.usbctld.plist root/LaunchDaemons/
+	# SWEETD=1: the command runner (it does nothing without sweetd=1 on the kernel's command line) and its token
+	rm -f root/etc/sweetd.token
+	if [ -n "$SWEETD" ] && [ -f obj/sweetd ]; then
+		if [ ! -s sweetd.token ]; then
+			(umask 077; od -An -N24 -tx1 /dev/urandom | tr -d ' \n' > sweetd.token)
+			echo "build.sh: made userland/sweetd.token (for sweetd and sweet-sh.py; keep it off git)"
+		fi
+		cp obj/sweetd root/bin/
+		install -m 600 sweetd.token root/etc/sweetd.token
+		cp com.hakios.sweetd.plist root/LaunchDaemons/
+	fi
 	if [ -n "$LOCATIOND" ] && [ -f obj/gnssd ]; then
 		cp com.hakios.gnssd.plist root/LaunchDaemons/
 		# (mkjobs.py looks for locationd in sysimage/rootfs, which has not got it, and says so; the system
@@ -689,7 +735,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# (BT_AUDIO=1: bluetoothd looks up its helpers when a headset connects -- com.apple.BTServer.avrcp, .le, .map,
 	# .pbap and bluetoothuserd -- which mkjobs.py's DENY keeps out; with REST=1 they come in, started on demand)
 	[ -n "$BT_AUDIO" ] && export ALLOW="${ALLOW:+$ALLOW }bluetooth BTServer"
-	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
+	# (the phone's changes to the radios' jobs above: devices/<name>/userland/jobs)
+	OVERLAY=""
+	[ -d $JOB_OVERLAY ] && OVERLAY="--overlay $JOB_OVERLAY"
+	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $OVERLAY $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
 # a phone whose firmware devices/<name>/pull-firmware.sh left in ../fw-<name>/: the files go to fw/ as they are
 if [ -d ../fw-$DEVICE ]; then

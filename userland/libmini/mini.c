@@ -168,6 +168,12 @@ mount(const char *type, const char *dir, int flags, void *data)
 }
 
 int
+unmount(const char *dir, int flags)
+{
+	return (int)SC(SYS_unmount, dir, flags, 0, 0, 0, 0);
+}
+
+int
 mkdir(const char *path, int mode)
 {
 	return (int)SC(SYS_mkdir, path, mode, 0, 0, 0, 0);

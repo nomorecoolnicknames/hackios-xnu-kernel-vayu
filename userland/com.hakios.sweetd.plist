@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.hakios.sweetd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/sweetd</string>
+	</array>
+	<!-- The test bench's command runner on TCP 5143 of en2, the kernel's USB network (src/sweetd.c; the client
+	     is devices/poco-x3-pro/tools/sweet-sh.py). Only with sweetd=1 on the kernel's command line: without it
+	     the program exits 0 at once, and a clean exit is not restarted. It waits for en2 by itself, and runs
+	     nothing without the token in the image (userland/sweetd.token). Root, as oslogfwd.
+	     After telegdyd/ios-vayu, branch vayu-dev, commit 80542801 (its com.hakios.sweetd.plist). -->
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>LimitLoadToSessionType</key>
+	<string>System</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

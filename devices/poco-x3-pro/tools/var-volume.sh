@@ -13,7 +13,7 @@
 # the newest var_store archive).
 set -euo pipefail
 OUT=${1:?usage: var-volume.sh OUT}
-eval "$(python3 -I "$(dirname "$0")/darwin-layout.py" sh)"
+eval "$(python3 -I "$(dirname "$0")/darwin-layout.py" --profile "${PROFILE:-vayu}" sh)"   # PROFILE=qemu: the QEMU test disk's
 [ ! -e "$OUT" ] || { echo "var-volume: $OUT exists" >&2; exit 1; }
 truncate -s $((VAR_BLOCKS * BS)) "$OUT"
 mkfs.hfsplus -s -J -b $BS -U 0 -G 0 -M 755 -v Data "$OUT"

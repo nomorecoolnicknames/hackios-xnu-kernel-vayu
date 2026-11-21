@@ -12,7 +12,8 @@ from here to everything that needs it:
   - the loader (2.5) reads that block, checks it and hands the kernel ufs_var_first=/ufs_var_blocks= and
     ufs_stage_first=/ufs_stage_blocks=/ufs_stage_head= on its command line (xnuloader/loader.c, darwin_layout);
   - the partition's identity (name, GUIDs, LBAs, unit) is the loader's struct darwin_identity as well:
-    `darwin-layout.py check-loader` compares the two.
+    `darwin-layout.py check-loader` compares the two -- darwin's, boot's, misc's and the recovery's (where the
+    multiboot keeps HakiOS: standalone.sh --part recovery, flash_stage_target=recovery).
 
 The identities are this phone's own GPT (its dump of 2026-11-17, darwin-install.sh dump-gpt, not in git:
 gpt-sda.head.bin sha256 c649dd9e..., gpt-sde.head.bin 9798fb3a...). The image sizes are the iOS 16.5 (20F66,
@@ -43,6 +44,8 @@ import zlib
 BS = 4096
 APFS = '7C3457EF-0000-11AA-AA11-00306543ECAC'
 ANDROID_BOOT = '20117F86-E985-4357-B9EE-374BC1D8487D'
+ANDROID_MISC = '82ACC91F-357C-4A68-9C8F-689E1B1A23A1'
+ANDROID_RECOVERY = '9D72D4E4-9958-42DA-AC26-BEA7A90B0434'
 
 PROFILES = {
     'vayu': {
@@ -50,17 +53,23 @@ PROFILES = {
                        first=55871232, last=62162938, unit=0, c='darwin_vayu'),
         'boot': dict(disk='sde', entry=49, name='boot', type=ANDROID_BOOT, uniq='6829CC63-8DF3-89CE-5473-55CBA9339A82',
                      first=79872, last=112639, unit=4, c='boot_vayu'),
-        # what must be as it is beside them (checked, never written): Android's data and the recovery
+        # Android's misc: its first block's command alone, set by the loader 2.6 (bcb_reboot=1, boot_tries=N)
+        'misc': dict(disk='sda', entry=11, name='misc', type=ANDROID_MISC, uniq='C21D9A5D-F0F0-0F54-E390-AEC3B873A497',
+                     first=1024, last=2047, unit=0, c='misc_vayu'),
+        # the recovery: in the multiboot HakiOS's place (standalone.sh --part recovery from the computer, the loader
+        # with flash_stage_target=recovery from iOS); Android stays in boot
+        'recovery': dict(disk='sda', entry=28, name='recovery', type=ANDROID_RECOVERY,
+                         uniq='F9606103-C42F-EFE1-595E-BC49331D22CE', first=2359808, last=2392575, unit=0,
+                         c='recovery_vayu'),
+        # what must be as it is beside them (checked, never written): Android's data
         'others': [dict(disk='sda', entry=32, name='userdata', type='1B81E7E6-F50D-419B-A739-2AEEF8DA3335',
-                        uniq='F195412A-B809-DE82-929E-CFC7D8B7BDFA', first=2851328, last=55871231),
-                   dict(disk='sda', entry=28, name='recovery', type='9D72D4E4-9958-42DA-AC26-BEA7A90B0434',
-                        uniq='F9606103-C42F-EFE1-595E-BC49331D22CE', first=2359808, last=2392575)],
+                        uniq='F195412A-B809-DE82-929E-CFC7D8B7BDFA', first=2851328, last=55871231)],
         'lun_blocks': {'sda': 62162944, 'sde': 262144},
         'write_first': 2097152,
         'layout_block': 2097151,
         'extents': [('root', 0, 1374208), ('oscryptex', 1374208, 665600), ('appcryptex', 2039808, 2560),
-                    ('layout', 2097151, 1), ('varstore', 2097152, 1048576), ('var', 3145728, 2097152),
-                    ('stage', 6258938, 32768), ('stagehead', 6291706, 1)],
+                    ('layout', 2097151, 1), ('varstore', 2097152, 1048576), ('var', 3145728, 3113209),
+                    ('stage', 6258938, 32768), ('stagehead', 6291706, 1), ('tries', 6258937, 1)],
     },
     # the test disk of qemu/run-standalone-test.sh: the same shape, small; its GUIDs are nobody's but this test's
     'qemu': {
@@ -68,18 +77,24 @@ PROFILES = {
                        first=2304, last=14303, unit=0, c='darwin_qemu'),
         'boot': dict(disk='vda', entry=1, name='boot', type=ANDROID_BOOT, uniq='48414B49-4F53-424F-4F54-000000000002',
                      first=256, last=2303, unit=0, c='boot_qemu'),
+        'misc': dict(disk='vda', entry=3, name='misc', type=ANDROID_MISC, uniq='48414B49-4F53-4D49-5343-000000000003',
+                     first=16, last=47, unit=0, c='misc_qemu'),
+        'recovery': dict(disk='vda', entry=4, name='recovery', type=ANDROID_RECOVERY,
+                         uniq='48414B49-4F53-5245-4356-000000000004', first=14304, last=16351, unit=0, c='recovery_qemu'),
         'others': [],
         'lun_blocks': {'vda': 16384},
         'write_first': 1024,
         'layout_block': 1023,
         'extents': [('root', 0, 256), ('oscryptex', 256, 256), ('appcryptex', 512, 256), ('layout', 1023, 1),
-                    ('varstore', 1024, 1024), ('var', 2048, 4096), ('stage', 9951, 2048), ('stagehead', 11999, 1)],
+                    ('varstore', 1024, 1024), ('var', 2048, 4096), ('stage', 9951, 2048), ('stagehead', 11999, 1),
+                    ('tries', 9950, 1)],
     },
 }
 # (the stage and its header at darwin's very end: the free space stays in one piece right after var, for the
-# HFS Plus volume to grow into later)
+# HFS Plus volume to grow into later; the count of starts for boot_tries= -- loader 2.6, xnuloader/bcb.h -- just
+# before the stage)
 # written while iOS runs: at write_first or past it (the loader checks the same)
-WRITTEN_BY_IOS = ('varstore', 'var', 'stage', 'stagehead')
+WRITTEN_BY_IOS = ('varstore', 'var', 'stage', 'stagehead', 'tries')
 # written by the installer from the recovery, and the images for them: their containers must fill them exactly
 INSTALLED = ('root', 'oscryptex', 'appcryptex')
 
@@ -115,8 +130,12 @@ def check_profile(p):
         raise Bad('the layout extent is not the layout block')
     if 'stagehead' in d and d['stagehead'][2] != 1:
         raise Bad('the stage header is not one block')
+    if 'tries' in d and d['tries'][2] != 1:
+        raise Bad('the count of starts is not one block')
     if 'stage' in d and d['stage'][2] > blocks_of(p['boot']):
         raise Bad('the stage is larger than boot')
+    if 'stage' in d and d['stage'][2] > blocks_of(p['recovery']):
+        raise Bad('the stage is larger than the recovery')
     for a, b in (('root', 'oscryptex'), ('oscryptex', 'appcryptex')):
         if a in d and b in d and d[a][1] + d[a][2] != d[b][1]:
             raise Bad(f'{b} does not begin where {a} ends (the kernel finds a container where the one before ends)')
@@ -226,7 +245,7 @@ def check_gpt(p, disk, head, backup=None):
     if disk not in p['lun_blocks']:
         raise Bad(f'{disk}: no partition of this file is on it')
     entries, fu, lu = parse_gpt(head, p['lun_blocks'][disk], backup)
-    mine = [x for x in [p['darwin'], p['boot']] + p['others'] if x['disk'] == disk]
+    mine = [x for x in [p['darwin'], p['boot'], p['misc'], p['recovery']] + p['others'] if x['disk'] == disk]
     for want in mine:
         got = entries.get(want['entry'])
         have = dict((k, want[k]) for k in ('name', 'type', 'uniq', 'first', 'last'))
@@ -253,7 +272,7 @@ def check_loader(path):
     src = open(path).read()
     bad = []
     for prof_name, p in PROFILES.items():
-        for role in ('darwin', 'boot'):
+        for role in ('darwin', 'boot', 'misc', 'recovery'):
             want = p[role]
             m = re.search(r'static const struct darwin_identity ' + want['c'] + r' = \{(.*?)\n\};', src, re.S)
             if not m:
@@ -280,7 +299,7 @@ def make_disk(p, out):
     """a GPT disk of 4096-byte blocks with boot and darwin as the profile says, darwin's layout block in it"""
     n = p['lun_blocks']['vda']
     entries = bytearray(128 * 128)
-    for part in (p['boot'], p['darwin']):
+    for part in (p['boot'], p['darwin'], p['misc'], p['recovery']):
         struct.pack_into('<16s16sQQQ72s', entries, (part['entry'] - 1) * 128, uuid.UUID(part['type']).bytes_le,
                          uuid.UUID(part['uniq']).bytes_le, part['first'], part['last'], 0,
                          part['name'].encode('utf-16-le'))
@@ -319,7 +338,7 @@ def make_stagehead(p, image):
 
 
 def shell(p):
-    d, b = p['darwin'], p['boot']
+    d, b, r = p['darwin'], p['boot'], p['recovery']
     lines = [f'DARWIN_DISK={d["disk"]} DARWIN_PART={d["entry"]} DARWIN_NODE=/dev/block/{d["disk"]}{d["entry"]}',
              f'DARWIN_FIRST={d["first"]} DARWIN_LAST={d["last"]} DARWIN_BLOCKS={blocks_of(d)}',
              f'DARWIN_TYPE={d["type"]} DARWIN_UNIQ={d["uniq"]}',
@@ -327,6 +346,12 @@ def shell(p):
              f'BOOT_DISK={b["disk"]} BOOT_PART={b["entry"]} BOOT_NODE=/dev/block/{b["disk"]}{b["entry"]}',
              f'BOOT_FIRST={b["first"]} BOOT_LAST={b["last"]} BOOT_BLOCKS={blocks_of(b)} BOOT_BYTES={blocks_of(b) * BS}',
              f'BOOT_LUN_BLOCKS={p["lun_blocks"][b["disk"]]}',
+             f'MISC_DISK={p["misc"]["disk"]} MISC_PART={p["misc"]["entry"]} '
+             f'MISC_NODE=/dev/block/{p["misc"]["disk"]}{p["misc"]["entry"]} MISC_FIRST={p["misc"]["first"]} '
+             f'MISC_BLOCKS={blocks_of(p["misc"])} MISC_BYTES={blocks_of(p["misc"]) * BS}',
+             f'RECOVERY_DISK={r["disk"]} RECOVERY_PART={r["entry"]} RECOVERY_NODE=/dev/block/{r["disk"]}{r["entry"]} '
+             f'RECOVERY_FIRST={r["first"]} RECOVERY_LAST={r["last"]} RECOVERY_BLOCKS={blocks_of(r)} '
+             f'RECOVERY_BYTES={blocks_of(r) * BS} RECOVERY_LUN_BLOCKS={p["lun_blocks"][r["disk"]]}',
              f'WRITE_FIRST={p["write_first"]} LAYOUT_BLOCK={p["layout_block"]} BS={BS}']
     for name, first, count in p['extents']:
         lines.append(f'{name.upper()}_FIRST={first} {name.upper()}_BLOCKS={count}')

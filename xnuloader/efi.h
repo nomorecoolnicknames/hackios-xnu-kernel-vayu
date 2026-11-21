@@ -16,7 +16,13 @@ typedef uint16_t char16;
 
 #define EFI_ERROR_BIT        0x8000000000000000ULL
 #define EFI_ERROR(s)         (((s) & EFI_ERROR_BIT) != 0)
+#define EFI_SUCCESS          0
+#define EFI_LOAD_ERROR       (EFI_ERROR_BIT | 1)
+#define EFI_INVALID_PARAMETER (EFI_ERROR_BIT | 2)
+#define EFI_UNSUPPORTED      (EFI_ERROR_BIT | 3)
 #define EFI_BUFFER_TOO_SMALL (EFI_ERROR_BIT | 5)
+#define EFI_NOT_FOUND        (EFI_ERROR_BIT | 14)
+#define EFI_ABORTED          (EFI_ERROR_BIT | 21)
 
 typedef struct {
 	uint32_t a; uint16_t b; uint16_t c; uint8_t d[8];
@@ -40,6 +46,8 @@ typedef struct {
 	uint32_t type; uint32_t pad; uint64_t phys_start; uint64_t virt_start; uint64_t pages; uint64_t attribute;
 } efi_memory_descriptor;
 
+struct efi_device_path;
+
 typedef struct {
 	efi_table_header hdr;
 	void *raise_tpl, *restore_tpl;
@@ -55,12 +63,19 @@ typedef struct {
 	void *install_protocol_interface, *reinstall_protocol_interface, *uninstall_protocol_interface;
 	efi_status (EFIAPI *handle_protocol)(efi_handle h, const efi_guid *guid, void **iface);
 	void *reserved, *register_protocol_notify, *locate_handle, *locate_device_path, *install_configuration_table;
-	void *load_image, *start_image, *exit, *unload_image;
+	/* boot_policy is a BOOLEAN; with source != NULL the image is taken from there and path only names it */
+	efi_status (EFIAPI *load_image)(uint8_t boot_policy, efi_handle parent, const struct efi_device_path *path,
+	    void *source, uint64_t source_size, efi_handle *image);
+	efi_status (EFIAPI *start_image)(efi_handle image, uint64_t *exit_data_size, char16 **exit_data);
+	efi_status (EFIAPI *exit)(efi_handle image, efi_status status, uint64_t exit_data_size, char16 *exit_data);
+	efi_status (EFIAPI *unload_image)(efi_handle image);
 	efi_status (EFIAPI *exit_boot_services)(efi_handle image, uint64_t map_key);
 	void *get_next_monotonic_count;
 	efi_status (EFIAPI *stall)(uint64_t microseconds);
 	efi_status (EFIAPI *set_watchdog_timer)(uint64_t timeout, uint64_t code, uint64_t size, char16 *data);
-	void *connect_controller, *disconnect_controller, *open_protocol, *close_protocol, *open_protocol_information;
+	efi_status (EFIAPI *connect_controller)(efi_handle controller, efi_handle *drivers, const struct efi_device_path *remaining,
+	    uint8_t recursive);
+	void *disconnect_controller, *open_protocol, *close_protocol, *open_protocol_information;
 	void *protocols_per_handle;
 	efi_status (EFIAPI *locate_handle_buffer)(int type, const efi_guid *guid, void *key, uint64_t *count, efi_handle **buf);
 	efi_status (EFIAPI *locate_protocol)(const efi_guid *guid, void *registration, void **iface);
@@ -83,10 +98,20 @@ typedef struct {
 	efi_status (EFIAPI *get_time)(struct efi_time *time, void *capabilities);
 	void *set_time, *get_wakeup_time, *set_wakeup_time;
 	void *set_virtual_address_map, *convert_pointer;
-	void *get_variable, *get_next_variable_name, *set_variable;
+	efi_status (EFIAPI *get_variable)(const char16 *name, const efi_guid *vendor, uint32_t *attributes, uint64_t *size,
+	    void *data);
+	void *get_next_variable_name, *set_variable;
 	void *get_next_high_mono_count;
 	void (EFIAPI *reset_system)(int type, efi_status status, uint64_t size, void *data);
+	/* UEFI 2.0 */
+	void *update_capsule, *query_capsule_capabilities;
+	efi_status (EFIAPI *query_variable_info)(uint32_t attributes, uint64_t *max_storage, uint64_t *remaining,
+	    uint64_t *max_variable);
 } efi_runtime_services;
+
+#define EFI_VARIABLE_NON_VOLATILE       0x1u
+#define EFI_VARIABLE_BOOTSERVICE_ACCESS 0x2u
+#define EFI_VARIABLE_RUNTIME_ACCESS     0x4u
 
 typedef struct {
 	efi_table_header hdr;
@@ -101,10 +126,61 @@ typedef struct {
 } efi_system_table;
 
 /* a device path is a list of these, each followed by its data, ending with type 0x7f subtype 0xff */
-typedef struct {
+typedef struct efi_device_path {
 	uint8_t type, subtype;
 	uint8_t length[2];                      /* of the whole node, header included, little endian */
 } efi_device_path;
+
+#define EFI_DP_TYPE_MEDIA       0x04
+#define EFI_DP_MEDIA_FILE_PATH  0x04            /* data: the path, char16, NUL-terminated */
+#define EFI_DP_TYPE_END         0x7f
+#define EFI_DP_END_ENTIRE       0xff
+
+/* EFI_LOADED_IMAGE_PROTOCOL */
+typedef struct {
+	uint32_t revision;
+	efi_handle parent;
+	void *system_table;
+	efi_handle device;                      /* the volume the image came from */
+	efi_device_path *file_path;             /* its path on that volume */
+	void *reserved;
+	uint32_t load_options_size;             /* bytes */
+	void *load_options;
+	void *image_base;
+	uint64_t image_size;
+	uint32_t image_code_type, image_data_type;
+	void *unload;
+} efi_loaded_image;
+
+/* EFI_FILE_PROTOCOL (revision 1 calls) and EFI_SIMPLE_FILE_SYSTEM_PROTOCOL */
+#define EFI_FILE_MODE_READ      0x1ULL
+#define EFI_FILE_DIRECTORY      0x10ULL
+
+typedef struct efi_file {
+	uint64_t revision;
+	efi_status (EFIAPI *open)(struct efi_file *self, struct efi_file **out, const char16 *name, uint64_t mode,
+	    uint64_t attributes);
+	efi_status (EFIAPI *close)(struct efi_file *self);
+	void *delete_file;
+	efi_status (EFIAPI *read)(struct efi_file *self, uint64_t *size, void *buf);   /* of a directory: one efi_file_info */
+	void *write;
+	void *get_position, *set_position;
+	efi_status (EFIAPI *get_info)(struct efi_file *self, const efi_guid *type, uint64_t *size, void *buf);
+	void *set_info, *flush;
+} efi_file;
+
+typedef struct efi_simple_file_system {
+	uint64_t revision;
+	efi_status (EFIAPI *open_volume)(struct efi_simple_file_system *self, efi_file **root);
+} efi_simple_file_system;
+
+typedef struct {
+	uint64_t size;                          /* of this structure, the name included */
+	uint64_t file_size, physical_size;
+	struct { uint8_t t[16]; } create_time, access_time, modification_time;
+	uint64_t attribute;
+	char16 name[];
+} efi_file_info;
 
 /* Graphics Output */
 typedef struct {
@@ -255,6 +331,17 @@ typedef struct {
 #define EFI_BLOCK_IO_GUID       { 0x964e5b21, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
 #define EFI_BLOCK_IO2_GUID      { 0xa77b2472, 0xe282, 0x4e9f, { 0xa2, 0x45, 0xc2, 0xc0, 0xe2, 0x7b, 0xbc, 0xc1 } }
 #define EFI_DEVICE_PATH_GUID    { 0x09576e91, 0x6d3f, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
+#define EFI_LOADED_IMAGE_GUID   { 0x5b1b31a1, 0x9562, 0x11d2, { 0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
+#define EFI_SIMPLE_FS_GUID      { 0x964e5b22, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
+#define EFI_FILE_INFO_GUID      { 0x09576e92, 0x6d3f, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
+#define EFI_GLOBAL_VARIABLE_GUID { 0x8be4df61, 0x93ca, 0x11d2, { 0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c } }
+/* configuration tables (SystemTable->tables) */
+#define EFI_ACPI_20_TABLE_GUID  { 0x8868e871, 0xe4f1, 0x11d3, { 0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81 } }
+#define EFI_ACPI_10_TABLE_GUID  { 0xeb9d2d30, 0x2d88, 0x11d3, { 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d } }
+#define EFI_SMBIOS_TABLE_GUID   { 0xeb9d2d31, 0x2d88, 0x11d3, { 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d } }
+#define EFI_SMBIOS3_TABLE_GUID  { 0xf2fd1544, 0x9794, 0x4a2c, { 0x99, 0x2e, 0xe5, 0xbb, 0xcf, 0x20, 0xe3, 0x94 } }
+#define EFI_FDT_TABLE_GUID      { 0xb1b621d5, 0xf19c, 0x41a5, { 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0 } }
+#define EFI_RT_PROPERTIES_TABLE_GUID { 0xeb66918a, 0x7eef, 0x402a, { 0x84, 0x2e, 0x93, 0x1d, 0x21, 0xc3, 0x8a, 0xe9 } }
 #define EFI_PARTITION_INFO_GUID { 0x8cf2f62c, 0xbc9b, 0x4821, { 0x80, 0x8d, 0xec, 0x9e, 0xc4, 0x21, 0xa1, 0xa0 } }
 #define QCOM_CHARGER_EX_GUID     { 0x6edc8a6d, 0x2663, 0x43cd, { 0x90, 0xff, 0x46, 0x21, 0xff, 0xd1, 0x0d, 0xf5 } }
 #define QCOM_CHARGER_GUID        { 0x21bfb78b, 0x02ea, 0x4ab7, { 0x99, 0x40, 0xb5, 0x8a, 0x2a, 0xd6, 0x58, 0x29 } }

@@ -8,9 +8,17 @@
  * and ufs_stage_head= (the block of the header). Without them -- a phone without the layout -- nothing is staged.
  *
  * The header, in the first bytes of block ufs_stage_head, the rest of the block zero (vayu-dev's loader 2.8 reads
- * the same): "XNUFLASH", the first block, the image's length in bytes, FNV-1a 64 of those bytes; little endian.
- * The loader takes a stage only if first_block is ufs_stage_first, the bytes fit there and in `boot`, the sum is
- * right and the image begins with "ANDROID!"; it clears the header before it writes `boot`.
+ * the first 32 bytes the same): "XNUFLASH", the first block, the image's length in bytes, FNV-1a 64 of those bytes;
+ * then "FORBOOT!", the length of `boot` and FNV-1a 64 of the whole of it as it is when the image is staged; little
+ * endian. The loader takes a stage only if first_block is ufs_stage_first, the bytes fit there and in `boot`, the
+ * sum is right, the image begins with "ANDROID!" and `boot` is still the one it was staged against (a stage left
+ * behind is not written by the next image that happens to say flash_stage=1: that one clears it); it clears the
+ * header before it writes `boot`. A header without "FORBOOT!" (this file's first form) it leaves alone.
+ *
+ * flash_stage_target=recovery on the command line (the multiboot: HakiOS in the recovery partition, Android in
+ * boot): the same with the recovery in boot's place -- the image summed against /dev/rufs_recovery, the header tied
+ * to it by "FORRECV!" instead of "FORBOOT!". The loader then writes the recovery and never boot, and an image whose
+ * target is boot clears a "FORRECV!" header (as one whose target is the recovery clears a "FORBOOT!" one).
  *
  * From another HakiOS port (MIT, as this file): telegdyd/ios-vayu, branch vayu-dev, commit 86984b16b016 (its flash_stage.c).
  */
@@ -22,6 +30,8 @@
 
 #define FLASH_STAGE_BLOCK       4096
 #define FLASH_STAGE_MAGIC       "XNUFLASH"
+#define FLASH_STAGE_BOOT_MAGIC  "FORBOOT!"
+#define FLASH_STAGE_RECOVERY_MAGIC "FORRECV!"
 #define FLASH_STAGE_MIN_BYTES   4096                    /* an Android boot image's header page at least */
 
 struct flash_stage_head {
@@ -29,6 +39,9 @@ struct flash_stage_head {
 	uint64_t first_block;
 	uint64_t bytes;
 	uint64_t fnv;
+	char boot_magic[8];             /* FLASH_STAGE_BOOT_MAGIC, or FLASH_STAGE_RECOVERY_MAGIC */
+	uint64_t boot_bytes;            /* `boot`'s length when the image was staged */
+	uint64_t boot_fnv;              /* FNV-1a 64 of all of `boot` then */
 };
 
 struct flash_stage_layout {
@@ -119,6 +132,52 @@ flash_stage_arg(const char *args, const char *name, uint64_t *value)
 	return found;
 }
 
+/*
+ * Which partition a stage is for: flash_stage_target=boot or =recovery on the command line, boot when there is none.
+ * NULL and *recovery, or why not (another value, or two of them: the kernel takes the last, a reader the first).
+ */
+static inline const char *
+flash_stage_target(const char *args, int *recovery)
+{
+	static const char key[] = "flash_stage_target=";
+	int found = 0;
+
+	*recovery = 0;
+	for (const char *p = args; p != NULL && *p != 0;) {
+		const char *end;
+		size_t i;
+
+		while (*p == ' ' || *p == '\t') {
+			p++;
+		}
+		for (end = p; *end != 0 && *end != ' ' && *end != '\t'; end++) {
+		}
+		for (i = 0; i < sizeof(key) - 1 && p + i < end && p[i] == key[i]; i++) {
+		}
+		if (i == sizeof(key) - 1) {
+			const char *v = p + i;
+			size_t n = (size_t)(end - v);
+			int r;
+
+			if (n == 4 && v[0] == 'b' && v[1] == 'o' && v[2] == 'o' && v[3] == 't') {
+				r = 0;
+			} else if (n == 8 && v[0] == 'r' && v[1] == 'e' && v[2] == 'c' && v[3] == 'o' && v[4] == 'v' && v[5] == 'e' &&
+			    v[6] == 'r' && v[7] == 'y') {
+				r = 1;
+			} else {
+				return "flash_stage_target= is neither boot nor recovery";
+			}
+			if (found && r != *recovery) {
+				return "flash_stage_target= is on the command line twice with two values";
+			}
+			*recovery = r;
+			found = 1;
+		}
+		p = end;
+	}
+	return NULL;
+}
+
 /* [a, a + an) and [b, b + bn) have a block in common */
 static inline int
 flash_stage_overlap(uint64_t a, uint64_t an, uint64_t b, uint64_t bn)
@@ -188,10 +247,13 @@ flash_stage_image(const uint8_t *img, uint64_t bytes, const struct flash_stage_l
 	return NULL;
 }
 
-/* The header block for an image: FLASH_STAGE_BLOCK bytes at out, zero but for the header. */
+/* The header block for an image staged against a boot of boot_bytes whose sum is boot_fnv (recovery: against the
+ * recovery, so summed): FLASH_STAGE_BLOCK bytes at out, zero but for the header. */
 static inline void
-flash_stage_head_block(uint8_t *out, const struct flash_stage_layout *l, const uint8_t *img, uint64_t bytes)
+flash_stage_head_block_for(uint8_t *out, const struct flash_stage_layout *l, const uint8_t *img, uint64_t bytes,
+    uint64_t boot_bytes, uint64_t boot_fnv, int recovery)
 {
+	const char *tie = recovery ? FLASH_STAGE_RECOVERY_MAGIC : FLASH_STAGE_BOOT_MAGIC;
 	struct flash_stage_head h;
 
 	for (size_t i = 0; i < FLASH_STAGE_BLOCK; i++) {
@@ -203,9 +265,21 @@ flash_stage_head_block(uint8_t *out, const struct flash_stage_layout *l, const u
 	h.first_block = l->first;
 	h.bytes = bytes;
 	h.fnv = flash_stage_fnv(FLASH_STAGE_FNV_START, img, (size_t)bytes);
+	for (int i = 0; i < 8; i++) {
+		h.boot_magic[i] = tie[i];
+	}
+	h.boot_bytes = boot_bytes;
+	h.boot_fnv = boot_fnv;
 	for (size_t i = 0; i < sizeof(h); i++) {
 		out[i] = ((const uint8_t *)&h)[i];
 	}
+}
+
+static inline void
+flash_stage_head_block(uint8_t *out, const struct flash_stage_layout *l, const uint8_t *img, uint64_t bytes,
+    uint64_t boot_bytes, uint64_t boot_fnv)
+{
+	flash_stage_head_block_for(out, l, img, bytes, boot_bytes, boot_fnv, 0);
 }
 
 /* A header block as the loader reads it: 1 and the header if it holds a stage of this layout, else 0. */
@@ -221,6 +295,32 @@ flash_stage_head_read(const uint8_t *block, const struct flash_stage_layout *l, 
 		}
 	}
 	return h->first_block == l->first && h->bytes >= FLASH_STAGE_MIN_BYTES && h->bytes <= l->blocks * FLASH_STAGE_BLOCK;
+}
+
+/* A stage's header (flash_stage_head_read) tied to a boot (recovery: to the recovery): 1 if staged against
+ * boot_bytes summing to boot_fnv, 0 if against another, -1 if against none (the first form: the loader leaves it
+ * alone), -2 if tied to the other partition (the loader clears it, writes nothing) */
+static inline int
+flash_stage_head_for_target(const struct flash_stage_head *h, uint64_t boot_bytes, uint64_t boot_fnv, int recovery)
+{
+	const char *tie = recovery ? FLASH_STAGE_RECOVERY_MAGIC : FLASH_STAGE_BOOT_MAGIC;
+	const char *other = recovery ? FLASH_STAGE_BOOT_MAGIC : FLASH_STAGE_RECOVERY_MAGIC;
+	int mine = 1, theirs = 1;
+
+	for (int i = 0; i < 8; i++) {
+		mine &= h->boot_magic[i] == tie[i];
+		theirs &= h->boot_magic[i] == other[i];
+	}
+	if (!mine) {
+		return theirs ? -2 : -1;
+	}
+	return h->boot_bytes == boot_bytes && h->boot_fnv == boot_fnv;
+}
+
+static inline int
+flash_stage_head_for(const struct flash_stage_head *h, uint64_t boot_bytes, uint64_t boot_fnv)
+{
+	return flash_stage_head_for_target(h, boot_bytes, boot_fnv, 0);
 }
 
 #endif /* FLASH_STAGE_H */

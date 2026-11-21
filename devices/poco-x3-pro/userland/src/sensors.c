@@ -28,7 +28,12 @@
  * The kernel's side is /dev/vayu-als and /dev/vayu-prox (sys/vayu_ssc.h), one small struct per
  * sensor, with /dev/vayu-motion v2 as the fallback for a kernel without them. A missing device
  * (the sensor core did not come up: vayu_slpi=6 without vayu_ssc_als=1) is not an error: the
- * library says so once and creates nothing, so a phone without the streams boots as before.
+ * library says so once and creates nothing until it is there, so a phone without the streams
+ * boots as before. Each device is looked for on its own, again and again (2 s, doubling to 30 s):
+ * the sensor core comes up 25-40 s after boot or later (vayu_slpi waits 20 s for QRTR, then looks
+ * the sensors up), one sensor's device being there does not stop the wait for the other, and a
+ * device that stops answering is closed and looked for again. Proximity that goes away (the
+ * device fails, or reads "unknown") while it said near is told far: the screen is never left off.
  *
  * Boot args: sensors_hid=0 (both off), als_hid=0, prox_hid=0 (one off), prox_mask_near=N (the
  * mask for "near", default 0x40 = Receiver). Default: both sensors on.
@@ -189,48 +194,132 @@ source_open(struct source *s, const char *device)
 	return true;
 }
 
-/* Read the sensor's latest sample; false when the device has nothing new or is not open. */
-static bool
+/* One read of a device: 1 the whole struct, 0 nothing this time (interrupted), -1 the device failed. */
+static int
+source_read(int fd, void *buffer, size_t size)
+{
+	ssize_t n = read(fd, buffer, size);
+
+	if (n == (ssize_t)size) {
+		return 1;
+	}
+	if (n >= 0) {
+		errno = EIO;            /* short: not the device it was */
+	}
+	return n < 0 && errno == EINTR ? 0 : -1;
+}
+
+/* Read the sensor's latest sample: 1 one was read (new or not), 0 nothing usable this time (another
+ * version), -1 the device failed and is to be opened again. */
+static int
 source_als(struct source *s, struct vayu_als *out)
 {
 	struct vayu_motion m;
+	int got;
 
-	if (s->fd < 0) {
-		return false;
-	}
 	if (s->combined) {
-		if (read(s->fd, &m, sizeof(m)) != (ssize_t)sizeof(m) || m.version < VAYU_MOTION_VERSION) {
-			return false;
+		if ((got = source_read(s->fd, &m, sizeof(m))) <= 0) {
+			return got;
+		}
+		if (m.version < VAYU_MOTION_VERSION) {
+			return 0;
 		}
 		out->version = VAYU_ALS_VERSION;
 		out->seq = m.light_seq;
 		out->lux_milli = m.lux_milli;
 		out->age_ms = m.light_age_ms;
-		return true;
+		return 1;
 	}
-	return read(s->fd, out, sizeof(*out)) == (ssize_t)sizeof(*out) && out->version == VAYU_ALS_VERSION;
+	if ((got = source_read(s->fd, out, sizeof(*out))) <= 0) {
+		return got;
+	}
+	return out->version == VAYU_ALS_VERSION ? 1 : 0;
 }
 
-static bool
+static int
 source_prox(struct source *s, struct vayu_prox *out)
 {
 	struct vayu_motion m;
+	int got;
 
-	if (s->fd < 0) {
-		return false;
-	}
 	if (s->combined) {
-		if (read(s->fd, &m, sizeof(m)) != (ssize_t)sizeof(m) || m.version < VAYU_MOTION_VERSION) {
-			return false;
+		if ((got = source_read(s->fd, &m, sizeof(m))) <= 0) {
+			return got;
+		}
+		if (m.version < VAYU_MOTION_VERSION) {
+			return 0;
 		}
 		out->version = VAYU_PROX_VERSION;
 		out->seq = m.prox_seq;
 		out->near = m.prox_near;
 		out->distance = m.prox_distance;
 		out->age_ms = m.prox_age_ms;
+		return 1;
+	}
+	if ((got = source_read(s->fd, out, sizeof(*out))) <= 0) {
+		return got;
+	}
+	return out->version == VAYU_PROX_VERSION ? 1 : 0;
+}
+
+/*
+ * A sensor's device, looked for until it is there and again when it goes: the first look at the
+ * thread's start, then 2 s, 4 s, ... 30 s apart, for as long as it takes. A sample read puts the
+ * wait back to 2 s, so a device that opens but fails at once is not opened in a tight loop.
+ */
+#define LOOK_FIRST_US           2000000ULL
+#define LOOK_MOST_US            30000000ULL
+
+struct sensor {
+	const char *device, *what;
+	struct source source;           /* fd -1: not open */
+	uint64_t look_at_us;            /* the next look for it */
+	uint64_t wait_us;               /* the wait after that one, if it is not there */
+	bool said;                      /* its absence said, once */
+};
+
+static void
+sensor_wait(struct sensor *s, uint64_t now_us)
+{
+	if (s->wait_us == 0) {
+		s->wait_us = LOOK_FIRST_US;
+	}
+	s->look_at_us = now_us + s->wait_us;
+	s->wait_us = s->wait_us * 2 > LOOK_MOST_US ? LOOK_MOST_US : s->wait_us * 2;
+}
+
+/* True when the sensor's device is open: it was, or this was the time to look and it is there. */
+static bool
+sensor_open(struct sensor *s, uint64_t now_us)
+{
+	if (s->source.fd >= 0) {
 		return true;
 	}
-	return read(s->fd, out, sizeof(*out)) == (ssize_t)sizeof(*out) && out->version == VAYU_PROX_VERSION;
+	if (now_us < s->look_at_us) {
+		return false;
+	}
+	if (source_open(&s->source, s->device)) {
+		say("hakios: sensors: %s source: %s\n", s->what, s->source.combined ? VAYU_MOTION_DEVICE : s->device);
+		return true;
+	}
+	if (!s->said) {
+		s->said = true;
+		say("hakios: sensors: no %s source (%s: %s); looking again, every 2 s to 30 s\n", s->what, s->device,
+		    strerror(errno));
+	}
+	sensor_wait(s, now_us);
+	return false;
+}
+
+/* The device failed: closed, and looked for again after the wait. */
+static void
+sensor_lost(struct sensor *s, uint64_t now_us)
+{
+	say("hakios: sensors: %s source failed (%s): looking for it again\n", s->what, strerror(errno));
+	close(s->source.fd);
+	s->source.fd = -1;
+	s->source.combined = false;
+	sensor_wait(s, now_us);
 }
 
 /* ---- the virtual services ------------------------------------------------------------------ */
@@ -498,104 +587,167 @@ send_prox(struct service *made, IOHIDServiceClientRef service, bool near, int32_
 struct run {
 	struct service als, prox;
 	IOHIDServiceClientRef als_service, prox_service;
-	struct source als_source, prox_source;
+	struct sensor als_sensor, prox_sensor;
+	IOHIDEventSystemClientRef client;
 };
 
 static struct run run;          /* the thread's, for the life of the process */
 
+/* The event server's client, made when the first sensor's device is there (a phone without the
+ * streams never makes one); NULL when none can be made. */
+static IOHIDEventSystemClientRef
+sensors_client(struct run *r)
+{
+	static const int types[] = { HID_CLIENT_SIMPLE, HID_CLIENT_RATE_CONTROLLED };
+
+	for (unsigned i = 0; r->client == NULL && i < sizeof(types) / sizeof(types[0]); i++) {
+		r->client = IOHIDEventSystemClientCreateWithType(NULL, types[i], NULL);
+		if (r->client != NULL) {
+			IOHIDEventSystemClientScheduleWithDispatchQueue(r->client, dispatch_queue_create("hakios.sensors", NULL));
+		}
+	}
+	if (r->client == NULL) {
+		say("hakios: sensors: no HID client\n");
+	}
+	return r->client;
+}
+
+/* Proximity that can no longer be trusted (its device failed, or it reads unknown) while near was
+ * said: far, so that the screen is not left off by a sensor that is gone. */
 static void
-sensors_run(struct run *r, IOHIDEventSystemClientRef client, bool want_als, bool want_prox)
+prox_release(struct run *r, int32_t *last_near, const char *why)
+{
+	if (*last_near == 1) {
+		say("hakios: sensors: proximity %s while near: far\n", why);
+		send_prox(&r->prox, r->prox_service, false, 0);
+		*last_near = 0;
+	}
+}
+
+static void
+sensors_run(struct run *r, bool want_als, bool want_prox)
 {
 	uint32_t last_als_seq = 0, last_prox_seq = 0;
 	int32_t last_near = -1;
 	unsigned als_shown = 0;
 	uint64_t last_als_at = 0, last_said = 0;
-	CFMutableDictionaryRef extra = proximity_extras();
+	struct vayu_als pending;        /* the latest ambient-light sample, until it is sent */
+	bool als_pending = false;
+	CFMutableDictionaryRef extra;
 
-	if (want_als) {
-		r->als_service = make_service(client, &r->als, "Hakios ambient light", HID_PAGE_SENSOR,
-		    HID_USAGE_AMBIENT_LIGHT, NULL);
-	}
-	if (want_prox) {
-		r->prox_service = make_service(client, &r->prox, "Hakios proximity", HID_PAGE_APPLE_VENDOR,
-		    HID_USAGE_APPLE_PROXIMITY, extra);
-	}
-	CFRelease(extra);
-	say("hakios: sensors: services %p (ALS 0x%x/0x%x) %p (proximity 0x%x/0x%x), sources %d/%d\n",
-	    (void *)r->als_service, HID_PAGE_SENSOR, HID_USAGE_AMBIENT_LIGHT, (void *)r->prox_service,
-	    HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_PROXIMITY, r->als_source.fd, r->prox_source.fd);
-	for (;;) {
+	while (want_als || want_prox) {
 		uint64_t now = mach_absolute_time(), now_us = micros(now);
 		struct vayu_als a;
 		struct vayu_prox p;
+		int got;
 
-		if (r->als_service != NULL && source_als(&r->als_source, &a) && a.seq != 0 && a.seq != last_als_seq) {
+		if (want_als && sensor_open(&r->als_sensor, now_us)) {
+			if (r->als_service == NULL) {
+				if (sensors_client(r) == NULL) {
+					return;
+				}
+				r->als_service = make_service(r->client, &r->als, "Hakios ambient light", HID_PAGE_SENSOR,
+				    HID_USAGE_AMBIENT_LIGHT, NULL);
+				say("hakios: sensors: service %p (ALS 0x%x/0x%x), source fd %d\n", (void *)r->als_service,
+				    HID_PAGE_SENSOR, HID_USAGE_AMBIENT_LIGHT, r->als_sensor.source.fd);
+				if (r->als_service == NULL) {
+					want_als = false;
+					close(r->als_sensor.source.fd);
+					r->als_sensor.source.fd = -1;
+				}
+			}
+			if (r->als_service == NULL) {
+				/* left out */
+			} else if ((got = source_als(&r->als_sensor.source, &a)) < 0) {
+				sensor_lost(&r->als_sensor, now_us);
+				last_als_seq = 0;       /* whatever comes after it is new */
+			} else if (got > 0) {
+				r->als_sensor.wait_us = LOOK_FIRST_US;
+				r->als_sensor.said = false;
+				if (a.seq != 0 && a.seq != last_als_seq) {
+					/* kept until the interval allows it: a change that comes inside the
+					 * interval and is the last one for a while is sent late, not lost */
+					last_als_seq = a.seq;
+					pending = a;
+					als_pending = true;
+				}
+			}
+		}
+		if (als_pending) {
 			/* the event server's ReportInterval if it asked for one, else the sensor's 5 Hz;
 			 * never faster than 10 ms or slower than 1 s */
 			double interval = r->als.interval_us > 0 ? r->als.interval_us : 200000;
 
-			last_als_seq = a.seq;
 			if (interval < 10000) interval = 10000;
 			if (interval > 1000000) interval = 1000000;
 			if (now_us - last_als_at >= (uint64_t)interval) {
+				als_pending = false;
 				last_als_at = now_us;
-				send_als(&r->als, r->als_service, a.lux_milli);
+				send_als(&r->als, r->als_service, pending.lux_milli);
 				if (als_shown < 5 || now_us - last_said >= 30000000) {
 					als_shown++;
 					last_said = now_us;
 					say("hakios: sensors: ambient light #%u: %d milli-lux (age %u ms), every %.0f us, continuous %d\n",
-					    a.seq, a.lux_milli, a.age_ms, interval, r->als.continuous);
+					    pending.seq, pending.lux_milli, pending.age_ms, interval, r->als.continuous);
 				}
 			}
 		}
-		if (r->prox_service != NULL && source_prox(&r->prox_source, &p) && p.seq != 0 && p.seq != last_prox_seq) {
-			last_prox_seq = p.seq;
-			if (p.near >= 0 && p.near != last_near) {
-				last_near = p.near;
-				send_prox(&r->prox, r->prox_service, p.near == 1, p.distance);
+		if (want_prox && sensor_open(&r->prox_sensor, now_us)) {
+			if (r->prox_service == NULL) {
+				if (sensors_client(r) == NULL) {
+					return;
+				}
+				extra = proximity_extras();
+				r->prox_service = make_service(r->client, &r->prox, "Hakios proximity", HID_PAGE_APPLE_VENDOR,
+				    HID_USAGE_APPLE_PROXIMITY, extra);
+				CFRelease(extra);
+				say("hakios: sensors: service %p (proximity 0x%x/0x%x), source fd %d\n", (void *)r->prox_service,
+				    HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_PROXIMITY, r->prox_sensor.source.fd);
+				if (r->prox_service == NULL) {
+					want_prox = false;
+					close(r->prox_sensor.source.fd);
+					r->prox_sensor.source.fd = -1;
+				}
+			}
+			if (r->prox_service == NULL) {
+				/* left out */
+			} else if ((got = source_prox(&r->prox_sensor.source, &p)) < 0) {
+				sensor_lost(&r->prox_sensor, now_us);
+				last_prox_seq = 0;
+				prox_release(r, &last_near, "source failed");
+			} else if (got > 0) {
+				r->prox_sensor.wait_us = LOOK_FIRST_US;
+				r->prox_sensor.said = false;
+				if (p.seq == 0 || p.near < 0) {
+					prox_release(r, &last_near, "unknown");
+				} else if (p.seq != last_prox_seq) {
+					last_prox_seq = p.seq;
+					if (p.near != last_near) {
+						last_near = p.near;
+						send_prox(&r->prox, r->prox_service, p.near == 1, p.distance);
+					}
+				}
 			}
 		}
-		usleep(20000);
+		/* 50 Hz while a device is open; once a second while only waiting for them */
+		usleep(r->als_sensor.source.fd >= 0 || r->prox_sensor.source.fd >= 0 || als_pending ? 20000 : 1000000);
 	}
 }
 
 /* The thread: after the event server is up (libhakios's input and motion threads have had their
- * turn), open the sensors and make the services; a sensor that is not there is skipped. */
+ * turn), look for the sensors' devices and make each service when its device is there. */
 static void *
 sensors_thread(void *arg)
 {
-	static const int types[] = { HID_CLIENT_SIMPLE, HID_CLIENT_RATE_CONTROLLED };
 	bool want_als = ((int)(intptr_t)arg & 1) != 0, want_prox = ((int)(intptr_t)arg & 2) != 0;
 	struct run *r = &run;
-	IOHIDEventSystemClientRef client = NULL;
 
 	pthread_setname_np("hakios sensors");
 	mach_timebase_info(&timebase);
+	r->als_sensor = (struct sensor){ .device = VAYU_ALS_DEVICE, .what = "ambient-light", .source.fd = -1 };
+	r->prox_sensor = (struct sensor){ .device = VAYU_PROX_DEVICE, .what = "proximity", .source.fd = -1 };
 	sleep(12);                      /* libhakios's input at 3 s, libhakios.motion at 10 s */
-	if (want_als) {
-		want_als = source_open(&r->als_source, VAYU_ALS_DEVICE);
-		if (!want_als) {
-			say("hakios: sensors: no ambient-light source (%s: %s)\n", VAYU_ALS_DEVICE, strerror(errno));
-		}
-	}
-	if (want_prox) {
-		want_prox = source_open(&r->prox_source, VAYU_PROX_DEVICE);
-		if (!want_prox) {
-			say("hakios: sensors: no proximity source (%s: %s)\n", VAYU_PROX_DEVICE, strerror(errno));
-		}
-	}
-	if (!want_als && !want_prox) {
-		return NULL;
-	}
-	for (unsigned i = 0; client == NULL && i < sizeof(types) / sizeof(types[0]); i++) {
-		client = IOHIDEventSystemClientCreateWithType(NULL, types[i], NULL);
-	}
-	if (client == NULL) {
-		say("hakios: sensors: no HID client\n");
-		return NULL;
-	}
-	IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("hakios.sensors", NULL));
-	sensors_run(r, client, want_als, want_prox);
+	sensors_run(r, want_als, want_prox);
 	return NULL;
 }
 

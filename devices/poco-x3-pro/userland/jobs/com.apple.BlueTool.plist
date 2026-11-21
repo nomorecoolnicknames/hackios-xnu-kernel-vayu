@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.apple.BlueTool on vayu: bluetoothd asks this service to run the controller's boot script before it opens the
+  transport, and Apple's /usr/sbin/BlueTool -R has only Broadcom scripts; against vayu's Qualcomm controller it
+  times out and bluetoothd never powers on (lab receipt 2026-10-28, TEST11). src/bluetool_stub.c answers in its
+  place: the kernel has already loaded crbtfw21 and crnv21. Without this job the REST pass would ship Apple's BlueTool.
+-->
+<plist version="1.0">
+<dict>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/bluetool_stub</string>
+	</array>
+</dict>
+</plist>

@@ -6,6 +6,10 @@
  * A library of its own and not more of inject.c, so that it can be left out for a phone without the
  * sensor. backboardd is the HID event server; like libhakios's touch screen, the accelerometer is a
  * virtual service made by a client of that server inside the same process.
+ *
+ * The device is waited for for as long as it takes (2 s, doubling to 30 s apart): the sensor core
+ * comes when it comes, 25-40 s after boot or much later, and nothing is made before it is there.
+ * A device that stops answering is closed and opened again the same way; the services stay.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
@@ -297,6 +301,37 @@ motion_orientation(double x, double y, double z, uint64_t now_us)
 }
 
 /*
+ * /dev/vayu-motion, opened once it is there: looked for every 2 s at first, the wait doubling to 30 s,
+ * with no end (the old 5 minutes gave up on a sensor core that came late or came back).
+ */
+#define LOOK_FIRST_S            2
+#define LOOK_MOST_S             30
+
+static unsigned
+look_longer(unsigned wait)
+{
+	return wait * 2 > LOOK_MOST_S ? LOOK_MOST_S : wait * 2;
+}
+
+static int
+motion_open(void)
+{
+	unsigned wait = LOOK_FIRST_S;
+	bool said = false;
+	int device;
+
+	while ((device = open(VAYU_MOTION_DEVICE, O_RDONLY)) < 0) {
+		if (!said) {
+			said = true;
+			say("hakios: motion: %s: %s; looking again, every 2 s to 30 s\n", VAYU_MOTION_DEVICE, strerror(errno));
+		}
+		sleep(wait);
+		wait = look_longer(wait);
+	}
+	return device;
+}
+
+/*
  * Boot-arg motion_orient=0 (off), 1 (A: the samples as accelerometer events on 0xFF00/3 and 0xFF0C/3; the default),
  * 2 (A, and B: the orientation from them told to backboardd directly). Nothing at all happens without the device.
  */
@@ -306,20 +341,10 @@ motion_run(IOHIDEventSystemClientRef client, int mode)
 	IOHIDServiceClientRef services[2] = { NULL, NULL };
 	struct vayu_motion m;
 	uint32_t last_seq = 0;
-	unsigned shown = 0;
+	unsigned shown = 0, lost_wait = LOOK_FIRST_S;
 	uint64_t last_said = 0;
-	int device = -1;
+	int device = motion_open();
 
-	for (unsigned waited = 0; (device = open(VAYU_MOTION_DEVICE, O_RDONLY)) < 0; waited++) {
-		if (waited == 0) {
-			say("hakios: motion: %s: %s; trying every 2 s\n", VAYU_MOTION_DEVICE, strerror(errno));
-		}
-		if (waited >= 150) {            /* 5 minutes: the sensor core is not coming in this boot */
-			say("hakios: motion: %s never came\n", VAYU_MOTION_DEVICE);
-			return;
-		}
-		sleep(2);
-	}
 	services[0] = make_service(client, "Hakios accelerometer", HID_PAGE_APPLE_VENDOR, HID_USAGE_ACCELEROMETER);
 	services[1] = make_service(client, "Hakios motion accel", HID_PAGE_APPLE_MOTION, HID_USAGE_ACCELEROMETER);
 	say("hakios: motion: %s open, services %p (0xff00/3) %p (0xff0c/3), mode %d\n", VAYU_MOTION_DEVICE,
@@ -330,13 +355,26 @@ motion_run(IOHIDEventSystemClientRef client, int mode)
 
 		if (interval < 10000) interval = 10000;
 		if (interval > 200000) interval = 200000;
-		if (read(device, &m, sizeof(m)) == (ssize_t)sizeof(m) && m.version == VAYU_MOTION_VERSION && m.seq != 0 &&
-		    m.seq != last_seq) {
+		ssize_t got = read(device, &m, sizeof(m));
+
+		if (got != (ssize_t)sizeof(m) && !(got < 0 && errno == EINTR)) {
+			/* the device failed: closed and opened again, the wait growing while it keeps failing */
+			say("hakios: motion: %s failed (%s): opening it again in %u s\n", VAYU_MOTION_DEVICE,
+			    got < 0 ? strerror(errno) : "short read", lost_wait);
+			close(device);
+			sleep(lost_wait);
+			lost_wait = look_longer(lost_wait);
+			device = motion_open();
+			last_seq = 0;           /* whatever comes after it is new */
+			continue;
+		}
+		if (got == (ssize_t)sizeof(m) && m.version == VAYU_MOTION_VERSION && m.seq != 0 && m.seq != last_seq) {
 			/* g, Apple's sign (HYPOTHESIS: Apple flat face up z = -1 g, Android +9.8) */
 			double x = -m.accel_mm_s2[0] / STANDARD_GRAVITY_MM, y = -m.accel_mm_s2[1] / STANDARD_GRAVITY_MM,
 			    z = -m.accel_mm_s2[2] / STANDARD_GRAVITY_MM;
 
 			last_seq = m.seq;
+			lost_wait = LOOK_FIRST_S;
 			for (unsigned i = 0; i < 2; i++) {
 				IOHIDEventRef event;
 
@@ -376,17 +414,15 @@ motion_thread(void *arg)
 	pthread_setname_np("hakios motion");
 	mach_timebase_info(&timebase);
 	if (access(VAYU_MOTION_DEVICE, F_OK) != 0) {
-		/* a boot without the sensor core streaming: wait for the device first, quietly, before any client */
-		for (unsigned waited = 0; access(VAYU_MOTION_DEVICE, F_OK) != 0; waited++) {
-			if (waited == 0) {
-				say("hakios: motion: %s: %s; trying every 2 s\n", VAYU_MOTION_DEVICE, strerror(errno));
-			}
-			if (waited >= 150) {
-				say("hakios: motion: %s never came\n", VAYU_MOTION_DEVICE);
-				return NULL;
-			}
-			sleep(2);
+		/* a boot without the sensor core streaming (yet): wait for the device first, quietly, before any client */
+		unsigned wait = LOOK_FIRST_S;
+
+		say("hakios: motion: %s: %s; looking again, every 2 s to 30 s\n", VAYU_MOTION_DEVICE, strerror(errno));
+		while (access(VAYU_MOTION_DEVICE, F_OK) != 0) {
+			sleep(wait);
+			wait = look_longer(wait);
 		}
+		say("hakios: motion: %s is there\n", VAYU_MOTION_DEVICE);
 	}
 	sleep(10);                      /* libhakios's input thread makes its services 3 s in; ours after it */
 	for (unsigned i = 0; client == NULL && i < sizeof(types) / sizeof(types[0]); i++) {

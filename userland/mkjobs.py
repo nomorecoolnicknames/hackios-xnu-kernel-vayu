@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Copy stock iOS launchd job definitions into the small image, adjusted for the bring-up.
 
-usage: mkjobs.py [--rest] [--root-volume LISTING] IOS_ROOTFS DEST_DIR label...
+usage: mkjobs.py [--rest] [--root-volume LISTING] [--overlay DIR] IOS_ROOTFS DEST_DIR label...
 
 For every label, IOS_ROOTFS/System/Library/LaunchDaemons/<label>.plist is copied to DEST_DIR with
 its standard error sent to the console, which is where a daemon's last words are read (there
@@ -10,6 +10,13 @@ is no log viewer or crash reporter yet). For the jobs named in the environment v
 everything the daemon has to say -- SpringBoard alone says a megabyte in half a minute, which
 costs time and pushes everybody else out of the log that comes back from the phone.
 The program itself must be there at run time; a warning is printed if it will not be.
+
+With --overlay DIR, a named job that has DIR/<label>.plist gets that plist merged over Apple's: what one
+phone's hardware needs changed in a stock job (devices/<name>/userland/jobs, see build.sh) -- an
+environment variable, another program, RunAtLoad. A key there replaces Apple's, except that a dictionary
+is merged into Apple's dictionary of the same key (EnvironmentVariables gains variables, it does not lose
+Apple's), and the list _Remove names keys of Apple's to take out. Only the jobs named on the command line
+are overlaid; the rest (--rest) stay as Apple wrote them.
 
 What "there at run time" means is the recipe, not what happens to be unpacked on this machine, and the
 two recipes differ. With the system image as the root, it is what select-system.py chose, and a daemon it
@@ -230,6 +237,11 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
 # retries with a 0 s delay.  The retry is stopped on the nfcd side instead
 # (userland/src/inject_nfcrestore.m); adding this plist is not the fix.
 
+# A phone that runs bluetoothd, nfcd or CommCenter names them (build.sh BLUETOOTHD, NFCD, COMMCENTER, with
+# devices/<name>/userland/jobs), and a named job does not go through this tuple at all. Their words stay in it for
+# the rest: the helpers nobody has tried on a phone (BTServer.*, bluetoothuserd, the CommCenter helpers), and
+# com.apple.CommCenter-noncellular, which carries the same label as the named cellular job.
+
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
 
@@ -239,6 +251,11 @@ root_volume = None              # the listing of the whole iOS volume, when that
 if '--root-volume' in args:
     i = args.index('--root-volume')
     root_volume = args[i + 1]
+    del args[i:i + 2]
+overlay = None                  # devices/<name>/userland/jobs: this phone's changes to named jobs
+if '--overlay' in args:
+    i = args.index('--overlay')
+    overlay = args[i + 1]
     del args[i:i + 2]
 args = [a for a in args if a != '--rest']
 src_root, dest, labels = args[0], args[1], args[2:]
@@ -259,6 +276,9 @@ def volume_paths(listing, _cache={}):
 
 
 def present(program):
+    # a program of ours: in this image, which is mounted on /redwood (DEST_DIR is its LaunchDaemons)
+    if program.startswith('/redwood/'):
+        return os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(dest)), program[len('/redwood/'):]))
     for prefix, unpacked in CRYPTEXES.items():
         if program.startswith(prefix):
             return os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(src_root)), unpacked,
@@ -277,6 +297,18 @@ for label in labels:
     # a job that is named is wanted, whatever hardware it says it is for: wifid's asks for a node "wlan" in the
     # device tree, which the loader's tree does not have yet
     job.pop('_LimitLoadToDeviceTree', None)
+    changed = ''
+    if overlay and os.path.isfile(f'{overlay}/{label}.plist'):
+        with open(f'{overlay}/{label}.plist', 'rb') as f:
+            change = plistlib.load(f)
+        for key in change.pop('_Remove', []):
+            job.pop(key, None)
+        for key, value in change.items():
+            if isinstance(value, dict) and isinstance(job.get(key), dict):
+                job[key].update(value)
+            else:
+                job[key] = value
+        changed = f'   (overlay {os.path.basename(os.path.abspath(overlay))}/{label}.plist)'
     if 'all' in oslog or label in oslog:
         job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
     with open(f'{dest}/{label}.plist', 'wb') as f:
@@ -284,7 +316,7 @@ for label in labels:
     program = job.get('Program') or job['ProgramArguments'][0]
     missing = '' if present(program) else ('   (NOT on the iOS volume!)' if root_volume
                                            else '   (NOT in the system image!)')
-    print(f'  job {label}: {program}{missing}')
+    print(f'  job {label}: {program}{missing}{changed}')
 
 if rest:
     count = 0

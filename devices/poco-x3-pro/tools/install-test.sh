@@ -3,7 +3,10 @@
 # scripts' commands on files standing for the LUNs, the partitions, sysfs and /proc/mounts. What it shows: every
 # check refuses what it should (another GPT, another sysfs view, a mounted darwin, a size, a missing magic, no
 # DARWIN_WRITE/FLASH_BOOT, a layout block that is not darwin-layout.py's), the writes land where the layout says,
-# read back, and a boot write that does not read back puts the saved boot back. No phone is touched.
+# read back, and a boot write that does not read back puts the saved boot back. The writes go as phone-write.sh
+# makes them: a push, the staged copy checked, dd from it; the fake adb breaks each step once (a wrong copy, a
+# device that writes wrong, no room, another writer, a shell that drops while its dd goes on) and the scripts must
+# refuse, roll back or wait -- never start a second writer. No phone is touched.
 #
 #   devices/poco-x3-pro/tools/install-test.sh [GPT_DIR]
 #
@@ -17,7 +20,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 GPT_DIR=${1:-}
 T=$(mktemp -d "${TMPDIR:-/tmp}/install-test.XXXXXX"); trap 'rm -rf "$T"' EXIT
 export FAKE=$T/phone FAKE_SERIAL=0123456789abcdef TOP_LOGS=$T
-export SERIAL=$FAKE_SERIAL
+export SERIAL=$FAKE_SERIAL STAGE_DIR=/hakios-stage      # the phone's staging place: $FAKE/stage
 fails=0
 ok() { echo "  ok   $1"; }
 bad() { echo "  FAIL $1"; fails=$((fails + 1)); }
@@ -30,20 +33,35 @@ expect() {      # expect yes|no WHAT COMMAND...: the command succeeds (yes) or i
 mkdir -p $T/bin
 cat > $T/bin/adb <<'EOF'
 #!/bin/bash
+# The phone's side of the writes (phone-write.sh) runs here as it would there. Switches, each used once:
+#   $FAKE/corrupt     NAME: the next dd that writes a node ending in NAME writes every byte +1 (the device's fault)
+#   $FAKE/badpush     the next push delivers a copy with one byte changed (the transport's fault)
+#   $FAKE/drop        SECONDS: the next writing shell returns at once, without a word (the transport broke), while
+#                     its script goes on in the background SECONDS later -- as a dd may go on after adb has gone
 [ "$1" = -s ] && { [ "$2" = "$FAKE_SERIAL" ] || { echo "error: device '$2' not found" >&2; exit 1; }; shift 2; }
-rewrite() { sed -e "s|/dev/block/|$FAKE/dev/block/|g" -e "s|/sys/class/block/|$FAKE/sys/class/block/|g" \
+rewrite() { sed -e "s|/hakios-stage|$FAKE/stage|g" -e "s|/dev/block/|$FAKE/dev/block/|g" -e "s|/sys/class/block/|$FAKE/sys/class/block/|g" \
 	-e "s|/proc/sys/vm/drop_caches|$FAKE/drop_caches|g" -e "s|/proc/mounts|$FAKE/mounts|g"; }
-pre='blockdev() { case $1 in --getsize64) stat -L -c %s "$2" ;; --getss) echo 4096 ;; esac; }; id() { echo 0; };'
+pre='blockdev() { case $1 in --getsize64) stat -L -c %s "$2" ;; --getss) echo 4096 ;; esac; }; id() { echo 0; };
+dd() { local a i= o=(); if [ -f $FAKE/corrupt ] && [[ " $* " == *" of="*"$(cat $FAKE/corrupt) "*fsync* ]]; then
+	rm -f $FAKE/corrupt; for a; do case $a in if=*) i=${a#if=} ;; *) o+=("$a") ;; esac; done
+	tr "\000-\377" "\001-\377\000" < "$i" | command dd "${o[@]}"; else command dd "$@"; fi; };'
 case $1 in
 get-state) cat $FAKE/state ;;
-shell) bash -c "$pre $(printf '%s' "$2" | rewrite)" | sed "s|$FAKE||g" ;;
+shell)
+	if [ -f $FAKE/drop ] && [[ "$2" == *conv=notrunc,fsync* ]]; then
+		d=$(cat $FAKE/drop); rm -f $FAKE/drop
+		( sleep $d; bash -c "$pre $(printf '%s' "$2" | rewrite)" ) </dev/null >/dev/null 2>&1 &
+		echo "error: closed" >&2; exit 255
+	fi
+	bash -c "$pre $(printf '%s' "$2" | rewrite)" | sed "s|$FAKE||g" ;;
 exec-out) bash -c "$pre $(printf '%s' "$2" | rewrite)" ;;
-exec-in)
-	if [ -f $FAKE/corrupt ] && grep -q "$(cat $FAKE/corrupt)" <<< "$2"; then
-		rm -f $FAKE/corrupt; tr '\000-\377' '\001-\377\000' | bash -c "$pre $(printf '%s' "$2" | rewrite)"   # one write goes wrong
-	else
-		bash -c "$pre $(printf '%s' "$2" | rewrite)"
-	fi ;;
+push)
+	dst=$(printf '%s' "$3" | rewrite)
+	[ -d "$(dirname "$dst")" ] || { echo "adb: error: failed to copy '$2' to '$3': remote No such file or directory" >&2; exit 1; }
+	cp "$2" "$dst" || exit 1
+	if [ -f $FAKE/badpush ]; then rm -f $FAKE/badpush; printf '\x5a' | dd of="$dst" bs=1 seek=100 conv=notrunc 2>/dev/null; fi
+	echo "$2: 1 file pushed." ;;
+exec-in) echo "$*" >> $FAKE/exec-in-used; cat > /dev/null; exit 1 ;;     # not a write path any more
 *) exit 1 ;;
 esac
 EOF
@@ -54,7 +72,7 @@ cat > $T/bin/fastboot <<'EOF'
 case $1 in
 devices) echo "$FAKE_SERIAL	fastboot" ;;
 getvar) echo "$2: vayu" >&2 ;;
-flash) [ "$2" = boot ] && dd if="$3" of=$FAKE/dev/block/$(cat $FAKE/bootnode) conv=notrunc 2>/dev/null && echo OKAY ;;
+flash) case $2 in boot|recovery) dd if="$3" of=$FAKE/dev/block/$(cat $FAKE/${2}node) conv=notrunc 2>/dev/null && echo OKAY ;; esac ;;
 boot) echo "booting $2"; echo OKAY ;;
 esac
 EOF
@@ -66,17 +84,23 @@ phone() {       # phone PROFILE HEAD_OF_DARWIN_LUN HEAD_OF_BOOT_LUN [TAILS...]
 	local prof=$1 dh=$2 bh=$3
 	rm -rf $FAKE; mkdir -p $FAKE/dev/block/by-name $FAKE/sys/class/block
 	eval "$(python3 -I $HERE/darwin-layout.py --profile $prof sh)"
-	: > $FAKE/mounts; : > $FAKE/drop_caches; echo recovery > $FAKE/state
+	: > $FAKE/mounts; : > $FAKE/drop_caches; echo recovery > $FAKE/state; mkdir -p $FAKE/stage
 	truncate -s $((DARWIN_LUN_BLOCKS * BS)) $FAKE/dev/block/$DARWIN_DISK
 	dd if=$dh of=$FAKE/dev/block/$DARWIN_DISK conv=notrunc 2>/dev/null
 	[ -e $FAKE/dev/block/$BOOT_DISK ] || { truncate -s $((BOOT_LUN_BLOCKS * BS)) $FAKE/dev/block/$BOOT_DISK;
 		dd if=$bh of=$FAKE/dev/block/$BOOT_DISK conv=notrunc 2>/dev/null; }
 	truncate -s $((DARWIN_BLOCKS * BS)) $FAKE/dev/block/$DARWIN_DISK$DARWIN_PART
 	truncate -s $BOOT_BYTES $FAKE/dev/block/$BOOT_DISK$BOOT_PART
+	truncate -s $RECOVERY_BYTES $FAKE/dev/block/$RECOVERY_DISK$RECOVERY_PART
+	truncate -s $MISC_BYTES $FAKE/dev/block/$MISC_DISK$MISC_PART
+	ln -s $FAKE/dev/block/$MISC_DISK$MISC_PART $FAKE/dev/block/by-name/misc
 	ln -s $FAKE/dev/block/$DARWIN_DISK$DARWIN_PART $FAKE/dev/block/by-name/darwin
 	ln -s $FAKE/dev/block/$BOOT_DISK$BOOT_PART $FAKE/dev/block/by-name/boot
+	ln -s $FAKE/dev/block/$RECOVERY_DISK$RECOVERY_PART $FAKE/dev/block/by-name/recovery
 	echo $BOOT_DISK$BOOT_PART > $FAKE/bootnode
-	for p in "$DARWIN_DISK $DARWIN_PART $DARWIN_FIRST $DARWIN_BLOCKS darwin" "$BOOT_DISK $BOOT_PART $BOOT_FIRST $BOOT_BLOCKS boot"; do
+	echo $RECOVERY_DISK$RECOVERY_PART > $FAKE/recoverynode
+	for p in "$DARWIN_DISK $DARWIN_PART $DARWIN_FIRST $DARWIN_BLOCKS darwin" "$BOOT_DISK $BOOT_PART $BOOT_FIRST $BOOT_BLOCKS boot" \
+	    "$RECOVERY_DISK $RECOVERY_PART $RECOVERY_FIRST $RECOVERY_BLOCKS recovery" "$MISC_DISK $MISC_PART $MISC_FIRST $MISC_BLOCKS misc"; do
 		set -- $p
 		mkdir -p $FAKE/sys/class/block/$1$2
 		echo $2 > $FAKE/sys/class/block/$1$2/partition
@@ -86,6 +110,22 @@ phone() {       # phone PROFILE HEAD_OF_DARWIN_LUN HEAD_OF_BOOT_LUN [TAILS...]
 	done
 	printf 'ANDROID!' > $T/android-boot.img; head -c 3000000 /dev/urandom >> $T/android-boot.img
 	dd if=$T/android-boot.img of=$FAKE/dev/block/$BOOT_DISK$BOOT_PART conv=notrunc 2>/dev/null
+	printf 'ANDROID!' > $T/pbrp.img; head -c 2000000 /dev/urandom >> $T/pbrp.img
+	dd if=$T/pbrp.img of=$FAKE/dev/block/$RECOVERY_DISK$RECOVERY_PART conv=notrunc 2>/dev/null
+}
+# an image of this port's as mkxnuimg.py makes it (header 1, kernel = gzip(shim + XNUP) + DTB), its command line ARGS
+portimg() {     # portimg OUT ARGS
+	python3 -I - "$1" "$2" <<'PY'
+import gzip, os, struct, sys
+out, args = sys.argv[1], sys.argv[2].encode() + b'\0'
+def entry(name, data):
+    return struct.pack('<16sII', name, len(data), 0) + data + bytes(-len(data) % 16)
+body = entry(b'kernel', os.urandom(70000)) + entry(b'cmdline', args) + entry(b'standalone', b'1\0') + bytes(24)
+kernel = gzip.compress(b'shim XNUP not this one' + os.urandom(5000) + struct.pack('<II', 0x50554E58, len(body)) + body,
+                       6, mtime=0) + b'\xd0\x0d\xfe\xed' + bytes(100)
+h = struct.pack('<8s10I', b'ANDROID!', len(kernel), 0x8000, 0, 0x1000000, 0, 0, 0x100, 4096, 1, 0)
+open(out, 'wb').write(h + bytes(4096 - len(h)) + kernel + bytes(-len(kernel) % 4096))
+PY
 }
 apfs() {        # apfs OUT BLOCKS: a stand-in APFS container (its superblock says BLOCKS blocks of 4096)
 	python3 -I -c '
@@ -130,6 +170,31 @@ expect yes "write root: written, read back" env DARWIN_WRITE=yes $I write root $
 expect yes "write oscryptex: written, read back" env DARWIN_WRITE=yes $I write oscryptex $T/os.apfs
 cmp -s <(dd if=$FAKE/dev/block/vda2 bs=$BS skip=$OSCRYPTEX_FIRST count=$OSCRYPTEX_BLOCKS 2>/dev/null) $T/os.apfs &&
 	ok "oscryptex is at its first block" || bad "oscryptex is not where it should be"
+echo "-- the writes themselves: staged, chunked, checked (phone-write.sh)"
+apfs $T/app.apfs $APPCRYPTEX_BLOCKS
+cp $T/app.apfs $T/app2.apfs; printf 'second' | dd of=$T/app2.apfs bs=1 seek=$((APPCRYPTEX_BLOCKS * BS - 10000)) conv=notrunc 2>/dev/null
+region() { cmp -s <(dd if=$FAKE/dev/block/vda2 bs=$BS skip=$APPCRYPTEX_FIRST count=$APPCRYPTEX_BLOCKS 2>/dev/null) "$1"; }
+expect yes "write appcryptex in chunks of 100 blocks (100+100+56)" env DARWIN_WRITE=yes PW_CHUNK_BLOCKS=100 $I write appcryptex $T/app.apfs
+grep -q '100%' $T/out && region $T/app.apfs && ok "the chunks: every one in its place" || bad "the chunks"
+touch $FAKE/badpush
+expect no  "a push that delivers another copy: refused before dd" env DARWIN_WRITE=yes PW_CHUNK_BLOCKS=100 $I write appcryptex $T/app2.apfs
+grep -q "staged copy's sha256" $T/out && region $T/app.apfs && ok "... the region untouched" || bad "... the region"
+rm -f $FAKE/badpush
+expect no  "no room in the staging place: refused" env DARWIN_WRITE=yes PW_RESERVE_MB=100000000 $I write appcryptex $T/app2.apfs
+grep -q "KiB free" $T/out && region $T/app.apfs && ok "... nothing written" || bad "... no room"
+expect no  "no staging place: refused" env DARWIN_WRITE=yes STAGE_DIR=/nowhere $I write appcryptex $T/app2.apfs
+(exec -a dd python3 -c 'import time; time.sleep(60)' of=$FAKE/dev/block/vda2) & writer=$!; sleep 0.3
+expect no  "a dd writing darwin already: no second writer" env DARWIN_WRITE=yes $I write appcryptex $T/app2.apfs
+kill $writer; wait $writer 2>/dev/null
+grep -q "a dd is writing" $T/out && region $T/app.apfs && ok "... refused in the writing shell, nothing written" || bad "... the other writer"
+echo 1 > $FAKE/drop
+expect yes "the shell drops, the write goes on: waited for, read back" env DARWIN_WRITE=yes $I write appcryptex $T/app2.apfs
+grep -q "UNKNOWN" $T/out && grep -q "the writer is gone" $T/out && region $T/app2.apfs && ok "... the region is the image" || bad "... dropped shell"
+echo 4 > $FAKE/drop
+expect no  "the shell drops, the writer does not end in PW_WAIT: nothing more" env DARWIN_WRITE=yes PW_WAIT=2 PW_CHUNK_BLOCKS=100 $I write appcryptex $T/app.apfs
+grep -q "may still be running" $T/out && ! grep -q '%:' $T/out && ok "... stopped at the first chunk, no second writer" || bad "... unsettled"
+sleep 3; [ -z "$(ls $FAKE/stage)" ] && ok "the staging place is empty again" || bad "the staging place: $(ls $FAKE/stage)"
+expect yes "write appcryptex once more" env DARWIN_WRITE=yes $I write appcryptex $T/app.apfs
 python3 -I - $T/var.img $((VAR_BLOCKS * BS)) <<'PY'
 import sys
 f = open(sys.argv[1], 'wb'); f.truncate(int(sys.argv[2]))
@@ -162,6 +227,9 @@ expect yes "flash: saved first, written, read back" env BACKUPS=$T/bk FLASH_BOOT
 saved=$(ls $T/bk/boot-*.img | head -1)
 cmp -s <(head -c $(stat -c %s $T/android-boot.img) $saved) $T/android-boot.img && ok "the saved copy is the old boot" || bad "the saved copy"
 expect yes "verify: boot begins with the new image" env BACKUPS=$T/bk $S verify $T/new.img
+n=$(stat -c %s $T/new.img)
+[ $((n % 4096)) != 0 ] && cmp -s <(tail -c +$((n + 1)) $FAKE/dev/block/vda1) <(tail -c +$((n + 1)) $saved) &&
+	ok "an image of $n bytes (not whole blocks): the bytes after it are boot's as they were" || bad "the bytes after the image"
 echo $BOOT_NODE | sed 's|.*/||' > $FAKE/corrupt
 expect no  "flash whose write goes wrong: refused, the saved boot put back" env BACKUPS=$T/bk FLASH_BOOT=yes $S flash $T/notboot.img
 cp $T/new.img $T/new2.img; printf 'x' >> $T/new2.img
@@ -169,6 +237,17 @@ echo $BOOT_NODE | sed 's|.*/||' > $FAKE/corrupt
 expect no  "flash whose write goes wrong (a boot image): refused" env BACKUPS=$T/bk FLASH_BOOT=yes $S flash $T/new2.img
 grep -q "boot is as it was" $T/out && ok "the boot of before is back, read back" || bad "the boot of before was not put back"
 expect yes "verify: still the image flashed before" env BACKUPS=$T/bk $S verify $T/new.img
+touch $FAKE/badpush
+expect no  "flash whose push goes wrong: refused, the saved boot put back" env BACKUPS=$T/bk FLASH_BOOT=yes $S flash $T/new2.img
+grep -q "staged copy's sha256" $T/out && grep -q "boot is as it was" $T/out && ok "... refused before dd, boot as it was" || bad "... bad push"
+echo 1 > $FAKE/drop
+expect yes "flash whose shell drops: the writer waited for, read back" env BACKUPS=$T/bk FLASH_BOOT=yes $S flash $T/new2.img
+grep -q "UNKNOWN" $T/out && ok "... said so" || bad "... said so"
+echo 4 > $FAKE/drop
+expect no  "flash whose writer does not end in PW_WAIT: refused, NO rollback" env BACKUPS=$T/bk FLASH_BOOT=yes PW_WAIT=2 $S flash $T/new.img
+grep -q "Do NOT restart" $T/out && ! grep -q "putting .* back" $T/out && ok "... no second writer on boot" || bad "... a rollback over the writer"
+sleep 3
+expect yes "verify: the writer that went on has put the image in" env BACKUPS=$T/bk $S verify $T/new.img
 expect yes "rollback to the first saved copy" env BACKUPS=$T/bk FLASH_BOOT=yes $S rollback $saved
 expect yes "verify: boot is the old one again" env BACKUPS=$T/bk $S verify $T/android-boot.img
 cp $saved $T/bk/boot-20260101-000000-0000000000000000.img
@@ -180,6 +259,67 @@ expect yes "rollback-fastboot: fastboot flash boot" env BACKUPS=$T/bk FLASH_BOOT
 expect yes "try: fastboot boot (an image as it is)" env BACKUPS=$T/bk $S try $T/new.img
 echo recovery > $FAKE/state
 expect yes "verify: boot is what fastboot flashed" env BACKUPS=$T/bk $S verify $T/new.img
+
+echo "== the recovery (standalone.sh --part recovery: the multiboot, HakiOS in the recovery), the QEMU numbers"
+R="$S --part recovery"
+portimg $T/rec-ok.img "ufs=2 flash_stage=1 flash_stage_target=recovery usbnet_cmd=1 bcb_reboot=1"
+portimg $T/rec-boot.img "ufs=2 flash_stage=1 usbnet_cmd=1 bcb_reboot=1"
+portimg $T/rec-plain.img "ufs=2 usbnet_cmd=1"
+expect yes "image-args.py: the command line out of the gzipped kernel" eval 'python3 -I $HERE/image-args.py $T/rec-ok.img flash_stage_target=recovery flash_stage=1'
+expect no  "image-args.py: a word that is not there" python3 -I $HERE/image-args.py $T/rec-boot.img flash_stage_target=recovery
+expect no  "image-args.py: no image of this port's (no XNUP)" python3 -I $HERE/image-args.py $T/new.img
+boot_before=$(sha256sum < $FAKE/dev/block/$BOOT_DISK$BOOT_PART)
+expect no  "--part recovery flash with FLASH_BOOT=yes alone: refused" env BACKUPS=$T/bkr FLASH_BOOT=yes $R flash $T/rec-ok.img
+expect no  "--part nowhere: refused" env BACKUPS=$T/bkr FLASH_RECOVERY=yes $S --part nowhere flash $T/rec-ok.img
+expect no  "flash_stage=1 without flash_stage_target=recovery into the recovery: refused" env BACKUPS=$T/bkr FLASH_RECOVERY=yes $R flash $T/rec-boot.img
+grep -q "would stage into boot" $T/out && ok "... and says why" || bad "... why"
+expect no  "an image with flash_stage_target=recovery into boot: refused" env BACKUPS=$T/bkr FLASH_BOOT=yes $S flash $T/rec-ok.img
+expect no  "--part recovery build: refused (no such thing)" $R build
+expect yes "--part recovery flash: saved first, written, read back" env BACKUPS=$T/bkr FLASH_RECOVERY=yes $R flash $T/rec-ok.img
+rsaved=$(ls $T/bkr/recovery-*.img 2>/dev/null | head -1)
+[ -n "$rsaved" ] && cmp -s <(head -c $(stat -c %s $T/pbrp.img) $rsaved) $T/pbrp.img && ok "the saved copy is the old recovery (recovery-*.img)" || bad "the saved copy of the recovery"
+cmp -s <(head -c $(stat -c %s $T/rec-ok.img) $FAKE/dev/block/$RECOVERY_DISK$RECOVERY_PART) $T/rec-ok.img && ok "the recovery holds the image" || bad "the recovery does not hold the image"
+[ "$(sha256sum < $FAKE/dev/block/$BOOT_DISK$BOOT_PART)" = "$boot_before" ] && ok "boot untouched" || bad "boot was written"
+expect yes "--part recovery verify" env BACKUPS=$T/bkr $R verify $T/rec-ok.img
+expect no  "--part recovery verify of another image: refused" env BACKUPS=$T/bkr $R verify $T/rec-plain.img
+expect yes "--part recovery flash: an image of the port without flash_stage=1" env BACKUPS=$T/bkr FLASH_RECOVERY=yes $R flash $T/rec-plain.img
+echo $RECOVERY_NODE | sed 's|.*/||' > $FAKE/corrupt
+expect no  "--part recovery flash whose write goes wrong: refused, the saved recovery put back" env BACKUPS=$T/bkr FLASH_RECOVERY=yes $R flash $T/rec-ok.img
+grep -q "recovery is as it was" $T/out && ok "... the recovery of before is back" || bad "... not put back"
+expect yes "--part recovery rollback to PBRP (an image not of the port's: taken as it is)" env BACKUPS=$T/bkr FLASH_RECOVERY=yes $R rollback $rsaved
+expect yes "--part recovery verify: PBRP again" env BACKUPS=$T/bkr $R verify $T/pbrp.img
+[ "$(sha256sum < $FAKE/dev/block/$BOOT_DISK$BOOT_PART)" = "$boot_before" ] && ok "boot untouched through all of it" || bad "boot was written"
+echo fastboot > $FAKE/state
+expect no  "--part recovery rollback-fastboot without FLASH_RECOVERY=yes: refused" env BACKUPS=$T/bkr FLASH_BOOT=yes $R rollback-fastboot $T/rec-ok.img
+expect yes "--part recovery rollback-fastboot: fastboot flash recovery" env BACKUPS=$T/bkr FLASH_RECOVERY=yes $R rollback-fastboot $T/rec-ok.img
+grep -q "fastboot flash recovery" $T/out && ok "... said so" || bad "... said so"
+echo recovery > $FAKE/state
+expect yes "--part recovery verify: what fastboot flashed" env BACKUPS=$T/bkr $R verify $T/rec-ok.img
+[ "$(sha256sum < $FAKE/dev/block/$BOOT_DISK$BOOT_PART)" = "$boot_before" ] && ok "boot untouched by the recovery's fastboot" || bad "boot was written"
+
+echo "== misc from the recovery (phone-mode.sh bcb, bcb-set, android), the QEMU numbers"
+P="env IP=127.0.0.1 PORT=1 WAIT=1 PHONE_MODE_LOG=$T/phone-mode.log $HERE/phone-mode.sh"
+MN=$FAKE/dev/block/$MISC_DISK$MISC_PART
+python3 -I -c 'import sys; b = bytearray(8192); r = b"recovery\n--prompt_and_wipe_data\n"; b[64:64 + len(r)] = r; b[5000] = 7; sys.stdout.buffer.write(b)' |
+	dd of=$MN conv=notrunc 2>/dev/null
+mrest() { tail -c +33 $MN | sha256sum; }
+mcmd() { head -c 32 $MN | tr -d '\0'; }
+rest0=$(mrest)
+expect yes "bcb: read" $P bcb
+grep -q 'recovery "recovery|--prompt_and_wipe_data|"' $T/out && grep -q "WARNING: the recovery field asks for userdata to be wiped" $T/out &&
+	ok "bcb: the recovery field shown, the wipe said loudly" || { bad "bcb: the recovery field"; sed 's/^/       | /' $T/out; }
+expect no  "bcb-set without MISC_WRITE=yes: refused" $P bcb-set
+[ -z "$(mcmd)" ] && ok "... misc untouched" || bad "... misc written"
+expect yes "bcb-set: boot-recovery, read back" env MISC_WRITE=yes $P bcb-set
+[ "$(mcmd)" = boot-recovery ] && [ "$(mrest)" = "$rest0" ] && ok "... the command alone" || bad "... misc: '$(mcmd)'"
+expect yes "bcb-set again: nothing written" env MISC_WRITE=yes $P bcb-set
+grep -q "already: nothing written" $T/out && ok "... said so" || bad "... said so"
+expect no  "android from the recovery: misc cleared, then no Android in WAIT (the fake has none)" env MISC_WRITE=yes $P android
+[ -z "$(mcmd)" ] && [ "$(mrest)" = "$rest0" ] && ok "... misc's command cleared, the rest as it was" || bad "... misc: '$(mcmd)'"
+printf 'boot-fastboot' | dd of=$MN conv=notrunc 2>/dev/null
+expect no  "bcb-set over another command: refused" env MISC_WRITE=yes $P bcb-set
+[ "$(mcmd)" = boot-fastboot ] && ok "... left alone" || bad "... misc: '$(mcmd)'"
+dd if=/dev/zero of=$MN bs=32 count=1 conv=notrunc 2>/dev/null
 
 if [ -n "$GPT_DIR" ] && [ -f "$GPT_DIR/gpt-sda.head.bin" ] && [ -f "$GPT_DIR/gpt-sde.head.bin" ]; then
 	echo "== vayu's own numbers (sparse sda and sde with this phone's GPT; no 5.6 GB write)"
@@ -212,8 +352,13 @@ if [ -n "$GPT_DIR" ] && [ -f "$GPT_DIR/gpt-sda.head.bin" ] && [ -f "$GPT_DIR/gpt
 	expect yes "flash boot (sde49): saved, written, read back" env BACKUPS=$T/bkv FLASH_BOOT=yes $S flash $T/new.img
 	expect yes "rollback boot" env BACKUPS=$T/bkv FLASH_BOOT=yes $S rollback
 	expect yes "verify: Android's boot again" env BACKUPS=$T/bkv $S verify $T/android-boot.img
+	portimg $T/rec-ok.img "ufs=2 flash_stage=1 flash_stage_target=recovery"
+	expect yes "flash the recovery (sda28): saved, written, read back" env BACKUPS=$T/bkvr FLASH_RECOVERY=yes $S --part recovery flash $T/rec-ok.img
+	expect yes "rollback the recovery" env BACKUPS=$T/bkvr FLASH_RECOVERY=yes $S --part recovery rollback
+	expect yes "verify: the recovery as it was" env BACKUPS=$T/bkvr $S --part recovery verify $T/pbrp.img
 else
 	echo "== vayu's own numbers: skipped (no GPT_DIR with gpt-sda.head.bin and gpt-sde.head.bin)"
 fi
 
+[ ! -e $T/phone/exec-in-used ] && ok "no write went through adb exec-in" || bad "adb exec-in was used: $(cat $T/phone/exec-in-used)"
 [ $fails = 0 ] && echo "install-test: PASS" || { echo "install-test: $fails FAILED"; exit 1; }

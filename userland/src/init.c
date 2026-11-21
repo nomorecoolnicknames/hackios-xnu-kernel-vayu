@@ -1085,7 +1085,7 @@ mount_writable(void)
 	static const char *const markers[] = { "/private/var/db/diagnostics/.migrated",
 		                               "/private/var/db/diagnostics/timesync/.migrated", "/private/var/db/uuidtext/.migrated" };
 	int ok, fd, made = 0, files = 0;
-	const char *jb;
+	const char *jb, *strict;
 	struct stat st;
 
 	printf("\n-- writable filesystem --\n");
@@ -1095,6 +1095,16 @@ mount_writable(void)
 	}
 	check(ok, var_volume != VAR_IN_MEMORY ? "mount the data volume on /private/var (HFS Plus, on the flash)" :
 	    "mount a memory filesystem on /private/var");
+	strict = boot_arg("var_hfs_strict");
+	if (var_hfs_failed && strict != NULL && strcmp(strict, "1") == 0) {
+		/* var_hfs_strict=1: no iOS on a memory filesystem in place of the data volume that did not mount */
+		printf("\n=== init: the data volume on the flash did not mount (var_hfs_strict=1): iOS is not started ===\n"
+		    "=== the recovery: the command port (recovery), or the phone's buttons ===\n");
+		sync();
+		for (;;) {
+			usleep(60 * 1000000);
+		}
+	}
 
 	/* the directories of the data volume, as listed in the template that ships with iOS (sysimage/mkvarskel.py) */
 	read_whole(in_image("/etc/var.skel"), skeleton, sizeof(skeleton));

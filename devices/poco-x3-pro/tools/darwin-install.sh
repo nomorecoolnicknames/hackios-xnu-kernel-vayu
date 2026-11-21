@@ -4,6 +4,12 @@
 # is there already. Where everything inside it goes is darwin-layout.py's (the one place the numbers are made);
 # what darwin is -- its GPT entry, GUIDs, LBAs, and the phone's own view of it in sysfs -- is checked before
 # every write, again inside the same adb shell right before dd, and every write is read back by sha256.
+# The bytes never go as a stream into dd (adb exec-in does not wait for dd, nor say how it ended): they go in
+# chunks (PW_CHUNK_MB, default 64 MiB; darwin's regions are GBs, the recovery's /tmp is RAM), each pushed to
+# the phone (STAGE_DIR, default /tmp), checked there by length and sha256, written from that copy by one adb
+# shell that waits and says how it ended, and read back by itself (phone-write.sh); then the whole region is
+# read back as before. A chunk whose end the phone did not report stops everything: no further write until it
+# says that the writer is gone.
 #
 #   darwin-install.sh check                darwin is this phone's darwin, now                            (writes nothing)
 #   darwin-install.sh status               check, then what darwin holds: the layout block, the containers at
@@ -39,6 +45,7 @@ mkdir -p "$TOP/logs"
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; echo "darwin-install: $*"; }
 die() { log "REFUSED: $*"; exit 1; }
 sh_phone() { $A shell "$1" | tr -d '\r'; }
+PW_SAY=log; . "$HERE/phone-write.sh"
 # the node, checked in the same shell right before the command that writes it
 GUARD="[ \"\$(readlink -f /dev/block/by-name/darwin)\" = $DARWIN_NODE ] && [ \"\$(blockdev --getsize64 $DARWIN_NODE)\" = $((DARWIN_BLOCKS * BS)) ]"
 
@@ -115,9 +122,15 @@ dump_gpt() {
 	(cd "$dir" && sha256sum gpt-*.bin) | tee -a "$LOG"
 }
 
-# the bytes go in through adb's exec-in, into the node by name after the guard; then read back
-put() { # put FIRST_BLOCK (stdin: the bytes; a whole number of MiB from a MiB boundary, or BS-blocks with BS=4096)
-	$A exec-in "$GUARD && dd of=$DARWIN_NODE bs=$2 seek=$(($1 * BS / $2)) conv=notrunc,fsync 2>/dev/null"
+# put IMAGE SKIP COUNT FIRST_BLOCK WHAT: COUNT blocks of IMAGE from its block SKIP at darwin's FIRST_BLOCK, chunk by
+# chunk (phone-write.sh), each checked by GUARD in the shell that writes it and read back; refused otherwise
+put() {
+	pw_put_blocks "$1" "$2" "$3" $DARWIN_NODE "$GUARD" "$4"
+	case $? in
+	0) ;;
+	3) die "$5: the phone did not say how a write ended and a writer may still be running: nothing more is written. Do NOT restart the phone; when adb is back and 'adb -s $SERIAL shell ps -A | grep -w dd' shows no dd, run it again" ;;
+	*) die "$5: not written (see above); nothing is writing darwin now" ;;
+	esac
 }
 
 layout() {
@@ -131,7 +144,8 @@ layout() {
 		rm -f "$tmp"; die "darwin's block $LAYOUT_BLOCK holds something else (LAYOUT_REPLACE=yes to replace it; '$0 status' shows it)"
 	fi
 	log "layout: writing it into block $LAYOUT_BLOCK"
-	put $LAYOUT_BLOCK $BS < "$tmp" || { rm -f "$tmp"; die "the write did not finish"; }
+	trap 'rm -f "$tmp"' EXIT
+	put "$tmp" 0 1 $LAYOUT_BLOCK layout
 	[ "$(sum $LAYOUT_BLOCK 1)" = "$(sha256sum < "$tmp" | cut -d' ' -f1)" ] || { rm -f "$tmp"; die "read back different"; }
 	rm -f "$tmp"
 	log "layout: written, read back the same"
@@ -153,7 +167,7 @@ write() {
 	want=$(sha256sum "$img" | cut -d' ' -f1)
 	log "write: $region: $img, $bytes bytes, sha256 $want, at block $first"
 	t0=$(date +%s)
-	put $first 1048576 < "$img" || die "the write did not finish"
+	put "$img" 0 $count $first "write $region"
 	dt=$(( $(date +%s) - t0 + 1 ))
 	[ "$(sum $first $count)" = "$want" ] || die "$region read back different from $img"
 	log "write: $region done in $dt s ($((bytes / 1048576 / dt)) MB/s), read back the same"
@@ -185,16 +199,19 @@ while at < end:
 	H+|HX) [ "$VAR_REINIT" = yes ] || die "the var region holds an HFS Plus volume already: /private/var. VAR_REINIT=yes erases it" ;;
 	esac
 	log "var: $img: $(wc -l <<< "$pieces") pieces, $((total * BS)) bytes, into darwin's blocks $VAR_FIRST..$((VAR_FIRST + VAR_BLOCKS - 1))"
-	while read -r a c; do
+	# (fd 3: adb inside the loop reads stdin, and would eat the rest of the list -- 18.11, only piece 1 was written)
+	while read -r a c <&3; do
 		n=$((n + 1))
-		dd if="$img" bs=$BS skip=$a count=$c 2>/dev/null | put $((VAR_FIRST + a)) $BS || die "piece $n (blocks $a+$c) did not finish"
-	done <<< "$pieces"
+		put "$img" $a $c $((VAR_FIRST + a)) "var: piece $n (blocks $a+$c)" </dev/null
+	done 3<<< "$pieces"
+	[ $n = $(wc -l <<< "$pieces") ] || die "var: $n pieces written of $(wc -l <<< "$pieces")"
 	n=0
-	while read -r a c; do
+	while read -r a c <&3; do
 		n=$((n + 1))
 		want=$(dd if="$img" bs=$BS skip=$a count=$c 2>/dev/null | sha256sum | cut -d' ' -f1)
-		[ "$(sum $((VAR_FIRST + a)) $c)" = "$want" ] || die "piece $n (blocks $a+$c) read back different"
-	done <<< "$pieces"
+		[ "$(sum $((VAR_FIRST + a)) $c </dev/null)" = "$want" ] || die "piece $n (blocks $a+$c) read back different"
+	done 3<<< "$pieces"
+	[ $n = $(wc -l <<< "$pieces") ] || die "var: $n pieces read back of $(wc -l <<< "$pieces")"
 	log "var: written, every piece read back the same"
 }
 
@@ -210,5 +227,5 @@ sum) [ $# = 3 ] || exit 2; check; sum "$2" "$3" ;;
 layout) [ $# = 1 ] || exit 2; layout ;;
 write) [ $# = 3 ] || exit 2; write "$2" "$3" ;;
 var) [ $# = 2 ] || exit 2; var "$2" ;;
-*) sed -n '2,25p' "$0"; exit 2 ;;
+*) sed -n '2,32p' "$0"; exit 2 ;;
 esac

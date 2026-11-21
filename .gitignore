@@ -43,15 +43,26 @@ __pycache__/
 *.rej
 
 /xnuloader/*
+!/xnuloader/bcb.h
+!/xnuloader/boot_menu.c
+!/xnuloader/boot_menu.h
+!/xnuloader/boot_menu_font.h
+!/xnuloader/font-OFL.txt
+!/xnuloader/mkfont.py
 !/xnuloader/build.sh
 !/xnuloader/efi.h
+!/xnuloader/efi_chainload.c
+!/xnuloader/efi_chainload.h
 !/xnuloader/loader.c
 !/xnuloader/mkidentity.py
 !/xnuloader/mkpayload.py
+!/xnuloader/refind_menu.c
+!/xnuloader/refind/
 
 /qemu/*
 !/qemu/*.sh
 !/qemu/*.py
+!/qemu/efi/
 
 /userland/*
 !/userland/build.sh

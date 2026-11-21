@@ -17,11 +17,17 @@ if [ -z "${CLANG:-}" ]; then
 	fi
 fi
 LLD_LINK=${LLD_LINK:-lld-link}
-$CLANG --target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector -fshort-wchar \
-  -mgeneral-regs-only -O1 -Wall -Wextra -Wno-unused-parameter -c loader.c -o loader.obj
+# the loader's sources: loader.c, and the parts that have a file of their own
+SRCS="loader.c efi_chainload.c"
+OBJS=
+for c in $SRCS; do
+	$CLANG --target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector -fshort-wchar \
+	  -mgeneral-regs-only -O1 -Wall -Wextra -Wno-unused-parameter -c $c -o ${c%.c}.obj
+	OBJS="$OBJS ${c%.c}.obj"
+done
 # /base: UEFI loads an image at its preferred address when that is free. The PE default (0x140000000)
 # is in the middle of the phone's largest block of RAM, which XNU needs in one piece.
 # /Brepro: hash the PE header timestamp, so rebuilding the boot image gives the same bytes.
 $LLD_LINK /subsystem:efi_application /entry:efi_main /nodefaultlib /base:0xA1000000 /Brepro \
-  /out:loader.efi loader.obj
+  /out:loader.efi $OBJS
 ls -la loader.efi

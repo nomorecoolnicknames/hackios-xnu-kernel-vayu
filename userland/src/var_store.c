@@ -116,12 +116,12 @@ struct entry {
 #define VAR_SAVE_WANTED 2
 #define VAR_SAVE_DONE   3
 
-/* Is NAME=VALUE among the kernel's arguments? (as init.c reads them) */
+/* Is NAME=VALUE among the kernel's arguments? (as init.c reads them; VALUE NULL: NAME= with any value) */
 static int
 boot_arg_is(const char *name, const char *value)
 {
 	static char args[4096];
-	size_t len = sizeof(args) - 1, n = strlen(name), v = strlen(value);
+	size_t len = sizeof(args) - 1, n = strlen(name), v = value != NULL ? strlen(value) : 0;
 
 	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
 		return 0;
@@ -131,8 +131,8 @@ boot_arg_is(const char *name, const char *value)
 		while (*p == ' ') {
 			p++;
 		}
-		if (strncmp(p, name, n) == 0 && p[n] == '=' && strncmp(p + n + 1, value, v) == 0 &&
-		    (p[n + 1 + v] == 0 || p[n + 1 + v] == ' ')) {
+		if (strncmp(p, name, n) == 0 && p[n] == '=' && (value == NULL || (strncmp(p + n + 1, value, v) == 0 &&
+		    (p[n + 1 + v] == 0 || p[n + 1 + v] == ' ')))) {
 			return 1;
 		}
 		while (*p && *p != ' ') {
@@ -1471,6 +1471,14 @@ main(int argc, char **argv, char **envp)
 		if (fs_type(ROOT, type, sizeof(type)) == 0 && strcmp(type, "hfs") == 0) {
 			/* (var_hfs: a save would only copy the volume on the flash into the store at every Shut Down) */
 			printf("var_store: /private/var is the data volume on the flash itself: nothing to watch\n");
+			return 0;
+		}
+		if (boot_arg_is("var_hfs", NULL) && !boot_arg_is("var_hfs", "0")) {
+			/*
+			 * The volume was asked for and did not mount: this boot's memory filesystem is a stand-in, and a
+			 * save of it would write over one of the slots the volume was filled from. The store stays as it is.
+			 */
+			printf("var_store: the data volume on the flash was asked for (var_hfs) and this is its stand-in in memory: not saved\n");
 			return 0;
 		}
 		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;

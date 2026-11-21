@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  bluetoothd's own address for this phone. The controller's NVM (crnv21.bin, tag 2) has none and the factory one is
+  not readable offline (xnu/files/bsd/dev/vayu_bt.c, vayu_bt_nv_mac), so with wlan.debug.generate-mac on the
+  command line bluetoothd takes the address from this preference (lab receipt 2026-10-25, bt5: "Local address from
+  plist"). A locally administered address (02:...), the one the lab's root29 seeded and c01-c04 ran with; bluetoothd
+  keeps whatever is here, and a data volume on the flash that already has the file keeps its own.
+-->
+<plist version="1.0">
+<dict>
+	<key>SelfGeneratedLocalAddress</key>
+	<string>02:52:44:57:00:02</string>
+</dict>
+</plist>

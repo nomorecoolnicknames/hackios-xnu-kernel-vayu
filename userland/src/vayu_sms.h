@@ -20,6 +20,26 @@
  *                       0 UIM (default), 1 NV
  *   vayu_sms_refresh=S  seconds between automatic List Messages sweeps (default 60,
  *                       0 disables, at least 15 otherwise)
+ *   vayu_sms_smsc=0|1   0: Raw Send carries the TPDU and the modem reads EF_SMSC;
+ *                       1: the full PDU with a leading 0x00 "default SMSC" byte
+ *   vayu_sms_list=0|1|2 0 (default): List with message tag 1 (MT not read), then with
+ *                       tag 0 (MT read) when the first is refused; 1: tag 1 only;
+ *                       2: tag 0 only.  Read-only; nothing is sent or deleted.
+ *   vayu_sms_ims_tlv=N  Raw Send's SMS-on-IMS TLV type: 2 (default, the
+ *                       qmi-service-wms.json value), 19 (0x13, the k25 form), 0 (omit)
+ *   vayu_sms_format=N   Raw Send's message format byte (default 6, GSM point-to-point)
+ *   vayu_sms_send_timeout=S  seconds Raw Send waits for the network's answer
+ *                       (default 30, 5..120)
+ *   vayu_sms=2          as 1, and every List/Raw Read sweep is dumped
+ *   vayu_sms=3          CommCenter owns WMS (the stock path through the baseband bridge,
+ *                       vayu_qmux=1): the kernel starts no WMS client of its own -- no
+ *                       event report, no route, no ack, no delete, no inbox -- and only
+ *                       reads the WMS frames the bridge passes (vayu_sms_wms_observe()),
+ *                       for content-free log lines and the STATUS counters.  SEND,
+ *                       DELETE and REFRESH answer ENOTSUP.  vayu_sms=1/2 together with
+ *                       vayu_qmux=1 is taken as 3 (two WMS clients would both answer a
+ *                       transfer route's ack), unless vayu_sms_coexist=1.
+ *   vayu_sms_strict=1   /dev/vayu-sms is 0600 root:wheel instead of 0666
  *
  * Privacy: the kernel log masks a sender number to its last four digits, never
  * prints message text or a PDU byte, and never prints an identifier.  The inbox
@@ -34,6 +54,7 @@
 #ifndef _SYS_VAYU_SMS_H_
 #define _SYS_VAYU_SMS_H_
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define VAYU_SMS_MAGIC          0x534d5331u     /* "SMS1" little-endian */
@@ -67,6 +88,7 @@
 #define VAYU_SMS_STATE_CONFIGURING  2
 #define VAYU_SMS_STATE_READY        3
 #define VAYU_SMS_STATE_FAILED       4
+#define VAYU_SMS_STATE_COMMCENTER   5   /* vayu_sms=3: CommCenter is the WMS client; the kernel only watches */
 
 struct vayu_sms_message {
 	uint32_t seq;                   /* inbox sequence, never 0; Delete and dedupe key */
@@ -167,6 +189,15 @@ struct vayu_qrtr;
 int vayu_sms_start(struct vayu_qrtr *q);
 /* Ask the thread to stop and wait a bounded time; /dev/vayu-sms stays readable. */
 void vayu_sms_stop(void);
+
+/*
+ * The baseband bridge's hook: one call per WMS (0x05) QMI message it carries, `qmi` the
+ * 7-byte QMI header and its TLVs, direction VAYU_SMS_WMS_AP_TO_MODEM (0) or
+ * VAYU_SMS_WMS_MODEM_TO_AP (1).  It reads the frame and returns: no allocation, no sleep,
+ * only vayu_sms's own lock, nothing kept from the frame but numbers.  A no-op unless
+ * vayu_sms=3 (or 1/2 taken as 3).  Safe to call before vayu_sms_start() and after stop.
+ */
+void vayu_sms_wms_observe(uint32_t direction, const void *qmi, size_t length);
 #endif /* KERNEL */
 
 #endif /* _SYS_VAYU_SMS_H_ */

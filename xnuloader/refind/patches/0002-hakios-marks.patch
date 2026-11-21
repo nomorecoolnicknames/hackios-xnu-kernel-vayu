@@ -1,0 +1,213 @@
+diff -ruN a/refind/Makefile b/refind/Makefile
+--- a/refind/Makefile	2026-11-18 22:14:24.334308392 +0000
++++ b/refind/Makefile	2026-11-18 22:14:24.334308392 +0000
+@@ -39,7 +39,7 @@
+ OBJS            = apple.o config.o crc32.o driver_support.o gpt.o icns.o \
+                   install.o launch_efi.o launch_legacy.o lib.o line_edit.o \
+                   linux.o log.o main.o menu.o mystrings.o pointer.o scan.o \
+-                  screen.o
++                  screen.o hakios.o
+ 
+ include $(SRCDIR)/../Make.common
+ 
+diff -ruN a/refind/hakios.c b/refind/hakios.c
+--- a/refind/hakios.c	1970-01-01 00:00:00.000000000 +0000
++++ b/refind/hakios.c	2026-11-18 22:14:24.334308392 +0000
+@@ -0,0 +1,50 @@
++/*
++ * HakiOS/vayu: see hakios.h. GPL v3, as rEFInd.
++ */
++#include "hakios.h"
++#include "lib.h"
++#include "../include/refit_call_wrapper.h"
++
++#define HAKIOS_HANDOFF_GUID { 0x6b1f6a4e, 0x2d39, 0x4c55, { 0x9a, 0x61, 0x3e, 0x0b, 0x7d, 0x52, 0xc4, 0x18 } }
++#define HAKIOS_HANDOFF_MAGIC 0x444e4652         /* "RFND" */
++
++typedef struct _hakios_handoff {
++    UINT32 Magic, Revision;
++    VOID (EFIAPI *Choose)(struct _hakios_handoff *This, UINT32 Choice);
++    /* revision 2 */
++    VOID (EFIAPI *Mark)(struct _hakios_handoff *This, CHAR16 *What, UINT32 Flags);
++    UINT32 ScanAll, TestHang;       /* TestHang: the loader's refind_test_hang=1, a test of its watchdog */
++} HAKIOS_HANDOFF;
++
++static HAKIOS_HANDOFF *Hakios = NULL;
++
++VOID HakiosInit(VOID) {
++    EFI_GUID Guid = HAKIOS_HANDOFF_GUID;
++    HAKIOS_HANDOFF *H = NULL;
++
++    if (!EFI_ERROR(refit_call3_wrapper(BS->LocateProtocol, &Guid, NULL, (VOID **) &H)) && (H != NULL) &&
++        (H->Magic == HAKIOS_HANDOFF_MAGIC) && (H->Revision >= 2) && (H->Mark != NULL))
++        Hakios = H;
++}
++
++BOOLEAN HakiosOn(VOID) {
++    return Hakios != NULL;
++}
++
++BOOLEAN HakiosScanAll(VOID) {
++    return (Hakios == NULL) || Hakios->ScanAll;
++}
++
++VOID HakiosMark(IN CHAR16 *What, IN UINTN Flags) {
++    if (Hakios != NULL)
++        Hakios->Mark(Hakios, What, (UINT32) Flags);
++}
++
++// refind_test_hang=1: rEFInd stops here for good, with no sign of life (the loader must reset the phone)
++VOID HakiosTestHang(VOID) {
++    if ((Hakios != NULL) && Hakios->TestHang) {
++        HakiosMark(L"test: hanging here", HAKIOS_MARK_STAGE);
++        for (;;)
++            refit_call1_wrapper(BS->Stall, 1000000);
++    }
++}
+diff -ruN a/refind/hakios.h b/refind/hakios.h
+--- a/refind/hakios.h	1970-01-01 00:00:00.000000000 +0000
++++ b/refind/hakios.h	2026-11-18 22:14:24.334308392 +0000
+@@ -0,0 +1,20 @@
++/*
++ * HakiOS/vayu: the loader that started rEFInd (xnuloader/refind_menu.c in the HakiOS port) may offer a protocol;
++ * with it, rEFInd reports how far it got (HakiosMark: the loader's log and, before the menu is up, its screen) and
++ * scans only its own volume unless the loader says otherwise. Without the protocol nothing changes.
++ */
++#ifndef __HAKIOS_H_
++#define __HAKIOS_H_
++
++#include "global.h"
++
++#define HAKIOS_MARK_STAGE  1    /* a stage of the start: logged, flushed, shown */
++#define HAKIOS_MARK_SCREEN 2    /* rEFInd draws from here on: the loader stops drawing its marks */
++
++VOID HakiosInit(VOID);
++BOOLEAN HakiosOn(VOID);
++BOOLEAN HakiosScanAll(VOID);
++VOID HakiosMark(IN CHAR16 *What, IN UINTN Flags);
++VOID HakiosTestHang(VOID);
++
++#endif
+diff -ruN a/refind/lib.c b/refind/lib.c
+--- a/refind/lib.c	2026-11-18 22:14:24.334308392 +0000
++++ b/refind/lib.c	2026-11-18 22:14:24.334308392 +0000
+@@ -58,6 +58,7 @@
+ #pragma pack(0)
+ #include "global.h"
+ #include "lib.h"
++#include "hakios.h"
+ #include "icns.h"
+ #include "screen.h"
+ #include "../include/refit_call_wrapper.h"
+@@ -1308,6 +1309,10 @@
+ 
+     // first pass: collect information about all handles
+     for (HandleIndex = 0; HandleIndex < HandleCount; HandleIndex++) {
++        // HakiOS/vayu: its own volume alone, unless the loader asks for all of them
++        if (!HakiosScanAll() && (Handles[HandleIndex] != SelfLoadedImage->DeviceHandle))
++            continue;
++        HakiosMark(L"volume", 0);
+         Volume = AllocateZeroPool(sizeof(REFIT_VOLUME));
+         Volume->DeviceHandle = Handles[HandleIndex];
+         AddPartitionTable(Volume);
+diff -ruN a/refind/main.c b/refind/main.c
+--- a/refind/main.c	2026-11-18 22:14:24.334308392 +0000
++++ b/refind/main.c	2026-11-18 22:14:24.334308392 +0000
+@@ -72,6 +72,7 @@
+ #include "scan.h"
+ #include "log.h"
+ #include "../include/refit_call_wrapper.h"
++#include "hakios.h"
+ #include "../include/version.h"
+ #include "../libeg/efiConsoleControl.h"
+ #include "../libeg/efiUgaDraw.h"
+@@ -480,6 +481,8 @@
+ 
+     // bootstrap
+     InitializeLib(ImageHandle, SystemTable);
++    HakiosInit();
++    HakiosMark(L"started", HAKIOS_MARK_STAGE);
+     Status = InitRefitLib(ImageHandle);
+     if (EFI_ERROR(Status))
+         return Status;
+@@ -495,8 +498,11 @@
+     // and ReadConfig(); however, if drivers are loaded, a second call to
+     // ScanVolumes() is needed to register the new filesystem(s) accessed
+     // by the drivers.
++    HakiosMark(L"scanning volumes", HAKIOS_MARK_STAGE);
+     ScanVolumes();
++    HakiosMark(L"reading refind.conf", HAKIOS_MARK_STAGE);
+     ReadConfig(GlobalConfig.ConfigFilename);
++    HakiosMark(L"secure boot, drivers", HAKIOS_MARK_STAGE);
+     if (GlobalConfig.LogLevel > 0) {
+         StartLogging(FALSE);
+         LogBasicInfo();
+@@ -512,6 +518,7 @@
+     if (GlobalConfig.SpoofOSXVersion && GlobalConfig.SpoofOSXVersion[0] != L'\0')
+         SetAppleOSInfo();
+ 
++    HakiosMark(L"screen", HAKIOS_MARK_STAGE);
+     InitScreen();
+     WarnIfLegacyProblems();
+     MainMenu.TimeoutSeconds = GlobalConfig.Timeout;
+@@ -521,10 +528,14 @@
+     refit_call4_wrapper(BS->SetWatchdogTimer, 0x0000, 0x0000, 0x0000, NULL);
+ 
+     // further bootstrap (now with config available)
++    HakiosMark(L"graphics", HAKIOS_MARK_STAGE | HAKIOS_MARK_SCREEN);
++    HakiosTestHang();
+     SetupScreen();
+     SetVolumeIcons();
++    HakiosMark(L"entries", HAKIOS_MARK_STAGE);
+     ScanForBootloaders(FALSE);
+     ScanForTools();
++    HakiosMark(L"background", HAKIOS_MARK_STAGE);
+ 
+     // SetupScreen() clears the screen; but ScanForBootloaders() may display a
+     // message that must be deleted, so do so
+@@ -547,6 +558,7 @@
+     if (GlobalConfig.ShutdownAfterTimeout)
+         MainMenu.TimeoutText = L"Shutdown";
+ 
++    HakiosMark(L"main loop", HAKIOS_MARK_STAGE);
+     LOG(1, LOG_LINE_SEPARATOR, L"Entering main loop");
+     while (MainLoopRunning) {
+         MenuExit = RunMainMenu(&MainMenu, &SelectionName, &ChosenEntry);
+diff -ruN a/refind/menu.c b/refind/menu.c
+--- a/refind/menu.c	2026-11-18 22:14:24.334308392 +0000
++++ b/refind/menu.c	2026-11-18 22:14:24.334308392 +0000
+@@ -60,6 +60,7 @@
+ #include "lib.h"
+ #include "log.h"
+ #include "menu.h"
++#include "hakios.h"
+ #include "config.h"
+ #include "libeg.h"
+ #include "libegint.h"
+@@ -1348,6 +1349,7 @@
+ 
+         case MENU_FUNCTION_PAINT_ALL:
+             VMenuPaintAll(Screen, State);
++            HakiosMark(L"menu drawn", HAKIOS_MARK_STAGE);
+             break;
+ 
+         case MENU_FUNCTION_PAINT_SELECTION:
+@@ -1425,6 +1427,7 @@
+             break;
+ 
+         case MENU_FUNCTION_PAINT_ALL:
++            HakiosMark(L"menu drawn", HAKIOS_MARK_STAGE);
+             PaintAll(Screen, State, itemPosX, row0PosY, row1PosY, textPosY);
+             PaintArrows(State, row0PosX - TILE_XSPACING, row0PosY + (TileSizes[0] / 2), row0Loaders);
+             break;
+@@ -1541,6 +1544,10 @@
+     EFI_STATUS Status;
+ 
+     LOG(3, LOG_LINE_NORMAL, L"Entering WaitForInput(), Timeout = %d", Timeout);
++    // HakiOS/vayu: never wait for good -- each pass of the menu's loop reads the keys, and that is how the
++    // loader that started rEFInd knows it is alive (it feeds the watchdog only then)
++    if ((Timeout == 0) && HakiosOn())
++        Timeout = 1000;
+     Status = refit_call5_wrapper(BS->CreateEvent, EVT_TIMER, 0, NULL, NULL, &TimerEvent);
+     if (Timeout == 0) {
+         Length--;

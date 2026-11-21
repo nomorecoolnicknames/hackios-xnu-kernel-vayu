@@ -15,6 +15,9 @@
  */
 #include "efi.h"
 #include "identity.h"         /* who iOS shall think we are: from the iPhone's own device tree (mkidentity.py) */
+#include "bcb.h"              /* misc's boot control block and the count of starts (2.6): what may be written there */
+#include "efi_chainload.h"    /* other EFI applications: Linux, Windows, a shell (boot_menu_efi=1) */
+#include "boot_menu.h"        /* the boot menu of a standalone start (boot_menu=1): boot_menu.c, below */
 
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
@@ -650,6 +653,8 @@ struct platform {
 	uint64_t fb_base;                /* fallback identification: the framebuffer the firmware reports (GOP) */
 	const struct darwin_identity *darwin;      /* the port's partition; NULL: none, nothing is ever written */
 	const struct darwin_identity *boot;        /* "boot", for a staged image (flash_stage=1); NULL: never written */
+	const struct darwin_identity *misc;        /* "misc", its first block's command alone (bcb.h); NULL: never written */
+	const struct darwin_identity *recovery;    /* "recovery", for a staged image with flash_stage_target=recovery */
 	const struct ufs_reference *ufs_refs;      /* ufs=1: the partitions hashed, and how far */
 	unsigned ufs_nrefs;
 };
@@ -698,6 +703,28 @@ static const struct darwin_identity boot_vayu = {
 	.uniq = { 0x6829cc63, 0x8df3, 0x89ce, { 0x54, 0x73, 0x55, 0xcb, 0xa9, 0x33, 0x9a, 0x82 } },
 };
 /*
+ * vayu's misc (sda11: entry 11 of unit 0, LBA 1024..2047, 4 MiB; Android's misc type, unique
+ * c21d9a5d-f0f0-0f54-e390-aec3b873a497; gpt-sda.head.bin c649dd9e... of the same dump). ABL looks for it by
+ * that type and reads its first block at every start (bcb.h): with bcb_reboot=1 the kernel may set or clear
+ * that block's command, and with boot_tries=N this loader sets it itself -- nothing else of misc is written.
+ */
+static const struct darwin_identity misc_vayu = {
+	.first_lba = 1024, .last_lba = 2047, .unit = 0,
+	.type = { 0x82acc91f, 0x357c, 0x4a68, { 0x9c, 0x8f, 0x68, 0x9e, 0x1b, 0x1a, 0x23, 0xa1 } },
+	.uniq = { 0xc21d9a5d, 0xf0f0, 0x0f54, { 0xe3, 0x90, 0xae, 0xc3, 0xb8, 0x73, 0xa4, 0x97 } },
+};
+/*
+ * vayu's recovery (sda28: entry 28 of unit 0, LBA 2359808..2392575, 128 MiB like boot; type 9d72d4e4-9958-42da-
+ * ac26-bea7a90b0434, unique f9606103-c42f-efe1-595e-bc49331d22ce; gpt-sda.head.bin c649dd9e... of the same dump).
+ * In the multiboot (plans/VAYU_DUALBOOT_PLAN_v2.md) HakiOS lives there and Android in boot: an image that says
+ * flash_stage_target=recovery has its staged update written here, and never into boot.
+ */
+static const struct darwin_identity recovery_vayu = {
+	.first_lba = 2359808, .last_lba = 2392575, .unit = 0,
+	.type = { 0x9d72d4e4, 0x9958, 0x42da, { 0xac, 0x26, 0xbe, 0xa7, 0xa9, 0x0b, 0x04, 0x34 } },
+	.uniq = { 0xf9606103, 0xc42f, 0xefe1, { 0x59, 0x5e, 0xbc, 0x49, 0x33, 0x1d, 0x22, 0xce } },
+};
+/*
  * QEMU: the test disk of qemu/run-standalone-test.sh (darwin-layout.py --profile qemu makes its partition
  * table and layout block), so that a standalone start -- the layout, a staged image written into "boot"
  * -- can be tried with no phone. Its GUIDs are this test's own: no real device has them.
@@ -712,6 +739,16 @@ static const struct darwin_identity boot_qemu = {
 	.first_lba = 256, .last_lba = 2303, .unit = 0,
 	.type = { 0x20117f86, 0xe985, 0x4357, { 0xb9, 0xee, 0x37, 0x4b, 0xc1, 0xd8, 0x48, 0x7d } },
 	.uniq = { 0x48414b49, 0x4f53, 0x424f, { 0x4f, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02 } },
+};
+static const struct darwin_identity misc_qemu = {
+	.first_lba = 16, .last_lba = 47, .unit = 0,
+	.type = { 0x82acc91f, 0x357c, 0x4a68, { 0x9c, 0x8f, 0x68, 0x9e, 0x1b, 0x1a, 0x23, 0xa1 } },
+	.uniq = { 0x48414b49, 0x4f53, 0x4d49, { 0x53, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03 } },
+};
+static const struct darwin_identity recovery_qemu = {
+	.first_lba = 14304, .last_lba = 16351, .unit = 0,
+	.type = { 0x9d72d4e4, 0x9958, 0x42da, { 0xac, 0x26, 0xbe, 0xa7, 0xa9, 0x0b, 0x04, 0x34 } },
+	.uniq = { 0x48414b49, 0x4f53, 0x5245, { 0x43, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04 } },
 };
 static const struct ufs_reference ufs_refs_vayu[] = {
 	{ "bluetooth", 1048576 }, { "abl", 2097152 }, { "aop", 524288 }, { "xbl", 7340032 },
@@ -728,7 +765,7 @@ static const struct platform platform_qemu_virt = {
 	 * is that of real hardware: an eighth of a second by a 24 MHz clock, a twentieth here.
 	 */
 	.timeout_scale = 20,
-	.darwin = &darwin_qemu, .boot = &boot_qemu,
+	.darwin = &darwin_qemu, .boot = &boot_qemu, .misc = &misc_qemu, .recovery = &recovery_qemu,
 };
 
 static const struct platform platform_redwood = {
@@ -758,7 +795,7 @@ static const struct platform platform_vayu = {
 	.small_cores = 0x0f,
 	/* FACT: on the phone the loader printed "display 1080 x 2400 at 9c000000"; fallback only. */
 	.fb_base = 0x9C000000,
-	.darwin = &darwin_vayu, .boot = &boot_vayu,
+	.darwin = &darwin_vayu, .boot = &boot_vayu, .misc = &misc_vayu, .recovery = &recovery_vayu,
 	.ufs_refs = ufs_refs_vayu, .ufs_nrefs = sizeof(ufs_refs_vayu) / sizeof(ufs_refs_vayu[0]),
 };
 
@@ -1175,6 +1212,22 @@ static int charger_enabled;
  * UEFI charger calls every 5 s starve the USB side; this switch tests it.
  */
 static int charger_paused;
+/*
+ * vayu_charge=1 on the payload command line (vayu only; default off: the polls stay read only): during
+ * the run the loader does what Qualcomm's own charger app does in its loop -- GetChargingAction in its
+ * charging mode (1), and the answer handed to TakeAction -- but only for the three answers that keep a
+ * phone charging: 7 (load the battery profile: the charge parameters), 1 (start charging), 0 (continue,
+ * which also pets the charger's watchdog). Never anything else: 4, 5 and 8 shut the phone down, 6 and 10
+ * stop charging or shut down, 2 stops, 3 ends the charger's session. The codes are the ones the apollo
+ * fork found by disassembling the Mi 10T's QcomChargerApp.efi/QcomChargerDxeLA.efi (forks.git
+ * refs/forks/enesuzun2002/apollo, xnuloader/loader.c:1029-1036, apollo_charge=1: Mu-Silicium and the
+ * same Qualcomm charger DXE generation; HYPOTHESIS for vayu's SM8150 build until a run shows them).
+ * The PMIC stays the firmware's: XNU writes nothing to the charger, the firmware's limits (APSD, ICL,
+ * JEITA, temperature) are its own. Lines: "battery: vayu_charge: action N taken (status)", and for an
+ * answer not taken "... action N: not one this loader takes; left to the firmware".
+ */
+static int charger_take;
+static uint32_t charger_taken[3], charger_last_action = 0xffffffffu;
 
 /* The screen recording the last kernel left in memory, if it made one ("oem recording" stages it). */
 static const char *recording_data;
@@ -1187,6 +1240,7 @@ static uint64_t sound_len;
 #define KERNEL_LIVE_MAGIC       0x214556494c554e58ULL
 #define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
+#define OTHER_CPU_OVER_BUDGET   1002    /* ... the kernel lives, but did not come back in its time (loader_budget_reset=1) */
 #define START_SECONDS           5
 /*
  * How long without a heartbeat before the watching loader calls the kernel hung and writes its log
@@ -1197,6 +1251,16 @@ static uint64_t sound_len;
  */
 #define SILENCE_SECONDS         50
 #define NOTE_SECONDS            24      /* how long the kernel's progress is written down as it happens */
+/*
+ * loader_budget_reset=1: a kernel that said it would run loader_return_after=N seconds and is still on its core
+ * N + loader_budget_margin= seconds (default BUDGET_MARGIN_SECONDS) after it started is given up on as a hung one
+ * is: its log into logdump, then the reset. loader_return_after is the kernel's own timer, and the way back stops
+ * the GPU, Wi-Fi, the DSPs and the modem first: one of them that never returns leaves the heartbeat ticking (it is
+ * another thread_call) and, with no watchdog on vayu, the phone where it is. The margin covers the way back
+ * itself (var_store's save). 0: off (the default), and always off without loader_return_after.
+ */
+#define BUDGET_MARGIN_SECONDS   120
+static uint64_t budget_reset_after;
 
 static void wdt_pet(void);
 static int wdt_armed;
@@ -1292,6 +1356,8 @@ compose_live_log(const struct kernel_live *live, uint64_t slide)
 }
 
 static void print(const char *fmt, ...);
+static void ipa_persist_report(int at_start);
+static void ipa_smmu_fault_dump(void);
 static void flush_log(void);
 static void put_char(char c);
 
@@ -1307,7 +1373,28 @@ soc_from_voltage(uint32_t mv)
 	return 100;
 }
 
-/* Read-only status query.  No TakeAction call and no charger-limit writes are made here. */
+/* vayu_charge=1 (see charger_take): the firmware's answer handed back to it, if it keeps the phone charging. */
+static void
+charger_take_action(uint32_t action, const struct qcom_battery_status *status)
+{
+	if (action == 7 || action == 1 || action == 0) {
+		efi_status t = QCOM_CHARGER->take_action(action, status);
+
+		charger_taken[action == 7 ? 2 : action]++;
+		if (action != charger_last_action || EFI_ERROR(t)) {
+			print("battery: vayu_charge: action %d taken (%x); so far: continue %d, start %d, profile %d\n",
+			    (uint64_t)action, t, (uint64_t)charger_taken[0], (uint64_t)charger_taken[1], (uint64_t)charger_taken[2]);
+		}
+	} else if (action != charger_last_action) {
+		print("battery: vayu_charge: action %d: not one this loader takes; left to the firmware\n", (uint64_t)action);
+	}
+	charger_last_action = action;
+}
+
+/*
+ * Status query: read only, no TakeAction call and no charger-limit writes, unless vayu_charge=1 asks for
+ * the charger app's loop (charger_take_action()).
+ */
 static void
 charger_poll(void)
 {
@@ -1337,7 +1424,12 @@ charger_poll(void)
 		}
 	}
 	if (QCOM_CHARGER != NULL) {
-		s = QCOM_CHARGER->get_charging_action(&action, &status, 0);
+		int take = charger_take && PLAT == &platform_vayu;
+
+		s = QCOM_CHARGER->get_charging_action(&action, &status, take ? 1 : 0);
+		if (take && !EFI_ERROR(s)) {
+			charger_take_action(action, &status);
+		}
 		if (!EFI_ERROR(s)) {
 			charger_shared.charger_action = action;
 			if (status.battery_voltage_mv >= 2500 && status.battery_voltage_mv <= 5000) {
@@ -1779,6 +1871,12 @@ struct loader_block {
 	uint32_t write_part_plus_one;
 	uint32_t write_caps;                   /* BLOCK_CAN_FAST; zero from a loader before 2.5, which a kernel reads as none */
 	uint64_t write_first;
+	/*
+	 * bcb_reboot=1 (2.6): misc, by its identity, as its index plus one (0: none) -- its first block takes a write
+	 * of its command alone (bcb.h, block_bcb_serve). Padding before, so zero from an older loader: no such write.
+	 */
+	uint32_t bcb_part_plus_one;
+	uint32_t bcb_reserved;
 	/* written by the kernel: what it wants, then request is advanced */
 	struct {
 		volatile uint32_t request;
@@ -1830,6 +1928,9 @@ static int block_enabled;
 static int block_write_requested;       /* ufs_write=1 on the command line */
 static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
 static uint64_t block_writes, block_writes_refused, block_write_bytes;
+static int block_bcb_requested;         /* bcb_reboot=1 on the command line (2.6) */
+static int block_bcb_part = -1;         /* misc, whose first block's command alone may be written; -1: none */
+static uint64_t block_bcb_writes, block_bcb_refused;
 
 /* the bytes of a device path before its end node */
 static uint64_t
@@ -2260,7 +2361,9 @@ static struct {
 	efi_block_io *bio;              /* darwin, by its identity */
 	uint64_t var_first, var_blocks; /* "var": /dev/ufs_var (0 blocks: none) */
 	uint64_t stage_first, stage_blocks, stage_head;  /* "stage", "stagehead": a staged boot image (0: none) */
+	uint64_t tries_block;           /* "tries": the count of starts for boot_tries= (2.6; 0: none) */
 } layout;
+static int tries_counted;               /* boot_tries= counted this start: the kernel is told where (ufs_tries_block=) */
 static uint8_t layout_buf[4096] __attribute__((aligned(4096)));
 
 static uint32_t
@@ -2304,7 +2407,7 @@ layout_check(const struct darwin_identity *d)
 		const uint8_t *e = b + 64 + 32 * i;
 		uint64_t first = le64(e + 16), count = le64(e + 24);
 		const char *name = (const char *)e;
-		int written = str_eq(name, "var") || str_eq(name, "stage") || str_eq(name, "stagehead");
+		int written = str_eq(name, "var") || str_eq(name, "stage") || str_eq(name, "stagehead") || str_eq(name, "tries");
 
 		if (e[15] != 0 || count == 0 || first >= blocks || count > blocks - first) {
 			return "an extent is empty or not inside darwin";
@@ -2324,6 +2427,9 @@ layout_check(const struct darwin_identity *d)
 		}
 		if (str_eq(name, "stagehead") && count != 1) {
 			return "the staged image's header is not one block";
+		}
+		if (str_eq(name, "tries") && count != 1) {
+			return "the count of starts is not one block";
 		}
 	}
 	return NULL;
@@ -2366,14 +2472,16 @@ layout_load(void)
 			layout.stage_blocks = le64(e + 24);
 		} else if (str_eq(name, "stagehead")) {
 			layout.stage_head = le64(e + 16);
+		} else if (str_eq(name, "tries")) {
+			layout.tries_block = le64(e + 16);
 		}
 	}
 	if (layout.stage_blocks == 0 || layout.stage_head == 0) {
 		layout.stage_first = layout.stage_blocks = layout.stage_head = 0;
 	}
 	layout.state = 1;
-	print("layout: darwin's block %d: var %d+%d, stage %d+%d, its header %d\n", d->layout_block, layout.var_first,
-	    layout.var_blocks, layout.stage_first, layout.stage_blocks, layout.stage_head);
+	print("layout: darwin's block %d: var %d+%d, stage %d+%d, its header %d, tries %d\n", d->layout_block, layout.var_first,
+	    layout.var_blocks, layout.stage_first, layout.stage_blocks, layout.stage_head, layout.tries_block);
 }
 
 static void
@@ -2388,7 +2496,10 @@ block_start(void)
 	static struct block_unit units[BLOCK_MAX_UNITS];
 	uint64_t nunits;
 
+	unsigned misc_named = 0;
+
 	memset(&block_shared, 0, sizeof(block_shared));
+	block_bcb_part = -1;
 	block_tables();
 	nunits = block_units(units, BLOCK_MAX_UNITS, 1);
 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
@@ -2419,6 +2530,16 @@ block_start(void)
 		}
 		if (block_write_requested && block_is_darwin(info, bio, bp)) {
 			block_write_part = (int)block_shared.parts;
+		}
+		if (block_bcb_requested && str_eq(bp->name, "misc")) {
+			const char *why = part_identity_why(info, bio, bp->unit, PLAT->misc);
+
+			misc_named++;
+			if (why == NULL) {
+				block_bcb_part = (int)block_shared.parts;
+			} else {
+				print("ufs: misc: its boot control block is not written this run: %s\n", why);
+			}
 		}
 		block_bios[block_shared.parts++] = bio;
 		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
@@ -2464,6 +2585,17 @@ block_start(void)
 	/* per run, like the two above: this loader stays resident across runs, and a tally carried
 	 * over from the run before is read as this one's */
 	block_writes = block_writes_refused = block_write_bytes = 0;
+	block_bcb_writes = block_bcb_refused = 0;
+	if (block_bcb_part >= 0 && misc_named > 1) {
+		print("ufs: misc: more than one partition of that name: its boot control block is not written this run\n");
+		block_bcb_part = -1;
+	}
+	if (block_bcb_part >= 0) {
+		block_shared.bcb_part_plus_one = (uint32_t)block_bcb_part + 1;
+		print("ufs: misc (LBA %d..%d of unit %d): its first block's command may be set to \"boot-recovery\" or cleared "
+		    "this run (bcb_reboot=1); nothing else of it\n", PLAT->misc->first_lba, PLAT->misc->last_lba,
+		    (uint64_t)PLAT->misc->unit);
+	}
 	if (block_write_part >= 0) {
 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
 		block_shared.write_first = PLAT->darwin->write_first;   /* block_is_darwin() said yes: there is one */
@@ -2562,6 +2694,52 @@ block_io2_probe(efi_handle h, efi_block_io *bio)
 	    t_sync * 1000000 / freq, t_issue * 1000000 / freq, returned_done, t_all * 1000000 / freq, pending);
 }
 
+/*
+ * A write of misc (bcb_reboot=1), the kernel's block in block_buffer: misc's first block, its command alone set to
+ * "boot-recovery" or cleared and every other byte what the flash holds now (bcb.h bcb_refusal, against the block
+ * read here first); then flushed and read back, as darwin's writes are.
+ */
+static uint8_t bcb_now[BCB_BLOCK_BYTES] __attribute__((aligned(4096)));
+
+static efi_status
+block_bcb_serve(efi_block_io *bio, uint64_t lba, uint64_t bytes)
+{
+	const char *why;
+	uint32_t want;
+	efi_status s;
+
+	flush_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + bytes);
+	s = bio->read_blocks(bio, bio->media->media_id, 0, sizeof(bcb_now), bcb_now);
+	flush_dcache((uint64_t)(uintptr_t)bcb_now, (uint64_t)(uintptr_t)bcb_now + sizeof(bcb_now));
+	why = EFI_ERROR(s) ? "its first block could not be read" : bcb_refusal(lba, bytes, bcb_now, block_buffer);
+	if (why != NULL) {
+		if (block_bcb_refused++ < 8) {
+			print("ufs: a write of %d bytes at block %d of misc: REFUSED: %s\n", bytes, lba, why);
+		}
+		return 0x800000000000000FULL;   /* EFI_ACCESS_DENIED */
+	}
+	want = ufs_crc32(block_buffer, bytes);
+	s = bio->write_blocks(bio, bio->media->media_id, 0, bytes, block_buffer);
+	if (!EFI_ERROR(s)) {
+		s = bio->flush_blocks(bio);
+	}
+	if (!EFI_ERROR(s)) {
+		s = bio->read_blocks(bio, bio->media->media_id, 0, bytes, block_buffer);
+		flush_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + bytes);
+		if (!EFI_ERROR(s) && ufs_crc32(block_buffer, bytes) != want) {
+			s = 0x800000000000000AULL;      /* EFI_VOLUME_CORRUPTED */
+		}
+	}
+	if (EFI_ERROR(s)) {
+		print("ufs: misc: the write of its boot control block did not read back the same (%x)\n", (uint64_t)s);
+		return s;
+	}
+	block_bcb_writes++;
+	print("ufs: misc: the boot control block's command is now %s, read back the same\n",
+	    bcb_is_recovery(block_buffer) ? "\"boot-recovery\" (ABL starts the recovery next)" : "cleared");
+	return 0;
+}
+
 /* one request, if there is one: called from core 0's watch loop while the kernel runs */
 static void
 block_poll(void)
@@ -2595,6 +2773,9 @@ block_poll(void)
 			}
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
+		} else if (op == BLOCK_OP_WRITE && block_bcb_part >= 0 && part == (uint32_t)block_bcb_part) {
+			s = block_bcb_serve(bio, lba, bytes);
+			bytes = EFI_ERROR(s) ? 0 : bytes;
 		} else if (op == BLOCK_OP_WRITE || op == BLOCK_OP_WRITE_FAST || op == BLOCK_OP_FLUSH) {
 			int fast = op != BLOCK_OP_WRITE;
 
@@ -2848,6 +3029,14 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			/* (not while the kernel's own transfer list is in: Qualcomm's DXEs are not to touch the storage) */
 			charger_poll();
 			last_battery = READ_SYSREG(CNTVCT_EL0);
+		}
+		if (arrived && budget_reset_after != 0 && seconds_since(started) >= budget_reset_after) {
+			loader_ctx[CTX_LOG_PA] = loader_ctx[CTX_LOG_LEN] = 0;
+			if (live != NULL) {
+				log_of_hung_kernel(live, slide);
+			}
+			status = OTHER_CPU_OVER_BUDGET;
+			break;
 		}
 		if (arrived && live != NULL) {
 			if (live->heartbeat != last_beat) {
@@ -3707,6 +3896,8 @@ struct payload_info {
 	uint32_t resident_size;
 	int usb_mode;
 	int standalone;                 /* "standalone": the image boots the phone by itself, no host (2.5) */
+	const uint8_t *refindfs;        /* "refindfs": rEFInd's FAT image, for boot_menu=refind (refind_menu.c) */
+	uint32_t refindfs_size;
 };
 
 static uint64_t
@@ -3767,6 +3958,9 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
 		} else if (str_eq(e->name, "standalone")) {
 			pi->standalone = 1;                       /* boot by itself: see standalone_start() */
+		} else if (str_eq(e->name, "refindfs")) {
+			pi->refindfs = p + sizeof(*e);            /* rEFInd's disk: boot_menu=refind */
+			pi->refindfs_size = e->size;
 		}
 		p += sizeof(*e) + ((e->size + 15) & ~15u);
 	}
@@ -4973,6 +5167,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * loader asked for (the loader stays resident across runs) */
 	block_write_requested = 0;
 	block_write_part = -1;
+	block_bcb_requested = aud_word(pi.cmdline, "bcb_reboot=1");
+	block_bcb_part = -1;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
@@ -5026,6 +5222,23 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			}
 			break;
 		}
+	}
+	budget_reset_after = 0;
+	if (kernel_budget != 0 && aud_word(pi.cmdline, "loader_budget_reset=1")) {
+		uint64_t margin = BUDGET_MARGIN_SECONDS;
+
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "loader_budget_margin=")) {
+				margin = 0;
+				for (c += 21; *c >= '0' && *c <= '9'; c++) {
+					margin = margin * 10 + (uint64_t)(*c - '0');
+				}
+				break;
+			}
+		}
+		budget_reset_after = kernel_budget + margin;
+		print("loader_budget_reset=1: a kernel still out %d s after it started (its %d and %d more) is reset\n",
+		    budget_reset_after, kernel_budget, margin);
 	}
 	if (kernel_budget == 0 && standalone_boot) {
 		kernel_budget = STANDALONE_BUDGET_SECONDS;
@@ -5179,6 +5392,18 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				if (n < FULL_CMD_LEN - 1) full_cmd[n++] = ' ';
 			}
 			print("layout: for the kernel: %s\n", full_cmd + from);    /* (full_cmd is zeros past n) */
+		}
+		/* boot_tries=N counted this start: the block the kernel zeroes once the start has come good */
+		if (tries_counted && layout.state == 1 && layout.tries_block != 0) {
+			static const char tname[] = "ufs_tries_block=0x";
+
+			for (const char *c = tname; *c && n < FULL_CMD_LEN - 1; c++) {
+				full_cmd[n++] = *c;
+			}
+			for (int shift = 60; shift >= 0 && n < FULL_CMD_LEN - 1; shift -= 4) {
+				full_cmd[n++] = hex[(layout.tries_block >> shift) & 0xf];
+			}
+			if (n < FULL_CMD_LEN - 1) full_cmd[n++] = ' ';
 		}
 	}
 	if (battery_requested) {
@@ -5496,6 +5721,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (charger_paused) {
 		print("loader_charger=0: no charger polls during this run\n");
 	}
+	charger_take = nvt_cmdline_word(pi.cmdline, "vayu_charge=1") && PLAT == &platform_vayu;
+	if (charger_take) {
+		print("vayu_charge=1: the charger app's loop during the run (TakeAction 7, 1, 0 only)%s\n",
+		    charger_paused ? "; but loader_charger=0: no polls, so none" : "");
+	}
 	if (nvt_cmdline_word(pi.cmdline, "nvt_qup=1") || nvt_cmdline_word(pi.cmdline, "touch_driver=nvt_qup")) {
 		nvt_qup_setup(pi.cmdline);
 	}
@@ -5572,17 +5802,45 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			jump_to_kernel((uint64_t)(uintptr_t)&loader_return_stub, 0);
 		}
 		if (kernel_mpidr != this_mpidr) {
+			/* wdt_dump_ipa=1: a hung kernel's IPA breadcrumb (vayu_ipa_persist=1) into this log and logdump;
+			 * =2: then also the SMMU's recorded faults. vayu only. */
+			int wdt_dump_ipa = PLAT == &platform_vayu ? aud_word(pi.cmdline, "wdt_dump_ipa=1") ? 1 :
+			    aud_word(pi.cmdline, "wdt_dump_ipa=2") ? 2 : 0 : 0;
 			int64_t status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide, kernel_budget);
 
 			wdt_set_ms(WDT_BITE_MS);
 			if (status != 0) {
 				/* a kernel that hung may have left its own transfer list in the controller */
-				hc_take_back(status == OTHER_CPU_HUNG ? "the kernel hung" : "the kernel did not start");
+				hc_take_back(status == OTHER_CPU_HUNG ? "the kernel hung" : status == OTHER_CPU_OVER_BUDGET ?
+				    "the kernel did not come back in its time" : "the kernel did not start");
+			}
+			if (status == OTHER_CPU_OVER_BUDGET) {
+				/* alive, maybe, but no longer to be waited for: as a hung one, its log and the reset */
+				print("THE KERNEL DID NOT COME BACK on core %x in %d seconds (loader_budget_reset=1); its log follows\n",
+				    kernel_mpidr, budget_reset_after);
+				if (wdt_dump_ipa) {
+					print("ipa-wdt: the kernel did not come back; its last IPA breadcrumb:\n");
+					ipa_persist_report(0);
+				}
+				set_result("over-budget", loader_ctx[CTX_LOG_LEN], 0);
+				write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
+				usb_restart_after_run();
+				return 1;
 			}
 			if (status == OTHER_CPU_HUNG) {
 				/* the kernel still has that core; what it logged can be had all the same */
 				print("THE KERNEL HUNG on core %x: no sign of life for %d seconds; its log follows\n", kernel_mpidr,
 				    (uint64_t)SILENCE_SECONDS);
+				if (wdt_dump_ipa) {
+					/* (the kernel's page, read while its DDR is still this boot's: no reset in between) */
+					print("ipa-wdt: the kernel hung; its last IPA breadcrumb:\n");
+					ipa_persist_report(0);
+				}
+				if (wdt_dump_ipa == 2) {
+					/* the breadcrumb goes to logdump first: a read of a wedged SMMU may not come back */
+					write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
+					ipa_smmu_fault_dump();
+				}
 				set_result("hung", loader_ctx[CTX_LOG_LEN], 0);
 				write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
 				usb_restart_after_run();        /* (also after a handover: usb_handover=1) */
@@ -5616,6 +5874,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (block_write_requested) {
 		print("ufs: %d writes into darwin, %d bytes, read back the same; %d refused\n", block_writes,
 		    block_write_bytes, block_writes_refused);
+	}
+	if (block_bcb_requested) {
+		print("ufs: %d writes of misc's boot control block, read back the same; %d refused\n", block_bcb_writes,
+		    block_bcb_refused);
 	}
 	/* ... and its other cores should all be off again: the next kernel cannot start one that is not */
 	for (int i = 1; i < cpu_count; i++) {
@@ -5799,6 +6061,15 @@ usb_restart_after_run(void)
 	efi_status s;
 
 	if (USB == NULL || (usb_run_changes == 0 && !usb_given_away)) {
+		return;
+	}
+	if (standalone_boot) {
+		/*
+		 * (2.6) A standalone start resets the phone right after this, and no host can reach this loader then:
+		 * Qualcomm's stack is not stopped and started again over a controller the kernel drove last, which
+		 * could only hold the reset up.
+		 */
+		print("usb: a standalone start: the phone restarts now; the USB stack is left as the kernel left it\n");
 		return;
 	}
 	if (!usb_restart_enabled && !usb_given_away) {
@@ -6250,7 +6521,7 @@ fb_command(char *cmd)
 			if (str_eq(var, "product")) {
 				fb_reply("OKAY", "xnuloader");
 			} else if (str_eq(var, "version")) {
-				fb_reply("OKAY", "2.5");      /* 0.6: idle "oem log" stages the last kernel log; 0.7: USB receive re-armed; 0.8: vayu-ufs; 0.9: USB stack restarted after cable changes; 1.0: restart after 120 s without a host command; 1.1: usb_handover=1; 1.2: fb_spare=N frames below 4 GB; 1.3: the vayu train (cam/bt/jack/nfc pin paths, all opt-in by cmdline); 1.4: vayu_ir_pins=1 (TLMM exception 7); 1.5: vayu_ir_clk=1 (GCC exception 7a); 1.6: fb_spare frames of 12 MiB (zero-copy surfaces); 1.7: fb_spare clear of the vendor's reserved ranges, oem fbspare / oem fbtouch; 1.8: logdump kept at boot if it holds the last run's log, oem prevlog; 1.8a: idle reset 600 s with usb_handover=1; 1.9: the whole command line in /chosen hakios-bootargs; 2.0: vayu darwin (sda33) known, writes served with ufs_write=1; 2.1: vayu_cam_pins also sets GPIO 24 (rear VAF enable); 2.3: usbctl -- oem touch/swipe/key/sh/pull through the kernel (bsd/dev/vayu_ctl.c, /redwood/bin/usbctld), on the 2.1 base; the in-run USB receive changes of 2.2 are not included; 2.4: getvar uctl (the numbers the fastboot client does not print), oem touch X Y [MS]; 2.5: standalone boot (payload entries "standalone" and "resident": no time limit without a host, vayu-dev 2.2/2.3), darwin's layout block (the ufs_var_ and ufs_stage_ boot-args for the kernel, BLOCK_OP_WRITE_FAST/FLUSH inside var), a staged boot image written into boot with flash_stage=1 (vayu-dev 2.8), flush_blocks checked on every write */
+				fb_reply("OKAY", "2.6");      /* 0.6: idle "oem log" stages the last kernel log; 0.7: USB receive re-armed; 0.8: vayu-ufs; 0.9: USB stack restarted after cable changes; 1.0: restart after 120 s without a host command; 1.1: usb_handover=1; 1.2: fb_spare=N frames below 4 GB; 1.3: the vayu train (cam/bt/jack/nfc pin paths, all opt-in by cmdline); 1.4: vayu_ir_pins=1 (TLMM exception 7); 1.5: vayu_ir_clk=1 (GCC exception 7a); 1.6: fb_spare frames of 12 MiB (zero-copy surfaces); 1.7: fb_spare clear of the vendor's reserved ranges, oem fbspare / oem fbtouch; 1.8: logdump kept at boot if it holds the last run's log, oem prevlog; 1.8a: idle reset 600 s with usb_handover=1; 1.9: the whole command line in /chosen hakios-bootargs; 2.0: vayu darwin (sda33) known, writes served with ufs_write=1; 2.1: vayu_cam_pins also sets GPIO 24 (rear VAF enable); 2.3: usbctl -- oem touch/swipe/key/sh/pull through the kernel (bsd/dev/vayu_ctl.c, /redwood/bin/usbctld), on the 2.1 base; the in-run USB receive changes of 2.2 are not included; 2.4: getvar uctl (the numbers the fastboot client does not print), oem touch X Y [MS]; 2.5: standalone boot (payload entries "standalone" and "resident": no time limit without a host, vayu-dev 2.2/2.3), darwin's layout block (the ufs_var_ and ufs_stage_ boot-args for the kernel, BLOCK_OP_WRITE_FAST/FLUSH inside var), a staged boot image written into boot with flash_stage=1 (vayu-dev 2.8), flush_blocks checked on every write; 2.6: bcb_reboot=1 -- the kernel may set misc's boot control block to "boot-recovery" or clear it (its command alone, read back), boot_tries=N -- standalone starts counted in darwin's "tries" block, the recovery after N that never came good (bcb.h) */
 			} else if (str_eq(var, "max-download-size")) {
 				fb_reply("OKAY", download_to_ramdisk ? "0xffffffff" : "0x03f00000");
 			} else if (str_eq(var, "result")) {
@@ -6798,13 +7069,24 @@ ramfb_phone_screen(void)
  * and nothing is written), only from where darwin's layout puts it (stage, stagehead), and only into the
  * boot partition the platform names (PLAT->boot: its name, GUIDs, LBAs and unit, from this phone's GPT).
  *
- * The header ("XNUFLASH", u64 first block, u64 bytes, u64 FNV-1a 64 of the bytes) is cleared first, so that
- * whatever happens next the following start is an ordinary one. The image is then read through once: its
+ * The header ("XNUFLASH", u64 first block, u64 bytes, u64 FNV-1a 64 of the bytes; then "FORBOOT!", u64 bytes
+ * and u64 FNV-1a 64 of the whole of boot as it was when the image was staged: userland/src/flash_stage.h) is taken
+ * only for the boot it was staged against: a stage left behind -- a test, a deploy given up -- is not written
+ * by whatever image comes next with flash_stage=1. A header without "FORBOOT!" (an older flash_stage's) is left
+ * alone; one staged against another boot is cleared, and nothing is written. The header is cleared first, so
+ * that whatever happens next the following start is an ordinary one. The image is then read through once: its
  * place, size, magic ("ANDROID!") and sum are checked, and if one of them is wrong nothing is written and
  * this start goes on as ever. Then boot's present contents are kept in memory and the image is written a
- * megabyte at a time, each piece flushed and read back; if a piece does not come back the same, the old
- * contents go back the same way and this start goes on (the payload in memory is untouched). Done: a reset
- * into the new image.
+ * megabyte at a time, each piece flushed and read back, boot's first block zero until the rest is in and
+ * written last: a write cut short leaves no "ANDROID!" at boot's start, and ABL falls back to its own fastboot
+ * instead of starting half an image. If a piece does not come back the same, the old contents go back the same
+ * way and this start goes on (the payload in memory is untouched). Done: a reset into the new image.
+ *
+ * flash_stage_target=recovery (the multiboot: HakiOS in the recovery partition, Android in boot): all of the
+ * above with the recovery (PLAT->recovery, its own identity) in boot's place, the header tied to it by
+ * "FORRECV!" instead of "FORBOOT!". Each way refuses the other's header -- cleared, nothing written -- so an
+ * image in the recovery never writes Android's boot, whatever is staged; a loader before this one leaves a
+ * "FORRECV!" header alone (not tied to a boot). Any other flash_stage_target= : nothing is written.
  */
 #define STAGE_CHUNK     (1024 * 1024)
 
@@ -6823,14 +7105,49 @@ stage_copy(efi_block_io *to, const uint8_t *from, uint64_t at, uint64_t n, uint8
 	return !EFI_ERROR(s) && memcmp(check, from, n) == 0;
 }
 
+/* boot's first block last: a write cut short leaves it zero (from: the rounded image, n bytes of it) */
+static int
+stage_write_boot(efi_block_io *boot, const uint8_t *from, uint64_t n, uint8_t *check)
+{
+	static uint8_t zero[4096] __attribute__((aligned(4096)));
+
+	if (!stage_copy(boot, zero, 0, sizeof(zero), check)) {
+		return 0;
+	}
+	for (uint64_t at = 4096; at < n; at += STAGE_CHUNK) {
+		if (!stage_copy(boot, from + at, at, n - at < STAGE_CHUNK ? n - at : STAGE_CHUNK, check)) {
+			return 0;
+		}
+	}
+	return stage_copy(boot, from, 0, 4096, check);
+}
+
+/* a word of the command line that begins with key ("flash_stage_target="): 1 if there is one */
+static int
+cmdline_has_key(const char *cmdline, const char *key)
+{
+	unsigned klen = 0;
+
+	while (key[klen] != 0) {
+		klen++;
+	}
+	for (const char *c = cmdline; *c; c++) {
+		if ((c == cmdline || c[-1] == ' ') && memcmp(c, key, klen) == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static void
 standalone_staged_flash(const struct payload_info *pi)
 {
 	static uint8_t head[4096] __attribute__((aligned(4096)));
 	efi_block_io *darwin = layout.bio, *boot;
-	uint64_t first, bytes, fnv, rounded, at, sum, boot_bytes, saved_pa = 0;
-	uint8_t *chunk = NULL, *check = NULL, *saved;
-	const char *why = NULL;
+	uint64_t first, bytes, fnv, rounded, at, sum, boot_bytes, for_bytes, for_fnv, saved_pa = 0, image_pa = 0;
+	uint8_t *chunk = NULL, *check = NULL, *saved, *image;
+	const char *why = NULL, *target = "boot", *tie = "FORBOOT!", *other = "FORRECV!";
+	const struct darwin_identity *target_id = PLAT->boot;
 	efi_status s;
 
 	if (layout.state != 1 || layout.stage_blocks == 0 ||
@@ -6843,9 +7160,72 @@ standalone_staged_flash(const struct payload_info *pi)
 		    "left alone\n");
 		return;
 	}
+	if (aud_word(pi->cmdline, "flash_stage_target=recovery")) {
+		target = "recovery", tie = "FORRECV!", other = "FORBOOT!", target_id = PLAT->recovery;
+	} else if (cmdline_has_key(pi->cmdline, "flash_stage_target=") && !aud_word(pi->cmdline, "flash_stage_target=boot")) {
+		print("staged flash: flash_stage_target= is neither boot nor recovery: left alone, nothing written\n");
+		return;
+	}
 	first = le64(head + 8);
 	bytes = le64(head + 16);
 	fnv = le64(head + 24);
+	if (memcmp(head + 32, other, 8) == 0) {
+		print("staged flash: the image was staged for %s, and this one's flash_stage_target is %s: not flashed, the "
+		    "header is cleared\n", other[3] == 'B' ? "boot" : "the recovery", target);
+		memset(head, 0, sizeof(head));
+		s = darwin->write_blocks(darwin, darwin->media->media_id, layout.stage_head, sizeof(head), head);
+		if (!EFI_ERROR(s)) {
+			s = darwin->flush_blocks(darwin);
+		}
+		if (EFI_ERROR(s)) {
+			print("staged flash: the header could not be cleared (%x)\n", (uint64_t)s);
+		}
+		return;
+	}
+	if (memcmp(head + 32, tie, 8) != 0) {
+		print("staged flash: the staged header is not tied to a boot (an older flash_stage's): left alone, not "
+		    "flashed (flash_stage cancel clears it)\n");
+		return;
+	}
+	for_bytes = le64(head + 40);
+	for_fnv = le64(head + 48);
+	boot = part_by_identity(target, target_id, &why);
+	if (boot == NULL) {
+		print("staged flash: %s not written: %s\n", target, why);
+		return;
+	}
+	if (target_id != PLAT->boot) {
+		print("staged flash: flash_stage_target=recovery: the image goes into the recovery (LBA %d..%d of unit %d), "
+		    "boot is not written\n", target_id->first_lba, target_id->last_lba, (uint64_t)target_id->unit);
+	}
+	why = NULL;
+	boot_bytes = (boot->media->last_block + 1) * boot->media->block_size;
+	rounded = (bytes + 4095) / 4096 * 4096;
+	if (EFI_ERROR(BS->allocate_pool(EfiLoaderData, STAGE_CHUNK, (void **)&chunk)) ||
+	    EFI_ERROR(BS->allocate_pool(EfiLoaderData, STAGE_CHUNK, (void **)&check))) {
+		print("staged flash: no memory for it: not flashed\n");
+		goto out;
+	}
+	/* staged against this boot? (the whole partition, as flash_stage summed /dev/rufs_boot or rufs_recovery) */
+	sum = 0xcbf29ce484222325ULL;
+	for (at = 0; at < boot_bytes && why == NULL; at += STAGE_CHUNK) {
+		uint64_t n = boot_bytes - at < STAGE_CHUNK ? boot_bytes - at : STAGE_CHUNK;
+
+		if (EFI_ERROR(boot->read_blocks(boot, boot->media->media_id, at / 4096, n, chunk))) {
+			why = "the partition could not be read";
+		} else {
+			sum = ufs_fnv(sum, chunk, n);
+		}
+		wdt_pet();
+	}
+	if (why != NULL) {
+		print("staged flash: not flashed: %s\n", why);
+		goto out;
+	}
+	if (for_bytes != boot_bytes || for_fnv != sum) {
+		print("staged flash: the image was staged against another %s (fnv %x of %d bytes; %s is %x of %d): "
+		    "not flashed, the header is cleared\n", target, for_fnv, for_bytes, target, sum, boot_bytes);
+	}
 	memset(head, 0, sizeof(head));
 	s = darwin->write_blocks(darwin, darwin->media->media_id, layout.stage_head, sizeof(head), head);
 	if (!EFI_ERROR(s)) {
@@ -6853,41 +7233,44 @@ standalone_staged_flash(const struct payload_info *pi)
 	}
 	if (EFI_ERROR(s)) {
 		print("staged flash: the header could not be cleared (%x): not flashed\n", (uint64_t)s);
-		return;
+		goto out;
 	}
-	print("staged flash: %d bytes at darwin block %d, fnv %x; the header is cleared\n", bytes, first, fnv);
-	rounded = (bytes + 4095) / 4096 * 4096;
-	boot = part_by_identity("boot", PLAT->boot, &why);
-	if (boot == NULL) {
-		print("staged flash: boot not written: %s\n", why);
-		return;
+	if (for_bytes != boot_bytes || for_fnv != sum) {
+		goto out;
 	}
-	boot_bytes = (boot->media->last_block + 1) * boot->media->block_size;
+	print("staged flash: %d bytes at darwin block %d, fnv %x, staged against this %s; the header is cleared\n",
+	    bytes, first, fnv, target);
 	if (first != layout.stage_first || bytes < 4096 || rounded > layout.stage_blocks * 4096 || rounded > boot_bytes) {
 		print("staged flash: the header is not one to trust (its place or size): not flashed\n");
-		return;
+		goto out;
 	}
-	if (EFI_ERROR(BS->allocate_pool(EfiLoaderData, STAGE_CHUNK, (void **)&chunk)) ||
-	    EFI_ERROR(BS->allocate_pool(EfiLoaderData, STAGE_CHUNK, (void **)&check)) ||
-	    EFI_ERROR(BS->allocate_pages(AllocateAnyPages, EfiLoaderData, rounded >> 12, &saved_pa))) {
+	if (EFI_ERROR(BS->allocate_pages(AllocateAnyPages, EfiLoaderData, rounded >> 12, &saved_pa))) {
 		print("staged flash: no memory for it: not flashed\n");
 		saved_pa = 0;
 		goto out;
 	}
+	if (EFI_ERROR(BS->allocate_pages(AllocateAnyPages, EfiLoaderData, rounded >> 12, &image_pa))) {
+		print("staged flash: no memory for it: not flashed\n");
+		image_pa = 0;
+		goto out;
+	}
 	saved = (uint8_t *)(uintptr_t)saved_pa;
-	/* once through: the image is what its header says, and an Android boot image */
-	sum = 0xcbf29ce484222325ULL;
+	image = (uint8_t *)(uintptr_t)image_pa;
+	/* into memory once: the image is what its header says, and an Android boot image */
 	for (at = 0; at < rounded && why == NULL; at += STAGE_CHUNK) {
 		uint64_t n = rounded - at < STAGE_CHUNK ? rounded - at : STAGE_CHUNK;
 
-		if (EFI_ERROR(darwin->read_blocks(darwin, darwin->media->media_id, first + at / 4096, n, chunk))) {
+		if (EFI_ERROR(darwin->read_blocks(darwin, darwin->media->media_id, first + at / 4096, n, image + at))) {
 			why = "the staged image could not be read";
-		} else if (at == 0 && memcmp(chunk, "ANDROID!", 8) != 0) {
-			why = "the staged image is not an Android boot image";
-		} else {
-			sum = ufs_fnv(sum, chunk, bytes - at < n ? bytes - at : n);
 		}
 		wdt_pet();
+	}
+	if (why == NULL) {
+		memset(image + bytes, 0, rounded - bytes);      /* (the last block's rest: zeros) */
+		sum = ufs_fnv(0xcbf29ce484222325ULL, image, bytes);
+		if (memcmp(image, "ANDROID!", 8) != 0) {
+			why = "the staged image is not an Android boot image";
+		}
 	}
 	if (why == NULL && sum != fnv) {
 		print("staged flash: fnv %x, the header says %x\n", sum, fnv);
@@ -6897,54 +7280,35 @@ standalone_staged_flash(const struct payload_info *pi)
 		uint64_t n = rounded - at < STAGE_CHUNK ? rounded - at : STAGE_CHUNK;
 
 		if (EFI_ERROR(boot->read_blocks(boot, boot->media->media_id, at / 4096, n, saved + at))) {
-			why = "boot's present contents could not be read (to put back if the write went wrong)";
+			why = "the partition's present contents could not be read (to put back if the write went wrong)";
 		}
 	}
 	if (why != NULL) {
 		print("staged flash: not flashed: %s\n", why);
 		goto out;
 	}
-	print("staged flash: writing boot (%d bytes of %d), a megabyte at a time, each piece read back\n", rounded, boot_bytes);
+	print("staged flash: writing %s (%d bytes of %d), a megabyte at a time, each piece read back, its first block "
+	    "last\n", target, rounded, boot_bytes);
 	flush_log();
-	sum = 0xcbf29ce484222325ULL;
-	for (at = 0; at < rounded && why == NULL; at += STAGE_CHUNK) {
-		uint64_t n = rounded - at < STAGE_CHUNK ? rounded - at : STAGE_CHUNK;
-
-		if (EFI_ERROR(darwin->read_blocks(darwin, darwin->media->media_id, first + at / 4096, n, chunk))) {
-			why = "the staged image could not be read again";
-			break;
-		}
-		if (bytes - at < n) {
-			memset(chunk + (bytes - at), 0, n - (bytes - at));      /* (the last block's rest: zeros) */
-		}
-		sum = ufs_fnv(sum, chunk, bytes - at < n ? bytes - at : n);
-		if (!stage_copy(boot, chunk, at, n, check)) {
-			print("staged flash: the piece at byte %d did not read back the same\n", at);
-			why = "a piece of boot did not read back the same";
-		}
-	}
-	if (why == NULL && sum != fnv) {
-		why = "the staged image changed while it was written";
+	if (!stage_write_boot(boot, image, rounded, check)) {
+		why = "a piece of it did not read back the same";
 	}
 	if (why == NULL) {
-		print("staged flash: boot written, read back the same; restarting into it\n");
+		print("staged flash: %s written, read back the same; restarting into it\n", target);
 		flush_log();
 		BS->stall(1500000);     /* (a moment to read it on the screen) */
 		reboot();
 	}
-	print("staged flash: %s: boot's old contents go back\n", why);
-	for (at = 0, why = NULL; at < rounded && why == NULL; at += STAGE_CHUNK) {
-		uint64_t n = rounded - at < STAGE_CHUNK ? rounded - at : STAGE_CHUNK;
-
-		if (!stage_copy(boot, saved + at, at, n, check)) {
-			why = "NOT put back";
-		}
-	}
-	print("staged flash: boot's old contents %s; this start goes on without the new image\n",
-	    why == NULL ? "are back, read back the same" : "were NOT all put back: the next start from boot may fail "
-	    "(stock fastboot with the buttons, fastboot flash boot a saved image)");
+	print("staged flash: %s: %s's old contents go back\n", why, target);
+	why = stage_write_boot(boot, saved, rounded, check) ? NULL : "NOT put back";
+	print("staged flash: %s's old contents %s; this start goes on without the new image\n", target,
+	    why == NULL ? "are back, read back the same" : "were NOT all put back: the next start from it may fail "
+	    "(stock fastboot with the buttons, fastboot flash a saved image)");
 	flush_log();
 out:
+	if (image_pa != 0) {
+		BS->free_pages(image_pa, rounded >> 12);
+	}
 	if (saved_pa != 0) {
 		BS->free_pages(saved_pa, rounded >> 12);
 	}
@@ -6953,6 +7317,375 @@ out:
 	}
 	if (chunk != NULL) {
 		BS->free_pool(chunk);
+	}
+}
+
+/*
+ * boot_tries=N (2.6, bcb.h): this start is counted in darwin's "tries" block before the kernel runs; when the N
+ * starts before it never came good (the kernel calls a start good boot_tries_ok= seconds in: bsd/dev/hakios.ufs.c),
+ * misc's boot control block gets "boot-recovery" instead and the phone restarts -- ABL then starts the recovery,
+ * where adb answers: out of a boot loop with nobody at the phone. Every write is read back; one that fails leaves
+ * this start to go on as ever.
+ */
+static int
+tries_write(efi_block_io *bio, uint64_t lba, const uint8_t *block, uint8_t *check)
+{
+	efi_status s = bio->write_blocks(bio, bio->media->media_id, lba, BCB_BLOCK_BYTES, (void *)block);
+
+	if (!EFI_ERROR(s)) {
+		s = bio->flush_blocks(bio);
+	}
+	if (!EFI_ERROR(s)) {
+		s = bio->read_blocks(bio, bio->media->media_id, lba, BCB_BLOCK_BYTES, check);
+	}
+	return !EFI_ERROR(s) && memcmp(block, check, BCB_BLOCK_BYTES) == 0;
+}
+
+/*
+ * misc's first block with its command set to "boot-recovery" (recovery) or cleared: read, composed (bcb.h),
+ * checked against what was read (bcb_refusal: the command alone changes), written, flushed and read back whole.
+ * A command that is that already is not written again. NULL, or why not.
+ */
+static const char *
+misc_command_write(int recovery)
+{
+	static uint8_t now[BCB_BLOCK_BYTES] __attribute__((aligned(4096)));
+	static uint8_t want[BCB_BLOCK_BYTES] __attribute__((aligned(4096)));
+	static uint8_t check[BCB_BLOCK_BYTES] __attribute__((aligned(4096)));
+	const char *why = NULL;
+	efi_block_io *misc = part_by_identity("misc", PLAT->misc, &why);
+
+	if (misc == NULL) {
+		return why;
+	}
+	if (EFI_ERROR(misc->read_blocks(misc, misc->media->media_id, 0, sizeof(now), now))) {
+		return "its first block could not be read";
+	}
+	if (recovery ? bcb_is_recovery(now) : bcb_is_clear(now)) {
+		return NULL;
+	}
+	memcpy(want, now, sizeof(want));
+	bcb_compose(want, recovery);
+	why = bcb_refusal(0, sizeof(want), now, want);
+	if (why != NULL) {
+		return why;
+	}
+	return tries_write(misc, 0, want, check) ? NULL : "the write did not read back the same";
+}
+
+/*
+ * The menu (m1-menu, xnuloader/boot_menu.c) sets this when somebody chose HakiOS there (a key, or the host): such
+ * a start is counted but never sent away by boot_tries=, and the trips before it no longer count (bcb.h).
+ */
+static int standalone_by_hand;
+
+/*
+ * boot_tries_clear_bcb=1 (the multiboot, HakiOS in the recovery partition: taken only from an image that says
+ * flash_stage_target=recovery, the mark of one that lives there): the starts used up send the phone to
+ * Android -- misc's command cleared -- instead of the recovery, and boot_tries_max_cycles=K (with it) holds HakiOS
+ * back after K such trips since the last good start: every start goes straight on to Android, nothing counted,
+ * until a start comes good, the menu starts HakiOS by hand or the tries block is cleared (bcb.h tries_decide).
+ */
+static void
+standalone_tries(const struct payload_info *pi)
+{
+	static uint8_t block[BCB_BLOCK_BYTES] __attribute__((aligned(4096)));
+	static uint8_t check[BCB_BLOCK_BYTES] __attribute__((aligned(4096)));
+	efi_block_io *darwin = layout.bio;
+	struct tries t;
+	uint64_t limit = 0, cycles = 0;
+	int clear = aud_word(pi->cmdline, "boot_tries_clear_bcb=1"), decided;
+	const char *why = NULL;
+
+	tries_counted = 0;
+	if (!cmdline_number(pi->cmdline, "boot_tries=", &limit) || limit == 0) {
+		return;
+	}
+	if (limit > 100) {
+		print("standalone: boot_tries=%d: more than 100 is no limit at all: starts not counted\n", limit);
+		return;
+	}
+	if (clear && !aud_word(pi->cmdline, "flash_stage_target=recovery")) {
+		/* (an image in boot whose command is cleared starts itself again: a loop of restarts, no Android) */
+		print("standalone: boot_tries_clear_bcb=1 without flash_stage_target=recovery (an image that lives in the "
+		    "recovery partition): not taken, the starts used up go to the recovery as ever\n");
+		clear = 0;
+	}
+	if (clear && cmdline_number(pi->cmdline, "boot_tries_max_cycles=", &cycles) && cycles > 100) {
+		print("standalone: boot_tries_max_cycles=%d: more than 100 is no limit at all\n", cycles);
+		cycles = 0;
+	}
+	if (layout.state != 1 || layout.tries_block == 0 || layout.bio->media->block_size != BCB_BLOCK_BYTES) {
+		print("standalone: boot_tries=%d: darwin's layout has no \"tries\" block (darwin-install.sh layout writes "
+		    "one): starts not counted\n", limit);
+		return;
+	}
+	if (EFI_ERROR(darwin->read_blocks(darwin, darwin->media->media_id, layout.tries_block, sizeof(block), block))) {
+		print("standalone: boot_tries: darwin's block %d could not be read: starts not counted\n", layout.tries_block);
+		return;
+	}
+	if (!tries_read(block, &t)) {
+		print("standalone: boot_tries: no count in darwin's block %d yet: from 0\n", layout.tries_block);
+	}
+	decided = tries_decide(&t, (uint32_t)limit, clear, (uint32_t)cycles, standalone_by_hand);
+	if (decided == TRIES_HELD) {
+		print("standalone: boot_tries_max_cycles=%d: %d trips to Android since the last good start: HakiOS is not "
+		    "started by itself (the menu, or a good start, ends this); on to Android\n", cycles, (uint64_t)t.cycles);
+		why = misc_command_write(0);
+		if (why == NULL) {
+			print("standalone: misc's command is clear, read back the same; restarting into Android\n");
+			flush_log();
+			BS->stall(1500000);     /* (a moment to read it on the screen) */
+			reboot();
+		}
+		print("standalone: boot_tries: misc not cleared (%s): this start goes on\n", why);
+	} else if (decided == TRIES_RECOVERY || decided == TRIES_ANDROID) {
+		print("standalone: boot_tries=%d: the %d starts before this one never came good: into %s\n", limit,
+		    (uint64_t)t.count, decided == TRIES_RECOVERY ? "the recovery" : "Android (boot_tries_clear_bcb=1)");
+		why = misc_command_write(decided == TRIES_RECOVERY);
+		if (why == NULL) {
+			tries_after(&t, decided, 0);
+			tries_make(block, &t);
+			if (!tries_write(darwin, layout.tries_block, block, check)) {
+				print("standalone: boot_tries: the count could not be written back (it says the same next time)\n");
+			}
+			if (decided == TRIES_RECOVERY) {
+				print("standalone: misc's boot control block says \"boot-recovery\", read back the same; restarting "
+				    "into the recovery (%d times so far)\n", t.recoveries);
+			} else {
+				print("standalone: misc's command is clear, read back the same; restarting into Android (%d times so "
+				    "far, %d since the last good start)\n", t.recoveries, (uint64_t)t.cycles);
+			}
+			flush_log();
+			BS->stall(1500000);     /* (a moment to read it on the screen) */
+			reboot();
+		}
+		print("standalone: boot_tries: misc not written (%s): this start goes on\n", why);
+	}
+	tries_after(&t, TRIES_START, standalone_by_hand);
+	tries_make(block, &t);
+	if (!tries_write(darwin, layout.tries_block, block, check)) {
+		print("standalone: boot_tries: the count did not read back the same: starts not counted\n");
+		return;
+	}
+	tries_counted = 1;
+	print("standalone: boot_tries=%d: this is start %d since the last good one (%d in all, %d sent to the recovery)\n",
+	    limit, (uint64_t)t.count, t.starts, t.recoveries);
+	if (standalone_by_hand) {
+		print("standalone: boot_tries: HakiOS chosen by hand: counted, never sent away; the trips before forgotten\n");
+	}
+}
+
+/* ---- the boot menu's misc ---- */
+
+/*
+ * What the menu (xnuloader/boot_menu.c) shows and does with misc's boot control block: ABL starts the recovery
+ * partition while the command says "boot-recovery" and boot while it is empty. In the multiboot HakiOS and the menu
+ * are in the recovery, Android in boot: "Android" clears the command and restarts, "Default Boot" sets or clears it
+ * and stays. Writes as misc_command_write's (the command alone, checked, read back); "Android" wants bcb_reboot=1 on
+ * the image's command line for one, the switch boot_menu_bcb=1 as well. Nothing here returns into UEFI's boot
+ * manager: "Android" restarts the phone or says why not.
+ */
+#define BCB_MENU_UNREAD   (-1)
+#define BCB_MENU_CLEAR      0
+#define BCB_MENU_RECOVERY   1
+#define BCB_MENU_OTHER      2
+
+struct bcb_menu_state {
+	int command;                    /* BCB_MENU_* */
+	char command_text[BCB_COMMAND_BYTES + 1];
+	char status_text[BCB_STATUS_BYTES + 1];
+	char recovery_text[97];         /* the recovery field's start, '|' for its newlines */
+	int wipe_asked;                 /* it asks for userdata to be wiped (RescueParty's --prompt_and_wipe_data) */
+	uint32_t dirty;                 /* bytes 32..4095 of the block that are not zero */
+	int may_android, may_toggle;    /* "Android" may clear the command; "Default Boot" may write it */
+	const char *why;                /* why it was not read, or why they may not (NULL: they may) */
+	int tries_known;                /* darwin's tries block read, and one */
+	uint32_t tries_count, tries_cycles;
+	uint64_t tries_starts, tries_recoveries;
+};
+
+static void
+bcb_menu_read(const struct payload_info *pi, struct bcb_menu_state *st)
+{
+	static uint8_t block[BCB_BLOCK_BYTES] __attribute__((aligned(4096)));
+	efi_block_io *misc;
+	struct tries t;
+
+	memset(st, 0, sizeof(*st));
+	st->command = BCB_MENU_UNREAD;
+	if (layout.state == 1 && layout.tries_block != 0 && layout.bio->media->block_size == BCB_BLOCK_BYTES &&
+	    !EFI_ERROR(layout.bio->read_blocks(layout.bio, layout.bio->media->media_id, layout.tries_block,
+	    sizeof(block), block)) && tries_read(block, &t)) {
+		st->tries_known = 1;
+		st->tries_count = t.count, st->tries_cycles = t.cycles;
+		st->tries_starts = t.starts, st->tries_recoveries = t.recoveries;
+	}
+	misc = part_by_identity("misc", PLAT->misc, &st->why);
+	if (misc == NULL) {
+		return;
+	}
+	if (EFI_ERROR(misc->read_blocks(misc, misc->media->media_id, 0, sizeof(block), block))) {
+		st->why = "misc's first block could not be read";
+		return;
+	}
+	st->command = bcb_is_clear(block) ? BCB_MENU_CLEAR : bcb_is_recovery(block) ? BCB_MENU_RECOVERY : BCB_MENU_OTHER;
+	bcb_text(block, BCB_COMMAND_BYTES, st->command_text, sizeof(st->command_text));
+	bcb_text(block + BCB_STATUS_AT, BCB_STATUS_BYTES, st->status_text, sizeof(st->status_text));
+	bcb_text(block + BCB_RECOVERY_AT, BCB_RECOVERY_BYTES, st->recovery_text, sizeof(st->recovery_text));
+	st->wipe_asked = bcb_wipe_asked(block);
+	st->dirty = bcb_dirty(block);
+	st->may_android = st->command == BCB_MENU_CLEAR || aud_word(pi->cmdline, "bcb_reboot=1");
+	st->may_toggle = aud_word(pi->cmdline, "bcb_reboot=1") && aud_word(pi->cmdline, "boot_menu_bcb=1");
+	st->why = !st->may_android ? "misc is not written without bcb_reboot=1 on this image's command line" :
+	    !st->may_toggle ? "the default is not switched without boot_menu_bcb=1 bcb_reboot=1" : NULL;
+}
+
+/* "Android": the command cleared (if it is not) and a cold reset; back only to say why not */
+static const char *
+bcb_android_from(const struct payload_info *pi)
+{
+	struct bcb_menu_state st;
+	const char *why;
+
+	bcb_menu_read(pi, &st);
+	if (st.command == BCB_MENU_UNREAD) {
+		return st.why;
+	}
+	if (st.command != BCB_MENU_CLEAR) {
+		if (!st.may_android) {
+			return st.why;
+		}
+		print("menu: Android: misc's command is \"%s\": clearing it\n", st.command_text);
+		why = misc_command_write(0);
+		if (why != NULL) {
+			print("menu: Android: misc not cleared: %s\n", why);
+			return why;
+		}
+	}
+	print("menu: Android: misc's command is clear, read back the same; restarting (ABL starts boot)\n");
+	flush_log();
+	reboot();
+	return "the reset came back";
+}
+
+/* "Default Boot": 1 -- "boot-recovery" (the menu at every start), 0 -- cleared (Android); NULL, or why not */
+static const char *
+bcb_default_set(const struct payload_info *pi, int recovery)
+{
+	struct bcb_menu_state st;
+	const char *why;
+
+	bcb_menu_read(pi, &st);
+	if (st.command == BCB_MENU_UNREAD) {
+		return st.why;
+	}
+	if (!st.may_toggle) {
+		return st.why;
+	}
+	why = misc_command_write(recovery);
+	print("menu: default boot: misc's command %s: %s\n", recovery ? "\"boot-recovery\" (the menu at every start)" :
+	    "cleared (Android)", why == NULL ? "written, read back the same" : why);
+	return why;
+}
+
+/*
+ * The menu's hooks (BCB_MENU_HOOKS before boot_menu.c is included). They take the
+ * image's command line from the payload in memory, as run_kernel does.
+ */
+#define BCB_MENU_HOOKS
+
+static const char *
+bcb_menu_cmdline(struct payload_info *pi)
+{
+	return parse_payload(pi, 0) && pi->cmdline != NULL ? NULL : "no payload command line";
+}
+
+/* "Android" (and boot_menu_default=android's timer): misc's command cleared, a cold reset. Never back. */
+static void __attribute__((unused))
+bcb_menu_android(void)
+{
+	struct payload_info pi;
+	const char *why = bcb_menu_cmdline(&pi);
+
+	if (why == NULL) {
+		why = bcb_android_from(&pi);
+	}
+	print("menu: Android: %s: misc not cleared; restarting anyway (ABL starts what misc says)\n", why);
+	flush_log();
+	BS->stall(5000000);     /* (the line stays on the screen a while) */
+	reboot();
+}
+
+/* what the phone starts at power-on, as misc says it, for "Default: <name>" (21 characters at most) */
+static const char * __attribute__((unused))
+bcb_menu_default_name(void)
+{
+	struct payload_info pi;
+	struct bcb_menu_state st;
+
+	if (bcb_menu_cmdline(&pi) != NULL) {
+		return "? (no command line)";
+	}
+	bcb_menu_read(&pi, &st);
+	switch (st.command) {
+	case BCB_MENU_RECOVERY:
+		return "menu (boot-recovery)";
+	case BCB_MENU_CLEAR:
+		return "Android";
+	case BCB_MENU_OTHER:
+		return "other (misc: ours?)";
+	}
+	return "? (misc not read)";
+}
+
+/* the switch: the other of the two, written and read back; the new name, or a short reason why not */
+static const char * __attribute__((unused))
+bcb_menu_default_next(void)
+{
+	struct payload_info pi;
+	struct bcb_menu_state st;
+
+	if (bcb_menu_cmdline(&pi) != NULL) {
+		return "? (no command line)";
+	}
+	bcb_menu_read(&pi, &st);
+	if (st.command != BCB_MENU_CLEAR && st.command != BCB_MENU_RECOVERY) {
+		return st.command == BCB_MENU_OTHER ? "not ours: left alone" : "misc not read";
+	}
+	if (!st.may_toggle) {
+		return "needs boot_menu_bcb=1";
+	}
+	if (bcb_default_set(&pi, st.command == BCB_MENU_CLEAR) != NULL) {
+		return "NOT written";
+	}
+	return bcb_menu_default_name();
+}
+
+/*
+ * bcb_reboot=1: misc's block as this start finds it, into the log (read only): the command, and what Android or a
+ * recovery left past it -- RescueParty's "--prompt_and_wipe_data" in the recovery field above all, which a
+ * TWRP-like recovery put back into the recovery partition would act on.
+ */
+static void
+standalone_bcb_note(const struct payload_info *pi)
+{
+	struct bcb_menu_state st;
+
+	if (!aud_word(pi->cmdline, "bcb_reboot=1")) {
+		return;
+	}
+	bcb_menu_read(pi, &st);
+	if (st.command == BCB_MENU_UNREAD) {
+		print("standalone: misc not read: %s\n", st.why);
+		return;
+	}
+	print("standalone: misc's command \"%s\", status \"%s\", recovery \"%s\"; %d bytes past the command not zero%s\n",
+	    st.command_text, st.status_text, st.recovery_text, (uint64_t)st.dirty,
+	    st.wipe_asked ? "; the recovery field ASKS FOR A WIPE OF USERDATA (RescueParty?)" : "");
+	if (st.tries_known) {
+		print("standalone: tries: %d since the last good start, %d trips away since it; %d starts, %d trips in all\n",
+		    (uint64_t)st.tries_count, (uint64_t)st.tries_cycles, st.tries_starts, st.tries_recoveries);
 	}
 }
 
@@ -6977,6 +7710,73 @@ resident_from_payload(const struct payload_info *pi)
 }
 
 /*
+ * Other EFI applications (efi_chainload.c, plan L1): with boot_menu_efi=1 the firmware's tables and the EFI
+ * applications on its FAT volumes are listed in the log; boot_efi_run=N starts the Nth without a menu (the boot menu
+ * calls efi_chain_start itself). Before the start of an iOS one: an EFI start is not counted by boot_tries.
+ */
+static struct efi_chain_host efi_host;
+
+static void
+efi_before_start(void)
+{
+	if (wdt_armed) {                /* nothing started from here feeds the hypervisor's watchdog */
+		smc_call(VIRT_WDT_CONTROL, 0, 0, NULL, NULL);
+		wdt_armed = 0;
+	}
+	flush_log();
+}
+
+static void
+efi_chain_host_init(const char *cmdline)
+{
+	uint64_t v;
+
+	efi_host.st = ST;
+	efi_host.image = IMAGE;
+	efi_host.print = print;
+	efi_host.before_start = efi_before_start;
+	efi_host.reset = reboot;
+	efi_host.read_only = !(cmdline_number(cmdline, "boot_menu_efi_ro=", &v) && v == 0);
+	efi_host.watchdog_seconds = cmdline_number(cmdline, "boot_efi_watchdog=", &v) ? v : 300;
+}
+
+static int
+efi_chain_enabled(const char *cmdline)
+{
+	return aud_word(cmdline, "boot_menu_efi=1");
+}
+
+static void
+efi_chain_standalone(const char *cmdline)
+{
+	static struct efi_chain_entry list[EFI_CHAIN_MAX];
+	struct efi_chain_diag diag;
+	uint64_t run = 0;
+	int n;
+
+	if (!efi_chain_enabled(cmdline)) {
+		return;
+	}
+	efi_chain_host_init(cmdline);
+	if (aud_word(cmdline, "boot_efi_connect=1")) {
+		efi_chain_connect(&efi_host);
+	}
+	efi_chain_diag(&efi_host, &diag);
+	n = efi_chain_scan(&efi_host, list, EFI_CHAIN_MAX);
+	if (!cmdline_number(cmdline, "boot_efi_run=", &run) || run == 0) {
+		return;
+	}
+	if (run > (uint64_t)n) {
+		print("efi: boot_efi_run=%d: there are %d: the start goes on\n", run, (uint64_t)n);
+		return;
+	}
+	efi_chain_start(&efi_host, &list[run - 1], NULL);
+}
+
+#include "boot_menu.c"        /* boot_menu(): uses what is above, used by standalone_start() */
+#include "refind_menu.c"      /* boot_menu=refind: rEFInd as the menu (m4), its hand-off back into standalone_go() */
+
+/*
  * A standalone start: the image has a "standalone" entry (the phone's own boot partition, or the same image
  * tried from RAM with "fastboot boot"). Before the kernel: darwin's layout, a staged boot image if
  * flash_stage=1 lets it be written, and -- usb_handover=1 (vayu-dev's 2.3) -- this loader's USB stack, which
@@ -6988,11 +7788,138 @@ standalone_start(const struct payload_info *pi)
 	standalone_boot = 1;
 	print("standalone: the image boots by itself (no host)\n");
 	layout_load();
+	boot_menu(pi);          /* boot_menu=1 or =refind: comes back only when HakiOS is chosen */
+	standalone_go(pi);
+}
+
+/* The standalone start after the menu (also from rEFInd's choice: refind_choose) */
+static void
+standalone_go(const struct payload_info *pi)
+{
 	standalone_staged_flash(pi);
+	standalone_bcb_note(pi);
+	if (!boot_menu_wanted(pi->cmdline)) {
+		efi_chain_standalone(pi->cmdline);      /* (with the menu, EFI applications start from it alone) */
+	}
+	standalone_tries(pi);
 	if (aud_word(pi->cmdline, "usb_handover=1") && USB == NULL) {
 		print("standalone: usb_handover=1: %s\n", usb_start() ? "USB started, for the kernel to take" :
 		    "USB did not start: the kernel will have none");
 	}
+}
+
+/*
+ * ipa-persist: the breadcrumb a kernel with vayu_ipa_persist=1 leaves before and after each risky IPA
+ * access (bsd/dev/vayu_ipa.c, ipa_persist_init/ipa_pc), in the last page of the vendor's ramoops
+ * region (vendor_reserved[] above). A kernel that wedges the SoC there is reset by the watchdog; this
+ * runs before the loader allocates anything of its own, prints the newer valid slot once and marks it
+ * "SEEN". Layout, in 32-bit words: 0 magic "IPAP", 1 version 1, 2 seq, 3 stage, 4 pa, 5 op, 6 cpu,
+ * 7 done, 8 boot id, 9 ms, 10..17 tag, 18 checksum of 0..17, 19 "SEEN"; two slots of 128 bytes.
+ * The page is only read when UEFI's map describes it, and it is reserved for the session, so none of
+ * the loader's later allocations can land on it.
+ */
+#define IPA_PERSIST_PA          0xb07ff000ULL
+#define IPA_PERSIST_MAGIC       0x50415049u
+#define IPA_PERSIST_SEEN        0x4e454553u
+
+static void
+ipa_persist_report(int at_start)
+{
+	static const char *const stages[] = { "?", "TCS vote", "IPA CFG check", "PAS/AUTH", "post-AUTH look",
+		"init_hw", "SRAM", "uC read", "GSI data path", "firmware ready", "stop" };
+	static const char *const ops[] = { "?", "TCS", "read", "write", "SRAM zero", "SRAM canary", "uC read",
+		"step", "pause" };
+	volatile uint32_t *page = (volatile uint32_t *)(uintptr_t)IPA_PERSIST_PA;
+	int type = memory_type_at(IPA_PERSIST_PA), best = -1;
+	uint32_t best_seq = 0;
+	uint64_t claim = IPA_PERSIST_PA;
+
+	if (type < 1 || type > 7) {
+		/* (only RAM UEFI has mapped as such is read: a reserved or absent page may not be mapped at all) */
+		if (type < 0) {
+			print("ipa-persist: %x is not in UEFI's memory map: not read\n", IPA_PERSIST_PA);
+		} else {
+			print("ipa-persist: %x is UEFI type %d, not RAM it maps: not read\n", IPA_PERSIST_PA, (uint64_t)type);
+		}
+		return;
+	}
+	flush_dcache(IPA_PERSIST_PA, IPA_PERSIST_PA + 0x100);  /* (the kernel wrote it uncached) */
+	for (int s = 0; s < 2; s++) {
+		volatile uint32_t *w = page + s * 32;
+		uint32_t sum = 0x12345678u;
+
+		for (int i = 0; i < 18; i++) {
+			sum = (sum << 5 | sum >> 27) ^ w[i];
+		}
+		if (w[0] != IPA_PERSIST_MAGIC || w[1] != 1 || w[18] != sum) {
+			continue;
+		}
+		if (best < 0 || w[2] > best_seq) {
+			best = s;
+			best_seq = w[2];
+		}
+	}
+	if (best < 0) {
+		print("ipa-persist: none (no valid record at %x, UEFI type %d)\n", IPA_PERSIST_PA, (uint64_t)type);
+	} else {
+		volatile uint32_t *w = page + best * 32;
+		char tag[33];
+
+		for (int i = 0; i < 32; i++) {
+			char c = (char)(w[10 + i / 4] >> (8 * (i % 4)));
+
+			tag[i] = c == 0 ? 0 : (c < 0x20 || c > 0x7e) ? '?' : c;
+		}
+		tag[32] = 0;
+		print("ipa-persist: last stage %d (%s) \"%s\" op %s pa %x cpu %d %s, seq %d, %d ms after the IPA start, "
+		    "boot %x, slot %d%s\n", (uint64_t)w[3], w[3] < 11 ? stages[w[3]] : "?", tag,
+		    w[5] < 9 ? ops[w[5]] : "?", (uint64_t)w[4], (uint64_t)w[6],
+		    w[7] ? "AFTER (done)" : "BEFORE (not done)", (uint64_t)w[2], (uint64_t)w[9], (uint64_t)w[8],
+		    (uint64_t)best, w[19] == IPA_PERSIST_SEEN ? " (printed before)" : "");
+		if (w[19] != IPA_PERSIST_SEEN) {
+			w[19] = IPA_PERSIST_SEEN;
+			clean_dcache(IPA_PERSIST_PA, IPA_PERSIST_PA + 0x100);
+		}
+	}
+	if (at_start && type == EfiConventionalMemory) {
+		efi_status s = BS->allocate_pages(AllocateAddress, EfiLoaderData, 1, &claim);
+
+		if (EFI_ERROR(s)) {
+			print("ipa-persist: the page at %x could not be kept for this session (status %x)\n", IPA_PERSIST_PA, s);
+		}
+	}
+}
+
+/*
+ * wdt_dump_ipa=2, after the hung kernel's log is in logdump: what the application SMMU (0x15000000, an Arm
+ * MMU-500) has recorded -- the global fault and every context bank whose FSR is not 0, with its stream's
+ * CBAR. Reads only; the layout is the one bsd/dev/vayu_ipa_smmu.c uses (IDR1 page size and NUMPAGENDXB).
+ * Then logdump is written again with these lines.
+ */
+static void
+ipa_smmu_fault_dump(void)
+{
+	volatile uint8_t *smmu = (volatile uint8_t *)(uintptr_t)0x15000000ULL;
+	uint32_t idr1 = *(volatile uint32_t *)(smmu + 0x24), contexts = idr1 & 0xff, pages = 2u << ((idr1 >> 28) & 7);
+	uint64_t page = idr1 >> 31 ? 0x10000 : 0x1000;
+	int shown = 0;
+
+	print("ipa-wdt: SMMU sGFSR %x sGFAR %x sGFSYNR0 %x; %d contexts\n", (uint64_t)*(volatile uint32_t *)(smmu + 0x48),
+	    *(volatile uint64_t *)(smmu + 0x40), (uint64_t)*(volatile uint32_t *)(smmu + 0x50), (uint64_t)contexts);
+	for (uint32_t n = 0; n < contexts && n < 128; n++) {
+		volatile uint8_t *cb = smmu + (pages + n) * page;
+		uint32_t fsr = *(volatile uint32_t *)(cb + 0x58);
+
+		if (fsr == 0) {
+			continue;
+		}
+		shown++;
+		print("ipa-wdt: SMMU context %d: FSR %x FAR %x FSYNR0 %x CBAR %x\n", (uint64_t)n, (uint64_t)fsr,
+		    *(volatile uint64_t *)(cb + 0x60), (uint64_t)*(volatile uint32_t *)(cb + 0x68),
+		    (uint64_t)*(volatile uint32_t *)(smmu + page + 4 * n));
+	}
+	print("ipa-wdt: SMMU: %d context(s) with a recorded fault\n", (uint64_t)shown);
+	write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
 }
 
 efi_status EFIAPI
@@ -7005,8 +7932,13 @@ efi_main(efi_handle image, efi_system_table *st)
 	BS = st->bs;
 	IMAGE = image;
 
+	refind_child(image);    /* started by rEFInd (LoadOptions menu=...): its choice goes to the loader that started it */
 	BS->set_watchdog_timer(0, 0, 0, NULL);
 	print("== XNULOADER v3 ==\n");
+	if (loadopt_menu) {
+		print("LoadOptions: menu=%s (no rEFInd to hand it to: this start takes it)\n",
+		    loadopt_menu == MENU_OPT_OFF ? "off" : loadopt_menu == MENU_OPT_ANDROID ? "android" : "diag");
+	}
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
@@ -7047,6 +7979,9 @@ efi_main(efi_handle image, efi_system_table *st)
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	if (PLAT == &platform_vayu) {
+		ipa_persist_report(1);  /* (before any allocation of this session's: the page is the last run's) */
+	}
 
 	wdt_arm();
 

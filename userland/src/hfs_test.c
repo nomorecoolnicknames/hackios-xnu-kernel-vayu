@@ -15,6 +15,11 @@
  *     fsync or unmount; var_hfs_keep's syncer and HFS's own are what take it to the disk;
  *   - says "hfs_test: boot N: PASS ... written" (or FAIL and what), and waits to be cut off: the script ends QEMU
  *     with SIGKILL some seconds later.
+ * The fill's import (var_import=1) is this program too, as /bin/var_store of the root: started as "var_store
+ * import" it does what hfs_test_import= says -- ok: a file, exit 0; fail: half a file, exit 1; hang: half a file
+ * and it waits to be cut off, as a reset in the middle of the import would. So the script can check that a fill
+ * cut short or failed leaves the volume unmarked, that the next boot empties it and fills it again, and that
+ * what a whole fill brought stays (qemu/run-hfs-test.sh, SCENARIO=import).
  *
  * After other HakiOS ports (MIT, as this file): oosexgang/hakios-xnu-kernel, branch main, commit 83aceb83817c (its
  * qemu/run-hfs-test.sh and hfs_test.c, also in Scion-Project/scion-kernel, branch main), and telegdyd/ios-vayu, branch vayu-dev, commit
@@ -43,7 +48,7 @@ in_image(const char *path)
 static const char *
 boot_arg(const char *name)
 {
-	static char args[2048], value[64];
+	static char args[4096], value[64];
 	size_t len = sizeof(args) - 1, n = strlen(name);
 
 	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
@@ -111,6 +116,28 @@ write_all(const char *path, const void *data, size_t size)
 	return ok;
 }
 
+/* "var_store import", as var_hfs_fill runs it: what hfs_test_import= asks for */
+static int
+import_main(void)
+{
+	const char *how = boot_arg("hfs_test_import");
+	int hang = how != NULL && strcmp(how, "hang") == 0, fail = how != NULL && strcmp(how, "fail") == 0;
+
+	printf("hfs_import: %s\n", hang ? "hang" : fail ? "fail" : "ok");
+	if (hang || fail) {
+		write_all("/private/var/mobile/half", "half", 4);
+		sync();
+		if (hang) {
+			printf("hfs_import: hanging, to be cut off\n");
+			for (;;) {
+				usleep(1000000);
+			}
+		}
+		return 1;
+	}
+	return write_all("/private/var/mobile/imported", "imported\n", 9) ? 0 : 1;
+}
+
 static char *
 name_of(char *buf, const char *dir, long n)
 {
@@ -134,14 +161,16 @@ main(int argc, char **argv, char **envp)
 	static const char *const skeleton[] = { "/private/var/tmp", "/private/var/run", "/private/var/vm",
 		                                "/private/var/mobile", "/private/var/mobile/Library" };
 	uint8_t *want, *got;
-	char path[128], text[32];
+	char path[128], text[32], mode[16];
 	long before = 0, len;
 	struct stat st;
-	int fd = open("/dev/console", O_RDWR, 0);
+	int fd;
 
-	(void)argc;
-	(void)argv;
 	(void)envp;
+	if (argc > 1 && strcmp(argv[1], "import") == 0) {
+		return import_main();
+	}
+	fd = open("/dev/console", O_RDWR, 0);
 	dup2(fd, 0);
 	dup2(fd, 1);
 	dup2(fd, 2);
@@ -163,9 +192,23 @@ main(int argc, char **argv, char **envp)
 		for (unsigned i = 0; i < sizeof(skeleton) / sizeof(skeleton[0]); i++) {
 			made = mkdir(skeleton[i], 0755) == 0 && made;
 		}
+		const char *how = boot_arg("hfs_test_import");
+		int before_fill;
+
 		check(made, "a skeleton on the new volume");
+		strcpy(mode, how != NULL && strlen(how) < sizeof(mode) ? how : "");
+		before_fill = failures;
 		var_hfs_fill();
-		check(stat(VAR_MARK, &st) == 0, "the new volume marked (var_hfs_fill)");
+		if (strcmp(mode, "fail") == 0) {
+			failures = before_fill;         /* the import's failure is the point of this boot */
+			check(stat(VAR_MARK, &st) != 0 && stat(VAR_FILLING, &st) == 0,
+			    "a failed import leaves the volume unmarked, its fill begun (VAR_FILLING)");
+		} else {
+			check(stat(VAR_MARK, &st) == 0 && stat(VAR_FILLING, &st) != 0, "the new volume marked (var_hfs_fill)");
+			check(stat("/private/var/mobile/half", &st) != 0, "nothing of a fill cut short or failed is left");
+			check(strcmp(mode, "ok") != 0 || stat("/private/var/mobile/imported", &st) == 0,
+			    "what the import brought is there");
+		}
 	} else if (var_volume == VAR_ON_FLASH) {
 		len = read_all("/private/var/mobile/latest", (uint8_t *)text, sizeof(text) - 1);
 		text[len > 0 ? len : 0] = 0;
@@ -182,6 +225,11 @@ main(int argc, char **argv, char **envp)
 		check(stat("/private/var/tmp/junk", &st) != 0 && stat("/private/var/run/junk", &st) != 0,
 		    "the per-boot directories emptied");
 		check(stat("/private/var/mobile/Library", &st) == 0, "the skeleton of the first boot still there");
+		len = read_all(VAR_MARK, (uint8_t *)path, sizeof(path) - 1);
+		path[len > 0 ? len : 0] = 0;
+		if (len > 0 && memcmp(path, "filled with the skeleton and", 28) == 0) {
+			check(stat("/private/var/mobile/imported", &st) == 0, "what the fill imported, still there");
+		}
 	}
 
 	var_hfs_keep();

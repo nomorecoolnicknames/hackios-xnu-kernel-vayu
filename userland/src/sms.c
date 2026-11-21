@@ -42,6 +42,7 @@ state_name(uint32_t state)
 	case VAYU_SMS_STATE_CONFIGURING: return "configuring";
 	case VAYU_SMS_STATE_READY: return "ready";
 	case VAYU_SMS_STATE_FAILED: return "failed";
+	case VAYU_SMS_STATE_COMMCENTER: return "CommCenter owns WMS";
 	default: return "?";
 	}
 }
@@ -542,7 +543,8 @@ command_send(int device, int argc, char **argv)
 	send.text[used] = 0;
 	send.text_length = (uint32_t)used;
 	if (ioctl(device, VAYU_SMS_IOC_SEND, &send) < 0) {
-		fprintf(stderr, "sms: send: %s\n", strerror(errno));
+		fprintf(stderr, "sms: send: %s%s\n", strerror(errno), errno == ENOTSUP ?
+		    " (vayu_sms=3: CommCenter owns WMS; Messages sends and deletes)" : "");
 		return 1;
 	}
 	printf("sent: message id %u, reference %u, PDU %u bytes\n", send.message_id, send.message_reference,
@@ -565,7 +567,8 @@ command_delete(int device, const char *argument)
 	}
 	delete.seq = (uint32_t)seq;
 	if (ioctl(device, VAYU_SMS_IOC_DELETE, &delete) < 0) {
-		fprintf(stderr, "sms: delete: %s\n", strerror(errno));
+		fprintf(stderr, "sms: delete: %s%s\n", strerror(errno), errno == ENOTSUP ?
+		    " (vayu_sms=3: CommCenter owns WMS; Messages sends and deletes)" : "");
 		return 1;
 	}
 	printf("deleted #%u\n", delete.seq);
@@ -590,7 +593,8 @@ command_refresh(int device, const char *argument)
 	}
 	read = storage;
 	if (ioctl(device, VAYU_SMS_IOC_REFRESH, &read) < 0) {
-		fprintf(stderr, "sms: refresh: %s\n", strerror(errno));
+		fprintf(stderr, "sms: refresh: %s%s\n", strerror(errno), errno == ENOTSUP ?
+		    " (vayu_sms=3: CommCenter owns WMS; Messages sends and deletes)" : "");
 		return 1;
 	}
 	printf("refresh: %u message(s) read from storage %u\n", read, storage);
@@ -610,6 +614,22 @@ command_status(int device)
 		fprintf(stderr, "sms: the device speaks another version (magic %#x, version %u)\n", status.magic,
 		    status.version);
 		return 1;
+	}
+	if (status.state == VAYU_SMS_STATE_COMMCENTER) {
+		/* vayu_sms=3: the same record, counted from CommCenter's WMS frames (bsd/dev/vayu_sms.c) */
+		printf("state: %s; frames seen %u, event report %s, routes %s (%u)\n", state_name(status.state),
+		    status.requests, status.event_report ? "accepted" : "not seen",
+		    status.routes_written ? "set" : "not set", status.route_count);
+		if (status.routes_known) {
+			printf("service ready: %u (0 none, 1 3GPP, 2 3GPP2, 3 both)\n", status.last_failure);
+		} else {
+			printf("service ready: not seen\n");
+		}
+		printf("MT %u, unacknowledged %u; MO sent %u; deletes %u\n", status.received, status.dropped,
+		    status.sent, status.deleted);
+		printf("failed answers %u, last result %u error %u message %#x, RP cause %u\n", status.failures,
+		    status.last_result, status.last_error, status.last_message, status.last_gsm_cause);
+		return 0;
 	}
 	printf("state: %s, WMS %s, event report %s\n", state_name(status.state),
 	    status.wms_present ? "present" : "absent", status.event_report ? "on" : "off");

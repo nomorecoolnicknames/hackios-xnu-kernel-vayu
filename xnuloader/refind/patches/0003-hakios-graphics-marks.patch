@@ -1,0 +1,260 @@
+diff -ruN a/libeg/image.c b/libeg/image.c
+--- a/libeg/image.c	2026-11-18 23:35:13.854891937 +0000
++++ b/libeg/image.c	2026-11-18 23:35:13.862892306 +0000
+@@ -64,6 +64,7 @@
+ #include "lodepng.h"
+ #include "libeg.h"
+ #include "log.h"
++#include "../refind/hakios.h"
+ 
+ #define MAX_FILE_SIZE (1024*1024*1024)
+ 
+@@ -366,13 +367,16 @@
+         return NULL;
+ 
+     // load file
++    HakiosMarkf(L"load %s", FileName);
+     Status = egLoadFile(BaseDir, FileName, &FileData, &FileDataLength);
+     if (EFI_ERROR(Status))
+         return NULL;
+ 
+     // decode it
++    HakiosMarkf(L"decode %d bytes", FileDataLength);
+     NewImage = egDecodeAny(FileData, FileDataLength, 128 /* arbitrary value */, WantAlpha);
+     MyFreePool(FileData);
++    HakiosMarkf(L"decoded: %s", NewImage ? L"yes" : L"NO");
+ 
+     return NewImage;
+ }
+@@ -390,6 +394,7 @@
+         return NULL;
+ 
+     // load file
++    HakiosMarkf(L"icon %s", Path);
+     Status = egLoadFile(BaseDir, Path, &FileData, &FileDataLength);
+     if (EFI_ERROR(Status))
+         return NULL;
+diff -ruN a/libeg/screen.c b/libeg/screen.c
+--- a/libeg/screen.c	2026-11-18 23:35:13.854891937 +0000
++++ b/libeg/screen.c	2026-11-18 23:35:13.862892306 +0000
+@@ -62,6 +62,7 @@
+ #include "../include/refit_call_wrapper.h"
+ #include "libeg.h"
+ #include "log.h"
++#include "../refind/hakios.h"
+ #include "../include/Handle.h"
+ 
+ #include <efiUgaDraw.h>
+@@ -217,6 +218,13 @@
+         egSetMaxResolution();
+     }
+     egDetermineScreenSize();
++    if (GraphicsOutput != NULL)
++        HakiosMarkf(L"gop %dx%d fmt %d pitch %d mode %d/%d", GraphicsOutput->Mode->Info->HorizontalResolution,
++                    GraphicsOutput->Mode->Info->VerticalResolution, GraphicsOutput->Mode->Info->PixelFormat,
++                    GraphicsOutput->Mode->Info->PixelsPerScanLine, GraphicsOutput->Mode->Mode,
++                    GraphicsOutput->Mode->MaxMode);
++    HakiosMarkf(L"gop %s, uga %s, console control %s", GraphicsOutput ? L"yes" : L"no", UgaDraw ? L"yes" : L"no",
++                ConsoleControl ? L"yes" : L"no");
+ } // VOID egInitScreen()
+ 
+ // Convert a graphics mode (in *ModeWidth) to a width and height (returned in
+@@ -418,7 +426,7 @@
+ {
+     EFI_CONSOLE_CONTROL_SCREEN_MODE CurrentMode;
+ 
+-    if (ConsoleControl != NULL) {
++    if ((ConsoleControl != NULL) && !(HakiosGfx() & HAKIOS_GFX_NO_CONSOLE_CONTROL)) {
+         refit_call4_wrapper(ConsoleControl->GetMode, ConsoleControl, &CurrentMode, NULL, NULL);
+         return (CurrentMode == EfiConsoleControlScreenGraphics) ? TRUE : FALSE;
+     }
+@@ -431,7 +439,8 @@
+     EFI_CONSOLE_CONTROL_SCREEN_MODE CurrentMode;
+     EFI_CONSOLE_CONTROL_SCREEN_MODE NewMode;
+ 
+-    if (ConsoleControl != NULL) {
++    if ((ConsoleControl != NULL) && !(HakiosGfx() & HAKIOS_GFX_NO_CONSOLE_CONTROL)) {
++        HakiosMarkf(L"console control: %s", Enable ? L"graphics" : L"text");
+         refit_call4_wrapper(ConsoleControl->GetMode, ConsoleControl, &CurrentMode, NULL, NULL);
+ 
+         NewMode = Enable ? EfiConsoleControlScreenGraphics
+@@ -463,7 +472,21 @@
+     }
+     FillColor.Reserved = 0;
+ 
+-    if (GraphicsOutput != NULL) {
++    HakiosMarkf(L"blt: fill %dx%d", egScreenWidth, egScreenHeight);
++    if ((GraphicsOutput != NULL) && (HakiosGfx() & HAKIOS_GFX_FILL_BY_BUFFER)) {
++        // HakiOS/vayu (refind_safe=1): one row of the colour, copied down the screen
++        EFI_GRAPHICS_OUTPUT_BLT_PIXEL *Row = AllocatePool(egScreenWidth * sizeof(*Row));
++        UINTN x, y;
++
++        if (Row != NULL) {
++            for (x = 0; x < egScreenWidth; x++)
++                Row[x] = *(EFI_GRAPHICS_OUTPUT_BLT_PIXEL *) &FillColor;
++            for (y = 0; y < egScreenHeight; y++)
++                refit_call10_wrapper(GraphicsOutput->Blt, GraphicsOutput, Row, EfiBltBufferToVideo,
++                                     0, 0, 0, y, egScreenWidth, 1, 0);
++            MyFreePool(Row);
++        }
++    } else if (GraphicsOutput != NULL) {
+         // EFI_GRAPHICS_OUTPUT_BLT_PIXEL and EFI_UGA_PIXEL have the same
+         // layout, and the header from TianoCore actually defines them
+         // to be the same type.
+@@ -501,6 +524,7 @@
+        egComposeImage(CompImage, Image, 0, 0);
+     }
+ 
++    HakiosMarkf(L"blt: draw %dx%d at %d,%d", CompImage->Width, CompImage->Height, ScreenPosX, ScreenPosY);
+     if (GraphicsOutput != NULL) {
+        refit_call10_wrapper(GraphicsOutput->Blt, GraphicsOutput,
+                             (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)CompImage->PixelData,
+@@ -607,6 +631,7 @@
+         return NULL;
+     }
+ 
++    HakiosMarkf(L"blt: read %dx%d at %d,%d", Width, Height, XPos, YPos);
+     // get full screen image
+     if (GraphicsOutput != NULL) {
+         refit_call10_wrapper(GraphicsOutput->Blt, GraphicsOutput,
+diff -ruN a/refind/hakios.c b/refind/hakios.c
+--- a/refind/hakios.c	2026-11-18 23:35:13.854891937 +0000
++++ b/refind/hakios.c	2026-11-18 23:35:13.858892121 +0000
+@@ -14,6 +14,8 @@
+     /* revision 2 */
+     VOID (EFIAPI *Mark)(struct _hakios_handoff *This, CHAR16 *What, UINT32 Flags);
+     UINT32 ScanAll, TestHang;       /* TestHang: the loader's refind_test_hang=1, a test of its watchdog */
++    /* revision 3 */
++    UINT32 Gfx, Reserved;           /* HAKIOS_GFX_* */
+ } HAKIOS_HANDOFF;
+ 
+ static HAKIOS_HANDOFF *Hakios = NULL;
+@@ -40,6 +42,28 @@
+         Hakios->Mark(Hakios, What, (UINT32) Flags);
+ }
+ 
++static BOOLEAN MenuDrawn = FALSE;
++
++VOID HakiosMenuDrawn(VOID) {
++    MenuDrawn = TRUE;
++}
++
++VOID HakiosMarkf(IN CONST CHAR16 *Fmt, ...) {
++    CHAR16 Line[72];
++    va_list Args;
++
++    if ((Hakios == NULL) || MenuDrawn)
++        return;
++    va_start(Args, Fmt);
++    VSPrint(Line, sizeof(Line), (CHAR16 *) Fmt, Args);
++    va_end(Args);
++    Hakios->Mark(Hakios, Line, HAKIOS_MARK_STAGE);
++}
++
++UINT32 HakiosGfx(VOID) {
++    return ((Hakios != NULL) && (Hakios->Revision >= 3)) ? Hakios->Gfx : 0;
++}
++
+ // refind_test_hang=1: rEFInd stops here for good, with no sign of life (the loader must reset the phone)
+ VOID HakiosTestHang(VOID) {
+     if ((Hakios != NULL) && Hakios->TestHang) {
+diff -ruN a/refind/hakios.h b/refind/hakios.h
+--- a/refind/hakios.h	2026-11-18 23:35:13.854891937 +0000
++++ b/refind/hakios.h	2026-11-18 23:35:13.862892306 +0000
+@@ -15,6 +15,14 @@
+ BOOLEAN HakiosOn(VOID);
+ BOOLEAN HakiosScanAll(VOID);
+ VOID HakiosMark(IN CHAR16 *What, IN UINTN Flags);
++VOID HakiosMarkf(IN CONST CHAR16 *Fmt, ...);   /* a stage, formatted; quiet once the menu is drawn */
+ VOID HakiosTestHang(VOID);
+ 
++/* the loader's refind_safe=1: what the graphics of rEFInd's start leave out (each a suspect on vayu's Mu) */
++#define HAKIOS_GFX_NO_CONSOLE_CONTROL 1  /* no ConsoleControl SetMode */
++#define HAKIOS_GFX_NO_SCREEN_READ     2  /* the background from the banner, not read back from the screen */
++#define HAKIOS_GFX_FILL_BY_BUFFER     4  /* screen fills as BufferToVideo of a row, not VideoFill */
++UINT32 HakiosGfx(VOID);
++VOID HakiosMenuDrawn(VOID);
++
+ #endif
+diff -ruN a/refind/menu.c b/refind/menu.c
+--- a/refind/menu.c	2026-11-18 23:35:13.854891937 +0000
++++ b/refind/menu.c	2026-11-18 23:35:13.858892121 +0000
+@@ -1350,6 +1350,7 @@
+         case MENU_FUNCTION_PAINT_ALL:
+             VMenuPaintAll(Screen, State);
+             HakiosMark(L"menu drawn", HAKIOS_MARK_STAGE);
++            HakiosMenuDrawn();
+             break;
+ 
+         case MENU_FUNCTION_PAINT_SELECTION:
+@@ -1428,6 +1429,7 @@
+ 
+         case MENU_FUNCTION_PAINT_ALL:
+             HakiosMark(L"menu drawn", HAKIOS_MARK_STAGE);
++            HakiosMenuDrawn();
+             PaintAll(Screen, State, itemPosX, row0PosY, row1PosY, textPosY);
+             PaintArrows(State, row0PosX - TILE_XSPACING, row0PosY + (TileSizes[0] / 2), row0Loaders);
+             break;
+diff -ruN a/refind/screen.c b/refind/screen.c
+--- a/refind/screen.c	2026-11-18 23:35:13.854891937 +0000
++++ b/refind/screen.c	2026-11-18 23:35:13.862892306 +0000
+@@ -57,6 +57,7 @@
+ 
+ #include "global.h"
+ #include "screen.h"
++#include "hakios.h"
+ #include "config.h"
+ #include "libegint.h"
+ #include "lib.h"
+@@ -159,6 +160,7 @@
+        LOG(2, LOG_LINE_NORMAL, L"Recording current resolution as %dx%d", UGAWidth, UGAHeight);
+     }
+ 
++    HakiosMarkf(L"setup: %dx%d, text mode %d", UGAWidth, UGAHeight, GlobalConfig.RequestedTextMode);
+     // Set text mode. If this requires increasing the size of the graphics mode, do so.
+     if (egSetTextMode(GlobalConfig.RequestedTextMode)) {
+        egGetScreenSize(&NewWidth, &NewHeight);
+@@ -200,7 +202,9 @@
+             GlobalConfig.IconSizes[ICON_SIZE_MOUSE] *= 2;
+             HaveResized = TRUE;
+         } // if
++        HakiosMarkf(L"setup: graphics mode on");
+         SwitchToGraphics();
++        HakiosMarkf(L"setup: clearing, the banner");
+         if (GlobalConfig.ScreensaverTime != -1) {
+            BltClearScreen(TRUE);
+         } else { // start with screen blanked
+@@ -446,6 +450,8 @@
+                 Banner = egLoadImage(SelfDir, GlobalConfig.BannerFileName, FALSE);
+             if (Banner == NULL)
+                 Banner = egPrepareEmbeddedImage(&egemb_refind_banner, FALSE);
++            if (Banner != NULL)
++                HakiosMarkf(L"banner %dx%d", Banner->Width, Banner->Height);
+         }
+ 
+         if (Banner) {
+@@ -460,6 +466,7 @@
+            if (NewBanner) {
+               egFreeImage(Banner);
+               Banner = NewBanner;
++              HakiosMarkf(L"banner scaled %dx%d", Banner->Width, Banner->Height);
+            }
+            MenuBackgroundPixel = Banner->PixelData[0];
+         } // if Banner exists
+@@ -487,7 +494,15 @@
+ 
+     GraphicsScreenDirty = FALSE;
+     egFreeImage(GlobalConfig.ScreenBackground);
+-    GlobalConfig.ScreenBackground = egCopyScreen();
++    // HakiOS/vayu (refind_safe=1): a full-screen banner is the background as it is, not read back from the screen
++    if ((HakiosGfx() & HAKIOS_GFX_NO_SCREEN_READ) && (Banner != NULL) && (Banner->Width == UGAWidth) &&
++        (Banner->Height == UGAHeight) && ShowBanner && !(GlobalConfig.HideUIFlags & HIDEUI_FLAG_BANNER))
++        GlobalConfig.ScreenBackground = egCopyImage(Banner);
++    else if (HakiosGfx() & HAKIOS_GFX_NO_SCREEN_READ)
++        GlobalConfig.ScreenBackground = egCreateFilledImage(UGAWidth, UGAHeight, FALSE, &MenuBackgroundPixel);
++    else
++        GlobalConfig.ScreenBackground = egCopyScreen();
++    HakiosMarkf(L"background %s", GlobalConfig.ScreenBackground ? L"kept" : L"NONE");
+ } // VOID BltClearScreen()
+ 
+ 

@@ -143,7 +143,7 @@ static CFStringRef port_uw;             /* kFigCapturePortType_BackFacingSuperWi
 static bool
 uw_from_boot_args(bool *kernel, bool *dev)
 {
-	char arguments[1024];
+	char arguments[4096];         /* the boot line is ~2.5 KB: a 1 KB buffer makes sysctl fail */
 	size_t size = sizeof(arguments);
 
 	*kernel = *dev = false;

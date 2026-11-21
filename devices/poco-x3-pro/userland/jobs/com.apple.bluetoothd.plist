@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  bluetoothd on vayu (mkjobs.py merges this over Apple's com.apple.bluetoothd.plist; build.sh BLUETOOTHD=0 leaves the
+  job out). The kernel (vayu_bt=9, step 9) offers the controller as the kernel control com.vayu.bt.uart, and
+  bluetoothd's own POSIX driver reaches it by that name: BT_HCI_TRANSPORT is TRANSPORT:DRIVER:NAME,BAUD
+  (xnu/files/bsd/sys/vayu_bt.h, "What userland must run after step 9"). 115200 is what the kernel's UART runs at
+  unless vayu_bt_baud says otherwise.
+  KeepAlive and the activation-state launch event out, as in the lab's root29 that runs c01-c04 had them: a
+  bluetoothd that cannot reach its controller (no vayu_bt on the command line) exits, and Apple's
+  KeepAlive {SuccessfulExit: false} would start it again every ten seconds for good.
+-->
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>BT_HCI_TRANSPORT</key>
+		<string>H4:POSIX:com.vayu.bt.uart,115200</string>
+		<key>BT_BAUDRATE</key>
+		<string>115200</string>
+	</dict>
+	<key>_Remove</key>
+	<array>
+		<string>KeepAlive</string>
+		<string>SuccessfulExit</string>
+		<string>LaunchEvents</string>
+	</array>
+</dict>
+</plist>

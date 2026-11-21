@@ -1,7 +1,8 @@
 /*
  * Host tests of userland/src/flash_stage.h: the layout flash_stage takes from the kernel's command line, the image
  * it is willing to stage, and the header block -- as vayu-dev's loader 2.8 reads it (standalone_staged_flash):
- * "XNUFLASH", u64 first block, u64 bytes, u64 FNV-1a 64, little endian, the rest of the block zero.
+ * "XNUFLASH", u64 first block, u64 bytes, u64 FNV-1a 64, then "FORBOOT!", u64 boot's length, u64 FNV-1a 64 of boot,
+ * little endian, the rest of the block zero.
  */
 #include <stdarg.h>
 #include <stdbool.h>
@@ -126,7 +127,7 @@ test_image_and_head(void)
 	img[0] = 'A';
 
 	/* the header: byte for byte what the loader reads */
-	flash_stage_head_block(block, &l, img, 12345);
+	flash_stage_head_block(block, &l, img, 12345, 134217728, 0x0123456789abcdefULL);
 	for (size_t i = 0; i < 12345; i++) {
 		want = (want ^ img[i]) * 0x100000001b3ULL;
 	}
@@ -144,20 +145,69 @@ test_image_and_head(void)
 	{
 		int zero = 1;
 
-		for (size_t i = 32; i < sizeof(block); i++) {
+		check(memcmp(block + 32, "FORBOOT!", 8) == 0, "the boot's magic");
+		check(block[40] == 0 && block[43] == 0x08 && block[47] == 0, "boot's length, little endian");
+		check(block[48] == 0xef && block[55] == 0x01, "boot's sum, little endian");
+		for (size_t i = 56; i < sizeof(block); i++) {
 			zero = zero && block[i] == 0;
 		}
 		check(zero, "the rest of the block zero");
 	}
 	check(flash_stage_head_read(block, &l, &h) && h.bytes == 12345 && h.fnv == want, "read back as a stage");
+	check(flash_stage_head_for(&h, 134217728, 0x0123456789abcdefULL) == 1, "staged against that boot");
+	check(flash_stage_head_for(&h, 134217728, 0x0123456789abcdeeULL) == 0, "not against a boot of another sum");
+	check(flash_stage_head_for(&h, 134213632, 0x0123456789abcdefULL) == 0, "not against a boot of another length");
+	memset(block + 32, 0, 24);
+	check(flash_stage_head_read(block, &l, &h) && flash_stage_head_for(&h, 134217728, 0x0123456789abcdefULL) == -1,
+	    "the first form (no FORBOOT!): a stage tied to no boot");
 	block[0] = 'Y';
 	check(!flash_stage_head_read(block, &l, &h), "a block without the magic is no stage");
 	memset(block, 0, sizeof(block));
 	check(!flash_stage_head_read(block, &l, &h), "a zero block (cancelled) is no stage");
-	flash_stage_head_block(block, &l, img, 4096);
+	flash_stage_head_block(block, &l, img, 4096, 0, 0);
 	l.first++;
 	check(!flash_stage_head_read(block, &l, &h), "a stage of another area is none of this one");
-	check(sizeof(struct flash_stage_head) == 32, "the header is 32 bytes");
+	check(sizeof(struct flash_stage_head) == 56, "the header is 56 bytes");
+}
+
+/* flash_stage_target=recovery (the multiboot): the header tied to the recovery, and never taken for boot */
+static void
+test_target(void)
+{
+	struct flash_stage_layout l;
+	struct flash_stage_head h;
+	static uint8_t img[8192], block[FLASH_STAGE_BLOCK];
+	int r = -1;
+
+	check(flash_stage_target(LOADER_ARGS, &r) == NULL && r == 0, "no flash_stage_target=: boot");
+	check(flash_stage_target("flash_stage=1 flash_stage_target=boot", &r) == NULL && r == 0, "=boot: boot");
+	check(flash_stage_target("flash_stage=1 flash_stage_target=recovery usbnet_cmd=1", &r) == NULL && r == 1,
+	    "=recovery: the recovery");
+	check(flash_stage_target("flash_stage_target=recovery flash_stage_target=recovery", &r) == NULL && r == 1,
+	    "=recovery twice: the recovery");
+	check(flash_stage_target("flash_stage_target=recovery flash_stage_target=boot", &r) != NULL,
+	    "two targets: refused");
+	check(flash_stage_target("flash_stage_target=Recovery", &r) != NULL, "=Recovery: refused");
+	check(flash_stage_target("flash_stage_target=recoveryx", &r) != NULL, "=recoveryx: refused");
+	check(flash_stage_target("flash_stage_target=", &r) != NULL, "an empty target: refused");
+	check(flash_stage_target("xflash_stage_target=recovery", &r) == NULL && r == 0, "another word's tail: boot");
+
+	layout_of(LOADER_ARGS, &l);
+	memcpy(img, "ANDROID!", 8);
+	flash_stage_head_block_for(block, &l, img, sizeof(img), 134217728, 0x1111ULL, 1);
+	check(memcmp(block + 32, "FORRECV!", 8) == 0, "the recovery's magic");
+	check(flash_stage_head_read(block, &l, &h), "a recovery's stage read back as a stage");
+	check(flash_stage_head_for_target(&h, 134217728, 0x1111ULL, 1) == 1, "staged against that recovery");
+	check(flash_stage_head_for_target(&h, 134217728, 0x1112ULL, 1) == 0, "not against a recovery of another sum");
+	check(flash_stage_head_for_target(&h, 134217728, 0x1111ULL, 0) == -2, "boot's way: the other partition's");
+	check(flash_stage_head_for(&h, 134217728, 0x1111ULL) == -2, "flash_stage_head_for (boot): not taken");
+	flash_stage_head_block(block, &l, img, sizeof(img), 134217728, 0x1111ULL);
+	flash_stage_head_read(block, &l, &h);
+	check(flash_stage_head_for_target(&h, 134217728, 0x1111ULL, 1) == -2, "the recovery's way: boot's is the other's");
+	check(flash_stage_head_for_target(&h, 134217728, 0x1111ULL, 0) == 1, "boot's way: boot's own");
+	memset(block + 32, 0, 24);
+	flash_stage_head_read(block, &l, &h);
+	check(flash_stage_head_for_target(&h, 134217728, 0x1111ULL, 1) == -1, "the first form: tied to neither");
 }
 
 int
@@ -166,6 +216,7 @@ main(void)
 	test_args();
 	test_layout();
 	test_image_and_head();
+	test_target();
 	printf("flash-stage-test: %d checks, %d failure(s)\n", checks, failures);
 	return failures == 0 ? 0 : 1;
 }

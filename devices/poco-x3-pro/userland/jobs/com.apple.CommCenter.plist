@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  CommCenter on vayu: Apple's cellular job as it is (mkjobs.py drops its _LimitLoadToDeviceTree "baseband" for a
+  named job), as the lab's root-night23..root29 had it. Nothing to change in it: what it needs is the kernel's
+  side, the AppleBaseband stand-ins of vayu_bb=1 (iokit/Kernel/VayuBaseband.cpp); without them it aborts on "Unable to communicate
+  with AppleBaseband driver" and KeepAlive starts it again (mkjobs.py, the CommCenter note). build.sh COMMCENTER=0
+  leaves the job out; com.apple.CommCenter-noncellular, the same label, stays out either way (DENY).
+-->
+<plist version="1.0">
+<dict/>
+</plist>

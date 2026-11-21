@@ -1,0 +1,247 @@
+diff -ru a/refind/config.c b/refind/config.c
+--- a/refind/config.c	2026-11-18 21:00:23.701409474 +0000
++++ b/refind/config.c	2026-11-18 21:00:23.701409474 +0000
+@@ -836,6 +836,9 @@
+                 ReadConfig(TokenList[1]);
+             }
+ 
++        } else if (MyStriCmp(TokenList[0], L"vertical_menu")) {
++            GlobalConfig.VerticalMenu = HandleBoolean(TokenList, TokenCount);
++
+         } else if (MyStriCmp(TokenList[0], L"enable_mouse")) {
+             GlobalConfig.EnableMouse = HandleBoolean(TokenList, TokenCount);
+             if (GlobalConfig.EnableMouse) {
+diff -ru a/refind/global.h b/refind/global.h
+--- a/refind/global.h	2026-11-18 21:00:23.701409474 +0000
++++ b/refind/global.h	2026-11-18 21:00:23.701409474 +0000
+@@ -393,6 +393,7 @@
+    UINT32_LIST      *CsrValues;
+    UINTN            ShowTools[NUM_TOOLS];
+    CHAR8            ScanFor[NUM_SCAN_OPTIONS]; // codes of types of loaders for which to scan
++   BOOLEAN          VerticalMenu; // HakiOS/vayu: main menu as one column of rows (portrait screens)
+ } REFIT_CONFIG;
+ 
+ // Global variables
+diff -ru a/refind/lib.c b/refind/lib.c
+--- a/refind/lib.c	2026-11-18 21:00:23.701409474 +0000
++++ b/refind/lib.c	2026-11-18 21:00:23.705409639 +0000
+@@ -497,9 +497,11 @@
+             Status = CreateVarsDir();
+             if (Status == EFI_SUCCESS) {
+                 Status = egSaveFile(gVarsDir, name, (UINT8 *) buf, size);
+-            } else {
++            } else if (!GlobalConfig.VerticalMenu) {
+                 WriteToNvram = TRUE;
+             }
++            // HakiOS/vayu (vertical_menu): rEFInd runs from a read-only volume in RAM there, and the
++            // phone's NVRAM is not written for rEFInd's own variables (PreviousBoot, hidden tags): not saved
+         }
+         if (WriteToNvram) {
+             flags = EFI_VARIABLE_BOOTSERVICE_ACCESS|EFI_VARIABLE_RUNTIME_ACCESS;
+diff -ru a/refind/menu.c b/refind/menu.c
+--- a/refind/menu.c	2026-11-18 21:00:23.705409639 +0000
++++ b/refind/menu.c	2026-11-18 21:00:23.705409639 +0000
+@@ -116,6 +116,35 @@
+ // Graphics helper functions
+ //
+ 
++// HakiOS/vayu (vertical_menu true): the main menu as one column of rows for a portrait screen (1080x2400 on
++// the POCO X3 Pro): each entry a row with its icon at the left and its title beside it, the volume keys
++// (SCAN_UP/SCAN_DOWN) moving through every entry, wrapping at the ends. The rest of rEFInd as it is.
++#define VMENU_GAP (24)
++static EG_IMAGE *VMenuSelection = NULL;
++
++static BOOLEAN VMenuOn(VOID) {
++    return GlobalConfig.VerticalMenu && AllowGraphicsMode;
++}
++
++static UINTN VMenuTop(VOID) {
++    return UGAHeight / 4;
++}
++
++static UINTN VMenuRowWidth(VOID) {
++    return UGAWidth - 2 * (UGAWidth / 12);
++}
++
++static UINTN VMenuPitch(VOID) {
++    return TileSizes[0] + VMENU_GAP;
++}
++
++static UINTN VMenuMaxRows(VOID) {
++    UINTN Bottom = UGAHeight * 13 / 16, Rows;
++
++    Rows = (Bottom > VMenuTop()) ? (Bottom - VMenuTop()) / VMenuPitch() : 1;
++    return (Rows > 0) ? Rows : 1;
++}
++
+ static VOID InitSelection(VOID)
+ {
+     EG_IMAGE    *TempSmallImage = NULL, *TempBigImage = NULL;
+@@ -198,6 +227,16 @@
+ {
+     State->PreviousSelection = State->CurrentSelection;
+ 
++    if (VMenuOn() && (State->ScrollMode == SCROLL_MODE_ICONS)) {
++        if ((Movement == SCROLL_LINE_UP) || (Movement == SCROLL_LINE_LEFT)) {
++            State->CurrentSelection = (State->CurrentSelection > 0) ? State->CurrentSelection - 1 : State->MaxIndex;
++            Movement = SCROLL_NONE;
++        } else if ((Movement == SCROLL_LINE_DOWN) || (Movement == SCROLL_LINE_RIGHT)) {
++            State->CurrentSelection = (State->CurrentSelection < State->MaxIndex) ? State->CurrentSelection + 1 : 0;
++            Movement = SCROLL_NONE;
++        }
++    }
++
+     switch (Movement) {
+         case SCROLL_LINE_LEFT:
+             if (State->CurrentSelection > 0) {
+@@ -288,7 +327,7 @@
+             break;
+ 
+     }
+-    if (State->ScrollMode == SCROLL_MODE_TEXT)
++    if ((State->ScrollMode == SCROLL_MODE_TEXT) || (VMenuOn() && (State->ScrollMode == SCROLL_MODE_ICONS)))
+         AdjustScrollState(State);
+ 
+     if (!State->PaintAll && State->CurrentSelection != State->PreviousSelection)
+@@ -360,7 +399,11 @@
+             State->InitialRow1 = i;
+         } // if/else
+     } // for
+-    if ((State->ScrollMode == SCROLL_MODE_ICONS) && (State->MaxVisible > (State->FinalRow0 + 1)))
++    if (VMenuOn() && (State->ScrollMode == SCROLL_MODE_ICONS)) {
++        if (State->MaxVisible > State->MaxIndex + 1)
++            State->MaxVisible = State->MaxIndex + 1;
++        State->LastVisible = State->FirstVisible + State->MaxVisible - 1;
++    } else if ((State->ScrollMode == SCROLL_MODE_ICONS) && (State->MaxVisible > (State->FinalRow0 + 1)))
+         State->MaxVisible = State->FinalRow0 + 1;
+ } // static VOID IdentifyRows()
+ 
+@@ -1175,6 +1218,8 @@
+ }
+ 
+ UINTN ComputeRow0PosY(VOID) {
++    if (VMenuOn())
++        return VMenuTop();
+     return ((UGAHeight / 2) - TileSizes[0] / 2);
+ } // UINTN ComputeRow0PosY()
+ 
+@@ -1214,6 +1259,108 @@
+     }
+ } // VOID PaintArrows()
+ 
++// The title a row shows: a manual stanza's own title ("HakiOS"), else rEFInd's ("Boot ... from ...")
++static CHAR16 *VMenuTitle(REFIT_MENU_ENTRY *Entry) {
++    LOADER_ENTRY *Loader = (LOADER_ENTRY *) Entry;
++
++    if ((Entry->Tag == TAG_LOADER) && (Loader->DiscoveryType == DISCOVERY_TYPE_MANUAL) && (Loader->Title != NULL))
++        return Loader->Title;
++    return Entry->Title;
++}
++
++static VOID VMenuDrawEntry(REFIT_MENU_ENTRY *Entry, BOOLEAN Selected, UINTN Slot) {
++    UINTN RowW = VMenuRowWidth(), RowH = TileSizes[0];
++    UINTN PosX = (UGAWidth - RowW) / 2, PosY = VMenuTop() + Slot * VMenuPitch();
++    UINTN TextX = RowH + VMENU_GAP, IconX = 0, IconY = 0;
++    UINT8 Bright;
++    EG_IMAGE *Row;
++
++    if (PosY + RowH > UGAHeight)
++        return;
++    Row = egCropImage(GlobalConfig.ScreenBackground, PosX, PosY, RowW, RowH);
++    if (Row == NULL)
++        return;
++    Bright = (Row->PixelData[0].r + Row->PixelData[0].g + Row->PixelData[0].b) / 3;
++    if (Selected && VMenuSelection)
++        egComposeImage(Row, VMenuSelection, 0, 0);
++    if (Entry->Image) {
++        if (Entry->Image->Width < RowH)
++            IconX = (RowH - Entry->Image->Width) / 2;
++        if (Entry->Image->Height < RowH)
++            IconY = (RowH - Entry->Image->Height) / 2;
++        egComposeImage(Row, Entry->Image, IconX, IconY);
++    }
++    if ((TextX < RowW) && (egGetFontHeight() < RowH))
++        egRenderText(VMenuTitle(Entry), Row, TextX, (RowH - egGetFontHeight()) / 2, Bright);
++    BltImage(Row, PosX, PosY);
++    egFreeImage(Row);
++}
++
++static UINTN VMenuTextY(IN SCROLL_STATE *State) {
++    return VMenuTop() + State->MaxVisible * VMenuPitch() + VMENU_GAP;
++}
++
++static VOID VMenuPaintAll(IN REFIT_MENU_SCREEN *Screen, IN SCROLL_STATE *State) {
++    INTN i;
++
++    AdjustScrollState(State);
++    for (i = State->FirstVisible; (i <= State->LastVisible) && (i <= State->MaxIndex); i++)
++        VMenuDrawEntry(Screen->Entries[i], i == State->CurrentSelection, i - State->FirstVisible);
++}
++
++static VOID VMenuPaintSelection(IN REFIT_MENU_SCREEN *Screen, IN SCROLL_STATE *State) {
++    if ((State->CurrentSelection < State->FirstVisible) || (State->CurrentSelection > State->LastVisible)) {
++        VMenuPaintAll(Screen, State);
++        return;
++    }
++    if ((State->PreviousSelection >= State->FirstVisible) && (State->PreviousSelection <= State->LastVisible))
++        VMenuDrawEntry(Screen->Entries[State->PreviousSelection], FALSE, State->PreviousSelection - State->FirstVisible);
++    VMenuDrawEntry(Screen->Entries[State->CurrentSelection], TRUE, State->CurrentSelection - State->FirstVisible);
++}
++
++static VOID VMenuStyle(IN REFIT_MENU_SCREEN *Screen, IN SCROLL_STATE *State, IN UINTN Function, IN CHAR16 *ParamText)
++{
++    EG_IMAGE *Temp = NULL;
++
++    switch (Function) {
++        case MENU_FUNCTION_INIT:
++            InitScroll(State, Screen->EntryCount, GlobalConfig.MaxTags);
++            State->MaxVisible = VMenuMaxRows();
++            if ((GlobalConfig.MaxTags > 0) && (GlobalConfig.MaxTags < State->MaxVisible))
++                State->MaxVisible = GlobalConfig.MaxTags;
++            State->LastVisible = State->FirstVisible + State->MaxVisible - 1;
++            if (VMenuSelection == NULL) {
++                if (GlobalConfig.SelectionBigFileName != NULL)
++                    Temp = egLoadImage(SelfDir, GlobalConfig.SelectionBigFileName, TRUE);
++                if (Temp == NULL)
++                    Temp = egPrepareEmbeddedImage(&egemb_back_selected_big, TRUE);
++                if (Temp != NULL) {
++                    VMenuSelection = egScaleImage(Temp, VMenuRowWidth(), TileSizes[0]);
++                    egFreeImage(Temp);
++                }
++            }
++            InitSelection();
++            SwitchToGraphicsAndClear();
++            break;
++
++        case MENU_FUNCTION_CLEANUP:
++            break;
++
++        case MENU_FUNCTION_PAINT_ALL:
++            VMenuPaintAll(Screen, State);
++            break;
++
++        case MENU_FUNCTION_PAINT_SELECTION:
++            VMenuPaintSelection(Screen, State);
++            break;
++
++        case MENU_FUNCTION_PAINT_TIMEOUT:
++            DrawTextWithTransparency(L"", 0, VMenuTextY(State));
++            DrawTextWithTransparency(ParamText, (UGAWidth - egComputeTextWidth(ParamText)) >> 1, VMenuTextY(State));
++            break;
++    }
++}
++
+ // Display main menu in graphics mode
+ VOID MainMenuStyle(IN REFIT_MENU_SCREEN *Screen, IN SCROLL_STATE *State,
+                    IN UINTN Function, IN CHAR16 *ParamText)
+@@ -1225,6 +1372,10 @@
+     static UINTN row0PosY, textPosY;
+ 
+     State->ScrollMode = SCROLL_MODE_ICONS;
++    if (VMenuOn()) {
++        VMenuStyle(Screen, State, Function, ParamText);
++        return;
++    }
+     switch (Function) {
+ 
+         case MENU_FUNCTION_INIT:

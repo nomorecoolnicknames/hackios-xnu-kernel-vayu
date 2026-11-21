@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  nfcd on vayu: the PN553 through the kernel's AppleStockholm bridge (vayu_nfc_ios=2, iokit/Kernel/MiniAppleStockholm.cpp),
+  with src/inject_nfcrestore.m inside it (build.sh INJECT). Apple's job is on demand only, and on this phone nothing
+  asks for com.apple.nfcd.* at boot (no lookup in the runs of 18 November), so the lab's root29 had its job list run
+  `launchctl kickstart system/com.apple.nfcd` from the package manager's prefix; RunAtLoad is launchd's own way of
+  saying the same. build.sh NFCD=0 leaves the job out.
+-->
+<plist version="1.0">
+<dict>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>

@@ -15,6 +15,7 @@
 
 #include <sys/hakios.qmi.h>
 #include <sys/vayu_sms_qmi.h>
+#include <sys/vayu_sms_wms.h>
 
 static int checks, failures;
 
@@ -596,6 +597,192 @@ test_qmi_routes(void)
 	check(decoded.routes.route[1].message_class == 0 && decoded.routes.route[1].receipt_action == 2, "route 1");
 }
 
+/* ---- bsd/sys/vayu_sms_wms.h: CommCenter's frames as the observer reads them ---------------- */
+
+/* A QMI message: the 7-byte header, then the TLVs as given. */
+static size_t
+wms_frame(uint8_t *out, uint8_t type, uint16_t txn, uint16_t message, const uint8_t *tlvs, uint16_t length)
+{
+	out[0] = type;
+	out[1] = (uint8_t)txn; out[2] = (uint8_t)(txn >> 8);
+	out[3] = (uint8_t)message; out[4] = (uint8_t)(message >> 8);
+	out[5] = (uint8_t)length; out[6] = (uint8_t)(length >> 8);
+	memcpy(out + 7, tlvs, length);
+	return 7 + (size_t)length;
+}
+
+static void
+test_wms_mt_transfer(void)
+{
+	static const uint8_t tlvs[] = {
+		0x11, 0x0b, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01, 0x06, 0x03, 0x00, 0xaa, 0xbb, 0xcc,
+		0x12, 0x01, 0x00, 0x01,
+		0x16, 0x01, 0x00, 0x01,
+	};
+	uint8_t frame[64];
+	struct vayu_sms_wms_note n;
+	size_t length = wms_frame(frame, 0x04, 7, 0x0001, tlvs, sizeof(tlvs));
+
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, length, &n), 0, "wms mt: parse");
+	check(n.qmi_type == VAYU_SMS_WMS_INDICATION && n.message == 0x0001, "wms mt: type %u message 0x%04x",
+	    n.qmi_type, n.message);
+	check(n.mt_transfer && !n.mt_stored, "wms mt: transfer route seen");
+	check(n.ack_indicator == 0 && n.wms_transaction == 0x01020304u, "wms mt: ack %u transaction 0x%08x",
+	    n.ack_indicator, n.wms_transaction);
+	check(n.format == 6 && n.pdu_length == 3, "wms mt: format %u, %u bytes", n.format, n.pdu_length);
+	check(n.mode_valid && n.mode == 1 && n.sms_on_ims_valid && n.sms_on_ims == 1, "wms mt: mode and IMS");
+
+	/* a PDU length that runs past its TLV is not a transfer route */
+	{
+		uint8_t bad[sizeof(tlvs)];
+
+		memcpy(bad, tlvs, sizeof(tlvs));
+		bad[9] = 0x09;
+		length = wms_frame(frame, 0x04, 7, 0x0001, bad, sizeof(bad));
+		check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, length, &n), 0, "wms mt long: parse");
+		check(!n.mt_transfer, "wms mt long: refused");
+	}
+	/* the same TLVs in a request from CommCenter are not an MT */
+	length = wms_frame(frame, 0x00, 7, 0x0001, tlvs, sizeof(tlvs));
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_AP_TO_MODEM, frame, length, &n), 0, "wms mt req: parse");
+	check(!n.mt_transfer && !n.mt_stored, "wms mt req: not an MT");
+}
+
+static void
+test_wms_mt_stored(void)
+{
+	static const uint8_t tlvs[] = { 0x10, 0x05, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00 };
+	uint8_t frame[32];
+	struct vayu_sms_wms_note n;
+	size_t length = wms_frame(frame, 0x04, 1, 0x0001, tlvs, sizeof(tlvs));
+
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, length, &n), 0, "wms stored: parse");
+	check(n.mt_stored && n.storage == 0 && n.index == 5 && !n.mt_transfer, "wms stored: storage %u index %u",
+	    n.storage, n.index);
+}
+
+static void
+test_wms_send_ack(void)
+{
+	static const uint8_t tlvs[] = { 0x01, 0x06, 0x00, 0x04, 0x03, 0x02, 0x01, 0x01, 0x01 };
+	static const uint8_t reply[] = { 0x02, 0x04, 0x00, 0x01, 0x00, 0x30, 0x00, 0x10, 0x01, 0x00, 0x02 };
+	uint8_t frame[32];
+	struct vayu_sms_wms_note n;
+	size_t length = wms_frame(frame, 0x00, 3, 0x0037, tlvs, sizeof(tlvs));
+
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_AP_TO_MODEM, frame, length, &n), 0, "wms ack: parse");
+	check(n.ack_valid && n.ack_transaction == 0x01020304u && n.ack_protocol == 1 && n.ack_success == 1,
+	    "wms ack: fields");
+	length = wms_frame(frame, 0x02, 3, 0x0037, reply, sizeof(reply));
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, length, &n), 0, "wms ack reply: parse");
+	check(n.result_valid && n.result == 1 && n.error == 0x30, "wms ack reply: result %u error %u", n.result,
+	    n.error);
+	check(n.ack_failure_valid && n.ack_failure == 2, "wms ack reply: failure cause");
+}
+
+static void
+test_wms_raw_send(void)
+{
+	static const uint8_t request[] = { 0x01, 0x07, 0x00, 0x06, 0x04, 0x00, 0x11, 0x22, 0x33, 0x44 };
+	static const uint8_t ok[] = { 0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x34, 0x12 };
+	static const uint8_t refused[] = {
+		0x02, 0x04, 0x00, 0x01, 0x00, 0x24, 0x00,
+		0x10, 0x02, 0x00, 0x05, 0x00,
+		0x11, 0x01, 0x00, 0x01,
+		0x12, 0x03, 0x00, 0x29, 0x00, 0x00,
+	};
+	static const uint8_t async[] = {
+		0x01, 0x02, 0x00, 0x00, 0x00,
+		0x10, 0x02, 0x00, 0x07, 0x00,
+		0x13, 0x03, 0x00, 0x2a, 0x00, 0x01,
+	};
+	uint8_t frame[64];
+	struct vayu_sms_wms_note n;
+	size_t length = wms_frame(frame, 0x00, 9, 0x0020, request, sizeof(request));
+
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_AP_TO_MODEM, frame, length, &n), 0, "wms send: parse");
+	check(n.send_valid && n.send_format == 6 && n.send_length == 4, "wms send: format %u, %u bytes",
+	    n.send_format, n.send_length);
+	length = wms_frame(frame, 0x02, 9, 0x0020, ok, sizeof(ok));
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, length, &n), 0, "wms send ok: parse");
+	check(n.result_valid && n.result == 0 && n.message_id_valid && n.message_id == 0x1234,
+	    "wms send ok: message id 0x%04x", n.message_id);
+	length = wms_frame(frame, 0x02, 9, 0x0020, refused, sizeof(refused));
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, length, &n), 0, "wms send no: parse");
+	check(n.result == 1 && n.error == 0x24 && n.cause_valid && n.cause == 5 && n.error_class_valid &&
+	    n.error_class == 1, "wms send no: cause %u class %u", n.cause, n.error_class);
+	check(n.gw_cause_valid && n.rp_cause == 41 && n.tp_cause == 0, "wms send no: RP cause %u", n.rp_cause);
+	length = wms_frame(frame, 0x04, 0, 0x0059, async, sizeof(async));
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, length, &n), 0, "wms async: parse");
+	check(n.status_valid && n.status == 0 && n.message_id_valid && n.message_id == 7, "wms async: status");
+	check(n.gw_cause_valid && n.rp_cause == 42 && n.tp_cause == 1 && !n.cause_valid,
+	    "wms async: causes one TLV later than the reply's");
+}
+
+static void
+test_wms_routes(void)
+{
+	static const uint8_t request[] = {
+		0x01, 0x0a, 0x00, 0x02, 0x00, 0x00, 0x00, 0xff, 0x02, 0x00, 0x01, 0xff, 0x03,
+		0x10, 0x01, 0x00, 0x01,
+	};
+	uint8_t frame[64], bad[sizeof(request)];
+	struct vayu_sms_wms_note n;
+	size_t length = wms_frame(frame, 0x00, 2, 0x0032, request, sizeof(request));
+
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_AP_TO_MODEM, frame, length, &n), 0, "wms routes: parse");
+	check(n.routes_valid && n.route_count == 2, "wms routes: %u routes", n.route_count);
+	check(n.route[0].message_class == 0 && n.route[0].storage == 0xff && n.route[0].action == 2 &&
+	    n.route[1].message_class == 1 && n.route[1].action == 3, "wms routes: tuples");
+	check(n.transfer_ind_valid && n.transfer_ind == 1, "wms routes: transfer status reports");
+	memcpy(bad, request, sizeof(request));
+	bad[3] = 3;                                     /* three routes claimed, two there */
+	length = wms_frame(frame, 0x00, 2, 0x0032, bad, sizeof(bad));
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_AP_TO_MODEM, frame, length, &n), 0, "wms routes bad: parse");
+	check(!n.routes_valid, "wms routes bad: refused");
+}
+
+static void
+test_wms_misc(void)
+{
+	static const uint8_t list[] = {
+		0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x0e, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00,
+	};
+	static const uint8_t ready[] = { 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00 };
+	static const uint8_t ready_reply[] = {
+		0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x01, 0x00, 0x01, 0x11, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00,
+	};
+	static const uint8_t bind[] = { 0x01, 0x01, 0x00, 0x00 };
+	static const uint8_t truncated[] = { 0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x09, 0x00, 0x01 };
+	uint8_t frame[64];
+	struct vayu_sms_wms_note n;
+	size_t length = wms_frame(frame, 0x02, 4, 0x0031, list, sizeof(list));
+
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, length, &n), 0, "wms list: parse");
+	check(n.list_valid && n.list_count == 2, "wms list: %u stored", n.list_count);
+	length = wms_frame(frame, 0x04, 0, 0x005D, ready, sizeof(ready));
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, length, &n), 0, "wms ready: parse");
+	check(n.ready_valid && n.ready_status == 1, "wms ready: %u", n.ready_status);
+	check(strcmp(vayu_sms_wms_ready_name(n.ready_status), "3GPP") == 0, "wms ready: name");
+	length = wms_frame(frame, 0x02, 5, 0x005C, ready_reply, sizeof(ready_reply));
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, length, &n), 0, "wms ready reply: parse");
+	check(n.ready_valid && n.ready_status == 3, "wms ready reply: %u", n.ready_status);
+	length = wms_frame(frame, 0x00, 6, 0x004C, bind, sizeof(bind));
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_AP_TO_MODEM, frame, length, &n), 0, "wms bind: parse");
+	check(n.subscription_valid && n.subscription == 0, "wms bind: subscription");
+	/* a TLV past the end stops the walk, the result before it stays */
+	length = wms_frame(frame, 0x02, 7, 0x0035, truncated, sizeof(truncated));
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, length, &n), 0, "wms truncated: parse");
+	check(n.result_valid && n.result == 0, "wms truncated: result kept");
+	/* a header longer than the frame, or no header */
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, length - 1, &n), -1, "wms short frame");
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, frame, 6, &n), -1, "wms no header");
+	check_status(vayu_sms_wms_parse(VAYU_SMS_WMS_MODEM_TO_AP, NULL, 0, &n), -1, "wms null");
+	check(vayu_sms_wms_name(0x0037) != NULL && strcmp(vayu_sms_wms_name(0x0037), "send ack") == 0 &&
+	    vayu_sms_wms_name(0x7777) == NULL, "wms names");
+}
+
 int
 main(void)
 {
@@ -618,6 +805,12 @@ main(void)
 	test_qmi_delete();
 	test_qmi_send_ack();
 	test_qmi_routes();
+	test_wms_mt_transfer();
+	test_wms_mt_stored();
+	test_wms_send_ack();
+	test_wms_raw_send();
+	test_wms_routes();
+	test_wms_misc();
 
 	printf("sms-test: %d checks, %d failure(s)\n", checks, failures);
 	return failures == 0 ? 0 : 1;

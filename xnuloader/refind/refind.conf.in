@@ -1,0 +1,43 @@
+# rEFInd's configuration for vayu's boot_menu=refind (xnuloader/refind/mkrefindfs.sh fills in @TIMEOUT@).
+# rEFInd runs from a read-only FAT disk in RAM (refind_menu.c); its entries start this port's loader.efi from
+# the same disk with LoadOptions that the loader hands back to the loader that started rEFInd.
+timeout @TIMEOUT@
+default_selection HakiOS
+# nothing written: no NVRAM variables of rEFInd's own (the vertical_menu patch), none of systemd's
+use_nvram false
+write_systemd_vars false
+# no exit to the firmware, no shutdown, no firmware boot entries (Mu's BDS powers the phone off)
+showtools
+scanfor manual,internal,external
+dont_scan_volumes HAKIOSMENU
+# the phone: 1080x2400 portrait, the volume keys and Power only
+vertical_menu true
+hideui hints arrows badges editor safemode hwtest singleuser
+enable_mouse false
+enable_touch false
+big_icon_size 192
+small_icon_size 96
+banner theme\background.png
+banner_scale fillscreen
+selection_big theme\selection_big.png
+selection_small theme\selection_big.png
+font theme\font.png
+icons_dir theme\icons
+
+menuentry "HakiOS" {
+	icon \EFI\refind\theme\icons\os_hakios.png
+	loader \EFI\hakios\loader.efi
+	options "menu=off"
+}
+
+menuentry "Android" {
+	icon \EFI\refind\theme\icons\os_android.png
+	loader \EFI\hakios\loader.efi
+	options "menu=android"
+}
+
+menuentry "Diagnostics" {
+	icon \EFI\refind\theme\icons\tool_diag.png
+	loader \EFI\hakios\loader.efi
+	options "menu=diag"
+}
