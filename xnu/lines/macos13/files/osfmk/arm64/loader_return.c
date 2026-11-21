@@ -1,0 +1,974 @@
+/*
+ * Return-to-loader debug channel.
+ *
+ * On hardware without a serial port there is no way to get the kernel log
+ * out. The XNU loader therefore leaves UEFI intact (no ExitBootServices) and
+ * publishes the physical address of a return stub in /chosen/loader-return.
+ * When the kernel has nothing more to do (panic, halt, timer) it collects its
+ * message buffer, the panic buffer and any kprintf output, maps the stub 1:1
+ * through TTBR0 and jumps to it with that log. The loader then restores the UEFI environment and writes
+ * the log to storage.
+ *
+ * Only valid while the kernel does not drive hardware that UEFI also uses.
+ */
+#include <mach/mach_types.h>
+#include <machine/atomic.h>
+#include <kern/cpu_number.h>
+#include <kern/debug.h>
+#include <kern/startup.h>
+#include <kern/thread_call.h>
+#include <kern/thread.h>
+#include <kern/sched_prim.h>
+#include <kern/clock.h>
+#include <arm/cpu_internal.h>
+#include <arm/machine_routines.h>
+#include <arm64/psci_smp.h>
+#include <arm64/proc_reg.h>
+#include <pexpert/pexpert.h>
+#include <pexpert/arm64/board_config.h>
+#include <vm/vm_page.h>
+#include <vm/vm_compressor.h>
+
+/*
+ * The console log handed back to the loader. A long session writes more than fits, and both
+ * ends matter: the start of the boot is kept as it is, and of everything after it the most
+ * recent part (a ring); room is left for what is appended on the way out (the kernel message
+ * buffer, a panic's text). loader_log_linearize() puts the pieces in order before returning.
+ */
+/*
+ * 8 MB (512 KB from the boot's start, a 6.5 MB ring of the newest, 1 MB kept free for the kernel message buffer
+ * appended on the way out: a full ring had left it no room, and test sessions 231946/003059 came back without
+ * it); before that 7.5 MB of ring and no room; 1.5 MB (256 KB + 1 MB) until 2026-10-25, when
+ * userland logging filled the ring and runs lost their middle (the 151454 IR bursts 5-10). The loader stages up to
+ * 9 MB (loader 1.6).
+ */
+#define LOADER_LOG_SIZE (8 * 1024 * 1024)
+#define LOADER_LOG_HEAD (512 * 1024)
+#define LOADER_LOG_TAIL (1024 * 1024)   /* left free for what loader_return() appends: the kernel message buffer (msgbuf=, at most 1 MB) */
+#define LOADER_LOG_RING (LOADER_LOG_SIZE - LOADER_LOG_HEAD - LOADER_LOG_TAIL)
+
+#if defined(GENERIC_GIC_V3_IRQ)
+extern void gic_v3_irq_quiesce(void);
+extern void gic_v3_irq_cpu_shutdown(void);
+#endif
+
+void loader_log_putc(char c);
+void loader_return(void);
+extern void hakios_adreno_quiesce(void);
+extern void hakios_adreno_stop(void);
+extern void hakios_adreno_minute(void);
+extern void hakios_wifi_stop(void);
+extern void hakios_wifi_quiesce(void);
+extern void hakios_adsp_stop(void);
+extern void hakios_adsp_quiesce(void);
+extern void hakios_mpss_stop(void);
+extern void hakios_mpss_quiesce(void);
+extern void hakios_ddr_quiesce(void);
+extern void vayu_cpufreq_quiesce(void);
+extern void hakios_haptic_quiesce(void);
+extern void hakios_torch_quiesce(void);
+extern void vayu_audio_quiesce(void);
+extern void vayu_modem_quiesce(void);
+extern void vayu_slpi_quiesce(void);
+extern void vayu_smmu_quiesce(void);        /* bsd/dev/vayu_pas.c: bypass stream matches given back */
+extern void vayu_mdp_quiesce(void);
+extern void vayu_haptic_quiesce(void);
+extern void vayu_camera_quiesce(void);
+extern void vayu_venus_quiesce(void);          /* bsd/dev/vayu_venus.c: the video encoder stopped, if M1 started it */
+extern void hakios_camera_quiesce(void);
+extern void hakios_mic_quiesce(void);
+extern void hakios_ufs_quiesce(void);
+extern void hakios_var_save_on_return(void);   /* bsd/dev/hakios.ufs.c: the data volume into the flash */
+extern void IOSleep(unsigned int milliseconds);
+extern void hakios_var_save_ask(const char *why); /* ... and the same without waiting for it */
+extern void vayu_ir_quiesce(void);              /* bsd/dev/vayu_ir.c: an IR transfer in flight, cancelled */
+extern void vayu_usbnet_quiesce(void);          /* bsd/dev/vayu_usbnet.c: the USB controller, if it took it */
+void loader_checkpoint(uint64_t n);
+
+/* Also referenced from the early exception vector in start.s. */
+char     loader_log[LOADER_LOG_SIZE];
+uint32_t loader_log_len;
+static bool     loader_return_entered;
+
+/* One L1 table and one L2 table are enough to map a single 2 MB block. */
+static uint64_t loader_l1[512] __attribute__((aligned(4096)));
+static uint64_t loader_l2[512] __attribute__((aligned(4096)));
+
+static uint32_t loader_log_ring_at;      /* where the next character goes in the ring */
+static bool     loader_log_wrapped;
+static bool     loader_log_linear;       /* the pieces have been put in order: only appending from now on */
+static uint64_t loader_log_total;        /* characters ever put in: the live log's positions (loader_log_copy) */
+
+/*
+ * Characters come from every processor, and from interrupt handlers on top of whatever was
+ * writing one. The lock is of the simplest kind, good from the first line of C code to the
+ * last of a panic; whoever cannot have it for a long while (its holder is gone: a panic
+ * inside this very function) goes ahead without it.
+ */
+static uint32_t loader_log_lock;
+
+static void loader_log_put_locked(char c);
+
+void
+loader_log_putc(char c)
+{
+	uint64_t daif;
+	bool locked = false;
+
+	if (c == '\r') {
+		return;
+	}
+	daif = __builtin_arm_rsr64("DAIF");
+	__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
+	for (uint32_t tries = 0; !locked && tries < 10000000; tries++) {
+		locked = os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire);
+	}
+	loader_log_put_locked(c);
+	if (locked) {
+		os_atomic_store(&loader_log_lock, 0, release);
+	}
+	__builtin_arm_wsr64("DAIF", daif);
+}
+
+/*
+ * A whole line at once, under the lock: lines written from several processors at the same time
+ * (tools/latency.py's "tl:" lines, a frame's on one and a touch's on another) are not mixed up.
+ */
+void loader_log_line(const char *line);
+
+void
+loader_log_line(const char *line)
+{
+	uint64_t daif;
+	bool locked = false;
+
+	daif = __builtin_arm_rsr64("DAIF");
+	__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
+	for (uint32_t tries = 0; !locked && tries < 10000000; tries++) {
+		locked = os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire);
+	}
+	for (; *line != 0; line++) {
+		if (*line != '\r') {
+			loader_log_put_locked(*line);
+		}
+	}
+	if (locked) {
+		os_atomic_store(&loader_log_lock, 0, release);
+	}
+	__builtin_arm_wsr64("DAIF", daif);
+}
+
+static void
+loader_log_put_locked(char c)
+{
+	loader_log_total++;
+	if (loader_log_linear || loader_log_len < LOADER_LOG_HEAD) {
+		if (loader_log_len < LOADER_LOG_SIZE) {
+			loader_log[loader_log_len++] = c;
+		}
+	} else {
+		loader_log[LOADER_LOG_HEAD + loader_log_ring_at] = c;
+		if (++loader_log_ring_at == LOADER_LOG_RING) {
+			loader_log_ring_at = 0;
+			loader_log_wrapped = true;
+		}
+		if (!loader_log_wrapped) {
+			loader_log_len = LOADER_LOG_HEAD + loader_log_ring_at;
+		}
+	}
+}
+
+static void
+loader_log_reverse(char *p, uint32_t n)
+{
+	for (uint32_t i = 0, j = n; i + 1 < j; i++, j--) {
+		char t = p[i];
+
+		p[i] = p[j - 1];
+		p[j - 1] = t;
+	}
+}
+
+/* Oldest first: the head, a note about what was dropped, then the ring from its oldest character. */
+static void
+loader_log_linearize(void)
+{
+	static const char note[] = "\n\n[... the log between the first 512 KB and the last 6.5 MB was dropped ...]\n\n";
+	uint32_t n = LOADER_LOG_HEAD;
+
+	if (loader_log_linear) {
+		return;
+	}
+	loader_log_linear = true;
+	if (!loader_log_wrapped) {
+		return;
+	}
+	/* the ring rotated in place so that its oldest character comes first: three reversals, no second buffer */
+	loader_log_reverse(loader_log + LOADER_LOG_HEAD, loader_log_ring_at);
+	loader_log_reverse(loader_log + LOADER_LOG_HEAD + loader_log_ring_at, LOADER_LOG_RING - loader_log_ring_at);
+	loader_log_reverse(loader_log + LOADER_LOG_HEAD, LOADER_LOG_RING);
+	/* the note takes the place of the oldest characters of the ring */
+	__builtin_memcpy(loader_log + n, note, sizeof(note) - 1);
+	loader_log_len = LOADER_LOG_HEAD + LOADER_LOG_RING;
+}
+
+/*
+ * The live log (bsd/dev/vayu_usbnet_ecm.c, usbnet_log=1: TCP 5140): characters from *pos on, at most max, *pos
+ * moved on. Positions count every character ever put in: the head (the first LOADER_LOG_HEAD) stays as it is,
+ * the ring keeps the last LOADER_LOG_RING of the rest; a reader that fell further behind than the ring (less a
+ * margin for the writer) skips ahead. No lock: a character torn by a writer on another processor is the worst
+ * that can happen, and the reader must never wait for one. After telegdyd/ios-vayu, branch vayu-dev, commit
+ * 66d2e6bcb3c0 (its loader_log_copy).
+ */
+uint32_t loader_log_copy(uint64_t *pos, char *out, uint32_t max);
+
+uint32_t
+loader_log_copy(uint64_t *pos, char *out, uint32_t max)
+{
+	uint64_t total = os_atomic_load(&loader_log_total, relaxed);
+	uint32_t n = 0;
+
+	if (loader_log_linear) {
+		return 0;               /* (the run is ending: the pieces are being put in order) */
+	}
+	if (*pos >= LOADER_LOG_HEAD && total > *pos && total - *pos > LOADER_LOG_RING - 65536) {
+		*pos = total - (LOADER_LOG_RING - 65536);
+	}
+	while (n < max && *pos < total) {
+		out[n++] = *pos < LOADER_LOG_HEAD ? loader_log[*pos] :
+		    loader_log[LOADER_LOG_HEAD + (*pos - LOADER_LOG_HEAD) % LOADER_LOG_RING];
+		(*pos)++;
+	}
+	return n;
+}
+
+/* Patched by the loader: { magic, PA of its return stub, checkpoint to stop at, PA - VA }. See start.s. */
+extern uint64_t loader_stub_slot[4];
+
+/*
+ * For a loader that watches from another processor core while the kernel runs (it starts the
+ * kernel on a core of its choice and stays on the first one): a sign of life, and where the log
+ * is, so that the log of a kernel that hangs -- or dies before it has said a word through any
+ * other channel -- is not lost with it. The loader finds this by its first word in the kernel
+ * it has loaded. The addresses are the kernel's virtual ones, filled in by the linker and so
+ * valid from the first instruction; the loader knows the distance to the physical ones.
+ */
+struct loader_live {
+	uint64_t magic;                 /* "XNULIVE!" */
+	uint64_t heartbeat;             /* goes up every HV_WDT_PET_SECONDS while the kernel is alive */
+	const char *log;                /* loader_log */
+	const uint32_t *log_len;        /* how much of it is in use */
+	const uint32_t *log_ring_at;    /* where the ring part is being written */
+	const bool *log_wrapped;        /* the ring has gone round */
+	uint64_t log_head, log_ring;    /* sizes of the two parts */
+	const uint64_t *recording;      /* loader_recording: { physical address, length } of a screen recording */
+	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
+	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
+	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": the kernel has what follows */
+	volatile uint64_t usb_take;     /* ours: 1 = this kernel wants the USB controller (usb_handover=1) */
+	volatile uint64_t usb_given;    /* the loader's: 1 = it no longer touches USB in this run */
+	/*
+	 * usbctl (bsd/dev/vayu_ctl.c, bsd/sys/vayu_ctl.h): the loader's way to have the kernel
+	 * touch the screen, run a command or read a file while iOS runs.  The kernel allocates
+	 * the mailbox and the window for its answers and puts their physical addresses here --
+	 * the loader reads this struct at its physical address, so a pointer would not do.
+	 */
+	uint64_t magic4;                /* "XNULIVE4": the three fields below are there */
+	volatile uint64_t vctl_pa;      /* physical address of struct vayu_ctl_mbox (0: none) */
+	volatile uint64_t vctl_window_pa;
+	volatile uint64_t vctl_window_len;
+};
+
+/*
+ * A screen recording (the display driver makes one with boot-arg rec_secs): where it is, for the
+ * loader to hand to the host once the kernel is back. { physical address, bytes, kernel address }.
+ */
+uint64_t loader_recording[3];
+/* ... and of the sound (/dev/hakios-audio makes one with boot-arg rec_sound). */
+uint64_t loader_sound[3];
+
+struct loader_live loader_live = {
+	.magic = 0x214556494c554e58ULL, .log = loader_log, .log_len = &loader_log_len, .log_ring_at = &loader_log_ring_at,
+	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
+	.recording = loader_recording,
+	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
+	.magic3 = 0x334556494c554e58ULL, .usb_take = 0, .usb_given = 0,
+	.magic4 = 0x344556494c554e58ULL, .vctl_pa = 0, .vctl_window_pa = 0, .vctl_window_len = 0,
+};
+
+/*
+ * Called by bsd/dev/vayu_ctl.c once its mailbox and window exist (early boot).  The loader
+ * looks at magic4 first; a kernel without it is a loader that answers "no usbctl".
+ */
+void
+loader_live_set_vctl(uint64_t mbox_pa, uint64_t window_pa, uint64_t window_len)
+{
+	loader_live.vctl_window_pa = window_pa;
+	loader_live.vctl_window_len = window_len;
+	loader_live.vctl_pa = mbox_pa;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/*
+ * The handover, for a driver that takes a controller the loader's UEFI also drives (bsd/dev/
+ * vayu_usbnet.c with usb_handover=1): the kernel writes usb_take = 1, the loader stops touching
+ * the device and writes usb_given = 1, and only then does the kernel program it. Here rather than
+ * in the driver so that the struct stays this file's.
+ */
+uint64_t
+loader_live_usb_take(void)
+{
+	return loader_live.usb_take;
+}
+
+void
+loader_live_usb_take_set(uint64_t value)
+{
+	loader_live.usb_take = value;
+}
+
+uint64_t
+loader_live_usb_given(void)
+{
+	return loader_live.usb_given;
+}
+
+/*
+ * The end of the run as "xl stop" asks for it, asked from this side (vayu_usbnet_ecm.c's command port: "recovery",
+ * "reboot"): loader_stop_poll() sees it within a second and takes the orderly way back -- the data volume saved
+ * (var_store), the GPU, Wi-Fi and the DSP stopped -- and the loader of a standalone start then restarts the phone.
+ */
+void loader_live_stop_set(void);
+
+void
+loader_live_stop_set(void)
+{
+	loader_live.stop = 1;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
+static inline uint64_t
+static_kvtophys(const void *va)
+{
+	return (uint64_t)va + loader_stub_slot[3];
+}
+
+/*
+ * Jump to the loader's return stub. reason: 0 = orderly end, 2 = checkpoint.
+ * Returns only if no loader is listening.
+ */
+static void
+loader_jump(uint64_t reason, uint64_t code)
+{
+#if ARM_PGSHIFT == 12
+	uint64_t stub = loader_stub_slot[1];
+	uint64_t tcr, t0sz;
+	uint32_t own_core = 0;
+
+	if (stub == 0 || loader_return_entered) {
+		return;
+	}
+
+	tcr = __builtin_arm_rsr64("TCR_EL1");
+	t0sz = tcr & 0x3f;
+	/* The TTBR0 walk must start at L1 (1 GB per entry) and reach the stub. */
+	if (t0sz < 25 || t0sz > 33 || (stub >> (64 - t0sz)) != 0) {
+		return;
+	}
+	loader_return_entered = true;
+#if defined(GENERIC_GIC_V3_IRQ)
+	gic_v3_irq_quiesce();
+	/*
+	 * With a core of its own (bootcpu=) the kernel does not go back into the loader's code on
+	 * this processor: the stub leaves the log where the loader's core finds it and has the
+	 * firmware switch this one off. It must go as the other cores do (psci_smp_cpu_off()), with
+	 * nothing pending: after a panic the "stop" signal and the timer are.
+	 */
+	if (PE_parse_boot_argn("bootcpu", &own_core, sizeof(own_core))) {
+		__builtin_arm_wsr64("CNTV_CTL_EL0", CNTV_CTL_EL0_IMASKED);
+		gic_v3_irq_cpu_shutdown();
+	}
+#endif
+
+	loader_l1[stub >> 30] = static_kvtophys(loader_l2) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;
+	loader_l2[(stub >> 21) & 0x1ff] = (stub & ~0x1fffffULL) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_AP(AP_RWNA) |
+	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITEBACK);
+
+	/*
+	 * The stub turns the MMU off, and on real hardware dirty cache lines do
+	 * not survive that: write the log back to RAM first.
+	 */
+	for (uintptr_t p = (uintptr_t)loader_log & ~63UL; p < (uintptr_t)loader_log + loader_log_len; p += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (p));
+	}
+	/* ... and a screen recording, and the note of where it is */
+	for (uintptr_t p = loader_recording[2] & ~63UL; p < loader_recording[2] + loader_recording[1]; p += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (p));
+	}
+	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)loader_recording));
+	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)loader_recording + 16));
+	for (uintptr_t p = loader_sound[2] & ~63UL; p < loader_sound[2] + loader_sound[1]; p += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (p));
+	}
+	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)loader_sound));
+	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)loader_sound + 16));
+	__asm__ volatile ("dsb sy");
+
+	register uint64_t r_ttbr0 __asm__("x0") = static_kvtophys(loader_l1);
+	register uint64_t r_log __asm__("x2") = static_kvtophys(loader_log);
+	register uint64_t r_len __asm__("x3") = loader_log_len;
+	register uint64_t r_tcr __asm__("x4") = tcr;
+	register uint64_t r_stub __asm__("x5") = stub;
+	register uint64_t r_reason __asm__("x6") = reason;
+	register uint64_t r_code __asm__("x7") = code;
+
+	__asm__ volatile (
+                "msr DAIFSet, #0xf\n"
+                "bic x4, x4, #0x80\n"           /* TCR_EL1.EPD0: allow TTBR0 walks */
+                "msr TCR_EL1, x4\n"
+                "msr TTBR0_EL1, x0\n"
+                "isb\n"
+                "tlbi vmalle1\n"
+                "dsb sy\n"
+                "isb\n"
+                "mov x0, x2\n"
+                "mov x1, x3\n"
+                "mov x2, x6\n"
+                "mov x3, x7\n"
+                "br x5\n"
+                : : "r" (r_ttbr0), "r" (r_log), "r" (r_len), "r" (r_tcr), "r" (r_stub), "r" (r_reason), "r" (r_code));
+	__builtin_unreachable();
+#else
+	(void)reason; (void)code;
+#endif /* ARM_PGSHIFT == 12 */
+}
+
+extern char *debug_buf_base, *debug_buf_ptr;
+
+/* bsd/sys/msgbuf.h (not includable from osfmk) */
+struct msgbuf {
+	int   msg_magic;
+	int   msg_size;
+	int   msg_bufx;         /* write pointer */
+	int   msg_bufr;         /* read pointer */
+	char *msg_bufc;         /* buffer */
+};
+extern struct msgbuf *msgbufp;
+
+static void
+loader_log_puts(const char *s)
+{
+	for (; *s; s++) {
+		loader_log_putc(*s);
+	}
+}
+
+/*
+ * Everything printf()/IOLog()/os_log wrote ends up in the kernel message
+ * buffer (what dmesg shows), whether or not a console displayed it.
+ */
+static void
+loader_log_append_msgbuf(void)
+{
+	struct msgbuf *mb = msgbufp;
+
+	if (mb == NULL || mb->msg_bufc == NULL || mb->msg_size <= 0 || mb->msg_bufx < 0 || mb->msg_bufx > mb->msg_size) {
+		return;
+	}
+	loader_log_puts("\n--- kernel message buffer ---\n");
+	/* oldest data first: [bufx, size) is only meaningful once the buffer has wrapped */
+	for (int pass = 0; pass < 2; pass++) {
+		int from = pass == 0 ? mb->msg_bufx : 0;
+		int to = pass == 0 ? mb->msg_size : mb->msg_bufx;
+		for (int i = from; i < to; i++) {
+			if (mb->msg_bufc[i] != 0) {
+				loader_log_putc(mb->msg_bufc[i]);
+			}
+		}
+	}
+}
+
+/*
+ * What the end of the run does when the user asked for it (osfmk/kern/machine.c, host_reboot():
+ * a reboot(2) from the system -- "slide to power off" is one, with HOST_REBOOT_HALT). The ways out
+ * this kernel had before are the loader's: it takes the log and the phone stays in its hands. The
+ * two from the firmware (PSCI SYSTEM_OFF and SYSTEM_RESET) are what the user expects the buttons
+ * to do; the boot arguments choose, and a firmware that refuses them puts the loader's way back:
+ *
+ *   halt_psci=0       neither -- both ends are the loader's, exactly as before;
+ *   restart_loader=1  a restart is the loader's (its log is what a run being studied is for),
+ *                     a power-off is still the firmware's.
+ *
+ * A panic, a timed return (loader_return_after) or "xl stop" never asks, so nothing of this
+ * touches their way out.
+ */
+#define LOADER_END_RETURN       0       /* back to the boot loader (what everything else does) */
+#define LOADER_END_POWER_OFF    1       /* PSCI SYSTEM_OFF */
+#define LOADER_END_RESTART      2       /* PSCI SYSTEM_RESET */
+
+#if defined(GENERIC_PSCI_SMP)
+static int loader_end_action = LOADER_END_RETURN;
+#endif
+
+void
+loader_end_request(boolean_t restart)
+{
+#if defined(GENERIC_PSCI_SMP)
+	uint32_t psci = 1, to_loader = 0;
+
+	if (PE_parse_boot_argn("halt_psci", &psci, sizeof(psci)) && psci == 0) {
+		return;
+	}
+	if (restart && PE_parse_boot_argn("restart_loader", &to_loader, sizeof(to_loader)) && to_loader) {
+		return;
+	}
+	loader_end_action = restart ? LOADER_END_RESTART : LOADER_END_POWER_OFF;
+#else
+	(void)restart;
+#endif
+}
+
+void
+loader_return(void)
+{
+#if defined(GENERIC_PSCI_SMP)
+	printf("loader: the end of the run is here (action %d: 0 loader, 1 SYSTEM_OFF, 2 SYSTEM_RESET)\n",
+	    loader_end_action);
+	/*
+	 * With more than one processor: the others switch themselves off first, and the rest of
+	 * this is done by the boot processor, the one the loader gave us. This call comes back
+	 * on that processor only (on another one it has it call loader_return() in its turn).
+	 */
+	psci_smp_stop_others();
+#endif
+	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
+	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
+	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
+	hakios_adsp_quiesce();         /* nor the audio DSP */
+	hakios_mpss_quiesce();         /* nor the modem */
+	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
+	vayu_cpufreq_quiesce();         /* vayu: the OSM core and L3 rows the firmware had left */
+	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
+	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
+	vayu_audio_quiesce();           /* vayu's speaker amplifiers into shutdown, if a step let them out */
+	vayu_modem_quiesce();           /* vayu's modem stopped through TrustZone, if the probe started it */
+	vayu_slpi_quiesce();            /* vayu's sensors DSP stopped through TrustZone, if the probe started it */
+	vayu_smmu_quiesce();            /* then the SMMU matches its DMA used, as found */
+	vayu_mdp_quiesce();             /* the boot framebuffer back on the panel, if vayu_mdp=2 flipped it */
+	vayu_haptic_quiesce();          /* vayu's PM8150B haptics: PLAY off, module off, if anything was written */
+	vayu_camera_quiesce();          /* vayu: a camera sensor this probe powered, off again */
+	vayu_venus_quiesce();           /* vayu: the video encoder's firmware, SMMU context and MM3 vote, if M1 took them */
+	hakios_camera_quiesce();       /* the camera powered down, if it was powered up */
+	hakios_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
+	vayu_ir_quiesce();              /* the IR blaster's transfer stopped, if one was in flight */
+	vayu_usbnet_quiesce();          /* the USB controller stopped, if vayu_usbnet=2/3 took it from the loader */
+	/*
+	 * A panic's text is first collected in the panic buffer and only later
+	 * flushed to the console; if the console itself is what failed, that
+	 * never happens. Append the buffer so the loader gets it either way.
+	 */
+	loader_log_linearize();
+	if (!loader_return_entered) {
+		loader_log_append_msgbuf();
+	}
+	if (!loader_return_entered && debug_buf_base != NULL && debug_buf_ptr > debug_buf_base &&
+	    (size_t)(debug_buf_ptr - debug_buf_base) < 256 * 1024) {
+		loader_log_puts("\n--- panic buffer ---\n");
+		for (const char *c = debug_buf_base; c < debug_buf_ptr; c++) {
+			loader_log_putc(*c);
+		}
+	}
+#if defined(GENERIC_PSCI_SMP)
+	/*
+	 * The user's own way out: everything above is quiet and the other processors are off, so the
+	 * firmware is asked to end the system itself. The call does not come back when it is taken
+	 * (and then this log, with the memory it is in, goes with the system); when it is refused --
+	 * a hypervisor with only the CPU_* calls -- the status says so and the loader takes the run as
+	 * it always did. A panic that happened on the way here (the shutdown timed out, a driver
+	 * faulted) is not this: its log is what the loader is for, so it always goes back.
+	 */
+	if (loader_end_action != LOADER_END_RETURN && !panic_active()) {
+		bool power_off = loader_end_action == LOADER_END_POWER_OFF;
+		int64_t status;
+
+		/* Interrupts are off here: printf() would panic ("Console I/O from interrupt-disabled context"),
+		 * so the loader's own log is written to directly. */
+		loader_log_puts(power_off ? "\n--- PSCI SYSTEM_OFF ---\n" : "\n--- PSCI SYSTEM_RESET ---\n");
+		status = power_off ? psci_system_off() : psci_system_reset();
+		{
+			char line[96];
+
+			snprintf(line, sizeof(line), "--- PSCI SYSTEM_%s refused (%d): back to the loader ---\n",
+			    power_off ? "OFF" : "RESET", (int)status);
+			loader_log_puts(line);
+		}
+		loader_end_action = LOADER_END_RETURN;  /* once is enough if the loader is the way out again */
+	}
+#endif /* defined(GENERIC_PSCI_SMP) */
+	loader_jump(0, 0);
+}
+
+/* Bring-up aid: stop here if the loader asked for checkpoint n. */
+void
+loader_checkpoint(uint64_t n)
+{
+	if (loader_stub_slot[2] == n) {
+		loader_jump(2, n);
+	}
+}
+
+/*
+ * stop_deadline=SECS (0, the default: none, as before): each hakios_*_stop() on the orderly way out (a timed
+ * return, "xl stop", the command port's reboot, user_ready_deadline) runs in a thread of its own, and this one waits
+ * for it SECS seconds at most; the data volume's save (hakios_var_save_on_return) gets its own var_save_ms and five
+ * seconds of sync on top. One that has not finished by then is left where it is: the log says which, and the way
+ * out goes on -- the loader's return, which stops the processors and quiesces each block from what it knows, is
+ * what matters; a modem or DSP that hung in its shutdown never lets the run end otherwise (no hardware watchdog is
+ * armed on vayu). stop_test_hang=1 (a test, QEMU's qemu/run-standalone-test.sh): one more step that never
+ * finishes, to see the deadline taken.
+ */
+#define LOADER_STOP_JOBS        16
+
+struct loader_stop_job {
+	void (*fn)(void);
+	const char *name;
+	volatile uint32_t done;
+};
+
+static struct loader_stop_job loader_stop_jobs[LOADER_STOP_JOBS];      /* never reused: a hung one keeps its own */
+static uint32_t loader_stop_jobs_used;
+
+static void
+loader_stop_job_thread(void *arg, __unused wait_result_t wr)
+{
+	struct loader_stop_job *job = arg;
+
+	job->fn();
+	os_atomic_store(&job->done, 1, release);
+	thread_wakeup((event_t)&job->done);
+}
+
+static void
+loader_stop_test_hang(void)
+{
+	for (;;) {
+		IOSleep(60 * 1000);
+	}
+}
+
+static void
+loader_stop_bounded(const char *name, void (*fn)(void), uint32_t extra_ms)
+{
+	uint32_t seconds = 0, index;
+	struct loader_stop_job *job;
+	thread_t thread;
+	uint64_t deadline;
+
+	if (!PE_parse_boot_argn("stop_deadline", &seconds, sizeof(seconds)) || seconds == 0) {
+		fn();
+		return;
+	}
+	index = os_atomic_inc_orig(&loader_stop_jobs_used, relaxed);
+	if (index >= LOADER_STOP_JOBS) {
+		fn();
+		return;
+	}
+	job = &loader_stop_jobs[index];
+	job->fn = fn;
+	job->name = name;
+	if (kernel_thread_start(loader_stop_job_thread, job, &thread) != KERN_SUCCESS) {
+		printf("loader: %s: no thread for it: called here, without a deadline\n", name);
+		fn();
+		return;
+	}
+	thread_deallocate(thread);
+	clock_interval_to_deadline((uint64_t)seconds * 1000 + extra_ms, NSEC_PER_MSEC, &deadline);
+	while (!os_atomic_load(&job->done, acquire)) {
+		assert_wait_deadline((event_t)&job->done, THREAD_UNINT, deadline);
+		if (os_atomic_load(&job->done, acquire)) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+			break;
+		}
+		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT && !os_atomic_load(&job->done, acquire)) {
+			printf("loader: %s did NOT finish in %u ms (stop_deadline=%u): left as it is, the way out goes on\n",
+			    name, seconds * 1000 + extra_ms, seconds);
+			return;
+		}
+	}
+}
+
+/* What the orderly ways out stop while there is a thread to wait in (modem: the timed return's alone, as before). */
+static void
+loader_stops(bool modem)
+{
+	uint32_t hang = 0, var_ms = 40000;      /* (hakios.ufs.c VAR_SAVE_MS) */
+
+	PE_parse_boot_argn("var_save_ms", &var_ms, sizeof(var_ms));
+	loader_stop_bounded("hakios_var_save_on_return()", hakios_var_save_on_return, var_ms + 5000);
+	if (PE_parse_boot_argn("stop_test_hang", &hang, sizeof(hang)) && hang == 1) {
+		printf("loader: stop_test_hang=1: a step that never finishes (a test of stop_deadline)\n");
+		loader_stop_bounded("stop_test_hang", loader_stop_test_hang, 0);
+	}
+	loader_stop_bounded("hakios_adreno_stop()", hakios_adreno_stop, 0);
+	loader_stop_bounded("hakios_wifi_stop()", hakios_wifi_stop, 0);
+	loader_stop_bounded("hakios_adsp_stop()", hakios_adsp_stop, 0);
+	if (modem) {
+		loader_stop_bounded("hakios_mpss_stop()", hakios_mpss_stop, 0);
+	}
+}
+
+/*
+ * boot-arg loader_return_after=<seconds>: hand control back to the loader
+ * after that long, whatever the kernel is doing. This is how the log gets out
+ * when the kernel does not panic but simply waits (e.g. for a root device).
+ */
+/*
+ * For trying the ways out when there is more than one processor: boot-arg return_cpu=<n> has
+ * that processor make the timed return, from an interrupt handler -- any but the boot processor
+ * has to hand it over (psci_smp_stop_others()) --, and return_panic=1 makes a panic of it.
+ */
+static void
+loader_return_test(void *as_panic)
+{
+	if (as_panic != (void *)1) {
+		panic("return_panic: the panic that was asked for, on cpu %d", cpu_number());
+	}
+	loader_return();
+}
+
+static void
+loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	static const char banner[] = "\n--- loader_return_after expired ---\n";
+	uint32_t cpu = 0, as_panic = 0;
+
+	for (const char *c = banner; *c; c++) {
+		loader_log_putc(*c);
+	}
+	PE_parse_boot_argn("return_panic", &as_panic, sizeof(as_panic));
+	if (!as_panic) {
+		/*
+		 * The data volume kept, while the system is still whole; a GPU kept for the system given back while there
+		 * is a thread to wait in; the Wi-Fi DSP, if it runs, shut down; the audio DSP; the modem.
+		 */
+		loader_stops(true);
+	}
+	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
+	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {
+		for (;;) {
+			delay_for_interval(1000, NSEC_PER_MSEC);        /* that processor ends it */
+		}
+	}
+	loader_return_test((void *)(uintptr_t)(as_panic ? 2 : 1));
+}
+
+/*
+ * The volume is asked for this long before the run's own time is up (var_save_ask=SECONDS, 0: not
+ * before the end). The saver then packs and writes the 230 MB while the run is still whole; the way
+ * out at loader_return_after finds it finished (or waits the rest of var_save_ms for it). Without
+ * this the whole store had to fit in the seconds the way out is allowed to wait, and the save of
+ * d-morning14 was cut in the middle because of it.
+ */
+#define VAR_SAVE_LEAD_SECONDS   60
+
+static void
+loader_var_save_ask(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	hakios_var_save_ask("the run's time is nearly up");
+}
+
+__startup_func
+static void
+loader_return_timer_init(void)
+{
+	uint32_t seconds = 0;
+	uint64_t deadline;
+
+	if (!PE_parse_boot_argn("loader_return_after", &seconds, sizeof(seconds)) || seconds == 0) {
+		return;
+	}
+	thread_call_t call = thread_call_allocate(loader_return_timer, NULL);
+	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(call, deadline);
+	{
+		uint32_t lead = VAR_SAVE_LEAD_SECONDS;
+
+		PE_parse_boot_argn("var_save_ask", &lead, sizeof(lead));
+		if (lead != 0 && seconds > lead + 20) {
+			thread_call_t ask = thread_call_allocate(loader_var_save_ask, NULL);
+
+			clock_interval_to_deadline(seconds - lead, NSEC_PER_SEC, &deadline);
+			thread_call_enter_delayed(ask, deadline);
+		}
+	}
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
+
+/*
+ * halt_test=N: ask for the user's way out N seconds after boot, without iOS. It walks the same path a
+ * "slide to power off" should take -- loader_end_request(FALSE) -> halt_all_cpus(FALSE) ->
+ * loader_return() -> PSCI SYSTEM_OFF -- so the next run can tell "iOS never called reboot(2)" from
+ * "the kernel's end of the run is broken". On QEMU the VM simply goes away.
+ */
+static void
+loader_halt_test(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	printf("\n--- halt_test: the end of the run is asked for as a power-off ---\n");
+	loader_end_request(FALSE);
+	halt_all_cpus(FALSE);
+}
+
+__startup_func
+static void
+loader_halt_test_init(void)
+{
+	uint32_t seconds = 0;
+	uint64_t deadline;
+
+	if (!PE_parse_boot_argn("halt_test", &seconds, sizeof(seconds)) || seconds == 0) {
+		return;
+	}
+	thread_call_t call = thread_call_allocate(loader_halt_test, NULL);
+	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(call, deadline);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_halt_test_init);
+
+/*
+ * A loader that watches from another core also listens to the host, and passes on a request to
+ * end the run ("xl stop") by setting loader_live.stop. Look once a second.
+ */
+static thread_call_t loader_stop_call;
+
+static void
+loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t deadline;
+
+	if (loader_live.stop) {
+		static const char banner[] = "\n--- the host asked for the end of the run: back to the loader ---\n";
+		for (const char *c = banner; *c; c++) {
+			loader_log_putc(*c);
+		}
+		loader_stops(false);
+		loader_return();
+	}
+	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(loader_stop_call, deadline);
+}
+
+__startup_func
+static void
+loader_stop_poll_init(void)
+{
+	loader_stop_call = thread_call_allocate(loader_stop_poll, NULL);
+	loader_stop_poll(NULL, NULL);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_stop_poll_init);
+
+/*
+ * boot-arg hv_wdt_pet=1: the loader has armed the Qualcomm hypervisor's
+ * virtual watchdog (it resets the phone when a kernel hangs, so that test
+ * runs need nobody at the device). Its timeout is at most 65 seconds; feed
+ * it from a timer so that a healthy kernel can run for as long as it likes.
+ */
+#define VIRT_WDT_PET            0x86000007u
+#define HV_WDT_PET_SECONDS      10
+
+static thread_call_t hv_wdt_call;
+static uint32_t hv_wdt_enabled;
+/*
+ * hb_test_stop=SECS (a test; 0, the default: none): SECS seconds into the run (in heartbeats of HV_WDT_PET_SECONDS) the heartbeat (and the hypervisor
+ * watchdog's feed) stop, as they would in a kernel that hung, and nothing else does. A loader that watches from
+ * another core (bootcpu=, loader.c SILENCE_SECONDS) calls the kernel hung 50 s later, writes its log to logdump and
+ * restarts the phone: that way out is seen working before a real hang needs it.
+ */
+static uint32_t hb_test_stop;
+
+#define MEMORY_REPORT_BEATS     6               /* a line about memory every so many heartbeats */
+
+extern unsigned int memorystatus_available_pages, memorystatus_available_pages_critical,
+    memorystatus_available_pages_critical_base;
+extern uint32_t c_segment_pages_compressed;
+extern _Atomic uint64_t ramfs_pages_in_use;
+extern void MiniIOSurfaceUsage(uint32_t *count, uint64_t *bytes);
+
+/*
+ * Where the memory is, in megabytes: for reading a session's log afterwards. "available" is what
+ * the kernel's own count says (free and file-backed): below the first threshold it kills idle
+ * daemons, and once none is left and it is below the second, whatever is next in line -- the
+ * window server included.
+ */
+void hakios_memory_line(char *buf, size_t len);
+
+/* The line itself (also kern.hakios_memory, for a job list to keep: bsd/miscfs/apfs/apfs_vfsops.c) */
+void
+hakios_memory_line(char *buf, size_t len)
+{
+#define MB(pages)       ((unsigned int)(((uint64_t)(pages) * PAGE_SIZE) >> 20))
+	uint32_t surfaces = 0;
+	uint64_t surface_bytes = 0;
+
+	MiniIOSurfaceUsage(&surfaces, &surface_bytes);
+	snprintf(buf, len, "memory: free %u, files %u, programs %u, wired %u (%u surfaces %u, ramfs %u), compressor %u "
+	    "(holding %u) MB; available %u, kills below %u (the idle) and %u (anybody)\n",
+	    MB(vm_page_free_count), MB(vm_page_pageable_external_count), MB(vm_page_pageable_internal_count),
+	    MB(vm_page_wire_count), surfaces, (unsigned int)(surface_bytes >> 20),
+	    MB(os_atomic_load(&ramfs_pages_in_use, relaxed)),
+	    MB(VM_PAGE_COMPRESSOR_COUNT), MB(c_segment_pages_compressed),
+	    MB(memorystatus_available_pages),
+	    MB(memorystatus_available_pages_critical), MB(memorystatus_available_pages_critical_base));
+#undef MB
+}
+
+static void
+memory_report(void)
+{
+	char line[256];
+
+	hakios_memory_line(line, sizeof(line));
+	printf("%s", line);
+	hakios_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
+}
+
+/* Every HV_WDT_PET_SECONDS: feed the watchdog if there is one, and show any watching loader a sign of life. */
+static void
+hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t deadline;
+
+	if (hv_wdt_enabled) {
+		register uint64_t x0 __asm__("x0") = VIRT_WDT_PET;
+		register uint64_t x1 __asm__("x1") = 0;
+		register uint64_t x2 __asm__("x2") = 0;
+		register uint64_t x3 __asm__("x3") = 0;
+
+		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
+		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
+	}
+	if (++loader_live.heartbeat % MEMORY_REPORT_BEATS == 0) {
+		memory_report();
+	}
+	if (hb_test_stop != 0 && loader_live.heartbeat * HV_WDT_PET_SECONDS >= hb_test_stop) {
+		printf("hb_test_stop=%u: the heartbeat stops here (beat %llu): a watching loader calls the kernel hung "
+		    "in 50 s\n", hb_test_stop, loader_live.heartbeat);
+		return;
+	}
+
+	clock_interval_to_deadline(HV_WDT_PET_SECONDS, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(hv_wdt_call, deadline);
+}
+
+__startup_func
+static void
+hv_wdt_pet_init(void)
+{
+	PE_parse_boot_argn("hv_wdt_pet", &hv_wdt_enabled, sizeof(hv_wdt_enabled));
+	PE_parse_boot_argn("hb_test_stop", &hb_test_stop, sizeof(hb_test_stop));
+	hv_wdt_call = thread_call_allocate(hv_wdt_pet, NULL);
+	hv_wdt_pet(NULL, NULL);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hv_wdt_pet_init);

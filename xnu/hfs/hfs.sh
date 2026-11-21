@@ -9,6 +9,7 @@
 #
 # env: HFS_URL  where to fetch from (default Apple's repository on GitHub; a clone that has the tag will do)
 #      HFS_SRC  where the release is kept once fetched (default xnu-src/hfs-627.100.6 beside the kernel tree)
+#      HFS_PATCH  the patch to put or export (default xnu/hfs/hfs.patch; xnu/line.sh gives another line's)
 #
 # This script and the lists are upstream HakiOS's (MIT): oosexgang/hakios-xnu-kernel, branch main, commit
 # 7ef54e774d32; hfs.patch is made by xnu/export.sh from this port's tree (the changes as telegdyd/ios-vayu,
@@ -19,6 +20,7 @@ TAG=hfs-627.100.6
 BASE=31d5ec238dfab485e78a9a30b8b92d13e8914f03
 URL=${HFS_URL:-https://github.com/apple-oss-distributions/hfs.git}
 SRC=${HFS_SRC:-$HERE/../../xnu-src/$TAG}
+PATCH=${HFS_PATCH:-$HERE/hfs.patch}
 CMD=$1 TREE=$2
 [ -n "$CMD" ] && [ -d "$TREE" ] || { echo "usage: xnu/hfs/hfs.sh put|export TREE" >&2; exit 1; }
 
@@ -36,19 +38,19 @@ put)
 	mkdir -p "$TREE/bsd/hfs" "$TREE/bsd/hfs_encodings"
 	while read -r f; do cp "$SRC/core/$f" "$TREE/bsd/hfs/$f"; done < "$HERE/core.list"
 	while read -r f; do cp "$SRC/hfs_encodings/$f" "$TREE/bsd/hfs_encodings/$f"; done < "$HERE/encodings.list"
-	git -C "$TREE" apply --whitespace=nowarn "$HERE/hfs.patch"
-	echo "hfs.sh: $TAG: $(wc -l < "$HERE/core.list") + $(wc -l < "$HERE/encodings.list") files, $(grep -c '^+++ ' "$HERE/hfs.patch") changed"
+	git -C "$TREE" apply --whitespace=nowarn "$PATCH"
+	echo "hfs.sh: $TAG: $(wc -l < "$HERE/core.list") + $(wc -l < "$HERE/encodings.list") files, $(grep -c '^+++ ' "$PATCH") changed"
 	;;
 export)
-	: > "$HERE/hfs.patch.new"
+	: > "$PATCH.new"
 	while read -r f; do
-		diff -u --label "a/bsd/hfs/$f" --label "b/bsd/hfs/$f" "$SRC/core/$f" "$TREE/bsd/hfs/$f" >> "$HERE/hfs.patch.new" || true
+		diff -u --label "a/bsd/hfs/$f" --label "b/bsd/hfs/$f" "$SRC/core/$f" "$TREE/bsd/hfs/$f" >> "$PATCH.new" || true
 	done < "$HERE/core.list"
 	while read -r f; do
 		diff -u --label "a/bsd/hfs_encodings/$f" --label "b/bsd/hfs_encodings/$f" "$SRC/hfs_encodings/$f" \
-		    "$TREE/bsd/hfs_encodings/$f" >> "$HERE/hfs.patch.new" || true
+		    "$TREE/bsd/hfs_encodings/$f" >> "$PATCH.new" || true
 	done < "$HERE/encodings.list"
-	mv "$HERE/hfs.patch.new" "$HERE/hfs.patch"
+	mv "$PATCH.new" "$PATCH"
 	;;
 *)
 	echo "usage: xnu/hfs/hfs.sh put|export TREE" >&2; exit 1 ;;

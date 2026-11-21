@@ -1,0 +1,177 @@
+/*
+ * /dev/hakios-touch: touch samples on their way from whoever produces them to the
+ * program that turns them into HID events for the window server.
+ *
+ * iOS expects touches from Apple's multitouch driver through IOHIDFamily; neither exists
+ * here. Instead a producer -- a kernel driver for a real touch controller or for an emulated
+ * pointer, or a user program replaying a script -- posts samples, and code of ours running
+ * inside backboardd reads them and synthesizes the events. Both sides use the same record.
+ *
+ *   write(): one or more records (time is ignored; the kernel stamps them)
+ *   read():  blocks until there is at least one record, returns as many whole ones as fit
+ */
+#ifndef _SYS_HAKIOS_INPUT_H_
+#define _SYS_HAKIOS_INPUT_H_
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#define HAKIOS_TOUCH_DEVICE    "/dev/hakios-touch"
+
+#define HAKIOS_TOUCH_DOWN      1       /* a finger has landed */
+#define HAKIOS_TOUCH_MOVE      2
+#define HAKIOS_TOUCH_UP        3       /* it has lifted (x, y: where it was last) */
+#define HAKIOS_BUTTON_DOWN     4       /* a hardware button; `finger` says which (HAKIOS_BUTTON_*), x and y are 0 */
+#define HAKIOS_BUTTON_UP       5
+
+#define HAKIOS_BUTTON_LOCK     1       /* the side button */
+#define HAKIOS_BUTTON_VOLUME_UP 2
+#define HAKIOS_BUTTON_VOLUME_DOWN 3
+#define HAKIOS_BUTTON_HOME     4
+
+struct hakios_touch {
+	uint64_t time;                  /* mach_absolute_time() when the sample was posted */
+	uint32_t type;                  /* HAKIOS_TOUCH_* or HAKIOS_BUTTON_DOWN/UP */
+	uint32_t finger;                /* which finger, from 0 (or which button) */
+	uint32_t x, y;                  /* position on the display, 0 = left/top edge, 65535 = right/bottom edge */
+};
+
+#ifdef KERNEL
+/* For drivers; not from interrupt context. */
+void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
+/* The same, with the time the sample was taken (mach_absolute_time), not the time it was posted:
+ * a driver that spends a millisecond reading the controller stamps the read's start instead of its
+ * end (bsd/dev/vayu_nvt.c, boot-arg touch_hz). 0 means "now". */
+void hakios_touch_post_at(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time);
+/* usbctl: a sample from outside the drivers, counted like a program's (bsd/dev/vayu_ctl.c) */
+void hakios_touch_post_synthetic(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
+/* the panel's size in pixels, 1080x2400 on vayu when fb_fit is not on (the host's "oem touch") */
+void hakios_touch_panel_size(uint32_t *width, uint32_t *height);
+/* the USB control channel of a running kernel (bsd/dev/vayu_ctl.c) */
+void vayu_ctl_init(void);
+/* mach_absolute_time units since the last touch or button event; 0 while a finger is down; UINT64_MAX if never */
+uint64_t hakios_touch_idle_abs(void);
+/* the touch samples a program posted (write() to /dev/hakios-touch) since the last call, and whether such
+ * a finger is down now: for the display driver's s5_fps line, which tells a window a synthetic swipe
+ * produced from an idle one (iokit/Kernel/MiniIOMobileFramebuffer.cpp) */
+void hakios_touch_synthetic(uint32_t *samples, uint32_t *down);
+/* the same for the screen's own driver (a real finger, not a program's write): S8, so that a
+ * finger-driven scroll is measured by the display driver's S5FPS window in a normal boot */
+void hakios_touch_driver(uint32_t *samples, uint32_t *down);
+/* the screen driver's samples since the machine started and the fingers down now; unlike
+ * hakios_touch_driver() this does not clear the count, so a once-a-second line can be printed
+ * from the touch thread even when no frame arrives at the display driver (scroll120) */
+void hakios_touch_driver_total(uint64_t *samples, uint32_t *down);
+void hakios_input_init(void);
+/* every sample above, for macOS's HID event system (iokit/Kernel/VayuTouchPointer.cpp, boot-arg macos_hid=1);
+ * returns at once without it */
+void vayu_hid_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, uint64_t time);
+void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
+void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
+void vayu_nvt_init(void);            /* boot-args touchscreen=1 touch_driver=nvt: vayu's Novatek NT36672C */
+void hakios_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
+void hakios_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
+void hakios_ufs_report(const char *when); /* where reading the storage has spent its time so far */
+bool hakios_ufs_dev(dev_t dev);           /* one of the storage's devices */
+int hakios_ufs_read_partition(const char *name, uint64_t offset, uint8_t *dst, uint64_t len, uint64_t *bytes); /* for drivers */
+bool hakios_ufs_part(const char *name, uint32_t *part, uint64_t *bytes);   /* a GPT partition by name, for a kernel user */
+int hakios_ufs_part_read(uint32_t part, uint64_t offset, void *dst, uint64_t len);  /* read-only, through the same path */
+void hakios_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
+int hakios_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
+/* one transfer at a time through the PMIC arbiter for this system (bsd/dev/hakios.buttons.c) */
+void hakios_spmi_lock(void);
+void hakios_spmi_unlock(void);
+bool hakios_spmi_peek(uint16_t id, uint8_t reg, uint8_t *value);    /* hakios.buttons.c: one PMIC register, read only */
+/*
+ * How the battery is, as the audio DSP's battery manager says (bsd/dev/hakios.adsp.c, with adsp=1):
+ * handed to bsd/dev/hakios.battery.c, which keeps it for the sysctls kern.hakios.battery_* and
+ * passes it on to iokit/Kernel/hakios.battery.cpp, the power source that iOS reads. The structure
+ * is repeated there (this header is not seen from iokit/), and `size` tells whether the two agree.
+ */
+struct hakios_battery_state {
+	uint32_t size;                  /* sizeof(struct hakios_battery_state) */
+	int32_t percent_hundredths;     /* the charge, 0..10000 */
+	int32_t voltage_uv;
+	int32_t current_ua;             /* more than 0 while the battery takes charge */
+	int32_t temperature_hundredths; /* of a degree Celsius */
+	int32_t present;                /* 1 if there is a battery */
+	int32_t external;               /* 1 if a charger or a computer is on the USB port */
+	int32_t status;                 /* Linux's POWER_SUPPLY_STATUS_*: 1 charging, 2 discharging, 3 not charging, 4 full */
+	int32_t charge_uah, full_uah, design_uah, cycles;      /* 0 when not known (yet) */
+	int32_t usb_type;               /* Linux's POWER_SUPPLY_USB_TYPE_*: 1 a computer's port, 2 a charger, ... */
+	int32_t usb_voltage_uv, usb_current_ua;                 /* what the port gives */
+};
+void hakios_battery_report(const struct hakios_battery_state *state);
+void hakios_net_init(void);            /* en0, if there is something to carry its frames: sys/hakios.net.h */
+void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
+void hakios_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
+void hakios_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
+void hakios_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
+void hakios_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
+void vayu_adreno_init(void);            /* boot-args gpu=1 vayu_gpu=1: vayu's Adreno 640, steps 1..N */
+void vayu_adreno_quiesce(void);         /* the same two endings for the vayu GPU block */
+void vayu_adreno_stop(void);
+/* vayu's GPU kept for the service HakiosGPU (vayu_keep=1): hakios_gpu_...() hand over to these */
+bool vayu_gpu_kept(void);
+bool vayu_gpu_parameter(uint32_t which, uint64_t *value);
+uint64_t vayu_gpu_address(uint64_t size);
+void vayu_gpu_address_free(uint64_t address, uint64_t size);
+void vayu_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most, uint64_t *lost,
+    uint32_t *refused);
+bool vayu_gpu_map(uint64_t address, uint64_t phys, bool read_only);
+void vayu_gpu_mapped(void);
+void vayu_gpu_unmap(uint64_t address, uint64_t size);
+void vayu_gpu_to_memory(void *start, uint64_t size);
+uint32_t vayu_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+bool vayu_gpu_done(uint32_t fence);
+uint32_t vayu_gpu_last(void);
+void vayu_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
+void vayu_gpu_report(const char *why);
+bool vayu_gpu_recover(void);
+void vayu_gpu_stop(void);
+void hakios_wifi_init(void);           /* boot-arg wifi=1: the phone's Wi-Fi; wifi_step=N: the first N steps of it */
+void hakios_adsp_init(void);           /* boot-arg adsp=1: the phone's audio DSP started and linked; adsp_step=N: the first N steps */
+void hakios_mpss_init(void);           /* boot-arg modem=1: the phone's modem started and linked; modem_step=N: the first N steps */
+void hakios_wifi_stop(void);           /* where a run ends in order: the Wi-Fi DSP, if it was started, shut down */
+int hakios_wifi_say(const char *format, ...) __printflike(1, 2);      /* a line of the Wi-Fi steps' log */
+int hakios_wifi_tell(const char *format, ...) __printflike(1, 2);     /* ... one that is said even with wifi=1 */
+uint32_t hakios_wifi_option(const char *name);                         /* a boot-arg's number, or what wifi=1 stands for */
+const uint8_t *hakios_wifi_file(const char *name, uint64_t *size);     /* a file of fw/ in the small image, in place */
+bool hakios_wlfw_exchange(uint32_t step);                              /* step 15 of wifi_step=N: hakios.wlfw.c */
+bool hakios_wlfw_registers(uint64_t *address, uint32_t *size, bool *mission); /* ... and what it learnt for step 16 */
+void hakios_wlfw_stop(uint32_t step);                                  /* ... and its end, before the DSP is stopped */
+void hakios_wifi_quiesce(void);        /* on the way back to the loader: the Wi-Fi DSP, if it still runs, shut down */
+/* ath11k's object and the kernel's side of it (bsd/dev/hakios.lx.c), and what that asks of the phone's radio */
+int hakios_lx_start(void);             /* the driver brought up on the radio as far as it is built: 0 or an errno */
+void hakios_lx_stop(void);             /* ... and down again, if it stayed up (a network joined) */
+int hakios_lx_prepare(void);           /* before all that: the memory the radio will be shown, taken; 0 or an errno */
+void hakios_lx_net_early(void);        /* ... and en0 made on the radio now, if the kernel was given its address */
+bool hakios_wifi_dsp_is_up(void);      /* the DSP that runs the radio's firmware has been started and has a link */
+const uint8_t *hakios_wifi_driver_file(const char *name, uint64_t *size);     /* a file by the name Linux has for it */
+bool hakios_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address); /* memory shown to the radio */
+bool hakios_wifi_radio_msi(unsigned long long *address, uint32_t *data, uint32_t *first_spi); /* where the radio raises its interrupts */
+bool hakios_wifi_radio_address(uint8_t *address);      /* the radio's own address (boot-arg wifi_mac), if one was given */
+/* the network to join (fw/network of the small image): name and passphrase, buffer sizes in and lengths out */
+bool hakios_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length);
+
+/*
+ * The GPU kept on (boot-arg adreno_keep=1), for iokit/Kernel/hakios.gpu.cpp: see "the GPU kept on"
+ * in bsd/dev/hakios.adreno.c. One caller at a time.
+ */
+bool hakios_gpu_ready(void);
+bool hakios_gpu_parameter(uint32_t which, uint64_t *value);
+uint64_t hakios_gpu_address(uint64_t size);
+void hakios_gpu_address_free(uint64_t address, uint64_t size);
+bool hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only);
+void hakios_gpu_mapped(void);
+void hakios_gpu_unmap(uint64_t address, uint64_t size);
+void hakios_gpu_to_memory(void *start, uint64_t size);
+uint32_t hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+bool hakios_gpu_done(uint32_t fence);
+uint32_t hakios_gpu_last(void);
+void hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
+void hakios_gpu_report(const char *why);
+void hakios_gpu_stop(void);
+#endif
+
+#endif /* _SYS_HAKIOS_INPUT_H_ */

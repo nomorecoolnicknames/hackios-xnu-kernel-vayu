@@ -1,0 +1,383 @@
+--- a/bsd/hfs/hfs_iokit.h
++++ b/bsd/hfs/hfs_iokit.h
+@@ -30,7 +30,9 @@
+ #define hfs_iokit_h
+ 
+ #include <sys/cdefs.h>
++#if CONFIG_PROTECT
+ #include <AppleKeyStore/AppleKeyStoreFSServices.h>
++#endif
+ 
+ __BEGIN_DECLS
+ 
+@@ -42,6 +44,7 @@
+ 									void *arg);
+ kern_return_t hfs_get_platform_serial_number(char *serial_number_str,
+ 											 uint32_t len);
++#if CONFIG_PROTECT
+ int hfs_unwrap_key(aks_cred_t access, const aks_wrapped_key_t wrapped_key_in,
+ 				   aks_raw_key_t key_out);
+ int hfs_rewrap_key(aks_cred_t access, cp_key_class_t dp_class,
+@@ -52,6 +55,8 @@
+ int hfs_backup_key(aks_cred_t access, const aks_wrapped_key_t wrapped_key_in,
+ 				   aks_wrapped_key_t wrapped_key_out);
+ 
++#endif /* CONFIG_PROTECT */
++
+ __END_DECLS
+ 
+ #endif /* hfs_iokit_h */
+--- a/bsd/hfs/hfs_vfsops.c
++++ b/bsd/hfs/hfs_vfsops.c
+@@ -2622,6 +2622,10 @@
+ 
+ 	journal_init();
+ 
++	/* HakiOS: built in, so what the kext's start() did after vfs_fsadd() is done here */
++	hfs_init_zones();
++	hfs_sysctl_register();
++
+ 	return (0);
+ }
+ 
+--- a/bsd/hfs/hfs_vnops.c
++++ b/bsd/hfs/hfs_vnops.c
+@@ -77,6 +77,8 @@
+ #include "BTreesInternal.h"
+ #include "FileMgrInternal.h"
+ 
++extern uint32_t hakios_macos_abi;      /* bsd/kern/kern_exec.c: boot-arg macos_abi=1 (getattr, setattr, renamex) */
++
+ /* Global vfs data structures for hfs */
+ 
+ /*
+@@ -1154,6 +1156,16 @@
+     		vap->va_dataprotect_class = cp->c_cpentry ? CP_CLASS(cp->c_cpentry->cp_pclass) : 0;
+     		VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
+     	} 	
++#else
++	/*
++	 * (macos_abi=1) No content protection on this volume: every item's class is 0, none, said rather than
++	 * unsupported -- getattrlist() otherwise fails the whole request with EINVAL, and macOS's dirs_cleaner, which
++	 * asks it of /tmp and /var/run before it swaps them with fresh directories, cleaned nothing.
++	 */
++	if (hakios_macos_abi != 0 && VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {
++		vap->va_dataprotect_class = 0;
++		VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
++	}
+ #endif
+ 	if (VATTR_IS_ACTIVE(vap, va_write_gencount)) {
+ 		if (ubc_is_mapped_writable(vp)) {
+@@ -1638,6 +1650,11 @@
+ 	VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
+ 	if (!error && VATTR_IS_ACTIVE(vap, va_dataprotect_class))
+ 		error = cp_vnode_setclass(vp, vap->va_dataprotect_class);
++#else
++	/* (macos_abi=1) class 0 is what every item has here (getattr above): setting it changes nothing */
++	if (hakios_macos_abi != 0 && VATTR_IS_ACTIVE(vap, va_dataprotect_class) && vap->va_dataprotect_class == 0) {
++		VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
++	}
+ #endif
+ 
+ 	return (error);
+@@ -4498,6 +4515,41 @@
+  * been locked.  By taking the rsrc fork vnodes up front we ensure that they 
+  * cannot be recycled, and that the situation mentioned above cannot happen.
+  */
++/*
++ * RENAME_SWAP for HFS+ (boot-arg macos_abi=1 only; hfs_vnop_renamex). Apple's HFS+ refuses it (ENOTSUP): on a Mac the
++ * volumes that see it are APFS. This port's macOS Data volume is HFS+, and launchd's boot task dirs_cleaner empties
++ * /tmp and /var/run by swapping each with a fresh directory (renamex_np RENAME_SWAP) and removing the old one; without
++ * the swap nothing was emptied, the *.didRunThisBoot markers of the last boot stayed, and on the next boot logind took
++ * it for a run that had already started a loginwindow: none came (QEMU AQUA r10, r14).
++ *
++ * The swap is three catalog renames in the rename's one journal transaction -- the source to a name of its own in its
++ * directory, the target to the source's place, the source to the target's -- so a crash leaves either nothing done
++ * or all of it (the journal), never half. Hard links and directories with directory-hard-link descendants are
++ * refused (EPERM), as are items that are an ancestor of the other's parent (EINVAL).
++ */
++/* whether ANCESTOR is DIR or one of DIR's ancestors (catalog lookups, the catalog locked shared by the caller) */
++static int
++hfs_swap_is_ancestor(struct hfsmount *hfsmp, cnid_t ancestor, cnid_t dir)
++{
++	struct cat_desc desc;
++
++	for (int depth = 0; depth < 4096 && dir >= kHFSRootFolderID; depth++) {
++		if (dir == ancestor) {
++			return 1;
++		}
++		if (dir == kHFSRootFolderID) {
++			return 0;
++		}
++		bzero(&desc, sizeof(desc));
++		if (cat_idlookup(hfsmp, dir, 0, 0, &desc, NULL, NULL) != 0) {
++			return 1;       /* cannot say: refuse */
++		}
++		dir = desc.cd_parentcnid;
++		cat_releasedesc(&desc);
++	}
++	return 1;
++}
++
+ int
+ hfs_vnop_renamex(struct vnop_renamex_args *ap)
+ {
+@@ -4537,6 +4589,7 @@
+ 	int unlocked;
+ 	vnode_t old_doc_vp = NULL;
+ 	int rename_exclusive = 0;
++	int rename_swap = 0;
+ 
+ 	orig_from_ctime = VTOC(fvp)->c_ctime;
+ 	if (tvp && VTOC(tvp)) {
+@@ -4550,7 +4603,8 @@
+ 	/* Check the flags first, so we can avoid grabbing locks if necessary */
+ 	if (ap->a_flags) {
+ 		/* These are the only flags we support for now */
+-		if ((ap->a_flags & (VFS_RENAME_EXCL)) == 0) {
++		if ((ap->a_flags & (VFS_RENAME_EXCL)) == 0 &&
++		    (hakios_macos_abi == 0 || (ap->a_flags & VFS_RENAME_SWAP) == 0)) {
+ 			return ENOTSUP;	
+ 		}
+ 		
+@@ -4559,6 +4613,9 @@
+ 			case VFS_RENAME_EXCL: 
+ 				rename_exclusive = true;			
+ 				break;
++			case VFS_RENAME_SWAP:
++				rename_swap = 1;        /* (macos_abi=1, checked above) */
++				break;
+ 			default: 
+ 				return ENOTSUP;
+ 		}
+@@ -4673,6 +4730,18 @@
+ 	tdcp = VTOC(tdvp);
+ 	tcp = tvp ? VTOC(tvp) : NULL;
+ 
++	if (rename_swap && (tvp == NULL || fvp == tvp)) {
++		error = tvp == NULL ? ENOENT : 0;       /* a swap with nothing, or with itself */
++		hfs_unlockfour(fdcp, fcp, tdcp, tcp);
++		if (took_trunc_lock) {
++			hfs_unlock_truncate(VTOC(tvp), HFS_LOCK_DEFAULT);
++		}
++		if (tvp_rsrc) {
++			vnode_put(tvp_rsrc);
++		}
++		return error;
++	}
++
+ 	//
+ 	// if the item is tracked but doesn't have a document_id, assign one and generate an fsevent for it
+ 	//
+@@ -4875,7 +4944,7 @@
+ 	 *     /
+ 	 *    o fvp
+ 	 */
+-	if (tvp && vnode_isdir(tvp) && (tcp->c_entries != 0) && fvp != tvp) {
++	if (tvp && vnode_isdir(tvp) && (tcp->c_entries != 0) && fvp != tvp && !rename_swap) {
+ 		error = ENOTEMPTY;
+ 		goto out;
+ 	}
+@@ -5054,6 +5123,135 @@
+ 	}
+ 	got_cookie = 1;
+ 
++	if (rename_swap) {
++		struct cat_desc tmp_desc, t_from_desc, t_to_desc, f_from_desc, out_tmp, out_t, out_f;
++		char tmp_name[48];
++		const int f_dir = vnode_isdir(fvp), t_dir = vnode_isdir(tvp);
++
++		if (((fcp->c_flag | tcp->c_flag) & C_HARDLINK) ||
++		    ((fcp->c_attr.ca_recflags | tcp->c_attr.ca_recflags) & kHFSHasChildLinkMask)) {
++			error = EPERM;
++			goto out;
++		}
++		if ((tcp->c_bsdflags & (IMMUTABLE | APPEND)) || (tdcp->c_bsdflags & APPEND) ||
++		    hfs_is_journal_file(hfsmp, tcp)) {
++			error = EPERM;
++			goto out;
++		}
++		if (fcp->c_rsrc_vp != NULLVP || tcp->c_rsrc_vp != NULLVP) {
++			error = EBUSY;          /* a resource fork vnode's name would have to follow: not done here */
++			goto out;
++		}
++		cache_purge(tvp);
++		lockflags = hfs_systemfile_lock(hfsmp, SFL_CATALOG, HFS_EXCLUSIVE_LOCK);
++		if ((f_dir && fdvp != tdvp && hfs_swap_is_ancestor(hfsmp, fcp->c_fileid, tdcp->c_fileid)) ||
++		    (t_dir && fdvp != tdvp && hfs_swap_is_ancestor(hfsmp, tcp->c_fileid, fdcp->c_fileid))) {
++			hfs_systemfile_unlock(hfsmp, lockflags);
++			error = EINVAL;
++			goto out;
++		}
++		snprintf(tmp_name, sizeof(tmp_name), ".hfs-swap.%u", fcp->c_fileid);
++		bzero(&tmp_desc, sizeof(tmp_desc));
++		tmp_desc.cd_nameptr = (const u_int8_t *)tmp_name;
++		tmp_desc.cd_namelen = strlen(tmp_name);
++		tmp_desc.cd_parentcnid = fdcp->c_fileid;
++		tmp_desc.cd_flags = from_desc.cd_flags;
++		tmp_desc.cd_cnid = fcp->c_cnid;
++		bzero(&t_from_desc, sizeof(t_from_desc));
++		t_from_desc.cd_nameptr = (const u_int8_t *)tcnp->cn_nameptr;
++		t_from_desc.cd_namelen = tcnp->cn_namelen;
++		t_from_desc.cd_parentcnid = tdcp->c_fileid;
++		t_from_desc.cd_flags = tcp->c_desc.cd_flags & ~(CD_HASBUF | CD_DECOMPOSED);
++		t_from_desc.cd_cnid = tcp->c_cnid;
++		t_to_desc = t_from_desc;                /* the target in the source's place */
++		t_to_desc.cd_nameptr = from_desc.cd_nameptr;
++		t_to_desc.cd_namelen = from_desc.cd_namelen;
++		t_to_desc.cd_parentcnid = fdcp->c_fileid;
++		f_from_desc = tmp_desc;                 /* the source, from its own name, to the target's place */
++		bzero(&out_tmp, sizeof(out_tmp));
++		bzero(&out_t, sizeof(out_t));
++		bzero(&out_f, sizeof(out_f));
++		error = cat_rename(hfsmp, &from_desc, &fdcp->c_desc, &tmp_desc, &out_tmp);
++		if (error == 0) {
++			error = cat_rename(hfsmp, &t_from_desc, &fdcp->c_desc, &t_to_desc, &out_t);
++			if (error == 0) {
++				error = cat_rename(hfsmp, &f_from_desc, &tdcp->c_desc, &to_desc, &out_f);
++				if (error != 0) {
++					/* the target back where it was, the source back from its own name */
++					struct cat_desc undo;
++
++					bzero(&undo, sizeof(undo));
++					(void) cat_rename(hfsmp, &t_to_desc, &tdcp->c_desc, &t_from_desc, &undo);
++					cat_releasedesc(&undo);
++					bzero(&undo, sizeof(undo));
++					(void) cat_rename(hfsmp, &tmp_desc, &fdcp->c_desc, &from_desc, &undo);
++					cat_releasedesc(&undo);
++					cat_releasedesc(&out_t);
++				}
++			} else {
++				struct cat_desc undo;
++
++				bzero(&undo, sizeof(undo));
++				(void) cat_rename(hfsmp, &tmp_desc, &fdcp->c_desc, &from_desc, &undo);
++				cat_releasedesc(&undo);
++			}
++			cat_releasedesc(&out_tmp);
++		}
++		hfs_systemfile_unlock(hfsmp, lockflags);
++		if (error) {
++			if (error == EEXIST) {
++				error = ERECYCLE;
++			}
++			goto out;
++		}
++		if (tdcp->c_flag & C_NEG_ENTRIES) {
++			cache_purge_negatives(tdvp);
++			tdcp->c_flag &= ~C_NEG_ENTRIES;
++		}
++		if (fdcp->c_flag & C_NEG_ENTRIES) {
++			cache_purge_negatives(fdvp);
++			fdcp->c_flag &= ~C_NEG_ENTRIES;
++		}
++		replace_desc(fcp, &out_f);
++		fcp->c_parentcnid = tdcp->c_fileid;
++		fcp->c_hint = 0;
++		replace_desc(tcp, &out_t);
++		tcp->c_parentcnid = fdcp->c_fileid;
++		tcp->c_hint = 0;
++		if (fdvp != tdvp) {
++			fcp->c_flag |= C_NEEDS_DATEADDED;
++			tcp->c_flag |= C_NEEDS_DATEADDED;
++			if (f_dir && !t_dir) {
++				INC_FOLDERCOUNT(hfsmp, tdcp->c_attr);
++				DEC_FOLDERCOUNT(hfsmp, fdcp->c_attr);
++			} else if (t_dir && !f_dir) {
++				INC_FOLDERCOUNT(hfsmp, fdcp->c_attr);
++				DEC_FOLDERCOUNT(hfsmp, tdcp->c_attr);
++			}
++		}
++		(void) hfs_update(fvp, 0);
++		(void) hfs_update(tvp, 0);
++		fdcp->c_dirchangecnt++;
++		fdcp->c_flag |= C_MODIFIED;
++		fdcp->c_touch_chgtime = TRUE;
++		fdcp->c_touch_modtime = TRUE;
++		hfs_incr_gencount(fdcp);
++		(void) hfs_update(fdvp, 0);
++		if (fdvp != tdvp) {
++			tdcp->c_dirchangecnt++;
++			tdcp->c_flag |= C_MODIFIED;
++			tdcp->c_touch_chgtime = TRUE;
++			tdcp->c_touch_modtime = TRUE;
++			hfs_incr_gencount(tdcp);
++			(void) hfs_update(tdvp, 0);
++		}
++		vnode_update_identity(fvp, tdvp, tcnp->cn_nameptr, tcnp->cn_namelen, tcnp->cn_hash,
++		    (VNODE_UPDATE_PARENT | VNODE_UPDATE_NAME));
++		vnode_update_identity(tvp, fdvp, fcnp->cn_nameptr, fcnp->cn_namelen, fcnp->cn_hash,
++		    (VNODE_UPDATE_PARENT | VNODE_UPDATE_NAME));
++		goto out;
++	}
++
+ 	/*
+ 	 * If the destination exists then it may need to be removed.  
+ 	 * 
+--- a/bsd/hfs/kext-config.h
++++ b/bsd/hfs/kext-config.h
+@@ -1,55 +1,16 @@
+ /*
+- * Copyright (c) 2015 Apple Inc. All rights reserved.
+- *
+- * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
+- *
+- * This file contains Original Code and/or Modifications of Original Code
+- * as defined in and that are subject to the Apple Public Source License
+- * Version 2.0 (the 'License'). You may not use this file except in
+- * compliance with the License. The rights granted to you under the License
+- * may not be used to create, or enable the creation or redistribution of,
+- * unlawful or unlicensed copies of an Apple operating system, or to
+- * circumvent, violate, or enable the circumvention or violation of, any
+- * terms of an Apple operating system software license agreement.
+- *
+- * Please obtain a copy of the License at
+- * http://www.opensource.apple.com/apsl/ and read it before using this file.
+- *
+- * The Original Code and all software distributed under the License are
+- * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+- * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+- * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+- * Please see the License for the specific language governing rights and
+- * limitations under the License.
+- *
+- * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ * HakiOS: HFS Plus built into the kernel (bsd/hfs, from Apple's hfs-627.100.6) rather than a kext, for the data
++ * volume on the phone's flash.  FIFO, CONFIG_PROTECT and NAMEDSTREAMS are the kernel's own options (config/MASTER);
++ * what is HFS's alone is decided here.
+  */
+-
+ #ifndef _hfs_config_
+ #define _hfs_config_
+-
+-#include <TargetConditionals.h>
+-
+-#define HFS_COMPRESSION 1
+-#define FIFO 1
+-
+-// #define HFS_LEAK_DEBUG 1
+-
+-#if (TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR) // iOS (real hardware)
+-
++#define HFS_COMPRESSION 1       /* (the code does not build without it; decmpfs is the kernel's) */
++#ifndef QUOTA
+ #define QUOTA 0
+-#define CONFIG_PROTECT 1
+-#define CONFIG_SECLUDED_RENAME 1
+-
+-
+-#else // OS X
+-
+-#define QUOTA 1
+-#define NAMEDSTREAMS 1
+-#define CONFIG_HFS_DIRLINK 1
+-#define CONFIG_SEARCHFS 1
+-
+ #endif
+-
++#define CONFIG_SECLUDED_RENAME 0
++/* content protection's keys are AppleKeyStore's, which this kernel does not have (bsd/hfs/hfs_builtin.c) */
++#undef CONFIG_PROTECT
++#define CONFIG_PROTECT 0
+ #endif /* defined(_hfs_config_) */

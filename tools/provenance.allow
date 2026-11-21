@@ -20,6 +20,7 @@ pending  devices/poco-x5-pro/uefi/files/Resources/DTBs/redwood.dtb   the same de
 
 # --- the touch controller's firmware, compiled into a driver ---------------------------------------------
 pending  xnu/files/bsd/dev/hakios.focaltech_fw.h   FocalTech's firmware as a C array, from a blob on the POCO X5 Pro: the kernel (hakios.goodix.c) includes it, so it cannot simply be removed; to be loaded from the phone at run time like the rest of the firmware
+pending  xnu/lines/macos13/files/bsd/dev/hakios.focaltech_fw.h     FocalTech's firmware as a C array, from a blob on the POCO X5 Pro: the macOS line's copy of the same header (its hakios.goodix.c includes it), so it cannot simply be removed; to be loaded from the phone at run time like the rest of the firmware
 
 # --- proprietary: Qualcomm's and Xiaomi's, taken out of the phone's own UEFI; not for a public tree ---------
 vendor   devices/*/uefi/files/Binaries/*/*.efi      UEFI drivers extracted from the vendor's xbl firmware: each user extracts their own (UEFIReader)
