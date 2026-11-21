@@ -115,7 +115,7 @@ static uint32_t client_node, client_port;
 static struct hakios_qrtr_port *host_port;
 static uint32_t qmi_wait_ms = 60000, qmi_timeout_ms = 30000;
 static uint32_t qmi_regwait_ms = 5000, qmi_attempts = 3;
-static bool qmi_trace;
+static bool qmi_trace, filter_ack;
 /* vayu_ipa_try: opt-in experiments for a modem that does not answer INIT_MODEM_DRIVER (see the top
  * of this file). 0 or absent: nothing below changes anything. */
 #define VAYU_IPA_TRY_HELLO      (1u << 0)
@@ -844,6 +844,76 @@ ipa_send_complete(void)
 	}
 }
 
+static const uint8_t *
+ipa_qmi_tlv(const uint8_t *m, size_t length, uint8_t type, uint16_t *size)
+{
+	size_t end;
+
+	if (length < 7) return NULL;
+	end = 7 + (size_t)m[5] + ((size_t)m[6] << 8);
+	if (end > length) return NULL;
+	for (size_t at = 7; at + 3 <= end;) {
+		uint16_t n = (uint16_t)(m[at + 1] | m[at + 2] << 8);
+
+		if (n > end - at - 3) return NULL;
+		if (m[at] == type) {
+			*size = n;
+			return m + at + 3;
+		}
+		at += 3 + n;
+	}
+	return NULL;
+}
+
+/*
+ * IPA filter acknowledgements follow hakios.mpss.c's handler from
+ * kiwiiiii-eth/hakios-xnu-kernel@b47c5df21c8388f5459f906e5a50fc3497946d30:
+ * TLV 0x15 carries one count byte and 173-byte entries; each rule id is at
+ * offset 168. Until the IPA 4.1 QMI v01 entry size is confirmed, only echo
+ * IDs for that exact shape and answer malformed requests with success alone.
+ */
+static size_t
+ipa_filter_answer(const uint8_t *m, size_t length, uint8_t *answer, uint16_t transaction, uint16_t message,
+    unsigned *answered, uint16_t *request_size, bool *shape_known)
+{
+	uint16_t size = 0;
+	const uint8_t *list = ipa_qmi_tlv(m, length, 0x15, &size);
+	unsigned count = list != NULL && size >= 1 ? list[0] : 0;
+	size_t at = 14;
+
+	answer[0] = QMI_RESPONSE;
+	answer[1] = (uint8_t)transaction;
+	answer[2] = (uint8_t)(transaction >> 8);
+	answer[3] = (uint8_t)message;
+	answer[4] = (uint8_t)(message >> 8);
+	answer[7] = 2;
+	answer[8] = 4;
+	answer[9] = 0;
+	answer[10] = 0;
+	answer[11] = 0;
+	answer[12] = 0;
+	answer[13] = 0;
+
+	*answered = 0;
+	*request_size = size;
+	*shape_known = false;
+	if (list != NULL && size >= 1 && count <= 64 && size == 1 + count * 173) {
+		*shape_known = true;
+		answer[at++] = 0x11;
+		answer[at++] = (uint8_t)(1 + 4 * count);
+		answer[at++] = 0;
+		answer[at++] = (uint8_t)count;
+		for (unsigned r = 0; r < count; r++) {
+			memcpy(answer + at, list + 1 + r * 173 + 168, 4);
+			at += 4;
+		}
+		*answered = count;
+	}
+	answer[5] = (uint8_t)(at - 7);
+	answer[6] = (uint8_t)((at - 7) >> 8);
+	return at;
+}
+
 static void
 ipa_receive(void *context __unused, uint32_t node, uint32_t from_port, const void *data, size_t length)
 {
@@ -865,20 +935,42 @@ ipa_receive(void *context __unused, uint32_t node, uint32_t from_port, const voi
 	}
 	if (m[0] == 0) {
 		/* A request on our published host port. Answer with the same transaction id.
-		 * Only the handshake requests are implemented. Claiming success for a filter or
-		 * configuration request without applying it would be a fake data-ready path. */
+		 * Filter requests remain fail-closed unless the explicit acknowledgement flag is set. */
+		bool filter_request = filter_ack &&
+		    (message == VAYU_IPA_INSTALL_FILTER_RULE || message == VAYU_IPA_FILTER_INSTALLED_NOTIF);
 		bool supported = message == VAYU_IPA_INDICATION_REGISTER ||
-		    message == VAYU_IPA_DRIVER_INIT_COMPLETE;
+		    message == VAYU_IPA_DRIVER_INIT_COMPLETE || filter_request;
 		uint16_t result = supported ? 0 : 1;
 		uint16_t error = supported ? 0 : QMI_ERR_NOT_SUPPORTED_V01;
-		uint8_t answer[14] = { 2, m[1], m[2], m[3], m[4], 7, 0, 2, 4, 0,
+		uint8_t answer[7 + 7 + 3 + 1 + 4 * 64] = { 2, m[1], m[2], m[3], m[4], 7, 0, 2, 4, 0,
 		    (uint8_t)result, (uint8_t)(result >> 8), (uint8_t)error, (uint8_t)(error >> 8) };
+		size_t answer_length = 14;
 
 		if (!supported) vayu_ipa_data_filter_error();
-		(void)vayu_qrtr_ops.send(host_port, node, from_port, answer, sizeof(answer));
+		if (filter_request && message == VAYU_IPA_INSTALL_FILTER_RULE) {
+			unsigned answered;
+			uint16_t request_size;
+			bool shape_known;
+
+			answer_length = ipa_filter_answer(m, length, answer, (uint16_t)(m[1] | m[2] << 8),
+			    message, &answered, &request_size, &shape_known);
+			say("vayu-ipa-qmi: answered %u filter rule IDs (not programmed)\n", answered);
+			if (!shape_known) {
+				say("vayu-ipa-qmi: filter request shape not recognized (%u bytes); success has no rule IDs\n",
+				    request_size);
+			}
+		} else if (filter_request) {
+			answer[10] = 0;
+			answer[11] = 0;
+			answer[12] = 0;
+			answer[13] = 0;
+		}
+		(void)vayu_qrtr_ops.send(host_port, node, from_port, answer, answer_length);
 		if (!supported) {
 			say("vayu-ipa-qmi: modem request %#x (%zu bytes) answered NOT_SUPPORTED (nothing was changed)\n",
 			    message, length);
+		} else if (filter_request && message == VAYU_IPA_FILTER_INSTALLED_NOTIF) {
+			say("vayu-ipa-qmi: modem filter-installed notification answered success\n");
 		}
 	} else {
 		say("vayu-ipa-qmi: modem message %#x type %u on the host port: result %u error %u\n", message, m[0],
@@ -1173,6 +1265,12 @@ vayu_ipa_start(struct vayu_qrtr *q)
 	PE_parse_boot_argn("vayu_ipa_qmi_timeout", &qmi_timeout_ms, sizeof(qmi_timeout_ms));
 	PE_parse_boot_argn("vayu_ipa_qmi_regwait", &qmi_regwait_ms, sizeof(qmi_regwait_ms));
 	PE_parse_boot_argn("vayu_ipa_qmi_attempts", &qmi_attempts, sizeof(qmi_attempts));
+	{
+		uint32_t enabled = 0;
+
+		filter_ack = PE_parse_boot_argn("vayu_ipa_flt_ack", &enabled, sizeof(enabled)) && enabled == 1;
+		if (filter_ack) say("vayu-ipa-qmi: vayu_ipa_flt_ack=1: filter requests acknowledged; rules are not programmed\n");
+	}
 	if (qmi_timeout_ms < 1000 || qmi_timeout_ms > 60000) qmi_timeout_ms = 30000;
 	if (qmi_regwait_ms > 30000) qmi_regwait_ms = 30000;
 	if (qmi_attempts < 1 || qmi_attempts > 5) qmi_attempts = 3;
